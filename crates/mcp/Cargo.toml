@@ -12,6 +12,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+getrandom = "0.3.4"
 
 [dev-dependencies]
 tempfile.workspace = true
