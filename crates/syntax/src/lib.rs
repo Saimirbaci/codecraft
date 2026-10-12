@@ -1,8 +1,9 @@
 //! CodeCraft lexical syntax services (L0, no workspace deps).
 //!
-//! Language detection, fast lexical highlighting (Rust via `rustc_lexer`, plus TOML, Markdown,
-//! JSON, YAML and shell), bracket matching, folding ranges and a lexical outline used before the
-//! language server is ready. Semantic highlighting from the LSP layers on top in the UI.
+//! Language detection, fast lexical highlighting (Rust via `rustc_lexer`, plus hand-written
+//! lexers for TOML, Markdown, JSON, YAML, shell, C/C++, Python, Zig, TypeScript/JavaScript and
+//! SQL), bracket matching, folding ranges and a lexical outline used before the language server
+//! is ready. Semantic highlighting from the LSP layers on top in the UI.
 //!
 //! Every function accepts arbitrary text and never panics. Offsets are **char** offsets;
 //! highlight spans are char columns within a line. Lines are split on `\n` exactly, so a text
@@ -20,13 +21,19 @@
     clippy::string_slice
 )]
 
+mod c;
 mod common;
+mod js;
 mod json;
+mod lex;
 mod markdown;
+mod python;
 mod rust;
 mod shell;
+mod sql;
 mod toml;
 mod yaml;
+mod zig;
 
 use std::path::Path;
 
@@ -54,7 +61,8 @@ pub enum Language {
 }
 
 impl Language {
-    /// By file name/extension: `.rs`, `Cargo.toml`/`.toml`, `.md`, `.json`, `.yml`/`.yaml`, `.sh`.
+    /// By file name/extension: `.rs`, `Cargo.toml`/`.toml`, `.md`, `.json`, `.yml`/`.yaml`, `.sh`,
+    /// `.c`/`.h`, `.cpp`/`.hpp`/…, `.py`, `.zig`, `.ts`/`.tsx`, `.js`/`.jsx`/`.mjs`, `.sql`.
     pub fn from_path(path: &Path) -> Self {
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
         match ext.as_str() {
@@ -243,16 +251,14 @@ fn lexical_spans(language: Language, doc: &Doc) -> Vec<Span> {
         Language::Json => json::spans(doc),
         Language::Yaml => yaml::spans(doc),
         Language::Shell => shell::spans(doc),
-        // TODO(syntax agent): C, C++, Python, Zig, TypeScript, JavaScript, SQL lexers.
-        Language::C
-        | Language::Cpp
-        | Language::Python
-        | Language::Zig
-        | Language::TypeScript
-        | Language::JavaScript
-        | Language::Sql
-        | Language::Rust
-        | Language::PlainText => Vec::new(),
+        Language::C => c::spans(doc, false),
+        Language::Cpp => c::spans(doc, true),
+        Language::Python => python::spans(doc),
+        Language::Zig => zig::spans(doc),
+        Language::TypeScript => js::spans(doc, true),
+        Language::JavaScript => js::spans(doc, false),
+        Language::Sql => sql::spans(doc),
+        Language::Rust | Language::PlainText => Vec::new(),
     }
 }
 
@@ -264,6 +270,15 @@ fn lexical_spans(language: Language, doc: &Doc) -> Vec<Span> {
 pub fn matching_bracket(language: Language, text: &str, offset: usize) -> Option<usize> {
     let brackets = match language {
         Language::Rust => rust::brackets(text),
+        // Token-based lexers: brackets come from tokens, so JSX text and f-string literal
+        // parts never count.
+        Language::C => c::brackets(&Doc::new(text), false),
+        Language::Cpp => c::brackets(&Doc::new(text), true),
+        Language::Python => python::brackets(&Doc::new(text)),
+        Language::Zig => zig::brackets(&Doc::new(text)),
+        Language::TypeScript => js::brackets(&Doc::new(text), true),
+        Language::JavaScript => js::brackets(&Doc::new(text), false),
+        Language::Sql => sql::brackets(&Doc::new(text)),
         _ => {
             let doc = Doc::new(text);
             common::code_brackets(&doc.chars, &lexical_spans(language, &doc))
@@ -296,7 +311,12 @@ pub struct FoldRange {
 /// Rust: bracket blocks, comment runs and block comments, `use` runs. JSON: bracket blocks.
 /// TOML: tables, multi-line arrays, comment runs. Markdown: sections by heading, fenced code,
 /// HTML comments. YAML: indentation blocks, comment runs. Shell: brace/paren blocks,
-/// `if`/`case`/`do` blocks, comment runs.
+/// `if`/`case`/`do` blocks, comment runs. C/C++: bracket blocks, comments, `#include` runs,
+/// `#if`…`#endif` and `#pragma region`. Python: indented blocks of compound statements,
+/// brackets, multi-line strings (docstrings as comments), comments, import runs. Zig: bracket
+/// blocks, comments, `\\` string runs, `@import` runs. TypeScript/JavaScript: bracket blocks,
+/// comments, multi-line JSX elements, import/require runs. SQL: parenthesized groups,
+/// `BEGIN`/`CASE`/`IF`/`LOOP`…`END` blocks, dollar-quoted bodies, comments.
 pub fn folding_ranges(language: Language, text: &str) -> Vec<FoldRange> {
     match language {
         Language::Rust => rust::folding_ranges(text),
@@ -305,14 +325,14 @@ pub fn folding_ranges(language: Language, text: &str) -> Vec<FoldRange> {
         Language::Json => json::folding_ranges(&Doc::new(text)),
         Language::Yaml => yaml::folding_ranges(&Doc::new(text)),
         Language::Shell => shell::folding_ranges(&Doc::new(text)),
-        Language::C
-        | Language::Cpp
-        | Language::Python
-        | Language::Zig
-        | Language::TypeScript
-        | Language::JavaScript
-        | Language::Sql
-        | Language::PlainText => Vec::new(),
+        Language::C => c::folding_ranges(&Doc::new(text), false),
+        Language::Cpp => c::folding_ranges(&Doc::new(text), true),
+        Language::Python => python::folding_ranges(&Doc::new(text)),
+        Language::Zig => zig::folding_ranges(&Doc::new(text)),
+        Language::TypeScript => js::folding_ranges(&Doc::new(text), true),
+        Language::JavaScript => js::folding_ranges(&Doc::new(text), false),
+        Language::Sql => sql::folding_ranges(&Doc::new(text)),
+        Language::PlainText => Vec::new(),
     }
 }
 
@@ -347,17 +367,30 @@ pub struct OutlineItem {
 
 /// Lexical outline for File Structure (Cmd+F12) when no language server is available.
 /// Rust: fn/struct/enum/trait/impl (named `impl Trait for Type`)/mod/const/static/type/macro_rules.
-/// TOML: tables. Markdown: headings.
+/// TOML: tables. Markdown: headings. C/C++: function definitions, struct/class/union (`Struct`),
+/// enum, namespace (`Module`), typedef/using (`TypeAlias`), `#define` (`Macro`). Python: class
+/// (`Struct`), def (`Function`), module-level SCREAMING_CASE constants. Zig: fn, container
+/// declarations, tests (`Function` named `test "name"`). TypeScript/JavaScript: functions
+/// (including `const f = () =>`), classes (`Struct`) and their methods, interfaces (`Trait`),
+/// type aliases, enums, namespaces (`Module`). SQL: `CREATE` statements (`Section` named like
+/// `TABLE users`).
 ///
-/// Items come in document order. Rust items inside fn bodies are not listed; `impl` items are
-/// positioned at the `impl` keyword. TOML tables and Markdown headings are `Section`s; a
+/// Items come in document order. Items inside function bodies are not listed (Python nested
+/// `def`s are); `impl` items are positioned at the `impl` keyword. TOML tables and Markdown headings are `Section`s; a
 /// heading's depth is its level minus one.
 pub fn outline(language: Language, text: &str) -> Vec<OutlineItem> {
     match language {
         Language::Rust => rust::outline(text),
         Language::Toml => toml::outline(&Doc::new(text)),
         Language::Markdown => markdown::outline(&Doc::new(text)),
-        _ => Vec::new(),
+        Language::C => c::outline(&Doc::new(text), false),
+        Language::Cpp => c::outline(&Doc::new(text), true),
+        Language::Python => python::outline(&Doc::new(text)),
+        Language::Zig => zig::outline(&Doc::new(text)),
+        Language::TypeScript => js::outline(&Doc::new(text), true),
+        Language::JavaScript => js::outline(&Doc::new(text), false),
+        Language::Sql => sql::outline(&Doc::new(text)),
+        Language::Json | Language::Yaml | Language::Shell | Language::PlainText => Vec::new(),
     }
 }
 
@@ -381,6 +414,13 @@ mod tests {
             ("ci.yaml", Language::Yaml),
             ("run.sh", Language::Shell),
             ("x.zsh", Language::Shell),
+            ("main.c", Language::C),
+            ("lib.hpp", Language::Cpp),
+            ("app.py", Language::Python),
+            ("build.zig", Language::Zig),
+            ("index.tsx", Language::TypeScript),
+            ("index.mjs", Language::JavaScript),
+            ("schema.sql", Language::Sql),
             ("LICENSE", Language::PlainText),
             ("", Language::PlainText),
         ];
@@ -429,6 +469,13 @@ mod tests {
             Language::Json,
             Language::Yaml,
             Language::Shell,
+            Language::C,
+            Language::Cpp,
+            Language::Python,
+            Language::Zig,
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Sql,
             Language::PlainText,
         ] {
             assert_eq!(highlight(language, "").len_lines(), 1);

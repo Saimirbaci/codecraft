@@ -8,13 +8,20 @@ use std::time::{Duration, Instant};
 
 use codecraft_syntax::{FoldRange, Highlights, Language, folding_ranges, highlight, matching_bracket, outline};
 
-const LANGUAGES: [Language; 7] = [
+const LANGUAGES: [Language; 14] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
     Language::Json,
     Language::Yaml,
     Language::Shell,
+    Language::C,
+    Language::Cpp,
+    Language::Python,
+    Language::Zig,
+    Language::TypeScript,
+    Language::JavaScript,
+    Language::Sql,
     Language::PlainText,
 ];
 
@@ -126,6 +133,68 @@ const FRAGMENTS: &[&str] = &[
     "\r\n",
     "😀",
     "é",
+    // C/C++
+    "#include <",
+    "#define X ",
+    "#if 0\n",
+    "#endif\n",
+    "R\"x(",
+    ")x\"",
+    "u8\"",
+    "L'",
+    "[[",
+    "template<",
+    "operator",
+    "namespace ",
+    "class ",
+    "typedef ",
+    "::",
+    "->",
+    // Python
+    "def ",
+    "    ",
+    "f\"",
+    "f'{",
+    "rb'",
+    "{x:",
+    "@dec\n",
+    "lambda ",
+    "match ",
+    "case ",
+    "import ",
+    "from ",
+    ":\n",
+    // Zig
+    "\\\\",
+    "@import(",
+    "test \"",
+    "pub fn ",
+    "const X = struct {",
+    "@\"",
+    // TypeScript/JavaScript
+    "`",
+    "}",
+    "/re/g",
+    "<div>",
+    "</div>",
+    "/>",
+    "<>",
+    "=> ",
+    "function ",
+    "interface ",
+    "export ",
+    "#priv",
+    // SQL
+    "$$",
+    "$tag$",
+    "E'",
+    "-- ",
+    "BEGIN\n",
+    "END;",
+    "CASE ",
+    "CREATE TABLE ",
+    ":name",
+    "U&'",
 ];
 
 fn random_text(rng: &mut Rng) -> String {
@@ -248,9 +317,14 @@ fn mutated_samples_never_panic() {
         "{\"a\": [1, 2.5, true, null], \"b\": {\"c\": \"d\"}} // c\n",
         "a: 1\nb:\n  - c: 'x'\n    d: \"y\"\ne: |\n  text\nf: &x {g: [1, 2]}\n",
         "#!/bin/sh\nif [ -f x ]; then\n  echo \"$HOME ${x}\" 'y'\nfi\ncat <<EOF\nbody\nEOF\n",
+        C_SAMPLE,
+        PYTHON_SAMPLE,
+        ZIG_SAMPLE,
+        TS_SAMPLE,
+        SQL_SAMPLE,
     ];
     let mut rng = Rng(42);
-    for _ in 0..iterations(400) / 6 {
+    for _ in 0..iterations(400) / 11 {
         for (k, sample) in samples.iter().enumerate() {
             let mut chars: Vec<char> = sample.chars().collect();
             if k == 0 {
@@ -298,6 +372,34 @@ fn adversarial_inputs_stay_linear() {
         "- ".repeat(N / 2),
         "\n".repeat(N),
         "(".repeat(N / 2) + &"]".repeat(N / 2),
+        // Unclosed constructs of the newer lexers.
+        "`${".repeat(N / 3),
+        "R\"".repeat(N / 2),
+        "R\"x(".repeat(N / 4),
+        "\"\"\"".repeat(N / 3),
+        "'''x".repeat(N / 4),
+        "f'{".repeat(N / 3),
+        "f\"\"\"{x:{".repeat(N / 8),
+        "$$".repeat(N / 2),
+        "$a$".repeat(N / 3),
+        "/* /* ".repeat(N / 6),
+        "(/[".repeat(N / 3),
+        "x = /".repeat(N / 5),
+        "(<a ".repeat(N / 4),
+        "(<a>".repeat(N / 4) + "</a>",
+        "#if 0\n".repeat(N / 6),
+        "#define A {\n".repeat(N / 12),
+        "struct S { ".repeat(N / 10),
+        "class A { ".repeat(N / 10),
+        "template<".repeat(N / 9),
+        "operator".repeat(N / 8),
+        "def f():\n".repeat(N / 9),
+        "@d\n".repeat(N / 3),
+        "begin case ".repeat(N / 11),
+        "CREATE TABLE ".repeat(N / 13),
+        "const x = struct {".repeat(N / 18),
+        "\\\\x\n".repeat(N / 4),
+        (0..N / 40).map(|k| format!("{}if x:\n", " ".repeat(k % 200))).collect(),
     ];
     for text in &cases {
         for language in LANGUAGES {
@@ -315,6 +417,16 @@ fn adversarial_inputs_stay_linear() {
             );
         }
     }
+}
+
+/// A realistic file of at least `lines` lines, built by repeating `template`.
+fn generated(template: &str, lines: usize) -> String {
+    let mut out = String::with_capacity(lines * 40);
+    let per = template.lines().count().max(1);
+    for _ in 0..lines.div_ceil(per) {
+        out.push_str(template);
+    }
+    out
 }
 
 /// A realistic 10k-line Rust file.
@@ -346,12 +458,7 @@ fn helper(values: &[u32]) -> Option<u32> {
     values.iter().copied().filter(|v| *v > 0x10 && *v != 0b1010).max()
 }
 "##;
-    let mut out = String::with_capacity(lines * 40);
-    let per = TEMPLATE.lines().count();
-    for _ in 0..lines.div_ceil(per) {
-        out.push_str(TEMPLATE);
-    }
-    out
+    generated(TEMPLATE, lines)
 }
 
 #[test]
@@ -390,6 +497,55 @@ fn highlight_10k_lines_is_fast() {
     assert!(highlight_time < Duration::from_millis(50), "highlight took {highlight_time:?}");
 }
 
+/// A 10k-line file of each language with a lexer of its own highlights in under 10 ms.
+#[test]
+#[ignore = "performance check: run with `cargo test --release -- --ignored`"]
+fn highlight_10k_lines_every_language() {
+    let cases = [
+        (Language::C, C_SAMPLE),
+        (Language::Cpp, CPP_SAMPLE),
+        (Language::Python, PYTHON_SAMPLE),
+        (Language::Zig, ZIG_SAMPLE),
+        (Language::TypeScript, TS_SAMPLE),
+        (Language::JavaScript, TS_SAMPLE),
+        (Language::Sql, SQL_SAMPLE),
+        (Language::Shell, "if [ -f \"$x\" ]; then\n  echo \"hi $USER\" | grep -c x # count\nfi\n"),
+        (Language::Yaml, "key: value\nlist:\n  - 'a'\n  - b: [1, 2]\n"),
+    ];
+    let best = |f: &dyn Fn()| {
+        (0..10)
+            .map(|_| {
+                let start = Instant::now();
+                f();
+                start.elapsed()
+            })
+            .min()
+            .unwrap_or_default()
+    };
+    for (language, template) in cases {
+        let text = generated(template, 10_000);
+        let lines = text.lines().count();
+        let highlight_time = best(&|| {
+            let h = highlight(language, &text);
+            assert_eq!(h.len_lines(), text.matches('\n').count() + 1);
+        });
+        let fold_time = best(&|| {
+            let _ = folding_ranges(language, &text);
+        });
+        let outline_time = best(&|| {
+            let _ = outline(language, &text);
+        });
+        let bracket_time = best(&|| {
+            let _ = matching_bracket(language, &text, text.len() / 2);
+        });
+        println!(
+            "{language:?} {lines} lines: highlight {highlight_time:?}, folding {fold_time:?}, outline {outline_time:?}, \
+             matching_bracket {bracket_time:?}"
+        );
+        assert!(highlight_time < Duration::from_millis(10), "{language:?} highlight took {highlight_time:?}");
+    }
+}
+
 /// `\r\n` input highlights like `\n` input, apart from spans that also cover the `\r`.
 #[test]
 fn crlf_highlights_like_lf() {
@@ -400,6 +556,13 @@ fn crlf_highlights_like_lf() {
         (Language::Json, "{\n  \"k\": [1, true]\n}\n"),
         (Language::Yaml, "k: v\nl:\n  - 1\nb: |\n  text\n"),
         (Language::Shell, "if x; then\n  echo \"$a\" # c\nfi\ncat <<EOF\nbody\nEOF\n"),
+        (Language::C, C_SAMPLE),
+        (Language::Cpp, C_SAMPLE),
+        (Language::Python, PYTHON_SAMPLE),
+        (Language::Zig, ZIG_SAMPLE),
+        (Language::TypeScript, TS_SAMPLE),
+        (Language::JavaScript, TS_SAMPLE),
+        (Language::Sql, SQL_SAMPLE),
     ];
     for (language, lf) in samples {
         let crlf = lf.replace('\n', "\r\n");
@@ -415,3 +578,137 @@ fn crlf_highlights_like_lf() {
         assert_eq!(outline(language, lf), outline(language, &crlf), "{language:?}");
     }
 }
+
+const C_SAMPLE: &str = r#"#include <stdio.h>
+#include "util.h"
+#define MAX_LEN 64 /* bytes */
+
+/** A node. */
+typedef struct node {
+    int value;
+    struct node *next; // link
+} node_t;
+
+#if 0
+dead code, don't care
+#endif
+
+static size_t count(const node_t *n) {
+    size_t total = 0;
+    while (n != NULL) {
+        total += n->value > 0x1F ? 1u : 0;
+        n = n->next;
+    }
+    printf("%zu items in \"list\"\n", total);
+    return total;
+}
+"#;
+
+const CPP_SAMPLE: &str = r#"#include <vector>
+namespace app {
+/// Widget docs.
+template <typename T>
+class Widget : public Base<T> {
+public:
+    explicit Widget(int x) : x_(x) {}
+    [[nodiscard]] int size() const noexcept { return static_cast<int>(items_.size()); }
+    bool operator==(const Widget& o) const { return x_ == o.x_; }
+private:
+    std::vector<T> items_;
+    int x_ = 1'000;
+};
+auto raw = R"sql(SELECT "x" FROM t)sql";
+void run() {
+    auto f = [](auto a) { return a * 2.5e3; };
+    if (f(1) > 0) { std::puts(u8"ok"); }
+}
+}
+"#;
+
+const PYTHON_SAMPLE: &str = r#"import os
+from typing import Optional
+
+MAX_RETRIES = 3
+
+@dataclass
+class Client(Base):
+    """A client."""
+
+    def __init__(self, url: str, retries: int = MAX_RETRIES) -> None:
+        self.url = url  # remember
+        self.retries = retries
+
+    async def fetch(self, path: str) -> Optional[bytes]:
+        msg = f"GET {self.url}/{path!r:>10} {{literal}}"
+        if path.startswith('/') and len(path) > 0x10:
+            return await self._get(rb'\d+' + b"x")
+        return None
+"#;
+
+const ZIG_SAMPLE: &str = r#"const std = @import("std");
+const mem = std.mem;
+
+/// A point.
+pub const Point = struct {
+    x: i32 = 0,
+    y: i32,
+
+    pub fn len(self: Point) f32 {
+        const s =
+            \\multi "line"
+            \\string
+        ;
+        _ = s;
+        return @floatFromInt(self.x * self.x + self.y * 0x10);
+    }
+};
+
+test "point length" {
+    try std.testing.expect((Point{ .y = 1 }).len() >= 0.5);
+}
+"#;
+
+const TS_SAMPLE: &str = r#"import { api } from './api';
+const MAX = 10;
+
+/** A service. */
+export class Service<T> {
+  private cache = new Map<string, T>();
+  async load(id: string): Promise<T | undefined> {
+    const re = /^[a-z]+\/\d+$/i;
+    if (!re.test(id)) return undefined;
+    const value = await api.get(`items/${id}?limit=${MAX / 2}`);
+    return value ?? this.cache.get(id);
+  }
+}
+
+export const view = (name: string) => (
+  <div className="card" onClick={() => alert(name)}>
+    Hello, {name}!
+  </div>
+);
+"#;
+
+const SQL_SAMPLE: &str = r#"-- Users
+CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY,
+    email VARCHAR(255) NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+/* Active users with their order counts */
+SELECT u.id, u.email, COUNT(o.id) AS orders
+FROM users u
+LEFT JOIN orders o ON o.user_id = u.id AND o.status <> 'cancelled'
+WHERE u.created_at > $1 AND u.email LIKE 'a%''s'
+GROUP BY u.id, u.email
+ORDER BY orders DESC
+LIMIT 10;
+
+CREATE FUNCTION touch() RETURNS trigger AS $$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+"#;
