@@ -70,7 +70,7 @@ pub(crate) fn client_capabilities() -> Value {
             "completion": {
                 "dynamicRegistration": false,
                 "completionItem": {
-                    "snippetSupport": false,
+                    "snippetSupport": true,
                     "commitCharactersSupport": false,
                     "documentationFormat": markup,
                     "deprecatedSupport": true,
@@ -179,7 +179,7 @@ mod tests {
         let text = caps.text_document.unwrap();
         assert_eq!(text.hover.unwrap().content_format.unwrap().first(), Some(&MarkupKind::Markdown));
         let item = text.completion.unwrap().completion_item.unwrap();
-        assert_eq!(item.snippet_support, Some(false));
+        assert_eq!(item.snippet_support, Some(true));
         assert_eq!(item.label_details_support, Some(true));
         assert_eq!(item.resolve_support.unwrap().properties, ["documentation", "detail", "additionalTextEdits"]);
         assert!(text.signature_help.is_some());

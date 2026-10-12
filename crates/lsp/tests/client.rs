@@ -33,7 +33,7 @@ fn handshake_sends_initialize_then_initialized() {
     assert_eq!(params["initializationOptions"], json!({ "cargo": { "features": "all" } }));
     let caps = &params["capabilities"];
     assert_eq!(caps["general"]["positionEncodings"], json!(["utf-16"]));
-    assert_eq!(caps["textDocument"]["completion"]["completionItem"]["snippetSupport"], false);
+    assert_eq!(caps["textDocument"]["completion"]["completionItem"]["snippetSupport"], true);
     assert_eq!(caps["window"]["workDoneProgress"], true);
     // The whole thing is a valid InitializeParams.
     serde_json::from_value::<lsp_types::InitializeParams>(params.clone()).unwrap();

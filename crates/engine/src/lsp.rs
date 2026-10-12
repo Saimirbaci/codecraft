@@ -64,6 +64,8 @@ fn ra_config(use_clippy: bool) -> Value {
         "cargo": { "buildScripts": { "enable": true } },
         "procMacro": { "enable": true },
         "workspace": { "symbol": { "search": { "kind": "all_symbols", "limit": 256 } } },
+        // RustRover inserts `name()` with the caret inside, not argument placeholders.
+        "completion": { "callable": { "snippets": "add_parentheses" } },
         "inlayHints": { "typeHints": { "enable": true }, "parameterHints": { "enable": true } },
     })
 }
@@ -700,7 +702,8 @@ impl Session {
                     }
                     None => (it.insert_text.clone().unwrap_or_else(|| it.label.clone()), None),
                 };
-                let insert_text = if snippet { convert::strip_snippet(&raw_text) } else { raw_text };
+                let (insert_text, cursor) =
+                    if snippet { convert::snippet_with_cursor(&raw_text) } else { (raw_text, None) };
                 let additional_edits = it
                     .additional_text_edits
                     .unwrap_or_default()
@@ -719,6 +722,7 @@ impl Session {
                     detail,
                     kind: it.kind.map(completion_kind).unwrap_or("text").to_string(),
                     insert_text,
+                    cursor,
                     replace_start,
                     additional_edits,
                     documentation: it.documentation.as_ref().map(convert::documentation_text),

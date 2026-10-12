@@ -387,11 +387,11 @@ fn accept_completion(s: &mut Session, p: &Value) -> CmdResult {
         match ChangeSet::new(changes) {
             Ok(cs) => {
                 let inserted_end = cs.map_pos(end, codecraft_text::Assoc::After);
-                // Put the caret inside `()` when the insertion ends with an empty call.
-                let caret = if item.insert_text.ends_with("()") && matches!(item.kind.as_str(), "fn" | "method") {
-                    inserted_end.saturating_sub(1)
-                } else {
-                    inserted_end
+                // The snippet's final cursor (`name($0)` puts the caret inside the parentheses).
+                let len = item.insert_text.chars().count();
+                let caret = match item.cursor {
+                    Some(c) if c <= len => inserted_end.saturating_sub(len - c),
+                    _ => inserted_end,
                 };
                 Edit { changes: cs, selections: SelectionSet::caret(caret) }
             }

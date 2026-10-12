@@ -108,6 +108,19 @@ pub(crate) fn documentation_text(d: &lt::Documentation) -> String {
     }
 }
 
+/// Strip snippet syntax and return the char offset of the final cursor (`$0`, else the first
+/// tab stop), if the snippet has one.
+pub(crate) fn snippet_with_cursor(s: &str) -> (String, Option<usize>) {
+    for marker in ["$0", "${0}", "$1", "${1"] {
+        if let Some(byte) = s.find(marker) {
+            let before = strip_snippet(s.get(..byte).unwrap_or(""));
+            let cursor = before.chars().count();
+            return (strip_snippet(s), Some(cursor));
+        }
+    }
+    (strip_snippet(s), None)
+}
+
 /// Strip LSP snippet syntax: `$0`, `$1`, `${1:text}` → `text`, `${1|a,b|}` → `a`, `\$` → `$`.
 pub(crate) fn strip_snippet(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

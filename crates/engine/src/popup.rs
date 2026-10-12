@@ -55,6 +55,9 @@ pub struct CompletionItem {
     pub sort_text: String,
     /// Replacement for `[replace_start, caret)` when accepted.
     pub insert_text: String,
+    /// Caret position within `insert_text` after accepting (from the snippet's `$0`).
+    #[serde(default)]
+    pub cursor: Option<usize>,
     /// Char offset where the replaced range starts (from the item's text edit, or the word start).
     pub replace_start: Option<usize>,
     /// Extra edits (auto-import), char offsets in the document at request time.
