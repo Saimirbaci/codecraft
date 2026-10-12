@@ -237,6 +237,61 @@ fn run_lines(doc: &Document, lang: codecraft_syntax::Language) -> Vec<usize> {
     out
 }
 
+/// What the debugger shows in one file: breakpoints, the execution line, inline values and (while
+/// suspended) the current frame's locals for value hovers.
+#[derive(Default)]
+struct DebugMarks {
+    breakpoints: Vec<codecraft_engine::debug::Breakpoint>,
+    execution: Option<usize>,
+    inline: Vec<(usize, String)>,
+    locals: Vec<(String, String)>,
+}
+
+impl DebugMarks {
+    fn collect(s: &Session, path: &std::path::Path) -> Self {
+        let debug = &s.debug;
+        let breakpoints = debug.breakpoints_in(path).cloned().collect();
+        let Some(session) = debug.session.as_ref().filter(|x| x.is_stopped()) else {
+            return Self { breakpoints, ..Self::default() };
+        };
+        let execution = session.execution.as_ref().filter(|(p, _)| p == path).map(|(_, line)| *line);
+        let inline =
+            session.inline_values.iter().filter(|v| v.path == path).map(|v| (v.line, v.text.clone())).collect();
+        let locals = match (execution, session.scopes.first()) {
+            (Some(_), Some(scope)) => session
+                .variables
+                .get(&scope.reference)
+                .map(|vars| vars.iter().map(|v| (v.name.clone(), v.value.clone())).collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        Self { breakpoints, execution, inline, locals }
+    }
+}
+
+fn breakpoint_tooltip(bp: &codecraft_engine::debug::Breakpoint) -> String {
+    let mut text = String::from(if bp.temporary { "Temporary line breakpoint" } else { "Line breakpoint" });
+    if !bp.enabled {
+        text.push_str(" (disabled)");
+    }
+    if let Some(c) = &bp.condition {
+        text.push_str(&format!("\nCondition: {c}"));
+    }
+    if let Some(h) = &bp.hit_condition {
+        text.push_str(&format!("\nHit count: {h}"));
+    }
+    if let Some(m) = &bp.log_message {
+        text.push_str(&format!("\nLog: {m}"));
+    }
+    match (bp.verified, &bp.message) {
+        (Some(false), Some(m)) => text.push_str(&format!("\nNot set: {m}")),
+        (Some(false), None) => text.push_str("\nThe debugger has not set it (yet)."),
+        _ => {}
+    }
+    text.push_str("\nClick to remove · right-click to edit");
+    text
+}
+
 /// Paint the editor and handle pointer input. Returns the caret's screen position.
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId) {
     let theme = st.theme.clone();
@@ -246,6 +301,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let problems: Vec<Problem> =
         path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
+    let marks = path.as_deref().map(|p| DebugMarks::collect(s, p)).unwrap_or_default();
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
     let od = &*od;
@@ -255,6 +311,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let tab = settings.tab_size.max(1);
 
     let font = FontId::monospace(settings.editor_font_size);
+    let inline_font = FontId::proportional((settings.editor_font_size - 1.0).max(8.0));
     let (char_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
     let line_h = (settings.editor_font_size * settings.line_spacing).max(row_h).round();
     let rect = ui.available_rect_before_wrap();
@@ -264,7 +321,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
     let map = DisplayMap::build(doc.len_lines(), folds, &editor.folded);
     let digits = doc.len_lines().max(1).ilog10() as f32 + 1.0;
-    let gutter_w = if settings.show_line_numbers { (digits.max(2.0) + 1.0) * char_w } else { 0.0 } + 18.0 + 14.0 + 6.0;
+    // Breakpoints sit over the line numbers (RustRover's New UI), so keep room for them.
+    let numbers_w = if settings.show_line_numbers { (digits.max(2.0) + 1.0) * char_w } else { 16.0 };
+    let gutter_w = numbers_w + 18.0 + 14.0 + 6.0;
     let text_rect =
         Rect::from_min_max(pos2(rect.left() + gutter_w, rect.top()), pos2(rect.right() - STRIPE_W, rect.bottom()));
     let visible_rows = ((rect.height() / line_h).floor() as usize).max(1);
@@ -386,6 +445,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         if line == caret_line && primary.is_empty() {
             painter.rect_filled(line_rect, CornerRadius::ZERO, theme.caret_row);
         }
+        if marks.execution == Some(line) {
+            painter.rect_filled(line_rect, CornerRadius::ZERO, theme.execution_line);
+        }
         // Indent guides.
         let indent_cols = {
             let text = doc.line_text(line).unwrap_or_default();
@@ -464,6 +526,17 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         }
         // Text.
         text_painter.galley(pos2(text_x0 - scroll_x, text_y), ll.galley.clone(), theme.text_editor);
+        // Inline debugger values after the line end (while suspended).
+        for (_, text) in marks.inline.iter().filter(|(l, _)| *l == line) {
+            let x = text_x0 - scroll_x + ll.x_of(ll.len) + 2.0 * char_w;
+            text_painter.text(
+                pos2(x, y + line_h * 0.5),
+                Align2::LEFT_CENTER,
+                text,
+                inline_font.clone(),
+                theme.inline_value,
+            );
+        }
         // Folded placeholder.
         if editor.folded.contains(&line) && fold_starts.contains(&line) {
             let x = text_x0 - scroll_x + ll.x_of(ll.len) + char_w;
@@ -515,9 +588,30 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let gutter = Rect::from_min_max(rect.min, pos2(rect.left() + gutter_w, rect.bottom()));
     painter.rect_filled(gutter, CornerRadius::ZERO, theme.editor_bg);
     let num_font = FontId::monospace((settings.editor_font_size - 1.0).max(8.0));
+    // The breakpoint area: the line numbers, between the run icons and the fold markers.
+    let bp_area = (gutter.left() + 18.0)..(gutter.left() + 18.0 + numbers_w);
+    let bp_x = (bp_area.start + bp_area.end) * 0.5;
+    let bp_radius = (line_h * 0.32).clamp(4.0, 7.0);
+    let hover_line = ui
+        .input(|i| i.pointer.hover_pos())
+        .filter(|p| gutter.contains(*p) && bp_area.contains(&p.x) && path.is_some())
+        .and_then(|p| map.line((((p.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize));
     for (line, y, _) in &layouts {
         let cy = y + line_h * 0.5;
-        if settings.show_line_numbers {
+        let breakpoint = marks.breakpoints.iter().find(|b| b.line == *line);
+        if let Some(bp) = breakpoint {
+            crate::debug_panel::paint_breakpoint(&painter, pos2(bp_x, cy), bp_radius, bp, &theme);
+        } else if hover_line == Some(*line) {
+            painter.circle_filled(pos2(bp_x, cy), bp_radius, theme.breakpoint.gamma_multiply(0.45));
+        }
+        if marks.execution == Some(*line) {
+            crate::debug_panel::paint_exec_arrow(&painter, pos2(bp_x, cy), &theme);
+        }
+        if settings.show_line_numbers
+            && breakpoint.is_none()
+            && marks.execution != Some(*line)
+            && hover_line != Some(*line)
+        {
             let color = if *line == caret_line { theme.line_number_active } else { theme.line_number };
             painter.text(
                 pos2(gutter.right() - 20.0, cy),
@@ -620,6 +714,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                     if let Some(p) = &path {
                         commands.push(("run.contextConfiguration", json!({ "path": p, "line": line })));
                     }
+                } else if let Some(p) = path.as_ref().filter(|_| bp_area.contains(&pos.x)) {
+                    commands.push(("run.toggleBreakpoint.lineBreakpoint", json!({ "path": p, "line": line })));
                 } else {
                     let start = doc.line_start(line);
                     let end = (start + doc.line_len(line) + 1).min(doc.len_chars());
@@ -682,7 +778,25 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             .collect();
         if !msgs.is_empty() {
             response = response.on_hover_text_at_pointer(msgs.join("\n\n"));
+        } else if !marks.locals.is_empty() {
+            // While suspended: the value of the variable under the pointer.
+            let word = doc.slice(codecraft_text::movement::word_range_at(doc, off));
+            if let Some((name, value)) = marks.locals.iter().find(|(n, _)| *n == word) {
+                response = response.on_hover_text_at_pointer(format!("{name} = {value}"));
+            }
         }
+    }
+    let mut gutter_menu_breakpoint = None;
+    if let Some(pos) = response.hover_pos()
+        && gutter.contains(pos)
+        && bp_area.contains(&pos.x)
+        && let Some(line) = map.line((((pos.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize)
+        && let Some(bp) = marks.breakpoints.iter().find(|b| b.line == line)
+    {
+        if response.secondary_clicked() {
+            gutter_menu_breakpoint = Some(bp.id);
+        }
+        response = response.on_hover_text_at_pointer(breakpoint_tooltip(bp));
     }
     let _ = response;
 
@@ -716,6 +830,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     }
     for (cmd, params) in commands {
         crate::run_command(s, st, cmd, &params);
+    }
+    if let Some(id) = gutter_menu_breakpoint {
+        crate::debug_panel::select_breakpoint(s, st, id);
     }
 }
 
