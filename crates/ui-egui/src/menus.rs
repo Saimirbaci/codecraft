@@ -19,10 +19,21 @@ const EXTRA: &[(&str, &str)] = &[
     ("View", "view.toggleWhitespace"),
     ("View", "view.toggleLineNumbers"),
     ("Code", "code.showContextActions"),
-    ("Code", "code.folding.expand"),
-    ("Code", "code.folding.collapse"),
-    ("Code", "code.folding.expandAll"),
-    ("Code", "code.folding.collapseAll"),
+    ("Code › Folding", "code.folding.expand"),
+    ("Code › Folding", "code.folding.collapse"),
+    ("Code › Folding", "code.folding.expandAll"),
+    ("Code › Folding", "code.folding.collapseAll"),
+    // RustRover fills Run › Debugging Actions lazily, so the observation captured it empty.
+    ("Run › Debugging Actions", "run.debuggingActions.resume"),
+    ("Run › Debugging Actions", "run.debuggingActions.pause"),
+    ("Run › Debugging Actions", "run.debuggingActions.stepOver"),
+    ("Run › Debugging Actions", "run.debuggingActions.stepInto"),
+    ("Run › Debugging Actions", "run.debuggingActions.forceStepInto"),
+    ("Run › Debugging Actions", "run.debuggingActions.stepOut"),
+    ("Run › Debugging Actions", "run.debuggingActions.runToCursor"),
+    ("Run › Debugging Actions", "run.debuggingActions.evaluateExpression"),
+    ("Run › Debugging Actions", "debug.stop"),
+    ("Run", "debug.atCaret"),
     ("Build", "cargo.check"),
     ("Build", "cargo.clippy"),
     ("Build", "cargo.doc"),
@@ -90,7 +101,8 @@ fn menu_items(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, path: &[&str
         if item.submenu {
             let mut sub: Vec<&str> = path.to_vec();
             sub.push(item.label);
-            let has_children = children(&sub).any(|c| c.id != "---");
+            let key = sub.join(" › ");
+            let has_children = children(&sub).any(|c| c.id != "---") || EXTRA.iter().any(|(m, _)| *m == key);
             if has_children {
                 ui.menu_button(item.label, |ui| menu_items(ui, s, st, &sub));
             } else {
@@ -100,10 +112,13 @@ fn menu_items(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, path: &[&str
             item_button(ui, s, st, item.id, &label_for(item));
         }
     }
-    if path.len() == 1 {
-        let extras: Vec<&str> = EXTRA.iter().filter(|(m, _)| Some(m) == path.first()).map(|(_, id)| *id).collect();
+    {
+        let key = path.join(" › ");
+        let extras: Vec<&str> = EXTRA.iter().filter(|(m, _)| *m == key).map(|(_, id)| *id).collect();
         if !extras.is_empty() {
-            ui.separator();
+            if any {
+                ui.separator();
+            }
             for id in extras {
                 let label = registry().get(id).map(|s| s.label).unwrap_or(id);
                 item_button(ui, s, st, id, label);
