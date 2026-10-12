@@ -2,7 +2,8 @@
 //!
 //! `cargo run -p codecraft-ui-egui --example snapshot -- <file-or-project> <out.png> [command-id ...]`
 //! Each extra argument is a command id run before rendering (e.g. `view.toolWindows.problems`),
-//! optionally `id=<json params>`, or `wait=<ms>` to let background work (debugger, servers) progress.
+//! optionally `id=<json params>`, `wait=<ms>` to let background work (debugger, servers) progress,
+//! or `lsp` to start rust-analyzer (off by default in snapshots).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -37,6 +38,15 @@ fn main() -> Result<(), String> {
             while t.elapsed() < Duration::from_millis(ms) {
                 h.run_steps(1);
                 std::thread::sleep(Duration::from_millis(30));
+            }
+            continue;
+        }
+        // `lsp`: enable language servers (snapshots run without them by default) and start
+        // rust-analyzer.
+        if c == "lsp" {
+            h.state_mut().session.lsp_enabled = true;
+            if let Err(e) = h.state_mut().session.execute("lsp.restart", &serde_json::json!({ "server": "rust" })) {
+                eprintln!("lsp: {e}");
             }
             continue;
         }

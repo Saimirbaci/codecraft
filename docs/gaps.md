@@ -7,11 +7,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 1. ~~No debugger~~ (landed in M2: lldb-dap for Rust/C/C++/Zig, debugpy for Python). Remaining:
    `&str` values show the data pointer before the text; no memory/disassembly views; js-debug
    for Node/TS only when the user installs it; no attach-to-process UI yet.
-2. **No VCS.** The Git menu is unimplemented: commit, diff, log, branches, annotate (M4).
-3. **No terminal tool window** (M4). Needed to launch `claude` already connected to the IDE
-   (`IdeServerState::env_for_child()` provides the environment).
-4. **Highlighting is lexical only.** No semantic tokens yet: locals, parameters, mutable
-   bindings, unresolved references and trait methods all look the same. No inlay hints.
+2. ~~No VCS~~ (landed in M3). Remaining: 3-way merge view (conflicts open with markers
+   highlighted), per-hunk staging, worktrees, GitHub/GitLab integration.
+3. ~~No terminal tool window~~ (landed in M3, with `claude` launched already connected).
+4. ~~Highlighting is lexical only~~ (M3: semantic tokens with mutable underline and unresolved
+   references, inlay hints for types and parameters). Remaining: parameter-name hints are not
+   clickable; hints are not shown in non-active split views.
 5. **Full-file re-lex on every edit** (and full-text LSP sync). Fine at a few thousand lines;
    large files will feel it. Needs incremental lexing and incremental LSP sync.
 6. **macOS keymap only.** Windows/Linux keymaps (Ctrl-based) are not mapped yet.
@@ -26,7 +27,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 11. Run configurations are derived only (no Edit Configurations dialog, no env/args editing UI).
 12. Test results show as a summary + console; there is no test tree tool window yet.
 13. Settings dialog covers a handful of options; no color scheme editor, no keymap editor.
-14. No file watching: external changes are picked up on window focus and by Reload All from Disk.
+14. ~~No file watching~~ (M3: FSEvents/inotify watcher reloads unmodified files and refreshes the tree and Git).
 15. Reformat with rustfmt replaces the whole document (the caret is clamped, not mapped).
 16. Lazily filled RustRover submenus (Tools › Rust, Edit › Find Usages, Code › Folding…) were not
     captured by the menu observation. Open each menu in RustRover and re-run the dump.

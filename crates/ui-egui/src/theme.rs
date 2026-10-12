@@ -51,6 +51,9 @@ pub struct Theme {
     pub breakpoint_disabled: Color32,
     pub execution_line: Color32,
     pub inline_value: Color32,
+    // inlay hints (`: i32`, parameter names)
+    pub inlay_text: Color32,
+    pub inlay_bg: Color32,
     // diffs (agent review, VCS)
     pub diff_added: Color32,
     pub diff_removed: Color32,
@@ -143,6 +146,8 @@ impl Theme {
             breakpoint_disabled: hex(0x6F737A),
             execution_line: hex(0x2D3A5C),
             inline_value: hex(0x7EA1D8),
+            inlay_text: hex(0x868A91),
+            inlay_bg: hex(0x2B2D30),
             diff_added: hex(0x5FB865),
             diff_removed: hex(0xF75464),
             diff_added_bg: hex(0x294436),

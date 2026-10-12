@@ -59,6 +59,9 @@ pub(crate) fn client_capabilities() -> Value {
             "symbol": { "dynamicRegistration": false },
             "workspaceFolders": true,
             "configuration": true,
+            // The server asks us to re-request these once its analysis is ready.
+            "inlayHint": { "refreshSupport": true },
+            "semanticTokens": { "refreshSupport": true },
         },
         "textDocument": {
             "synchronization": {

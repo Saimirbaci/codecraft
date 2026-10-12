@@ -738,6 +738,21 @@ impl Session {
                 }
                 Ok(json!({ "success": true }))
             }
+            // The server's analysis changed (e.g. indexing finished): drop cached decorations
+            // so the next pump re-requests them.
+            "workspace/inlayHint/refresh" | "workspace/semanticTokens/refresh" => {
+                let inlays = method.contains("inlayHint");
+                for od in self.ws.docs_mut() {
+                    if server_kind(od.language) == Some(kind) {
+                        if inlays {
+                            od.inlay_hints = None;
+                        } else {
+                            od.semantic = None;
+                        }
+                    }
+                }
+                Ok(Value::Null)
+            }
             _ => Err(ResponseError { code: -32601, message: format!("unsupported request {method}") }),
         };
         if let Some(l) = self.servers.get(&kind)

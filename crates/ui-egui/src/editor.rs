@@ -107,10 +107,20 @@ impl LineLayout {
     }
 }
 
+/// Language-server decorations for the current document revision (stale ones are not passed).
+#[derive(Clone, Copy, Default)]
+struct Decor<'a> {
+    semantic: Option<&'a [Vec<codecraft_workspace::SemanticSpan>]>,
+    /// Inlay hints sorted by offset.
+    inlays: &'a [codecraft_workspace::InlayHint],
+}
+
+#[allow(clippy::too_many_arguments)]
 fn layout_line(
     ui: &egui::Ui,
     doc: &Document,
     hl: &Highlights,
+    decor: Decor<'_>,
     line: usize,
     font: &FontId,
     theme: &Theme,
@@ -120,46 +130,114 @@ fn layout_line(
     let chars: Vec<char> = text.chars().take(MAX_LAYOUT_CHARS).collect();
     let n = chars.len();
     let has_tabs = chars.contains(&'\t');
+    // Per-char style: lexical class, overridden by semantic tokens.
+    let mut kinds: Vec<Option<HighlightKind>> = vec![None; n];
+    for span in hl.line(line) {
+        for k in kinds.iter_mut().take(span.end.min(n)).skip(span.start) {
+            *k = Some(span.kind);
+        }
+    }
+    let mut mutable = vec![false; n];
+    let mut unresolved = vec![false; n];
+    if let Some(sem) = decor.semantic.and_then(|v| v.get(line)) {
+        for sp in sem {
+            for i in sp.start.min(n)..sp.end.min(n) {
+                if let Some(k) = kinds.get_mut(i) {
+                    *k = Some(sp.kind);
+                }
+                if let Some(m) = mutable.get_mut(i) {
+                    *m = sp.mutable;
+                }
+                if let Some(u) = unresolved.get_mut(i) {
+                    *u = sp.unresolved;
+                }
+            }
+        }
+    }
+    // Inlay hints on this line, as (column, hint).
+    let line_start = doc.line_start(line);
+    let first = decor.inlays.partition_point(|h| h.offset < line_start);
+    let inlays: Vec<(usize, &codecraft_workspace::InlayHint)> = decor
+        .inlays
+        .get(first..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|h| h.offset <= line_start + n)
+        .map(|h| (h.offset - line_start, h))
+        .collect();
+    let mapped = has_tabs || !inlays.is_empty();
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
-    let mut xcols: Vec<usize> = if has_tabs { Vec::with_capacity(n + 1) } else { Vec::new() };
-    let mut x = 0usize;
-    let mut push = |job: &mut LayoutJob, from: usize, to: usize, color: Color32| {
-        if from >= to {
-            return;
+    let mut xcols: Vec<usize> = if mapped { Vec::with_capacity(n + 1) } else { Vec::new() };
+    let (mut x, mut gi) = (0usize, 0usize);
+    let hint_font = FontId::new((font.size * 0.86).max(8.0), font.family.clone());
+    let mut next_inlay = 0usize;
+    let mut emit_inlays = |job: &mut LayoutJob, col: usize, gi: &mut usize| {
+        while let Some((c, h)) = inlays.get(next_inlay) {
+            if *c != col {
+                break;
+            }
+            let label =
+                format!("{}{}{}", if h.pad_left { " " } else { "" }, h.label, if h.pad_right { " " } else { "" });
+            *gi += label.chars().count();
+            let fmt = TextFormat {
+                font_id: hint_font.clone(),
+                color: theme.inlay_text,
+                background: theme.inlay_bg,
+                valign: egui::Align::Center,
+                ..TextFormat::default()
+            };
+            job.append(&label, 0.0, fmt);
+            next_inlay += 1;
+        }
+    };
+    let mut col = 0usize;
+    while col < n {
+        if mapped {
+            xcols.push(gi);
+        }
+        emit_inlays(&mut job, col, &mut gi);
+        // A run of chars with the same style.
+        let style = |i: usize| (kinds.get(i).copied().flatten(), mutable.get(i).copied(), unresolved.get(i).copied());
+        let st0 = style(col);
+        let mut end = col + 1;
+        while end < n && style(end) == st0 && !inlays.iter().any(|(c, _)| *c == end) {
+            end += 1;
         }
         let mut seg = String::new();
-        for c in chars.get(from..to).unwrap_or(&[]) {
-            if has_tabs {
-                xcols.push(x);
+        for (i, c) in chars.get(col..end).unwrap_or(&[]).iter().enumerate() {
+            if mapped && i > 0 {
+                xcols.push(gi);
             }
             if *c == '\t' {
                 let w = tab - (x % tab.max(1));
                 seg.extend(std::iter::repeat_n(' ', w));
                 x += w;
+                gi += w;
             } else {
                 seg.push(*c);
                 x += 1;
+                gi += 1;
             }
         }
-        job.append(&seg, 0.0, TextFormat { font_id: font.clone(), color, ..TextFormat::default() });
-    };
-    let mut col = 0usize;
-    for span in hl.line(line) {
-        let (s, e) = (span.start.min(n), span.end.min(n));
-        if s < col || s >= e {
-            continue;
+        let (kind, is_mut, is_unresolved) = st0;
+        let mut color = kind.map(|k| theme.syntax(k)).unwrap_or(theme.text_editor);
+        if is_unresolved == Some(true) {
+            color = theme.error;
         }
-        push(&mut job, col, s, theme.text_editor);
-        push(&mut job, s, e, theme.syntax(span.kind));
-        col = e;
+        let mut fmt = TextFormat { font_id: font.clone(), color, ..TextFormat::default() };
+        if is_mut == Some(true) {
+            fmt.underline = Stroke::new(1.0, color.gamma_multiply(0.7));
+        }
+        job.append(&seg, 0.0, fmt);
+        col = end;
     }
-    push(&mut job, col, n, theme.text_editor);
-    if has_tabs {
-        xcols.push(x);
+    if mapped {
+        xcols.push(gi);
     }
+    emit_inlays(&mut job, n, &mut gi);
     let galley = ui.fonts_mut(|f| f.layout_job(job));
-    LineLayout { galley, xcols: has_tabs.then_some(xcols), len: n }
+    LineLayout { galley, xcols: mapped.then_some(xcols), len: n }
 }
 
 fn is_ident(c: char) -> bool {
@@ -308,6 +386,16 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let od = &*od;
     let doc = &od.doc;
     let hl = od.cached_highlights();
+    // Server decorations only when they match the current text (never misplaced while typing).
+    let revision = od.doc.revision();
+    let decor = Decor {
+        semantic: od.semantic.as_ref().filter(|(r, _)| *r == revision).map(|(_, v)| v.as_slice()),
+        inlays: if settings.show_inlay_hints {
+            od.inlay_hints.as_ref().filter(|(r, _)| *r == revision).map(|(_, v)| v.as_slice()).unwrap_or(&[])
+        } else {
+            &[]
+        },
+    };
     let folds = od.cached_folds();
     let tab = settings.tab_size.max(1);
 
@@ -363,7 +451,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
     // Caret line layout for horizontal reveal.
     if reveal {
-        let ll = layout_line(ui, doc, hl, caret_line, &font, &theme, tab);
+        let ll = layout_line(ui, doc, hl, decor, caret_line, &font, &theme, tab);
         let cx = ll.x_of(primary.head.saturating_sub(doc.line_start(caret_line)));
         let view_w = text_rect.width() - 8.0;
         if cx - scroll_x > view_w - 4.0 * char_w {
@@ -439,7 +527,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         if y > rect.bottom() {
             break;
         }
-        let ll = layout_line(ui, doc, hl, line, &font, &theme, tab);
+        let ll = layout_line(ui, doc, hl, decor, line, &font, &theme, tab);
         let line_start = doc.line_start(line);
         let line_len = doc.line_len(line);
         let text_y = y + (line_h - row_h) * 0.5;
@@ -704,7 +792,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         let x = pos.x - text_x0 + scroll_x;
         let col = match layouts.iter().find(|(l, _, _)| *l == line) {
             Some((_, _, ll)) => ll.col_at_x(x),
-            None => layout_line(ui, doc, hl, line, &font, &theme, tab).col_at_x(x),
+            None => layout_line(ui, doc, hl, decor, line, &font, &theme, tab).col_at_x(x),
         };
         doc.line_start(line) + col.min(doc.line_len(line))
     };
