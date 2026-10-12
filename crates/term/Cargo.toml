@@ -12,6 +12,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+regex.workspace = true
+# The VT emulator (grid, scrollback, parser, selection). Its own tty/event loop is not used:
+# PTYs come from portable-pty, whose errors are returned instead of exiting the process.
+alacritty_terminal = { version = "0.26", default-features = false }
+portable-pty = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for kill(2)/waitid(2): process-group termination and non-reaping exit waits.
+rustix = { version = "1", default-features = false, features = ["std", "process"] }
 
 [dev-dependencies]
 tempfile.workspace = true
