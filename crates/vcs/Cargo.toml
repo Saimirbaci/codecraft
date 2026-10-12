@@ -12,6 +12,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+similar = { version = "2.7.0", features = ["inline"] }
 
 [dev-dependencies]
 tempfile.workspace = true
