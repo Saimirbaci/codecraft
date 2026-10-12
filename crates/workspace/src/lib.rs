@@ -74,8 +74,10 @@ pub struct FindResults {
     pub selected: usize,
 }
 
-/// User preferences (Settings dialog).
+/// User preferences (Settings dialog). Missing fields load as defaults, so older settings files
+/// keep working.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
     pub editor_font_size: f32,
     pub ui_font_size: f32,
@@ -91,6 +93,10 @@ pub struct Settings {
     /// Explicit rust-analyzer binary; `None` = discover.
     pub rust_analyzer_path: Option<PathBuf>,
     pub theme: String,
+    /// Restart a language server whose process group uses more than this (MiB); 0 = never.
+    pub lsp_memory_limit_mb: u64,
+    /// Smaller rust-analyzer caches and no eager dependency indexing.
+    pub rust_analyzer_low_memory: bool,
 }
 
 impl Default for Settings {
@@ -108,6 +114,8 @@ impl Default for Settings {
             use_clippy: false,
             rust_analyzer_path: None,
             theme: "Dark".into(),
+            lsp_memory_limit_mb: 0,
+            rust_analyzer_low_memory: false,
         }
     }
 }

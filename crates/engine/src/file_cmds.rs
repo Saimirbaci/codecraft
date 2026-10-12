@@ -218,10 +218,9 @@ fn close_project(s: &mut Session, _: &Value) -> CmdResult {
 }
 
 fn invalidate_caches(s: &mut Session, _: &Value) -> CmdResult {
-    let Some(root) = s.ws.project.as_ref().map(|p| p.root.clone()) else { return ok() };
-    s.start_lsp(&root);
+    s.restart_server(None);
     s.jobs_rescan();
-    s.status = "Caches invalidated: restarting rust-analyzer".into();
+    s.status = "Caches invalidated: restarting language servers".into();
     ok()
 }
 
@@ -321,7 +320,7 @@ fn set_setting(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::BadParams(format!("unknown setting `{key}`")));
     }
     obj.insert(key.to_string(), value);
-    let restart_lsp = matches!(key, "use_clippy" | "rust_analyzer_path");
+    let restart_lsp = matches!(key, "use_clippy" | "rust_analyzer_path" | "rust_analyzer_low_memory");
     s.ws.settings = serde_json::from_value(current).map_err(|e| CommandError::BadParams(format!("{key}: {e}")))?;
     s.ws.settings.editor_font_size = s.ws.settings.editor_font_size.clamp(6.0, 72.0);
     s.ws.settings.tab_size = s.ws.settings.tab_size.clamp(1, 16);

@@ -27,6 +27,7 @@
 mod client;
 mod discover;
 mod init;
+mod servers;
 mod transport;
 mod uri;
 
@@ -36,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use lsp_types;
+pub use servers::{ServerCommand, ServerKind, extra_bin_dirs, find_server, which};
 
 use crossbeam_channel::Receiver;
 use lsp_types::{notification as notif, request as req};
@@ -182,6 +184,11 @@ impl LspClient {
     }
 
     /// The last lines (up to 50) the spawned server wrote to stderr; empty for [`LspClient::connect`].
+    /// The server process id (for memory monitoring); `None` for [`LspClient::connect`]ed servers.
+    pub fn pid(&self) -> Option<u32> {
+        self.inner.pid()
+    }
+
     pub fn stderr_tail(&self) -> Vec<String> {
         self.inner.stderr_tail()
     }

@@ -182,6 +182,10 @@ pub(crate) fn spawn(config: ServerConfig) -> Result<(Arc<Inner>, Receiver<Server
         command.current_dir(&root.path);
     }
     crate::discover::hide_console(&mut command);
+    // Own process group, so the server's helpers (proc-macro servers, cargo check, …) can be
+    // killed together with it and never outlive the IDE.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().map_err(|source| LspError::Spawn { command: command_name.clone(), source })?;
     let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())
     else {
@@ -343,7 +347,7 @@ impl Inner {
             Some(child) => {
                 if !self.process_exited.wait_timeout(deadline.remaining()) {
                     log::warn!("language server did not exit in time; killing it");
-                    let _ = lock(child).kill();
+                    kill_tree(child);
                     self.process_exited.wait_timeout(KILL_GRACE);
                 }
             }
@@ -364,9 +368,8 @@ impl Inner {
         let _ = self.writer.send(WriterMsg::Stop);
         if let Some(child) = &self.child
             && !self.process_exited.is_set()
-            && let Err(e) = lock(child).kill()
         {
-            log::debug!("could not kill the language server: {e}");
+            kill_tree(child);
         }
     }
 
@@ -483,7 +486,7 @@ impl Inner {
         // The reaper reports the exit; make sure there is one to report.
         if !self.process_exited.wait_timeout(EXIT_GRACE) {
             log::warn!("language server closed its output but is still running; killing it");
-            let _ = lock(child).kill();
+            kill_tree(child);
             if !self.process_exited.wait_timeout(KILL_GRACE) {
                 self.emit_exited(None);
             }
@@ -521,6 +524,11 @@ impl Inner {
         tail.push_back(line);
     }
 
+    /// The server's process id (spawned servers only).
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| lock(c).id())
+    }
+
     fn reaper_loop(self: Arc<Self>) {
         let Some(child) = &self.child else { return };
         let status = loop {
@@ -535,6 +543,9 @@ impl Inner {
             }
         };
         self.process_exited.set();
+        // Helpers the server started (proc-macro servers, cargo) share its process group:
+        // end any that are left so nothing outlives the server.
+        signal_group(lock(child).id(), "-TERM");
         // Deliver what the server wrote before it went away, and let stderr catch up.
         self.reader_done.wait_timeout(DRAIN_GRACE);
         self.stderr_done.wait_timeout(DRAIN_GRACE);
@@ -832,6 +843,35 @@ fn response_message(id: Value, result: std::result::Result<Value, ResponseError>
             "id": id,
             "error": { "code": error.code, "message": error.message },
         }),
+    }
+}
+
+/// Kill a spawned server and everything in its process group.
+fn kill_tree(child: &Mutex<Child>) {
+    let mut child = lock(child);
+    signal_group(child.id(), "-KILL");
+    if let Err(e) = child.kill() {
+        log::debug!("could not kill the language server: {e}");
+    }
+}
+
+/// Send a signal to a process group with the `kill` command (no unsafe). Best effort.
+fn signal_group(pgid: u32, signal: &str) {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args([signal, "--", &format!("-{pgid}")])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if let Err(e) = status {
+            log::debug!("kill {signal} -{pgid}: {e}");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pgid, signal);
     }
 }
 

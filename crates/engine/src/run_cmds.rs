@@ -11,7 +11,7 @@ use crate::{CommandError, Popup, RunConfig, Session};
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
-        simple("build.buildProject", "Build Project", has_project, |s, _| cargo(s, CargoCommand::Build, "Build", true)),
+        simple("build.buildProject", "Build Project", has_project, build_project),
         simple("build.rebuildProject", "Rebuild Project", has_project, rebuild),
         spec("cargo.check", "Cargo Check", None, "", Context::Global, has_project, |s, _| {
             cargo(s, CargoCommand::Check, "Check", true)
@@ -92,6 +92,28 @@ fn rebuild(s: &mut Session, _: &Value) -> CmdResult {
     Ok(json!({ "tab": tab.0 }))
 }
 
+fn is_cargo_project(s: &Session) -> bool {
+    s.ws.project.as_ref().is_some_and(|p| p.cargo.is_some() || p.root.join("Cargo.toml").is_file())
+}
+
+/// Build Project: Cargo, else the project's own build (CMake, Zig, npm run build, make).
+fn build_project(s: &mut Session, p: &Value) -> CmdResult {
+    if is_cargo_project(s) {
+        return cargo(s, CargoCommand::Build, "Build", true);
+    }
+    let root = s.project_root().ok_or_else(|| CommandError::Disabled("no project is open".into()))?;
+    let _ = p;
+    match crate::run_configs::build_config(&root) {
+        Some(config) => {
+            let tab = crate::runs::start_config(s, &config)?;
+            Ok(json!({ "tab": tab.0, "config": config.name }))
+        }
+        None => Err(CommandError::Failed(
+            "No build system found (Cargo, CMake, Make, Zig or a package.json build script)".into(),
+        )),
+    }
+}
+
 fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(i) = opt_usize(p, "config")? {
         if i >= s.run_configs.len() {
@@ -102,13 +124,19 @@ fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
     s.popup = None;
     let config = match s.run_configs.get(s.selected_run_config) {
         Some(c) => c.clone(),
-        None => RunConfig { name: "cargo run".into(), invocation: CargoInvocation::new(CargoCommand::Run, root(s)?) },
+        None if is_cargo_project(s) => RunConfig::cargo("cargo run", CargoInvocation::new(CargoCommand::Run, root(s)?)),
+        None => return run_at_caret(s, &Value::Null),
     };
-    let tab = crate::runs::start(s, config.invocation, &config.name, false)?;
+    let tab = crate::runs::start_config(s, &config)?;
     Ok(json!({ "tab": tab.0, "config": config.name }))
 }
 
 fn stop(s: &mut Session, _: &Value) -> CmdResult {
+    // Cmd+F2 stops the debug session first, like RustRover.
+    if s.debug.is_active() {
+        crate::debug::stop(s);
+        return ok();
+    }
     let target =
         s.ws.active_run
             .filter(|t| s.runs.is_running(*t))
@@ -247,12 +275,22 @@ fn run_at_caret(s: &mut Session, p: &Value) -> CmdResult {
             (path, d.doc.char_to_line(e.selections.primary().head))
         }
     };
-    let Some((title, inv)) = context_invocation(s, &path, line) else {
+    if let Some((title, inv)) = context_invocation(s, &path, line) {
+        let tab = crate::runs::start(s, inv, &title, false)?;
+        return Ok(json!({ "tab": tab.0, "title": title }));
+    }
+    // Other languages: Python, Zig, JS/TS, single-file C/C++.
+    let text = match s.ws.doc_by_path(&path).and_then(|id| s.ws.doc(id)) {
+        Some(d) => d.doc.text(),
+        None => codecraft_fs::read_text_file(&path).map_err(|e| CommandError::Failed(e.to_string()))?,
+    };
+    let root = s.project_root().unwrap_or_else(|| path.parent().map(std::path::Path::to_path_buf).unwrap_or_default());
+    let Some(config) = crate::run_configs::context_config(&root, &path, &text, line) else {
         s.status = "Nothing to run here".into();
         return ok();
     };
-    let tab = crate::runs::start(s, inv, &title, false)?;
-    Ok(json!({ "tab": tab.0, "title": title }))
+    let tab = crate::runs::start_config(s, &config)?;
+    Ok(json!({ "tab": tab.0, "title": config.name }))
 }
 
 fn run_target(s: &mut Session, p: &Value) -> CmdResult {

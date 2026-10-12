@@ -167,15 +167,19 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             |s, p| {
                 let q = req_str(p, "query")?.to_string();
                 match &mut s.popup {
-                    Some(Popup::GotoSymbol { query, pending, .. })
-                    | Some(Popup::SearchEverywhere { query, pending, .. }) => {
+                    Some(Popup::GotoSymbol { query, pending, items, .. }) => {
                         *query = q.clone();
                         *pending = true;
+                        items.clear();
+                    }
+                    Some(Popup::SearchEverywhere { query, pending, symbols, .. }) => {
+                        *query = q.clone();
+                        *pending = true;
+                        symbols.clear();
                     }
                     _ => {}
                 }
-                if s.lsp_ready().is_ok() && !q.is_empty() {
-                    s.lsp_workspace_symbols(&q)?;
+                if !q.is_empty() && s.lsp_workspace_symbols(&q).is_ok() {
                 } else {
                     let items = s.lexical_symbols(&q);
                     if let Some(Popup::GotoSymbol { items: target, pending, .. }) = &mut s.popup {

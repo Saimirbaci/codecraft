@@ -1,15 +1,17 @@
-//! The engine side of the language server: lifecycle, document sync, diagnostics, and routing
-//! of responses to popups, navigation and edits.
+//! The engine side of the language servers: one server per language (rust-analyzer, clangd,
+//! a Python server, zls, a TypeScript server), document sync, diagnostics, memory supervision,
+//! and routing of responses to popups, navigation and edits.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use serde_json::{Value, json};
 
 use codecraft_lsp::lsp_types as lt;
-use codecraft_lsp::{LspClient, RequestId, ResponseError, ServerConfig, ServerEvent};
+use codecraft_lsp::{LspClient, RequestId, ResponseError, ServerConfig, ServerEvent, ServerKind};
+use codecraft_syntax::Language;
 use codecraft_workspace::{BackgroundTask, DocId, EditorId, FindResults, NotificationLevel, ToolWindowId};
 
 use crate::convert::{self, from_lsp_pos, utf16_col_to_char};
@@ -41,24 +43,72 @@ pub(crate) enum Pending {
     ExecuteCommand,
 }
 
+/// One running language server.
 pub(crate) struct LspState {
+    /// "rust-analyzer", "clangd", "basedpyright", …
+    pub(crate) name: String,
     client: LspClient,
     events: Receiver<ServerEvent>,
     pending: HashMap<RequestId, Pending>,
     ready: bool,
+    /// Process (and process group) id, for memory supervision.
+    pub(crate) pid: Option<u32>,
 }
 
 impl LspState {
     pub(crate) fn shutdown(self) {
         if let Err(e) = self.client.shutdown(Duration::from_secs(2)) {
-            log::warn!("language server shutdown: {e}");
+            log::warn!("{} shutdown: {e}", self.name);
         }
     }
 }
 
+/// Memory supervision: a background sampler of the servers' process groups.
+#[derive(Default)]
+pub(crate) struct ServerMemory {
+    rx: Option<Receiver<BTreeMap<u32, u64>>>,
+    last_sample: Option<Instant>,
+}
+
+/// Resident memory (KiB) per process group, from `ps` (no unsafe, works on macOS and Linux).
+fn sample_process_groups() -> BTreeMap<u32, u64> {
+    let mut out = BTreeMap::new();
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pgid=,rss="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return out;
+    };
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut it = line.split_whitespace();
+        if let (Some(pgid), Some(rss)) =
+            (it.next().and_then(|v| v.parse::<u32>().ok()), it.next().and_then(|v| v.parse::<u64>().ok()))
+        {
+            *out.entry(pgid).or_insert(0) += rss;
+        }
+    }
+    out
+}
+
+const MEMORY_SAMPLE_EVERY: Duration = Duration::from_secs(10);
+
+/// The server that handles a language.
+pub fn server_kind(language: Language) -> Option<ServerKind> {
+    match language {
+        Language::Rust => Some(ServerKind::RustAnalyzer),
+        Language::C | Language::Cpp => Some(ServerKind::Clangd),
+        Language::Python => Some(ServerKind::Python),
+        Language::Zig => Some(ServerKind::Zls),
+        Language::TypeScript | Language::JavaScript => Some(ServerKind::TypeScript),
+        _ => None,
+    }
+}
+
 /// rust-analyzer settings (sent as initializationOptions and for `workspace/configuration`).
-fn ra_config(use_clippy: bool) -> Value {
-    json!({
+fn ra_config(use_clippy: bool, low_memory: bool) -> Value {
+    let mut cfg = json!({
         "checkOnSave": true,
         "check": { "command": if use_clippy { "clippy" } else { "check" } },
         "cargo": { "buildScripts": { "enable": true } },
@@ -67,82 +117,193 @@ fn ra_config(use_clippy: bool) -> Value {
         // RustRover inserts `name()` with the caret inside, not argument placeholders.
         "completion": { "callable": { "snippets": "add_parentheses" } },
         "inlayHints": { "typeHints": { "enable": true }, "parameterHints": { "enable": true } },
-    })
+    });
+    if low_memory && let Some(obj) = cfg.as_object_mut() {
+        // Smaller query caches, no eager indexing of every dependency at startup.
+        obj.insert("lru".into(), json!({ "capacity": 64 }));
+        obj.insert("cachePriming".into(), json!({ "enable": false }));
+        obj.insert("numThreads".into(), json!(2));
+    }
+    cfg
 }
 
 pub(crate) const INSTALL_HINT: &str = "rust-analyzer was not found. Install it with `rustup component add rust-analyzer`, \
      or set its path in Settings. Highlighting, Cargo build/run/test and search keep working without it.";
 
 impl Session {
+    /// The server kind for the active editor's language.
+    fn active_kind(&self) -> Option<ServerKind> {
+        self.ws.active().and_then(|(_, d)| server_kind(d.language))
+    }
+
+    /// Status of one language server.
+    pub fn server_status(&self, kind: ServerKind) -> LspStatus {
+        match self.servers.get(&kind) {
+            Some(l) if l.ready => LspStatus::Ready,
+            Some(_) => LspStatus::Starting,
+            None => self.server_status.get(&kind).cloned().unwrap_or_default(),
+        }
+    }
+
+    /// Resident memory of a server and its helpers, in MiB (when sampled).
+    pub fn server_memory_mb(&self, kind: ServerKind) -> Option<u64> {
+        self.server_memory_mb.get(&kind).copied()
+    }
+
+    /// Display name of a running server ("basedpyright", "clangd", …).
+    pub fn server_name(&self, kind: ServerKind) -> Option<&str> {
+        self.servers.get(&kind).map(|l| l.name.as_str())
+    }
+
+    fn set_status(&mut self, kind: ServerKind, status: LspStatus) {
+        if kind == ServerKind::RustAnalyzer {
+            self.lsp_status = status.clone();
+        }
+        self.server_status.insert(kind, status);
+    }
+
+    /// Whether the server for the active editor's language is ready.
     pub(crate) fn lsp_ready(&self) -> Result<(), String> {
-        match &self.lsp {
+        let Some(kind) = self.active_kind().or_else(|| self.servers.keys().next().copied()) else {
+            return Err("no language server for this file type".into());
+        };
+        match self.servers.get(&kind) {
             Some(l) if l.ready => Ok(()),
-            Some(_) => Err("rust-analyzer is starting".into()),
-            None => Err(match &self.lsp_status {
-                LspStatus::Unavailable(m) | LspStatus::Stopped(m) => m.clone(),
-                _ => "rust-analyzer is not running".into(),
+            Some(l) => Err(format!("{} is starting", l.name)),
+            None => Err(match self.server_status.get(&kind) {
+                Some(LspStatus::Unavailable(m) | LspStatus::Stopped(m)) => m.clone(),
+                _ => format!("{} is not running", kind.label()),
             }),
         }
     }
 
-    /// Start rust-analyzer for the project root (stopping a previous instance).
+    /// Start (or restart) rust-analyzer for the project root.
     pub(crate) fn start_lsp(&mut self, root: &Path) {
-        if let Some(old) = self.lsp.take() {
+        self.start_server(ServerKind::RustAnalyzer, root);
+    }
+
+    /// Start a server of `kind` unless one runs (or it was found unavailable).
+    pub(crate) fn ensure_server(&mut self, kind: ServerKind) {
+        if self.servers.contains_key(&kind) || !self.lsp_enabled {
+            return;
+        }
+        if matches!(self.server_status.get(&kind), Some(LspStatus::Unavailable(_) | LspStatus::Stopped(_))) {
+            return;
+        }
+        let Some(root) = self.project_root() else { return };
+        self.start_server(kind, &root);
+    }
+
+    fn start_server(&mut self, kind: ServerKind, root: &Path) {
+        if let Some(old) = self.servers.remove(&kind) {
             old.shutdown();
         }
         if !self.lsp_enabled {
             return;
         }
-        let bin = self
-            .ws
-            .settings
-            .rust_analyzer_path
-            .clone()
-            .filter(|p| p.exists())
-            .or_else(codecraft_lsp::find_rust_analyzer);
-        let Some(bin) = bin else {
-            self.lsp_status = LspStatus::Unavailable(INSTALL_HINT.into());
-            self.ws.notify(NotificationLevel::Warning, "rust-analyzer not found", INSTALL_HINT);
+        let command = if kind == ServerKind::RustAnalyzer {
+            self.ws
+                .settings
+                .rust_analyzer_path
+                .clone()
+                .filter(|p| p.exists())
+                .map(|program| codecraft_lsp::ServerCommand { program, args: Vec::new(), name: "rust-analyzer".into() })
+                .or_else(|| codecraft_lsp::find_server(kind, root))
+        } else {
+            codecraft_lsp::find_server(kind, root)
+        };
+        let Some(command) = command else {
+            let hint = if kind == ServerKind::RustAnalyzer {
+                INSTALL_HINT.to_string()
+            } else {
+                format!("{} was not found. Install it with: {}", kind.label(), kind.install_hint())
+            };
+            self.set_status(kind, LspStatus::Unavailable(hint.clone()));
+            self.ws.notify(NotificationLevel::Warning, format!("{} not found", kind.label()), hint);
             return;
         };
-        let mut config = ServerConfig::rust_analyzer(bin, root.to_path_buf());
-        let settings = ra_config(self.ws.settings.use_clippy);
-        config.initialization_options = Some(settings.clone());
-        config.configuration = Some(settings);
+        let mut config = ServerConfig::rust_analyzer(command.program.clone(), root.to_path_buf());
+        config.args = command.args.clone();
+        match kind {
+            ServerKind::RustAnalyzer => {
+                let settings = ra_config(self.ws.settings.use_clippy, self.ws.settings.rust_analyzer_low_memory);
+                config.initialization_options = Some(settings.clone());
+                config.configuration = Some(settings);
+            }
+            ServerKind::Python => {
+                // Point pyright/basedpyright at the project's virtualenv when there is one.
+                let venv = [".venv/bin/python", "venv/bin/python"].iter().map(|p| root.join(p)).find(|p| p.is_file());
+                if let Some(py) = venv {
+                    config.configuration = Some(json!({ "pythonPath": py, "analysis": { "autoSearchPaths": true } }));
+                }
+            }
+            _ => {}
+        }
+        let name = command.name.clone();
         match LspClient::spawn(config) {
             Ok((client, events)) => {
-                self.lsp = Some(LspState { client, events, pending: HashMap::new(), ready: false });
-                self.lsp_status = LspStatus::Starting;
+                let pid = client.pid();
+                self.servers.insert(
+                    kind,
+                    LspState { name: name.clone(), client, events, pending: HashMap::new(), ready: false, pid },
+                );
+                self.set_status(kind, LspStatus::Starting);
                 self.ws.tasks.insert(
-                    "lsp-start".into(),
-                    BackgroundTask { title: "Starting rust-analyzer".into(), message: None, percentage: None },
+                    format!("lsp-start:{kind:?}"),
+                    BackgroundTask { title: format!("Starting {name}"), message: None, percentage: None },
                 );
             }
             Err(e) => {
-                let msg = format!("Cannot start rust-analyzer: {e}");
-                self.lsp_status = LspStatus::Stopped(msg.clone());
-                self.ws.notify(NotificationLevel::Error, "rust-analyzer", msg);
+                let msg = format!("Cannot start {name}: {e}");
+                self.set_status(kind, LspStatus::Stopped(msg.clone()));
+                self.ws.notify(NotificationLevel::Error, &name, msg);
             }
         }
     }
 
+    /// Restart a server (or every running one), clearing a previous "stopped" state.
+    pub(crate) fn restart_server(&mut self, kind: Option<ServerKind>) {
+        let Some(root) = self.project_root() else { return };
+        let kinds: Vec<ServerKind> = match kind {
+            Some(k) => vec![k],
+            None => self.servers.keys().copied().collect(),
+        };
+        for k in kinds {
+            self.server_status.remove(&k);
+            for od in self.ws.docs_mut() {
+                if server_kind(od.language) == Some(k) {
+                    od.lsp_synced = None;
+                }
+            }
+            self.start_server(k, &root);
+        }
+    }
+
     pub(crate) fn stop_lsp(&mut self) {
-        if let Some(l) = self.lsp.take() {
-            l.shutdown();
+        let servers = std::mem::take(&mut self.servers);
+        // Shut servers down in parallel so closing a polyglot project stays quick.
+        let handles: Vec<_> = servers.into_values().map(|l| std::thread::spawn(move || l.shutdown())).collect();
+        for h in handles {
+            let _ = h.join();
         }
         self.lsp_status = LspStatus::Off;
+        self.server_status.clear();
+        self.server_memory_mb.clear();
         for od in self.ws.docs_mut() {
             od.lsp_synced = None;
         }
     }
 
-    fn lsp_client(&self) -> Option<&LspClient> {
-        self.lsp.as_ref().filter(|l| l.ready).map(|l| &l.client)
+    fn client_for_path(&self, path: &Path) -> Option<&LspClient> {
+        let kind = server_kind(Language::from_path(path))?;
+        self.servers.get(&kind).filter(|l| l.ready).map(|l| &l.client)
     }
 
-    /// Tell the server about a newly opened document.
+    /// Tell the language's server about a newly opened document (starting the server if needed).
     pub(crate) fn lsp_did_open(&mut self, doc: DocId) {
-        let Some(l) = self.lsp.as_ref().filter(|l| l.ready) else { return };
+        let Some(kind) = self.ws.doc(doc).and_then(|d| server_kind(d.language)) else { return };
+        self.ensure_server(kind);
+        let Some(l) = self.servers.get(&kind).filter(|l| l.ready) else { return };
         let Some(od) = self.ws.doc_mut(doc) else { return };
         let Some(path) = od.path.clone() else { return };
         if od.lsp_synced.is_some() {
@@ -156,7 +317,7 @@ impl Session {
     }
 
     pub(crate) fn lsp_did_close(&mut self, path: &Path) {
-        if let Some(c) = self.lsp_client()
+        if let Some(c) = self.client_for_path(path)
             && let Err(e) = c.did_close(path)
         {
             log::warn!("didClose {}: {e}", path.display());
@@ -167,16 +328,17 @@ impl Session {
         if let Some(id) = self.ws.doc_by_path(path) {
             self.lsp_sync(id);
         }
-        if let Some(c) = self.lsp_client()
+        if let Some(c) = self.client_for_path(path)
             && let Err(e) = c.did_save(path)
         {
             log::warn!("didSave {}: {e}", path.display());
         }
     }
 
-    /// Send the document's current text if the server has an older revision.
+    /// Send the document's current text if its server has an older revision.
     pub(crate) fn lsp_sync(&mut self, doc: DocId) {
-        let Some(l) = self.lsp.as_ref().filter(|l| l.ready) else { return };
+        let Some(kind) = self.ws.doc(doc).and_then(|d| server_kind(d.language)) else { return };
+        let Some(l) = self.servers.get(&kind).filter(|l| l.ready) else { return };
         let Some(od) = self.ws.doc_mut(doc) else { return };
         if !od.needs_lsp_sync() {
             return;
@@ -200,16 +362,31 @@ impl Session {
         Ok((eid, path, offset, convert::lsp_pos(&d.doc, offset)))
     }
 
+    /// Send a request to the active editor's server (or the first ready one without an editor).
     pub(crate) fn lsp_send(
         &mut self,
         send: impl FnOnce(&LspClient) -> codecraft_lsp::Result<RequestId>,
         pending: Pending,
     ) -> Result<(), CommandError> {
+        let kind = self
+            .active_kind()
+            .filter(|k| self.servers.get(k).is_some_and(|l| l.ready))
+            .or_else(|| self.servers.iter().find(|(_, l)| l.ready).map(|(k, _)| *k))
+            .ok_or_else(|| CommandError::Disabled("no language server is ready".into()))?;
+        self.lsp_send_to(kind, send, pending)
+    }
+
+    pub(crate) fn lsp_send_to(
+        &mut self,
+        kind: ServerKind,
+        send: impl FnOnce(&LspClient) -> codecraft_lsp::Result<RequestId>,
+        pending: Pending,
+    ) -> Result<(), CommandError> {
         let l = self
-            .lsp
-            .as_mut()
+            .servers
+            .get_mut(&kind)
             .filter(|l| l.ready)
-            .ok_or_else(|| CommandError::Disabled("rust-analyzer is not ready".into()))?;
+            .ok_or_else(|| CommandError::Disabled(format!("{} is not ready", kind.label())))?;
         let id = send(&l.client).map_err(|e| CommandError::Failed(e.to_string()))?;
         l.pending.insert(id, pending);
         Ok(())
@@ -282,10 +459,17 @@ impl Session {
         self.lsp_send(|c| c.document_symbol(&path), Pending::DocumentSymbol)
     }
 
+    /// Query every ready server; results are merged as they arrive.
     pub(crate) fn lsp_workspace_symbols(&mut self, query: &str) -> Result<(), CommandError> {
-        self.lsp_ready().map_err(CommandError::Disabled)?;
-        let q = query.to_string();
-        self.lsp_send(|c| c.workspace_symbol(&q), Pending::WorkspaceSymbol { query: query.to_string() })
+        let ready: Vec<ServerKind> = self.servers.iter().filter(|(_, l)| l.ready).map(|(k, _)| *k).collect();
+        if ready.is_empty() {
+            return Err(CommandError::Disabled("no language server is ready".into()));
+        }
+        for kind in ready {
+            let q = query.to_string();
+            self.lsp_send_to(kind, |c| c.workspace_symbol(&q), Pending::WorkspaceSymbol { query: query.to_string() })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn lsp_code_actions(&mut self) -> Result<(), CommandError> {
@@ -359,29 +543,74 @@ impl Session {
     pub(crate) fn pump_lsp(&mut self) -> bool {
         let mut changed = false;
         // Sync edited documents (full text; cheap enough at typing speed).
-        if self.lsp.as_ref().is_some_and(|l| l.ready) {
+        if self.servers.values().any(|l| l.ready) {
             let dirty: Vec<DocId> = self.ws.docs().filter(|d| d.needs_lsp_sync()).map(|d| d.id).collect();
             for d in dirty {
                 self.lsp_sync(d);
             }
         }
-        for _ in 0..256 {
-            let Some(event) = self.lsp.as_ref().and_then(|l| l.events.try_recv().ok()) else { break };
+        let kinds: Vec<ServerKind> = self.servers.keys().copied().collect();
+        for kind in kinds {
+            for _ in 0..256 {
+                let Some(event) = self.servers.get(&kind).and_then(|l| l.events.try_recv().ok()) else { break };
+                changed = true;
+                self.handle_lsp_event(kind, event);
+            }
+        }
+        changed |= self.pump_server_memory();
+        changed
+    }
+
+    /// Sample server memory every few seconds; restart a server over the configured limit.
+    fn pump_server_memory(&mut self) -> bool {
+        let mut changed = false;
+        if let Some(rx) = &self.server_memory.rx
+            && let Ok(sample) = rx.try_recv()
+        {
+            self.server_memory.rx = None;
             changed = true;
-            self.handle_lsp_event(event);
+            let limit = self.ws.settings.lsp_memory_limit_mb;
+            let mut over = Vec::new();
+            for (kind, l) in &self.servers {
+                let Some(pid) = l.pid else { continue };
+                let mb = sample.get(&pid).copied().unwrap_or(0) / 1024;
+                self.server_memory_mb.insert(*kind, mb);
+                if limit > 0 && mb > limit {
+                    over.push((*kind, mb));
+                }
+            }
+            for (kind, mb) in over {
+                self.ws.notify(
+                    NotificationLevel::Warning,
+                    kind.label(),
+                    format!("used {mb} MiB (limit {limit} MiB); restarting it"),
+                );
+                self.restart_server(Some(kind));
+            }
+        }
+        let due = self.server_memory.last_sample.is_none_or(|t| t.elapsed() >= MEMORY_SAMPLE_EVERY);
+        if !self.servers.is_empty() && self.server_memory.rx.is_none() && due {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send(sample_process_groups());
+            });
+            self.server_memory.rx = Some(rx);
+            self.server_memory.last_sample = Some(Instant::now());
         }
         changed
     }
 
-    fn handle_lsp_event(&mut self, event: ServerEvent) {
+    fn handle_lsp_event(&mut self, kind: ServerKind, event: ServerEvent) {
+        let name = self.servers.get(&kind).map(|l| l.name.clone()).unwrap_or_else(|| kind.label().to_string());
         match event {
             ServerEvent::Initialized(_) => {
-                if let Some(l) = &mut self.lsp {
+                if let Some(l) = self.servers.get_mut(&kind) {
                     l.ready = true;
                 }
-                self.lsp_status = LspStatus::Ready;
-                self.ws.tasks.remove("lsp-start");
-                let docs: Vec<DocId> = self.ws.docs().map(|d| d.id).collect();
+                self.set_status(kind, LspStatus::Ready);
+                self.ws.tasks.remove(&format!("lsp-start:{kind:?}"));
+                let docs: Vec<DocId> =
+                    self.ws.docs().filter(|d| server_kind(d.language) == Some(kind)).map(|d| d.id).collect();
                 for d in docs {
                     self.lsp_did_open(d);
                 }
@@ -394,12 +623,12 @@ impl Session {
                 self.ws.set_lsp_problems(path, problems);
             }
             ServerEvent::Progress(p) => {
-                let key = format!("lsp:{}", p.token);
+                let key = format!("lsp:{kind:?}:{}", p.token);
                 if p.done {
                     self.ws.tasks.remove(&key);
                 } else {
                     let entry = self.ws.tasks.entry(key).or_insert(BackgroundTask {
-                        title: p.title.clone().unwrap_or_else(|| "rust-analyzer".into()),
+                        title: p.title.clone().unwrap_or_else(|| name.clone()),
                         message: None,
                         percentage: None,
                     });
@@ -418,33 +647,36 @@ impl Session {
                 } else {
                     NotificationLevel::Info
                 };
-                self.ws.notify(lvl, "rust-analyzer", message);
+                self.ws.notify(lvl, &name, message);
             }
-            ServerEvent::Log { message, .. } => log::debug!("rust-analyzer: {message}"),
-            ServerEvent::Notification { method, .. } => log::trace!("lsp notification {method}"),
-            ServerEvent::ServerRequest { id, method, params } => self.handle_server_request(id, &method, params),
+            ServerEvent::Log { message, .. } => log::debug!("{name}: {message}"),
+            ServerEvent::Notification { method, .. } => log::trace!("{name} notification {method}"),
+            ServerEvent::ServerRequest { id, method, params } => self.handle_server_request(kind, id, &method, params),
             ServerEvent::Response { id, result, .. } => {
-                let pending = self.lsp.as_mut().and_then(|l| l.pending.remove(&id));
+                let pending = self.servers.get_mut(&kind).and_then(|l| l.pending.remove(&id));
                 if let Some(p) = pending {
                     self.handle_response(p, result);
                 }
             }
             ServerEvent::Exited { code } => {
-                let msg =
-                    format!("rust-analyzer stopped (exit code {})", code.map_or("unknown".into(), |c| c.to_string()));
-                self.lsp = None;
-                self.lsp_status = LspStatus::Stopped(msg.clone());
-                self.ws.tasks.retain(|k, _| !k.starts_with("lsp"));
+                let msg = format!("{name} stopped (exit code {})", code.map_or("unknown".into(), |c| c.to_string()));
+                self.servers.remove(&kind);
+                self.server_memory_mb.remove(&kind);
+                self.set_status(kind, LspStatus::Stopped(msg.clone()));
+                let prefix = format!("lsp:{kind:?}");
+                self.ws.tasks.retain(|k, _| !k.starts_with(&prefix) && *k != format!("lsp-start:{kind:?}"));
                 for od in self.ws.docs_mut() {
-                    od.lsp_synced = None;
+                    if server_kind(od.language) == Some(kind) {
+                        od.lsp_synced = None;
+                    }
                 }
-                self.ws.notify(NotificationLevel::Warning, "rust-analyzer", msg);
+                self.ws.notify(NotificationLevel::Warning, &name, msg);
             }
-            ServerEvent::Error(e) => log::warn!("language server: {e}"),
+            ServerEvent::Error(e) => log::warn!("{name}: {e}"),
         }
     }
 
-    fn handle_server_request(&mut self, id: Value, method: &str, params: Value) {
+    fn handle_server_request(&mut self, kind: ServerKind, id: Value, method: &str, params: Value) {
         let reply = match method {
             "workspace/applyEdit" => {
                 let applied = serde_json::from_value::<lt::ApplyWorkspaceEditParams>(params)
@@ -457,7 +689,8 @@ impl Session {
             }
             "window/showMessageRequest" => {
                 if let Some(msg) = params.get("message").and_then(Value::as_str) {
-                    self.ws.notify(NotificationLevel::Info, "rust-analyzer", msg);
+                    let name = self.server_name(kind).unwrap_or("language server").to_string();
+                    self.ws.notify(NotificationLevel::Info, &name, msg);
                 }
                 Ok(Value::Null)
             }
@@ -474,7 +707,7 @@ impl Session {
             }
             _ => Err(ResponseError { code: -32601, message: format!("unsupported request {method}") }),
         };
-        if let Some(l) = &self.lsp
+        if let Some(l) = self.servers.get(&kind)
             && let Err(e) = l.client.respond(id, reply)
         {
             log::warn!("respond to {method}: {e}");
@@ -867,11 +1100,19 @@ impl Session {
                         matches!(i.kind.as_str(), "struct" | "enum" | "trait" | "type" | "union" | "class")
                     });
                 }
-                *target = items;
+                for it in items {
+                    if !target.contains(&it) {
+                        target.push(it);
+                    }
+                }
                 *pending = false;
             }
             Some(Popup::SearchEverywhere { query: q, symbols, pending, .. }) if q == query => {
-                *symbols = items;
+                for it in items {
+                    if !symbols.contains(&it) {
+                        symbols.push(it);
+                    }
+                }
                 *pending = false;
             }
             _ => {}

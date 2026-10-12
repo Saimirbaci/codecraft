@@ -15,11 +15,91 @@ use codecraft_workspace::{
 
 use crate::{CommandError, Session};
 
-/// A named Cargo invocation (RustRover's run configurations, derived from Cargo targets).
+/// A run configuration: a Cargo invocation (derived from Cargo targets), or any other process
+/// (CMake, Make, Zig, npm scripts, pytest, …) when `command` is set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunConfig {
     pub name: String,
+    /// The Cargo invocation; meaningful only when `command` is `None` (see [`RunConfig::cargo_invocation`]).
     pub invocation: CargoInvocation,
+    #[serde(default)]
+    pub command: Option<ProcessCommand>,
+}
+
+/// A plain process run configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProcessCommand {
+    /// Program name (resolved on PATH and the usual tool dirs) or path.
+    pub program: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Show in the Build tool window instead of Run.
+    #[serde(default)]
+    pub build: bool,
+}
+
+impl ProcessCommand {
+    pub fn new(program: impl Into<String>, args: &[&str], cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            args: args.iter().map(|a| (*a).to_string()).collect(),
+            cwd: cwd.into(),
+            env: Vec::new(),
+            build: false,
+        }
+    }
+
+    /// `sh -c <script>` (for chained steps such as configure && build && run).
+    pub fn shell(script: impl Into<String>, cwd: impl Into<PathBuf>) -> Self {
+        Self {
+            program: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: cwd.into(),
+            env: Vec::new(),
+            build: false,
+        }
+    }
+
+    pub fn command_line(&self) -> String {
+        std::iter::once(self.program.as_str())
+            .chain(self.args.iter().map(String::as_str))
+            .map(codecraft_cargo::shell_quote)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn resolved_program(&self) -> PathBuf {
+        let p = PathBuf::from(&self.program);
+        if p.components().count() > 1 {
+            return p;
+        }
+        codecraft_lsp::which(&self.program).unwrap_or(p)
+    }
+}
+
+impl RunConfig {
+    pub fn cargo(name: impl Into<String>, invocation: CargoInvocation) -> Self {
+        Self { name: name.into(), invocation, command: None }
+    }
+
+    pub fn process(name: impl Into<String>, command: ProcessCommand) -> Self {
+        let invocation = CargoInvocation::new(CargoCommand::Run, command.cwd.clone());
+        Self { name: name.into(), invocation, command: Some(command) }
+    }
+
+    /// The Cargo invocation, for Cargo configurations only.
+    pub fn cargo_invocation(&self) -> Option<&CargoInvocation> {
+        self.command.is_none().then_some(&self.invocation)
+    }
+
+    pub fn command_line(&self) -> String {
+        match &self.command {
+            Some(c) => c.command_line(),
+            None => self.invocation.command_line(),
+        }
+    }
 }
 
 struct Proc {
@@ -58,7 +138,7 @@ pub fn derive_configs(meta: &CargoMetadata) -> Vec<RunConfig> {
             let mut inv = CargoInvocation::new(CargoCommand::Run, root.clone());
             inv.package = Some(p.name.clone());
             inv.target = Some(TargetSelector::Bin(t.name.clone()));
-            out.push(RunConfig { name: format!("Run {}", t.name), invocation: inv });
+            out.push(RunConfig::cargo(format!("Run {}", t.name), inv));
         }
     }
     for p in meta.workspace_packages() {
@@ -66,18 +146,15 @@ pub fn derive_configs(meta: &CargoMetadata) -> Vec<RunConfig> {
             let mut inv = CargoInvocation::new(CargoCommand::Run, root.clone());
             inv.package = Some(p.name.clone());
             inv.target = Some(TargetSelector::Example(t.name.clone()));
-            out.push(RunConfig { name: format!("Run example {}", t.name), invocation: inv });
+            out.push(RunConfig::cargo(format!("Run example {}", t.name), inv));
         }
     }
-    out.push(RunConfig {
-        name: "Test workspace".into(),
-        invocation: CargoInvocation::new(CargoCommand::Test, root.clone()),
-    });
+    out.push(RunConfig::cargo("Test workspace", CargoInvocation::new(CargoCommand::Test, root.clone())));
     if multi {
         for p in meta.workspace_packages() {
             let mut inv = CargoInvocation::new(CargoCommand::Test, root.clone());
             inv.package = Some(p.name.clone());
-            out.push(RunConfig { name: format!("Test {}", p.name), invocation: inv });
+            out.push(RunConfig::cargo(format!("Test {}", p.name), inv));
         }
     }
     out
@@ -103,6 +180,27 @@ pub(crate) fn start_chain(
     }
     s.ws.layout.show(if build { ToolWindowId::Build } else { ToolWindowId::Run });
     s.runs.procs.push(Proc { tab, handle, events, root: inv.cwd.clone(), then });
+    s.status = format!("{title}: running");
+    Ok(tab)
+}
+
+/// Start any run configuration (saves all files first).
+pub(crate) fn start_config(s: &mut Session, config: &RunConfig) -> Result<RunTabId, CommandError> {
+    match &config.command {
+        Some(cmd) => start_process(s, cmd, &config.name),
+        None => start(s, config.invocation.clone(), &config.name, false),
+    }
+}
+
+/// Start a plain process in a Run (or Build) tab. Saves all files first.
+pub(crate) fn start_process(s: &mut Session, cmd: &ProcessCommand, title: &str) -> Result<RunTabId, CommandError> {
+    let _ = s.save_all();
+    let program = cmd.resolved_program();
+    let (handle, events) = codecraft_cargo::spawn_process(&program, &cmd.args, &cmd.cwd, &cmd.env, false)
+        .map_err(|e| CommandError::Failed(e.to_string()))?;
+    let tab = s.ws.add_run(title, cmd.command_line(), cmd.build);
+    s.ws.layout.show(if cmd.build { ToolWindowId::Build } else { ToolWindowId::Run });
+    s.runs.procs.push(Proc { tab, handle, events, root: cmd.cwd.clone(), then: None });
     s.status = format!("{title}: running");
     Ok(tab)
 }

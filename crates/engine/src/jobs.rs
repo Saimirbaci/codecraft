@@ -232,6 +232,8 @@ fn on_project_loaded(s: &mut Session, load: ProjectLoad) {
             }
         }
     }
+    // Run configurations of the other ecosystems in the project (CMake, Make, Zig, npm, Python).
+    s.run_configs.extend(crate::run_configs::derive_polyglot(&load.root));
     s.status = format!("Opened {}", load.root.display());
     if start_lsp {
         s.start_lsp(&load.root);
