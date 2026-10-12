@@ -7,6 +7,7 @@ follow `docs/clean-room.md`: visible UI and bundle metadata only.
 |---|---|---|
 | `rustrover-2026.1-menus.json` | 522 menu-bar entries: path, title, shortcut (macOS keymap), submenu flag | `osascript -l JavaScript tools/observe/dump_menus.js rustrover 4`, decoded by `python3 tools/observe/menus_outline.py <dump> json` |
 | `rustrover-2026.1-menus.txt` | The same as an indented outline | `menus_outline.py <dump>` |
+| `rustrover-2026.1-rea-inventory.md` | REA 6.4.0 execution-free artifact inventory and Apple application projection: formats, sizes, native helpers | `rea inspect-artifact`, `rea project-apple-application-graph` |
 | `rustrover-2026.1-bundled-plugins.txt` | Names of the plugin directories in the app bundle | `ls RustRover.app/Contents/plugins` |
 
 ## Bundle facts
