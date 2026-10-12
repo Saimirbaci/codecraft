@@ -692,6 +692,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "codecraft-agent"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "codecraft-cargo"
 version = "0.1.0"
 dependencies = [
@@ -714,12 +726,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "codecraft-dap"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "codecraft-db"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "codecraft-engine"
 version = "0.1.0"
 dependencies = [
+ "codecraft-agent",
  "codecraft-cargo",
+ "codecraft-dap",
+ "codecraft-db",
  "codecraft-fs",
  "codecraft-lsp",
+ "codecraft-mcp",
  "codecraft-syntax",
  "codecraft-text",
  "codecraft-workspace",
@@ -752,6 +792,18 @@ dependencies = [
  "lsp-types",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "codecraft-mcp"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "log",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 

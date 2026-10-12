@@ -9,8 +9,13 @@
     clippy::unreachable
 )]
 
+mod agent_panel;
+mod approvals_ui;
 mod chrome;
+mod database_panel;
+mod debug_panel;
 mod editor;
+mod feedback;
 mod fonts;
 pub mod keymap;
 mod markdown;
@@ -343,6 +348,8 @@ impl eframe::App for App {
             chrome::editor_area(ui, s, st);
         }
         popups::show(ui, s, st);
+        approvals_ui::show(ui, s, st);
+        feedback::overlay(ui, s, st);
         if st.focus_editor
             && let Some(id) = s.ws.active_editor
         {

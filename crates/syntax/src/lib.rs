@@ -42,6 +42,13 @@ pub enum Language {
     Json,
     Yaml,
     Shell,
+    C,
+    Cpp,
+    Python,
+    Zig,
+    TypeScript,
+    JavaScript,
+    Sql,
     #[default]
     PlainText,
 }
@@ -57,8 +64,18 @@ impl Language {
             "json" => Self::Json,
             "yml" | "yaml" => Self::Yaml,
             "sh" | "bash" | "zsh" => Self::Shell,
+            "c" | "h" => Self::C,
+            "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "tpp" | "inl" | "ixx" | "cppm" => {
+                Self::Cpp
+            }
+            "py" | "pyi" | "pyw" => Self::Python,
+            "zig" | "zon" => Self::Zig,
+            "ts" | "tsx" | "mts" | "cts" => Self::TypeScript,
+            "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
+            "sql" | "ddl" | "dml" | "psql" | "pgsql" => Self::Sql,
             _ => match path.file_name().and_then(|n| n.to_str()) {
                 Some("Cargo.lock") => Self::Toml,
+                Some("BUILD" | "WORKSPACE" | "SConstruct" | "SConscript") => Self::Python,
                 _ => Self::PlainText,
             },
         }
@@ -73,6 +90,13 @@ impl Language {
             Self::Json => "JSON",
             Self::Yaml => "YAML",
             Self::Shell => "Shell Script",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::Python => "Python",
+            Self::Zig => "Zig",
+            Self::TypeScript => "TypeScript",
+            Self::JavaScript => "JavaScript",
+            Self::Sql => "SQL",
             Self::PlainText => "Plain text",
         }
     }
@@ -86,21 +110,31 @@ impl Language {
             Self::Json => "json",
             Self::Yaml => "yaml",
             Self::Shell => "shellscript",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::Python => "python",
+            Self::Zig => "zig",
+            Self::TypeScript => "typescript",
+            Self::JavaScript => "javascript",
+            Self::Sql => "sql",
             Self::PlainText => "plaintext",
         }
     }
 
     pub fn line_comment(self) -> Option<&'static str> {
         match self {
-            Self::Rust | Self::Json => Some("//"),
-            Self::Toml | Self::Yaml | Self::Shell => Some("#"),
+            Self::Rust | Self::Json | Self::C | Self::Cpp | Self::Zig | Self::TypeScript | Self::JavaScript => {
+                Some("//")
+            }
+            Self::Toml | Self::Yaml | Self::Shell | Self::Python => Some("#"),
+            Self::Sql => Some("--"),
             Self::Markdown | Self::PlainText => None,
         }
     }
 
     pub fn block_comment(self) -> Option<(&'static str, &'static str)> {
         match self {
-            Self::Rust => Some(("/*", "*/")),
+            Self::Rust | Self::C | Self::Cpp | Self::TypeScript | Self::JavaScript | Self::Sql => Some(("/*", "*/")),
             Self::Markdown => Some(("<!--", "-->")),
             _ => None,
         }
@@ -209,7 +243,16 @@ fn lexical_spans(language: Language, doc: &Doc) -> Vec<Span> {
         Language::Json => json::spans(doc),
         Language::Yaml => yaml::spans(doc),
         Language::Shell => shell::spans(doc),
-        Language::Rust | Language::PlainText => Vec::new(),
+        // TODO(syntax agent): C, C++, Python, Zig, TypeScript, JavaScript, SQL lexers.
+        Language::C
+        | Language::Cpp
+        | Language::Python
+        | Language::Zig
+        | Language::TypeScript
+        | Language::JavaScript
+        | Language::Sql
+        | Language::Rust
+        | Language::PlainText => Vec::new(),
     }
 }
 
@@ -262,7 +305,14 @@ pub fn folding_ranges(language: Language, text: &str) -> Vec<FoldRange> {
         Language::Json => json::folding_ranges(&Doc::new(text)),
         Language::Yaml => yaml::folding_ranges(&Doc::new(text)),
         Language::Shell => shell::folding_ranges(&Doc::new(text)),
-        Language::PlainText => Vec::new(),
+        Language::C
+        | Language::Cpp
+        | Language::Python
+        | Language::Zig
+        | Language::TypeScript
+        | Language::JavaScript
+        | Language::Sql
+        | Language::PlainText => Vec::new(),
     }
 }
 
@@ -307,7 +357,7 @@ pub fn outline(language: Language, text: &str) -> Vec<OutlineItem> {
         Language::Rust => rust::outline(text),
         Language::Toml => toml::outline(&Doc::new(text)),
         Language::Markdown => markdown::outline(&Doc::new(text)),
-        Language::Json | Language::Yaml | Language::Shell | Language::PlainText => Vec::new(),
+        _ => Vec::new(),
     }
 }
 

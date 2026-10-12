@@ -12,13 +12,23 @@
     clippy::unreachable
 )]
 
+mod agent_cmds;
+pub mod agents;
+pub mod approvals;
 pub mod catalog;
 mod code_cmds;
 pub mod commands;
 mod convert;
+pub mod database;
+mod database_cmds;
+pub mod debug;
+mod debug_cmds;
 mod edit_cmds;
 mod editor_cmds;
+mod feedback_cmds;
 mod file_cmds;
+mod ide_cmds;
+pub mod ide_server;
 mod jobs;
 mod lsp;
 mod navigate_cmds;
@@ -34,8 +44,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use codecraft_agent as agent;
 pub use codecraft_cargo as cargo;
+pub use codecraft_dap as dap;
+pub use codecraft_db as db;
 pub use codecraft_fs as fs;
+pub use codecraft_mcp as mcp;
 pub use codecraft_syntax as syntax;
 pub use codecraft_text as text;
 pub use codecraft_workspace as workspace;
@@ -94,8 +108,14 @@ pub struct Session {
     pub selected_run_config: usize,
     /// Lines per page for Page Up/Down; the UI updates it from the editor height.
     pub page_lines: usize,
-    /// Start rust-analyzer for opened projects (the headless CLI turns this off).
+    /// Start language servers for opened projects (the headless CLI turns this off).
     pub lsp_enabled: bool,
+    /// Pending human approvals for agent actions (shared by every agent integration).
+    pub approvals: approvals::Approvals,
+    pub debug: debug::DebugState,
+    pub db: database::DbState,
+    pub agents: agents::AgentsState,
+    pub ide: ide_server::IdeServerState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -125,6 +145,11 @@ impl Session {
             selected_run_config: 0,
             page_lines: 40,
             lsp_enabled: true,
+            approvals: approvals::Approvals::default(),
+            debug: debug::DebugState::default(),
+            db: database::DbState::default(),
+            agents: agents::AgentsState::default(),
+            ide: ide_server::IdeServerState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             lsp: None,
@@ -170,6 +195,11 @@ impl Session {
         changed |= self.pump_lsp();
         changed |= runs::pump(self);
         changed |= jobs::pump(self);
+        changed |= self.approvals.pump();
+        changed |= debug::pump(self);
+        changed |= database::pump(self);
+        changed |= agents::pump(self);
+        changed |= ide_server::pump(self);
         changed
     }
 
@@ -185,6 +215,11 @@ impl Session {
 
     /// Stop the language server and running processes (window closing).
     pub fn shutdown(&mut self) {
+        debug::shutdown(self);
+        database::shutdown(self);
+        agents::shutdown(self);
+        ide_server::shutdown(self);
+        self.approvals.deny_all();
         runs::stop_all(self);
         if let Some(lsp) = self.lsp.take() {
             lsp.shutdown();

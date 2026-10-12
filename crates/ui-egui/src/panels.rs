@@ -22,6 +22,9 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Build => "🔨",
         ToolWindowId::Cargo => "📦",
         ToolWindowId::Notifications => "🔔",
+        ToolWindowId::Debug => "🐞",
+        ToolWindowId::Database => "🛢",
+        ToolWindowId::Agent => "✨",
         _ => "•",
     }
 }
@@ -149,6 +152,9 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Structure => structure_view(ui, s, st),
         ToolWindowId::Cargo => cargo_view(ui, s, st),
         ToolWindowId::Notifications => notifications_view(ui, s, st),
+        ToolWindowId::Debug => crate::debug_panel::show(ui, s, st),
+        ToolWindowId::Database => crate::database_panel::show(ui, s, st),
+        ToolWindowId::Agent => crate::agent_panel::show(ui, s, st),
         other => {
             ui.label(RichText::new(format!("{} is not implemented yet.", other.title())).color(st.theme.text_muted));
         }

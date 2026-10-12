@@ -42,7 +42,8 @@ fn workspace_root() -> PathBuf {
 
 fn layer_of(name: &str) -> Option<u8> {
     Some(match name {
-        "codecraft-text" | "codecraft-syntax" | "codecraft-fs" | "codecraft-lsp" | "codecraft-cargo" => 0,
+        "codecraft-text" | "codecraft-syntax" | "codecraft-fs" | "codecraft-lsp" | "codecraft-cargo"
+        | "codecraft-dap" | "codecraft-db" | "codecraft-agent" | "codecraft-mcp" => 0,
         "codecraft-workspace" => 1,
         "codecraft-engine" => 2,
         "codecraft-ui-egui" => 3,
@@ -140,25 +141,20 @@ const ID_OVERRIDES: &[(&str, &str)] = &[
 /// Items contributed by plugins outside RustRover's Rust focus (third-party or other stacks),
 /// or by the operating system. Matched against "path › title".
 const OUT_OF_SCOPE: &[&str] = &[
-    "Python",
     "Copilot",
     "Junie",
     "AI Assistant",
-    "Zig",
     "Educational",
     "JetBrains Academy",
     "Learn and Teach",
     "Emmet",
-    "TypeScript",
     "XPath",
     "XML",
     "JSONPath",
     "HTTP",
-    "Database",
     "Deployment",
     "Deployed",
     "Qodana",
-    "setup.py",
     "SSH",
     "Remote Development",
     "Dev Container",
@@ -192,7 +188,6 @@ const OUT_OF_SCOPE: &[&str] = &[
     "Gist",
     "Fork",
     "Share Project on",
-    "Python Package",
     "Encode XML",
     "Bidi Text",
     "UML",
@@ -219,6 +214,10 @@ const OS_ITEMS: &[&str] = &[
 
 /// In scope for RustRover parity but planned after the editor/build/LSP core (see docs/roadmap.md).
 const LATER: &[&str] = &[
+    "Python",
+    "Zig",
+    "TypeScript",
+    "setup.py",
     "Debug",
     "Breakpoint",
     "Coverage",

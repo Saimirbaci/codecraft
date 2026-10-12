@@ -186,7 +186,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "file.new.pythonPackage",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["File", "New"],
@@ -1090,7 +1090,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.database",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Core,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1098,7 +1098,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.databaseChanges",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Core,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1210,7 +1210,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.pythonConsole",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1218,7 +1218,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.pythonPackages",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1226,7 +1226,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.pythonProcessOutput",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1266,7 +1266,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.typeScript",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["View", "Tool Windows"],
@@ -1274,7 +1274,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "view.toolWindows.zig",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["View"],
@@ -2746,7 +2746,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "tools.pythonOrDebugConsole",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["Tools"],
@@ -2754,7 +2754,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "tools.createSetupPy",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["Tools"],
@@ -2762,7 +2762,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "tools.runSetupPyTask",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["Tools"],
@@ -2770,7 +2770,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "tools.managePythonPackages",
         submenu: false,
-        scope: Scope::Out,
+        scope: Scope::Later,
     },
     CatalogItem {
         path: &["Tools"],

@@ -122,6 +122,11 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::code_cmds::specs());
         specs.extend(crate::run_cmds::specs());
         specs.extend(crate::window_cmds::specs());
+        specs.extend(crate::debug_cmds::specs());
+        specs.extend(crate::database_cmds::specs());
+        specs.extend(crate::agent_cmds::specs());
+        specs.extend(crate::ide_cmds::specs());
+        specs.extend(crate::feedback_cmds::specs());
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {

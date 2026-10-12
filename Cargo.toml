@@ -16,6 +16,10 @@ codecraft-syntax = { path = "crates/syntax" }
 codecraft-fs = { path = "crates/fs" }
 codecraft-lsp = { path = "crates/lsp" }
 codecraft-cargo = { path = "crates/cargo" }
+codecraft-dap = { path = "crates/dap" }
+codecraft-db = { path = "crates/db" }
+codecraft-agent = { path = "crates/agent" }
+codecraft-mcp = { path = "crates/mcp" }
 codecraft-workspace = { path = "crates/workspace" }
 codecraft-engine = { path = "crates/engine" }
 codecraft-ui-egui = { path = "crates/ui-egui" }
