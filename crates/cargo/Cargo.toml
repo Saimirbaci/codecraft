@@ -1,0 +1,20 @@
+[package]
+name = "codecraft-cargo"
+description = "CodeCraft Cargo integration: metadata, invocations, process runner, compiler-message and libtest parsing, rustfmt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
