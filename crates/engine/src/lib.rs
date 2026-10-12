@@ -39,7 +39,12 @@ pub mod popup;
 mod run_cmds;
 pub mod run_configs;
 mod runs;
+pub mod terminal;
+mod terminal_cmds;
+pub mod vcs;
+mod vcs_cmds;
 mod view_cmds;
+mod watch;
 mod window_cmds;
 
 use std::path::{Path, PathBuf};
@@ -55,7 +60,9 @@ pub use codecraft_fs as fs;
 pub use codecraft_lsp::ServerKind;
 pub use codecraft_mcp as mcp;
 pub use codecraft_syntax as syntax;
+pub use codecraft_term as term;
 pub use codecraft_text as text;
+pub use codecraft_vcs as vcs_git;
 pub use codecraft_workspace as workspace;
 pub use commands::{CatalogItem, CommandError, CommandSpec, Context, Registry, Scope, registry};
 pub use lsp::server_kind;
@@ -121,6 +128,10 @@ pub struct Session {
     pub db: database::DbState,
     pub agents: agents::AgentsState,
     pub ide: ide_server::IdeServerState,
+    pub terminal: terminal::TerminalState,
+    pub vcs: vcs::VcsState,
+    /// Project file watcher (external changes).
+    watch: watch::Watch,
     /// The feedback overlay's draft and records (feedback track).
     pub feedback: feedback::FeedbackState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
@@ -162,6 +173,9 @@ impl Session {
             db: database::DbState::default(),
             agents: agents::AgentsState::default(),
             ide: ide_server::IdeServerState::default(),
+            terminal: terminal::TerminalState::default(),
+            vcs: vcs::VcsState::default(),
+            watch: watch::Watch::default(),
             feedback: feedback::FeedbackState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
@@ -216,6 +230,9 @@ impl Session {
         changed |= database::pump(self);
         changed |= agents::pump(self);
         changed |= ide_server::pump(self);
+        changed |= terminal::pump(self);
+        changed |= vcs::pump(self);
+        changed |= watch::pump(self);
         changed
     }
 
@@ -241,6 +258,9 @@ impl Session {
         database::shutdown(self);
         agents::shutdown(self);
         ide_server::shutdown(self);
+        terminal::shutdown(self);
+        vcs::shutdown(self);
+        self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);
         self.stop_lsp();

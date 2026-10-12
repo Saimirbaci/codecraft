@@ -25,7 +25,9 @@ mod menus;
 mod panels;
 mod popups;
 mod state;
+mod terminal_panel;
 pub mod theme;
+mod vcs_panels;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};

@@ -9,7 +9,7 @@ use crate::lsp::GotoKind;
 use crate::{Popup, Session};
 
 /// Tool windows CodeCraft implements (the others stay disabled in the menu until they exist).
-pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 12] = [
+pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 15] = [
     ToolWindowId::Project,
     ToolWindowId::Find,
     ToolWindowId::Run,
@@ -22,6 +22,9 @@ pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 12] = [
     ToolWindowId::Database,
     ToolWindowId::Agent,
     ToolWindowId::Services,
+    ToolWindowId::Terminal,
+    ToolWindowId::Commit,
+    ToolWindowId::Git,
 ];
 
 macro_rules! tool_window {
@@ -46,6 +49,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         tool_window!("view.toolWindows.debug", "Debug", ToolWindowId::Debug),
         tool_window!("view.toolWindows.database", "Database", ToolWindowId::Database),
         tool_window!("view.toolWindows.agent", "Agent", ToolWindowId::Agent),
+        tool_window!("view.toolWindows.terminal", "Terminal", ToolWindowId::Terminal),
+        tool_window!("view.toolWindows.commit", "Commit", ToolWindowId::Commit),
+        tool_window!("view.toolWindows.git", "Git", ToolWindowId::Git),
         spec(
             "view.hideAllToolWindows",
             "Hide All Tool Windows",

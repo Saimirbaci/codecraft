@@ -89,6 +89,7 @@ impl Session {
         self.find_bar = None;
         self.jobs.project = None;
         self.ws.tasks.remove(TASK_PROJECT);
+        self.stop_watching();
     }
 
     /// Rescan the project tree in the background (after file operations or focus regain).
@@ -232,6 +233,7 @@ fn on_project_loaded(s: &mut Session, load: ProjectLoad) {
             }
         }
     }
+    s.start_watching(&load.root);
     // Run configurations of the other ecosystems in the project (CMake, Make, Zig, npm, Python).
     s.run_configs.extend(crate::run_configs::derive_polyglot(&load.root));
     s.status = format!("Opened {}", load.root.display());

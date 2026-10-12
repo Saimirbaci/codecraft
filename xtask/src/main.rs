@@ -43,7 +43,8 @@ fn workspace_root() -> PathBuf {
 fn layer_of(name: &str) -> Option<u8> {
     Some(match name {
         "codecraft-text" | "codecraft-syntax" | "codecraft-fs" | "codecraft-lsp" | "codecraft-cargo"
-        | "codecraft-dap" | "codecraft-db" | "codecraft-agent" | "codecraft-mcp" => 0,
+        | "codecraft-dap" | "codecraft-db" | "codecraft-agent" | "codecraft-mcp" | "codecraft-term"
+        | "codecraft-vcs" => 0,
         "codecraft-workspace" => 1,
         "codecraft-engine" => 2,
         "codecraft-ui-egui" => 3,

@@ -18,6 +18,7 @@ mod io;
 mod mask;
 mod tree;
 mod walk;
+mod watch;
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub use fuzzy::FuzzyMatcher;
 pub use mask::FileMask;
+pub use watch::ProjectWatcher;
 
 #[derive(Debug, thiserror::Error)]
 pub enum FsError {

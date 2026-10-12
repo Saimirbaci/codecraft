@@ -20,6 +20,8 @@ codecraft-dap = { path = "crates/dap" }
 codecraft-db = { path = "crates/db" }
 codecraft-agent = { path = "crates/agent" }
 codecraft-mcp = { path = "crates/mcp" }
+codecraft-term = { path = "crates/term" }
+codecraft-vcs = { path = "crates/vcs" }
 codecraft-workspace = { path = "crates/workspace" }
 codecraft-engine = { path = "crates/engine" }
 codecraft-ui-egui = { path = "crates/ui-egui" }

@@ -26,6 +26,9 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Database => "🛢",
         ToolWindowId::Services => "📊",
         ToolWindowId::Agent => "✨",
+        ToolWindowId::Terminal => ">_",
+        ToolWindowId::Commit => "✓",
+        ToolWindowId::Git => "⑂",
         _ => "•",
     }
 }
@@ -157,6 +160,9 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Database => crate::database_panel::show(ui, s, st),
         ToolWindowId::Services => crate::database_panel::services(ui, s, st),
         ToolWindowId::Agent => crate::agent_panel::show(ui, s, st),
+        ToolWindowId::Terminal => crate::terminal_panel::show(ui, s, st),
+        ToolWindowId::Commit => crate::vcs_panels::show(ui, s, st),
+        ToolWindowId::Git => crate::vcs_panels::show_git(ui, s, st),
         other => {
             ui.label(RichText::new(format!("{} is not implemented yet.", other.title())).color(st.theme.text_muted));
         }

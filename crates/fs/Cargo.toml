@@ -11,6 +11,9 @@ ignore.workspace = true
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [dev-dependencies]
 tempfile.workspace = true
