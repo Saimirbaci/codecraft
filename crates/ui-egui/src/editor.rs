@@ -302,6 +302,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
     let marks = path.as_deref().map(|p| DebugMarks::collect(s, p)).unwrap_or_default();
+    let vcs = crate::vcs_panels::GutterVcs::collect(s, editor.doc);
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
     let od = &*od;
@@ -323,7 +324,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let digits = doc.len_lines().max(1).ilog10() as f32 + 1.0;
     // Breakpoints sit over the line numbers (RustRover's New UI), so keep room for them.
     let numbers_w = if settings.show_line_numbers { (digits.max(2.0) + 1.0) * char_w } else { 16.0 };
-    let gutter_w = numbers_w + 18.0 + 14.0 + 6.0;
+    // Git annotations (blame) take a column at the gutter's left edge while shown.
+    let ann_w = vcs.annotation_width(char_w);
+    let gutter_w = ann_w + numbers_w + 18.0 + 14.0 + 6.0;
     let text_rect =
         Rect::from_min_max(pos2(rect.left() + gutter_w, rect.top()), pos2(rect.right() - STRIPE_W, rect.bottom()));
     let visible_rows = ((rect.height() / line_h).floor() as usize).max(1);
@@ -444,6 +447,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
         if line == caret_line && primary.is_empty() {
             painter.rect_filled(line_rect, CornerRadius::ZERO, theme.caret_row);
+        }
+        if let Some(bg) = vcs.line_bg(line, &theme) {
+            painter.rect_filled(line_rect, CornerRadius::ZERO, bg);
         }
         if marks.execution == Some(line) {
             painter.rect_filled(line_rect, CornerRadius::ZERO, theme.execution_line);
@@ -585,8 +591,12 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     }
 
     // ------------------------------------------------------------ gutter
-    let gutter = Rect::from_min_max(rect.min, pos2(rect.left() + gutter_w, rect.bottom()));
+    let gutter = Rect::from_min_max(pos2(rect.left() + ann_w, rect.top()), pos2(rect.left() + gutter_w, rect.bottom()));
     painter.rect_filled(gutter, CornerRadius::ZERO, theme.editor_bg);
+    let ann_rect = Rect::from_min_max(rect.min, pos2(rect.left() + ann_w, rect.bottom()));
+    if ann_w > 0.0 {
+        painter.rect_filled(ann_rect, CornerRadius::ZERO, theme.vcs_annotation_bg);
+    }
     let num_font = FontId::monospace((settings.editor_font_size - 1.0).max(8.0));
     // The breakpoint area: the line numbers, between the run icons and the fold markers.
     let bp_area = (gutter.left() + 18.0)..(gutter.left() + 18.0 + numbers_w);
@@ -621,6 +631,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                 color,
             );
         }
+        vcs.paint_line(&painter, &theme, *line, *y, line_h, gutter, ann_rect, &num_font);
         if run_lines.contains(line) {
             let x = gutter.left() + 9.0;
             let tri = vec![pos2(x - 4.0, cy - 5.0), pos2(x + 5.0, cy), pos2(x - 4.0, cy + 5.0)];
@@ -705,10 +716,21 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         && !stripe.contains(pos)
     {
         ui.memory_mut(|m| m.request_focus(id));
-        if gutter.contains(pos) {
+        if ann_w > 0.0 && pos.x < gutter.left() {
+            // An annotation: show its commit in the Git log.
+            let row = (((pos.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize;
+            if let Some((hash, _)) = map.line(row).and_then(|l| vcs.annotation(l)) {
+                commands.push(("git.showGitLog", json!({})));
+                commands.push(("vcs.selectCommit", json!({ "hash": hash })));
+            }
+        } else if gutter.contains(pos) {
             let row = (((pos.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize;
             if let Some(line) = map.line(row) {
-                if pos.x > gutter.right() - 18.0 && fold_starts.contains(&line) {
+                if pos.x >= gutter.right() - 6.0 && vcs.has_change(line) {
+                    // A change marker: its popup (old content, rollback, diff).
+                    st.vcs.hunk_anchor = Some(pos);
+                    commands.push(("vcs.showHunk", json!({ "line": line })));
+                } else if pos.x > gutter.right() - 18.0 && fold_starts.contains(&line) {
                     commands.push(("code.folding.toggle", json!({ "line": line })));
                 } else if pos.x < gutter.left() + 18.0 && run_lines.contains(&line) {
                     if let Some(p) = &path {
@@ -785,6 +807,15 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                 response = response.on_hover_text_at_pointer(format!("{name} = {value}"));
             }
         }
+    }
+    if let Some(pos) = response.hover_pos()
+        && ann_w > 0.0
+        && pos.x < gutter.left()
+        && let Some((_, tip)) = map
+            .line((((pos.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize)
+            .and_then(|l| vcs.annotation(l))
+    {
+        response = response.on_hover_text_at_pointer(tip);
     }
     let mut gutter_menu_breakpoint = None;
     if let Some(pos) = response.hover_pos()

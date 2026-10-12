@@ -72,6 +72,8 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     }
                 }
             });
+            // Git branch widget (also draws the Git dialogs).
+            crate::vcs_panels::branch_widget(ui, s, st);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if tool_button(ui, st, "⚙", "Settings (⌘,)", true, None) {
                     run_command(s, st, "app.settings", &Value::Null);
@@ -329,8 +331,11 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     if e.pinned {
                         title = format!("📌 {title}");
                     }
+                    let vcs_color = d.path.as_deref().and_then(|p| crate::vcs_panels::file_color(s, &theme, p));
                     let color = if has_errors {
                         theme.error
+                    } else if let Some(c) = vcs_color {
+                        c
                     } else if active {
                         theme.text
                     } else {

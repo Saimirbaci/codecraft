@@ -28,7 +28,7 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Agent => "✨",
         ToolWindowId::Terminal => ">_",
         ToolWindowId::Commit => "✓",
-        ToolWindowId::Git => "⑂",
+        ToolWindowId::Git => "🔀",
         _ => "•",
     }
 }
@@ -259,7 +259,11 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             );
             let has_error = !node.is_dir && error_files.contains(&node.path)
                 || node.is_dir && error_files.iter().any(|f| f.starts_with(&node.path));
-            let name_color = if has_error { theme.error } else { theme.text };
+            let name_color = if has_error {
+                theme.error
+            } else {
+                crate::vcs_panels::tree_color(s, &theme, &node.path, node.is_dir).unwrap_or(theme.text)
+            };
             let mut job = LayoutJob::default();
             let name = if *depth == 0 { project.name.clone() } else { node.name.clone() };
             job.append(

@@ -76,6 +76,10 @@ pub struct UiState {
     pub db: database_panel::DbUi,
     /// Debug tool window view state (input fields, pane sizes).
     pub debug: debug_panel::DebugUi,
+    /// Terminal tool window view state (selection drag, wheel, blink, focus).
+    pub terminal: terminal_panel::TerminalUi,
+    /// Git tool windows, branch popup and dialogs view state.
+    pub vcs: vcs_panels::VcsUi,
 }
 
 impl UiState {
@@ -105,6 +109,8 @@ impl UiState {
             agent: agent_panel::AgentUi::default(),
             db: database_panel::DbUi::default(),
             debug: debug_panel::DebugUi::default(),
+            terminal: terminal_panel::TerminalUi::default(),
+            vcs: vcs_panels::VcsUi::default(),
         }
     }
 }
@@ -209,6 +215,13 @@ impl App {
             ) {
                 return;
             }
+        }
+
+        // The focused terminal takes every key and text event itself (it runs IDE-global Cmd
+        // shortcuts on its own; see `terminal_panel::handle_keys`).
+        if terminal_panel::has_focus(ctx) {
+            terminal_panel::handle_keys(ctx, &events, s, st);
+            return;
         }
 
         let completion_open = matches!(&s.popup, Some(Popup::Completion(c)) if !c.visible.is_empty());

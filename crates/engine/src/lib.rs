@@ -19,11 +19,11 @@ pub mod catalog;
 mod code_cmds;
 pub mod commands;
 mod convert;
-mod decorations;
 pub mod database;
 mod database_cmds;
 pub mod debug;
 mod debug_cmds;
+mod decorations;
 mod edit_cmds;
 mod editor_cmds;
 pub mod feedback;
@@ -248,6 +248,7 @@ impl Session {
             || self.ide.busy()
             || self.db.busy()
             || self.debug.busy()
+            || self.vcs.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.

@@ -166,6 +166,14 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
             {
                 run_command(s, st, "agent.backends", &json!({ "refresh": true }));
             }
+            // Terminal track: interactive Claude Code in a terminal tab, connected to CodeCraft.
+            if ui
+                .add(egui::Button::new(RichText::new(">_").color(theme.text_muted)).frame(false))
+                .on_hover_text("Open Claude Code in a terminal")
+                .clicked()
+            {
+                run_command(s, st, "terminal.openClaude", &Value::Null);
+            }
         });
     });
     let support = current.as_ref().map_or(Err("unknown agent".to_string()), |i| mode_support(i, st.agent.mode));

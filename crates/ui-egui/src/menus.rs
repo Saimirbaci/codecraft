@@ -33,6 +33,12 @@ const EXTRA: &[(&str, &str)] = &[
     ("Run › Debugging Actions", "run.debuggingActions.runToCursor"),
     ("Run › Debugging Actions", "run.debuggingActions.evaluateExpression"),
     ("Run › Debugging Actions", "debug.stop"),
+    // RustRover fills Git › Current File lazily too.
+    ("Git › Current File", "git.currentFile.annotate"),
+    ("Git › Current File", "git.currentFile.showHistory"),
+    ("Git › Current File", "git.currentFile.compareWithRevision"),
+    ("Git › Current File", "git.currentFile.compareWithBranch"),
+    ("Git › Current File", "git.currentFile.rollback"),
     ("Run", "debug.atCaret"),
     ("Build", "cargo.check"),
     ("Build", "cargo.clippy"),
