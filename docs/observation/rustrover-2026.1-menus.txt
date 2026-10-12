@@ -1,0 +1,521 @@
+[RustRover] About RustRover
+[RustRover] Check for Updates…
+  ----
+[RustRover] Settings…   (Cmd+,)
+  ----
+[RustRover] Services ▸
+  Activity Monitor
+  Allocations & Leaks
+  File Activity
+  System Trace
+  Time Profile Active Application
+  Time Profile App Under Mouse
+  Time Profile Entire System
+  Toggle Instruments Recording
+  Services Settings…
+  ----
+[RustRover] Hide RustRover   (Cmd+H)
+[RustRover] Hide Others   (Alt+Cmd+H)
+[RustRover] Show All
+  ----
+[RustRover] Quit RustRover   (Cmd+Q)
+[RustRover] Quit and Keep Windows   (Alt+Cmd+Q)
+[File] New ▸
+  Project…
+  Project from Version Control…
+    ----
+  Directory
+  Python Package
+  Cargo Crate
+  File
+  Scratch File   (Shift+Cmd+N)
+    ----
+  Dockerfile
+  Dev Container Config…
+[File] Open…
+[File] Learn and Teach ▸
+  Browse Courses
+  Create New Course
+[File] Recent Projects ▸
+[File] Close Project
+  ----
+[File] Remote Development…
+  ----
+[File] File Properties ▸
+  File Encoding
+  Remove BOM
+  Add BOM
+  Associate with File Type…
+  Make file read-only
+  Line Separators ▸
+    CRLF - Windows (\r\n)
+    LF - Unix and macOS (\n)
+      ----
+  ----
+[File] Local History ▸
+  Show History…
+  Show History for Selection…
+    ----
+  Show Project History…
+  Recent Changes   (Alt+Shift+C)
+  Put Label…
+  ----
+[File] Save All   (Cmd+S)
+[File] Reload All from Disk   (Alt+Cmd+Y)
+[File] Repair IDE
+[File] Invalidate Caches…
+  ----
+[File] Manage IDE Settings ▸
+[File] New Projects Setup ▸
+  Settings for New Projects…
+  Run Configuration Templates…
+[File] Save File as Template…
+  ----
+[File] Export ▸
+  Files or Selection to HTML…
+[File] Print…
+  ----
+[File] Power Save Mode
+[Edit] Undo   (Cmd+Z)
+[Edit] Redo   (Shift+Cmd+Z)
+  ----
+[Edit] Cut   (Cmd+X)
+[Edit] Copy   (Cmd+C)
+[Edit] Copy as Plain Text
+[Edit] Copy Path/Reference…
+[Edit] Paste ▸
+[Edit] Delete   (Backspace)
+  ----
+[Edit] Search In Selection   (Ctrl+Alt+E)
+[Edit] Find ▸
+  Find…   (Cmd+F)
+  Replace…   (Cmd+R)
+  Find Next Occurrence   (Cmd+G)
+  Find Previous Occurrence   (Shift+Cmd+G)
+  Select All Occurrences   (Ctrl+Cmd+G)
+  Add Selection for Next Occurrence   (Ctrl+G)
+  Unselect Occurrence   (Ctrl+Shift+G)
+  Search In Selection   (Ctrl+Alt+E)
+  Scroll to Results During Typing
+    ----
+  Next Occurrence of the Word at Caret
+  Previous Occurrence of the Word at Caret
+    ----
+  Find in Files…   (Shift+Cmd+F)
+  Replace in Files…   (Shift+Cmd+R)
+    ----
+  Search Structurally…
+  Replace Structurally…
+    ----
+  Find by XPath…   (Alt+Cmd+X)
+  Evaluate JSONPath Expression…
+[Edit] Find Usages ▸
+  ----
+[Edit] Column Selection Mode   (Shift+Cmd+8)
+[Edit] Select All   (Cmd+A)
+[Edit] Add Carets to Ends of Selected Lines   (Alt+Shift+G)
+[Edit] Extend Selection   (Alt+Up)
+[Edit] Shrink Selection   (Alt+Down)
+  ----
+[Edit] Toggle Case   (Shift+Cmd+U)
+[Edit] Join Lines   (Ctrl+Shift+J)
+[Edit] Duplicate Selection   (Cmd+D)
+[Edit] Fill Paragraph
+[Edit] Sort Lines
+[Edit] Reverse Lines
+[Edit] Transpose
+  ----
+[Edit] Indent Selection   (Tab)
+[Edit] Unindent Line or Selection   (Shift+Tab)
+[Edit] Convert Indents ▸
+  To Spaces
+  To Tabs
+  ----
+[Edit] Macros ▸
+[Edit] Bookmarks ▸
+  ----
+[Edit] Emoji & Symbols   (Ctrl+Cmd+Space)
+[Edit] Encode XML/HTML Special Characters
+[Edit] Edit as Table...
+[View] Tool Windows ▸
+  Commit   (Cmd+0)
+  Project   (Cmd+1)
+  Bookmarks   (Cmd+2)
+  Find   (Cmd+3)
+  Run   (Cmd+4)
+  Debug   (Cmd+5)
+  Problems   (Cmd+6)
+  Structure   (Cmd+7)
+  Services   (Cmd+8)
+  Git   (Cmd+9)
+  AI Assistant   (Alt+Shift+1)
+  Backup and Sync History
+  Build
+  Coverage
+  Database
+  Database Changes
+  Educational.CheckDetails
+  Junie
+  File Transfer
+  GitHub Coding Agent Jobs
+  GitHub Copilot Chat
+  GitHub Copilot MCP Log
+  GitHub Copilot Multiple Code Suggestions
+  Hierarchy
+  Language Servers
+  Merge Requests
+  Notifications
+  PR AI Assistant
+  Pull Requests
+  Python Console
+  Python Packages
+  Python Process Output
+  Cargo
+  Semantic Tokens Inspector
+  Terminal   (Alt+F12)
+  TODO
+  TypeScript
+  Zig
+[View] Appearance ▸
+  ----
+[View] Quick Definition   (Alt+Space)
+[View] Quick Type Definition
+[View] Parameter Info   (Cmd+P)
+[View] Context Info   (Ctrl+Shift+Q)
+[View] Error Description   (Cmd+F1)
+  ----
+[View] Recent Locations   (Shift+Cmd+E)
+[View] Recent Files   (Cmd+E)
+[View] Recently Changed Files
+[View] Recent Changes   (Alt+Shift+C)
+  ----
+[View] Compare With…
+[View] Compare with Clipboard
+  ----
+[View] Quick Switch Scheme…   (Ctrl+`)
+[View] Active Editor ▸
+  ----
+[View] Increase Font Size in All Editors   (Ctrl+Shift+.)
+[View] Decrease Font Size in All Editors   (Ctrl+Shift+,)
+[View] Reset Font Size in All Editors
+  ----
+[View] Bidi Text Base Direction ▸
+  Content-Based
+  Left-to-Right
+  Right-to-Left
+[Navigate] Back   (Cmd+[)
+[Navigate] Forward   (Cmd+])
+  ----
+[Navigate] Search Everywhere
+  ----
+[Navigate] Type...   (Cmd+O)
+[Navigate] File…   (Shift+Cmd+O)
+[Navigate] Symbol…   (Alt+Cmd+O)
+[Navigate] Text…   (Alt+Shift+Cmd+E)
+[Navigate] Line:Column…   (Cmd+L)
+  ----
+[Navigate] Next Highlighted Error   (F2)
+[Navigate] Previous Highlighted Error   (Shift+F2)
+  ----
+[Navigate] Next Emmet Edit Point   (Ctrl+Alt+Right)
+[Navigate] Previous Emmet Edit Point   (Ctrl+Alt+Left)
+[Navigate] Last Edit Location   (Shift+Cmd+Backspace)
+[Navigate] Next Edit Location
+  ----
+[Navigate] Navigate in File ▸
+  Next Method   (Ctrl+Shift+Down)
+  Previous Method   (Ctrl+Shift+Up)
+  Move Caret to Matching Brace   (Ctrl+M)
+    ----
+  Next Live Template Parameter
+  Previous Live Template Parameter
+  Custom Folding…   (Alt+Cmd+.)
+  ----
+[Navigate] Select In…   (Alt+F1)
+[Navigate] Jump to Navigation Bar   (Cmd+Up)
+  ----
+[Navigate] Declaration or Usages   (Cmd+B)
+[Navigate] Implementation(s)   (Alt+Cmd+B)
+[Navigate] Type Declaration   (Shift+Cmd+B)
+[Navigate] Super Method   (Cmd+U)
+[Navigate] Related Symbol…   (Ctrl+Cmd+Up)
+  ----
+[Navigate] File Structure   (Cmd+F12)
+[Navigate] File Path   (Alt+Cmd+F12)
+[Navigate] Type Hierarchy   (Ctrl+H)
+[Navigate] Method Hierarchy   (Shift+Cmd+H)
+[Navigate] Call Hierarchy   (Ctrl+Alt+H)
+  ----
+[Navigate] LSP Implementation(s)   (Alt+Cmd+G)
+[Navigate] LSP Reference(s)
+[Navigate] LSP Declaration(s)   (Alt+Cmd+Z)
+[Navigate] LSP Type Definition(s)   (Alt+Cmd+E)
+[Code] Override Methods…   (Ctrl+O)
+[Code] Implement Methods…   (Ctrl+I)
+[Code] Generate…   (Cmd+N)
+[Code] Modify Selected Code…   (Cmd+\)
+  ----
+[Code] Code Completion ▸
+  Basic   (Ctrl+Space)
+  Type-Matching   (Ctrl+Shift+Space)
+    ----
+  Complete Current Statement   (Shift+Cmd+Return)
+    ----
+  Cyclic Expand Word   (Alt+/)
+  Cyclic Expand Word (Backward)   (Alt+?)
+    ----
+  Call Inline Completion   (Alt+Shift+\)
+  Insert Inline Proposal
+  Insert Inline Proposal's Word   (Alt+Right)
+  Insert Inline Proposal's Line   (Cmd+Right)
+  Enable Command Completion
+  ----
+[Code] Inspect Code…
+[Code] Code Cleanup…
+[Code] Analyze Code ▸
+[Code] Analyze Stack Trace or Thread Dump…
+  ----
+[Code] Insert Live Template…   (Cmd+J)
+[Code] Save as Live Template…
+  ----
+[Code] Surround With…   (Alt+Cmd+T)
+[Code] Unwrap/Remove…   (Shift+Cmd+Backspace)
+  ----
+[Code] Folding ▸
+  ----
+[Code] Comment with Line Comment   (Cmd+/)
+[Code] Comment with Block Comment   (Alt+Cmd+/)
+[Code] Reformat Code   (Alt+Cmd+L)
+[Code] Reformat File…   (Alt+Shift+Cmd+L)
+[Code] Auto-Indent Lines   (Ctrl+Alt+I)
+[Code] Optimize Imports   (Ctrl+Alt+O)
+[Code] Rearrange Code
+  ----
+[Code] Move Statement Down   (Shift+Cmd+Down)
+[Code] Move Statement Up   (Shift+Cmd+Up)
+[Code] Move Element Left   (Alt+Shift+Cmd+Left)
+[Code] Move Element Right   (Alt+Shift+Cmd+Right)
+[Code] Move Line Down   (Alt+Shift+Down)
+[Code] Move Line Up   (Alt+Shift+Up)
+  ----
+[Code] Update Copyright…
+[Code] Reformat File with Rustfmt
+[Code] Reformat Cargo Project with Rustfmt
+[Refactor] Refactor This…   (Ctrl+T)
+[Refactor] Rename…   (Shift+F6)
+  ----
+[Refactor] Move File…   (F6)
+[Refactor] Copy File…   (F5)
+[Refactor] Safe Delete…   (Cmd+Backspace)
+[Build] Build Project
+[Build] Rebuild Project
+[Run] Run 'Run'   (Ctrl+R)
+[Run] Debug 'Run'   (Ctrl+D)
+[Run] Run 'Run' with Coverage
+[Run] Profile 'Run' ▸
+[Run] Run 'Run' with Valgrind Memcheck
+  ----
+[Run] Run…   (Ctrl+Alt+R)
+[Run] Debug…   (Ctrl+Alt+D)
+[Run] Attach to Process…   (Alt+Shift+F5)
+[Run] Attach to an Unstarted Process…
+[Run] Edit Configurations…
+[Run] Manage Targets…
+  ----
+[Run] Import Valgrind XML Results
+[Run] Stop   (Cmd+F2)
+[Run] Stop Background Processes…   (Shift+Cmd+F2)
+[Run] Show Running List
+  ----
+[Run] Debugging Actions ▸
+[Run] Toggle Breakpoint ▸
+  Line Breakpoint   (Cmd+F8)
+  Temporary Line Breakpoint   (Alt+Shift+Cmd+F8)
+  Toggle Breakpoint Enabled
+[Run] View Breakpoints…   (Shift+Cmd+F8)
+  ----
+[Run] Test History ▸
+[Run] Import Tests from File…
+[Run] Manage Coverage Reports…   (Alt+Cmd+F6)
+  ----
+[Run] Attach Profiler to Process…
+[Run] Open Profiler Snapshot ▸
+  Open…
+[Tools] AI Assistant
+  ----
+[Tools] Tasks & Contexts ▸
+  ----
+[Tools] Create Command Line Launcher…
+  ----
+[Tools] Services ▸
+[Tools] Markdown ▸
+[Tools] XML Actions ▸
+  Convert Schema...
+[Tools] Qodana ▸
+  Try Code Analysis with Qodana
+  Add Qodana to CI Pipeline
+  Log in to Qodana…
+    ----
+  Open Local Report…
+[Tools] Deployment ▸
+  Upload to Default Server
+  Upload To…   (Alt+Shift+Cmd+X)
+  Upload All Open Files to Default Server
+  Upload All Open Files To…
+  Download from Default Server
+  Download From…
+    ----
+  Compare Local File with Deployed Version
+  Compare with Deployed To…
+  Sync Local Subtree with Deployed
+  Sync with Deployed To…
+    ----
+  Configuration…
+  Options…
+  Automatic Upload
+    ----
+  Browse Remote Host
+[Tools] Start SSH Session…
+[Tools] Rust ▸
+[Tools] HTTP Client ▸
+  Create Request in HTTP Client
+  Open HTTP Requests Collection
+  Show HTTP Requests History
+  Convert cURL to HTTP Request
+  Add to HTTP Client… ▸
+    Variable in Public File
+    Variable in Private File
+    Auth Configuration
+  Import from Postman Collection File
+[Tools] Python or Debug Console
+[Tools] Create setup.py
+[Tools] Run setup.py Task…
+[Tools] Manage Python Packages…
+[Tools] GitHub Copilot ▸
+[Git] Commit…   (Cmd+K)
+[Git] Push…   (Shift+Cmd+K)
+[Git] Update Project...   (Cmd+T)
+[Git] Pull…
+[Git] Fetch
+  ----
+[Git] Merge…
+[Git] Rebase…
+  ----
+[Git] Branches…
+[Git] New Branch…   (Alt+Cmd+N)
+[Git] New Tag…
+[Git] Reset HEAD…
+  ----
+[Git] New Worktree…
+[Git] Worktrees…
+  ----
+[Git] Show Git Log
+[Git] Patch ▸
+  Create Patch from Local Changes…
+  Apply Patch…
+  Apply Patch from Clipboard…
+[Git] Uncommitted Changes ▸
+  Shelve Changes…
+  Show Shelf
+  Stash Changes…
+  Unstash Changes…
+  Rollback…
+  Show Local Changes as UML   (Alt+Shift+Cmd+D)
+[Git] Current File ▸
+  ----
+[Git] GitLab ▸
+  Share Project on GitLab
+  Clone Repository…
+    ----
+  Manage Accounts…
+[Git] GitHub ▸
+  Create Pull Request…
+  View Pull Requests
+  Sync Fork
+  Create Gist…
+    ----
+  Share Project on GitHub
+  Clone Repository…
+    ----
+  Manage Accounts…
+[Git] Manage Remotes…
+[Git] Clone…
+  ----
+[Git] VCS Operations Popup…   (Ctrl+V)
+[Window] Minimize   (Cmd+M)
+[Window] Zoom   (Ctrl+Cmd+=)
+[Window] Move to Built-in Display
+[Window] Layouts ▸
+  ----
+[Window] Active Tool Window ▸
+[Window] Editor Tabs ▸
+  Select Next Tab   (Shift+Cmd+])
+  Select Previous Tab   (Shift+Cmd+[)
+  Pin Tab
+  Keep Tab Open
+  Show Hidden Tabs
+    ----
+  Close Tab   (Cmd+W)
+  Close Other Tabs
+  Close All Tabs
+  Close Unmodified Tabs
+  Close All but Pinned
+  Close Tabs to the Left
+  Close Tabs to the Right
+  Close All Read-Only
+    ----
+  Split Right
+  Split and Move Right
+  Split Down
+  Split and Move Down
+  Split with Chooser Navigation ▸
+  Stretch Editor to Top
+  Stretch Editor to Left
+  Stretch Editor to Bottom
+  Stretch Editor to Right
+  Change Splitter Orientation
+  Maximize Editor/Normalize Splits
+  Unsplit
+  Unsplit All
+  Go to Next Splitter   (Alt+Tab)
+  Go to Previous Splitter   (Alt+Shift+Tab)
+    ----
+  Configure Editor Tabs…
+[Window] Notifications ▸
+[Window] Processes ▸
+  Show
+  Auto Show
+  ----
+[Window] Next Project Window   (Alt+Cmd+`)
+[Window] Previous Project Window   (Alt+Shift+Cmd+`)
+[Window] Merge All Project Windows
+  ----
+[Help] Find Action…   (Shift+Cmd+A)
+  ----
+[Help] Learn More About JetBrains Academy
+[Help] Help
+  ----
+[Help] Tip of the Day
+[Help] My Productivity
+  ----
+[Help] What's New in RustRover
+[Help] Getting Started
+[Help] Keyboard Shortcuts PDF
+  ----
+[Help] Contact Support…
+[Help] Submit a Bug Report…
+[Help] Submit Feedback…
+  ----
+[Help] Show Log in Finder
+[Help] Collect Logs and Diagnostic Data
+[Help] Collect Junie Logs
+[Help] Start CPU Usage Profiling
+[Help] Capture Memory Snapshot
+  ----
+[Help] Diagnostic Tools ▸
+[Help] Change Memory Settings
+[Help] Edit Custom Properties…
+[Help] Edit Custom VM Options…
+[Help] Delete Leftover IDE Directories…
+  ----
+[Help] Register…
