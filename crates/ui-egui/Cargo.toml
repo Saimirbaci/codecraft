@@ -1,0 +1,30 @@
+[package]
+name = "codecraft-ui-egui"
+description = "CodeCraft egui shell: menus, editor, tool windows and popups; a thin layer over the engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codecraft-text.workspace = true
+codecraft-syntax.workspace = true
+codecraft-fs.workspace = true
+codecraft-lsp.workspace = true
+codecraft-cargo.workspace = true
+codecraft-workspace.workspace = true
+codecraft-engine.workspace = true
+egui.workspace = true
+eframe.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }
+tempfile.workspace = true
+image = { version = "0.25", default-features = false, features = ["png"] }

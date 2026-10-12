@@ -1,0 +1,763 @@
+//! Tool windows: stripes with toggle buttons, and the left/bottom/right panels.
+
+use std::path::{Path, PathBuf};
+
+use egui::text::{LayoutJob, TextFormat};
+use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, ScrollArea, Sense, Stroke, vec2};
+use serde_json::{Value, json};
+
+use codecraft_engine::{IMPLEMENTED_TOOL_WINDOWS, Session};
+use codecraft_fs::NodeId;
+use codecraft_workspace::{ConsoleKind, NotificationLevel, RunStatus, Severity, Side, ToolWindowId};
+
+use crate::{UiState, keymap, run_command};
+
+fn icon(tw: ToolWindowId) -> &'static str {
+    match tw {
+        ToolWindowId::Project => "🗀",
+        ToolWindowId::Structure => "☰",
+        ToolWindowId::Run => "▶",
+        ToolWindowId::Problems => "⚠",
+        ToolWindowId::Find => "🔍",
+        ToolWindowId::Build => "🔨",
+        ToolWindowId::Cargo => "📦",
+        ToolWindowId::Notifications => "🔔",
+        _ => "•",
+    }
+}
+
+fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId) {
+    let visible = s.ws.layout.is_visible(tw);
+    let color = if visible { st.theme.text } else { st.theme.text_muted };
+    let mut tip = tw.title().to_string();
+    if let Some(sc) = tw.shortcut() {
+        tip = format!("{tip} ({})", keymap::display(sc));
+    }
+    let resp = ui
+        .add(egui::Button::new(RichText::new(icon(tw)).size(16.0).color(color)).frame(false).min_size(vec2(30.0, 30.0)))
+        .on_hover_text(tip);
+    if visible {
+        ui.painter().rect_filled(resp.rect.shrink(1.0), CornerRadius::same(6), Color32::from_white_alpha(14));
+    }
+    if resp.clicked() {
+        run_command(s, st, &format!("view.toolWindows.{}", tw.key()), &Value::Null);
+    }
+}
+
+/// The left and right stripes (RustRover's New UI puts bottom tool windows low on the left stripe).
+pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let frame = Frame::new()
+        .fill(st.theme.panel_bg)
+        .inner_margin(Margin::symmetric(3, 6))
+        .stroke(Stroke::new(1.0, st.theme.border));
+    egui::Panel::left("stripe-left").exact_size(38.0).resizable(false).frame(frame).show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Left) {
+                stripe_button(ui, s, st, tw);
+            }
+            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().rev().filter(|t| t.side() == Side::Bottom) {
+                    stripe_button(ui, s, st, tw);
+                }
+            });
+        });
+    });
+    egui::Panel::right("stripe-right").exact_size(38.0).resizable(false).frame(frame).show(ui, |ui| {
+        ui.vertical_centered(|ui| {
+            for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right) {
+                stripe_button(ui, s, st, tw);
+            }
+        });
+    });
+}
+
+fn header(ui: &mut egui::Ui, st: &UiState, title: &str) -> bool {
+    let mut hide = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(title).strong().size(13.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .add(egui::Button::new(RichText::new("—").color(st.theme.text_muted)).frame(false))
+                .on_hover_text("Hide")
+                .clicked()
+            {
+                hide = true;
+            }
+        });
+    });
+    ui.add_space(2.0);
+    hide
+}
+
+pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    if s.ws.layout.all_hidden {
+        return;
+    }
+    let frame =
+        Frame::new().fill(st.theme.panel_bg).inner_margin(Margin::same(6)).stroke(Stroke::new(1.0, st.theme.border));
+    if let Some(tw) = s.ws.layout.bottom {
+        let resp = egui::Panel::bottom("tw-bottom")
+            .resizable(true)
+            .default_size(s.ws.layout.bottom_height)
+            .size_range(80.0..=1200.0)
+            .frame(frame)
+            .show(ui, |ui| {
+                if header(ui, st, tw.title()) {
+                    s.ws.layout.hide(tw);
+                }
+                tool_window(ui, s, st, tw);
+            });
+        s.ws.layout.bottom_height = resp.response.rect.height();
+    }
+    if let Some(tw) = s.ws.layout.left {
+        let resp = egui::Panel::left("tw-left")
+            .resizable(true)
+            .default_size(s.ws.layout.left_width)
+            .size_range(140.0..=900.0)
+            .frame(frame)
+            .show(ui, |ui| {
+                if header(ui, st, tw.title()) {
+                    s.ws.layout.hide(tw);
+                }
+                tool_window(ui, s, st, tw);
+            });
+        s.ws.layout.left_width = resp.response.rect.width();
+    }
+    if let Some(tw) = s.ws.layout.right {
+        let resp = egui::Panel::right("tw-right")
+            .resizable(true)
+            .default_size(s.ws.layout.right_width)
+            .size_range(160.0..=900.0)
+            .frame(frame)
+            .show(ui, |ui| {
+                if header(ui, st, tw.title()) {
+                    s.ws.layout.hide(tw);
+                }
+                tool_window(ui, s, st, tw);
+            });
+        s.ws.layout.right_width = resp.response.rect.width();
+    }
+}
+
+fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId) {
+    match tw {
+        ToolWindowId::Project => project_view(ui, s, st),
+        ToolWindowId::Run => runs_view(ui, s, st, false),
+        ToolWindowId::Build => runs_view(ui, s, st, true),
+        ToolWindowId::Problems => problems_view(ui, s, st),
+        ToolWindowId::Find => find_view(ui, s, st),
+        ToolWindowId::Structure => structure_view(ui, s, st),
+        ToolWindowId::Cargo => cargo_view(ui, s, st),
+        ToolWindowId::Notifications => notifications_view(ui, s, st),
+        other => {
+            ui.label(RichText::new(format!("{} is not implemented yet.", other.title())).color(st.theme.text_muted));
+        }
+    }
+}
+
+// ---------------------------------------------------------------- Project
+
+/// `~/…` for paths under the home directory, like RustRover's project view.
+fn tilde(path: &Path) -> String {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) if path.starts_with(&home) => {
+            format!("~/{}", path.strip_prefix(&home).map(|p| p.display().to_string()).unwrap_or_default())
+        }
+        _ => path.display().to_string(),
+    }
+}
+
+fn file_badge(name: &str, is_dir: bool, theme: &crate::theme::Theme) -> (&'static str, Color32) {
+    if is_dir {
+        return ("▣", Color32::from_rgb(0x8C, 0x9B, 0xB5));
+    }
+    match Path::new(name).extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "rs" => ("◆", Color32::from_rgb(0xE0, 0x7B, 0x3C)),
+        "toml" => ("⚙", theme.text_muted),
+        "md" => ("M", Color32::from_rgb(0x54, 0x8A, 0xF7)),
+        "json" | "yml" | "yaml" => ("{}", theme.text_muted),
+        "lock" => ("🔒", theme.text_muted),
+        _ => ("▫", theme.text_muted),
+    }
+}
+
+fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let Some(project) = s.ws.project.clone() else {
+        ui.label(RichText::new("No project open").color(st.theme.text_muted));
+        return;
+    };
+    let theme = st.theme.clone();
+    let error_files: Vec<PathBuf> =
+        s.ws.all_problems()
+            .iter()
+            .filter(|(_, v)| v.iter().any(|p| p.severity == Severity::Error))
+            .map(|(p, _)| p.to_path_buf())
+            .collect();
+    // Flatten the visible tree.
+    let mut rows: Vec<(NodeId, usize)> = Vec::new();
+    let mut stack = vec![(project.tree.root(), 0usize)];
+    while let Some((id, depth)) = stack.pop() {
+        let Some(node) = project.tree.node(id) else { continue };
+        rows.push((id, depth));
+        if node.is_dir && project.expanded.contains(&node.path) {
+            for c in node.children.iter().rev() {
+                stack.push((*c, depth + 1));
+            }
+        }
+        if rows.len() > 20_000 {
+            break;
+        }
+    }
+    let row_h = 22.0;
+    let mut toggle: Option<PathBuf> = None;
+    let mut select: Option<PathBuf> = None;
+    let mut open: Option<PathBuf> = None;
+    let mut cmd: Option<(&'static str, Value)> = None;
+    ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
+        for (id, depth) in rows.get(range).unwrap_or(&[]) {
+            let Some(node) = project.tree.node(*id) else { continue };
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), row_h), Sense::click());
+            let selected = project.selected.as_deref() == Some(node.path.as_path());
+            if selected {
+                ui.painter().rect_filled(rect, CornerRadius::same(4), theme.list_selection);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, CornerRadius::same(4), theme.hover);
+            }
+            let x0 = rect.left() + 4.0 + *depth as f32 * 16.0;
+            let cy = rect.center().y;
+            if node.is_dir {
+                let arrow = if project.expanded.contains(&node.path) { "⏷" } else { "⏵" };
+                ui.painter().text(
+                    egui::pos2(x0 + 5.0, cy),
+                    egui::Align2::CENTER_CENTER,
+                    arrow,
+                    FontId::proportional(10.0),
+                    theme.text_muted,
+                );
+            }
+            let (badge, badge_color) = file_badge(&node.name, node.is_dir, &theme);
+            ui.painter().text(
+                egui::pos2(x0 + 20.0, cy),
+                egui::Align2::CENTER_CENTER,
+                badge,
+                FontId::proportional(11.0),
+                badge_color,
+            );
+            let has_error = !node.is_dir && error_files.contains(&node.path)
+                || node.is_dir && error_files.iter().any(|f| f.starts_with(&node.path));
+            let name_color = if has_error { theme.error } else { theme.text };
+            let mut job = LayoutJob::default();
+            let name = if *depth == 0 { project.name.clone() } else { node.name.clone() };
+            job.append(
+                &name,
+                0.0,
+                TextFormat { font_id: FontId::proportional(13.0), color: name_color, ..Default::default() },
+            );
+            if *depth == 0 {
+                job.append(
+                    &format!("  {}", tilde(&node.path)),
+                    0.0,
+                    TextFormat { font_id: FontId::proportional(12.0), color: theme.text_muted, ..Default::default() },
+                );
+            }
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            ui.painter().galley(egui::pos2(x0 + 30.0, cy - galley.size().y / 2.0), galley, theme.text);
+            if resp.clicked() {
+                select = Some(node.path.clone());
+                if node.is_dir && resp.interact_pointer_pos().is_some_and(|p| p.x < x0 + 12.0) {
+                    toggle = Some(node.path.clone());
+                }
+            }
+            if resp.double_clicked() {
+                if node.is_dir {
+                    toggle = Some(node.path.clone());
+                } else {
+                    open = Some(node.path.clone());
+                }
+            }
+            resp.context_menu(|ui| {
+                if ui.button("New › File").clicked() {
+                    select = Some(node.path.clone());
+                    cmd = Some(("file.new.file", Value::Null));
+                    ui.close();
+                }
+                if ui.button("New › Directory").clicked() {
+                    select = Some(node.path.clone());
+                    cmd = Some(("file.new.directory", Value::Null));
+                    ui.close();
+                }
+                if ui.button("Copy Absolute Path").clicked() {
+                    ui.ctx().copy_text(node.path.display().to_string());
+                    ui.close();
+                }
+                if ui.button("Reveal in Finder").clicked() {
+                    let dir = if node.is_dir {
+                        node.path.clone()
+                    } else {
+                        node.path.parent().map(Path::to_path_buf).unwrap_or_default()
+                    };
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("file://{}", dir.display())));
+                    ui.close();
+                }
+                if !node.is_dir && node.name.ends_with(".rs") && ui.button("Run Tests in File").clicked() {
+                    cmd = Some(("run.contextConfiguration", json!({ "path": node.path, "line": 0 })));
+                    ui.close();
+                }
+            });
+        }
+    });
+    if let Some(p) = &mut s.ws.project {
+        if let Some(sel) = select {
+            p.selected = Some(sel);
+        }
+        if let Some(t) = toggle
+            && !p.expanded.remove(&t)
+        {
+            p.expanded.insert(t);
+        }
+    }
+    if let Some(path) = open {
+        run_command(s, st, "file.open", &json!({ "path": path }));
+    }
+    if let Some((c, params)) = cmd {
+        run_command(s, st, c, &params);
+    }
+    if project.tree.truncated() {
+        ui.label(RichText::new("The project tree was truncated (too many files).").color(theme.warning).size(11.0));
+    }
+}
+
+// ---------------------------------------------------------------- Run / Build
+
+/// A `path.rs:line:col` reference in console output (rustc `-->`, panics, test failures).
+pub fn find_location(line: &str) -> Option<(String, usize, usize, std::ops::Range<usize>)> {
+    let idx = line.find(".rs:")?;
+    let start =
+        line[..idx].rfind(|c: char| c.is_whitespace() || c == '(' || c == '\'' || c == '"').map(|i| i + 1).unwrap_or(0);
+    let rest = &line[idx + 4..];
+    let ln_len = rest.chars().take_while(char::is_ascii_digit).count();
+    if ln_len == 0 {
+        return None;
+    }
+    let ln: usize = rest.get(..ln_len)?.parse().ok()?;
+    let after = &rest[ln_len..];
+    let (col, col_len) = match after.strip_prefix(':') {
+        Some(c) => {
+            let n = c.chars().take_while(char::is_ascii_digit).count();
+            (c.get(..n).and_then(|d| d.parse().ok()).unwrap_or(1), n + 1)
+        }
+        None => (1, 0),
+    };
+    let path = line.get(start..idx + 3)?.to_string();
+    Some((path, ln, col, start..idx + 4 + ln_len + col_len))
+}
+
+fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) {
+    let theme = st.theme.clone();
+    let tabs: Vec<_> =
+        s.ws.runs.iter().filter(|r| r.build == build).map(|r| (r.id, r.title.clone(), r.status)).collect();
+    if tabs.is_empty() {
+        ui.label(
+            RichText::new(if build {
+                "Build output appears here (Build › Build Project)."
+            } else {
+                "Nothing has run yet. Run › Run (⌃R)."
+            })
+            .color(theme.text_muted),
+        );
+        return;
+    }
+    let active = s.ws.active_run.filter(|a| tabs.iter().any(|(id, _, _)| id == a)).or_else(|| tabs.last().map(|t| t.0));
+    let mut select = None;
+    let mut close = None;
+    ui.horizontal(|ui| {
+        for (id, title, status) in &tabs {
+            let (mark, color) = match status {
+                RunStatus::Running => ("●", theme.success),
+                RunStatus::Succeeded => ("✓", theme.success),
+                RunStatus::Failed(_) => ("✖", theme.error),
+                RunStatus::Stopped => ("■", theme.text_muted),
+            };
+            let mut job = LayoutJob::default();
+            job.append(mark, 0.0, TextFormat { color, font_id: FontId::proportional(12.0), ..Default::default() });
+            job.append(
+                &format!(" {title}"),
+                0.0,
+                TextFormat { color: theme.text, font_id: FontId::proportional(13.0), ..Default::default() },
+            );
+            if ui.add(egui::Button::new(job).selected(Some(*id) == active)).clicked() {
+                select = Some(*id);
+            }
+            if ui.add(egui::Button::new(RichText::new("×").color(theme.text_muted)).frame(false)).clicked() {
+                close = Some(*id);
+            }
+        }
+    });
+    if let Some(id) = select {
+        s.ws.active_run = Some(id);
+    }
+    if let Some(id) = close {
+        run_command(s, st, "run.closeTab", &json!({ "tab": id.0 }));
+        return;
+    }
+    let Some(tab) = active.and_then(|a| s.ws.run(a)).cloned() else { return };
+    ui.horizontal(|ui| {
+        if ui.button("↻ Rerun").on_hover_text("Rerun (⌘R)").clicked() {
+            s.ws.active_run = Some(tab.id);
+            run_command(s, st, "run.rerun", &Value::Null);
+        }
+        if ui.add_enabled(tab.is_running(), egui::Button::new("■ Stop")).clicked() {
+            s.ws.active_run = Some(tab.id);
+            run_command(s, st, "run.stop", &Value::Null);
+        }
+        ui.checkbox(&mut st.console_follow, "Scroll to end");
+        let (p, f, i) = tab.test_counts();
+        if p + f + i > 0 {
+            let color = if f > 0 { theme.error } else { theme.success };
+            ui.label(RichText::new(format!("Tests passed: {p}, failed: {f}, ignored: {i}")).color(color));
+        }
+        if let Some(d) = tab.duration {
+            ui.label(RichText::new(format!("{:.1}s", d.as_secs_f32())).color(theme.text_muted));
+        }
+    });
+    let failed: Vec<&str> = tab
+        .tests
+        .iter()
+        .filter(|t| t.outcome == codecraft_cargo::TestOutcome::Failed)
+        .map(|t| t.name.as_str())
+        .collect();
+    if !failed.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Failed:").color(theme.error));
+            for name in failed {
+                ui.label(RichText::new(name).monospace().color(theme.error));
+            }
+        });
+    }
+    let root =
+        s.ws.project
+            .as_ref()
+            .map(|p| p.cargo.as_ref().map(|m| m.workspace_root.clone()).unwrap_or_else(|| p.root.clone()));
+    let font = FontId::monospace((s.ws.settings.editor_font_size - 1.0).max(9.0));
+    let row_h = ui.fonts_mut(|f| f.row_height(&font)) + 2.0;
+    let mut open: Option<(PathBuf, usize, usize)> = None;
+    Frame::new().fill(theme.editor_bg).inner_margin(Margin::same(4)).show(ui, |ui| {
+        ScrollArea::both().auto_shrink([false, false]).stick_to_bottom(st.console_follow).show_rows(
+            ui,
+            row_h,
+            tab.lines.len(),
+            |ui, range| {
+                for line in tab.lines.get(range).unwrap_or(&[]) {
+                    let color = match line.kind {
+                        ConsoleKind::Stdout => theme.text_editor,
+                        ConsoleKind::Stderr => {
+                            if line.text.starts_with("warning") {
+                                theme.warning
+                            } else if line.text.starts_with("error") {
+                                theme.console_stderr
+                            } else {
+                                theme.text_editor
+                            }
+                        }
+                        ConsoleKind::System => theme.console_system,
+                    };
+                    match find_location(&line.text) {
+                        Some((path, ln, col, range)) => {
+                            let mut job = LayoutJob::default();
+                            let fmt = |c: Color32| TextFormat { font_id: font.clone(), color: c, ..Default::default() };
+                            job.append(line.text.get(..range.start).unwrap_or(""), 0.0, fmt(color));
+                            let mut link = fmt(theme.link);
+                            link.underline = Stroke::new(1.0, theme.link);
+                            job.append(line.text.get(range.clone()).unwrap_or(""), 0.0, link);
+                            job.append(line.text.get(range.end..).unwrap_or(""), 0.0, fmt(color));
+                            if ui
+                                .add(egui::Label::new(job).sense(Sense::click()))
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                let p = PathBuf::from(&path);
+                                let abs = if p.is_absolute() { p } else { root.clone().unwrap_or_default().join(p) };
+                                open = Some((abs, ln.saturating_sub(1), col.saturating_sub(1)));
+                            }
+                        }
+                        None => {
+                            ui.label(RichText::new(&line.text).font(font.clone()).color(color));
+                        }
+                    }
+                }
+            },
+        );
+    });
+    if let Some((path, line, column)) = open {
+        run_command(s, st, "navigate.openLocation", &json!({ "path": path, "line": line, "column": column }));
+    }
+}
+
+// ---------------------------------------------------------------- Problems / Find / Structure
+
+fn severity_mark(theme: &crate::theme::Theme, s: Severity) -> (&'static str, Color32) {
+    match s {
+        Severity::Error => ("✖", theme.error),
+        Severity::Warning => ("⚠", theme.warning),
+        Severity::Info => ("ℹ", theme.weak),
+        Severity::Hint => ("·", theme.weak),
+    }
+}
+
+fn problems_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let theme = st.theme.clone();
+    let all = s.ws.all_problems();
+    if all.is_empty() {
+        ui.label(RichText::new("No problems found").color(theme.text_muted));
+        return;
+    }
+    let mut open = None;
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for (path, list) in &all {
+            let name =
+                s.ws.project
+                    .as_ref()
+                    .map(|p| p.relative(path).into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+            egui::CollapsingHeader::new(RichText::new(format!("{name}   {} problem(s)", list.len())).strong())
+                .id_salt(path)
+                .default_open(true)
+                .show(ui, |ui| {
+                    for p in list.iter().take(500) {
+                        let (mark, color) = severity_mark(&theme, p.severity);
+                        let mut job = LayoutJob::default();
+                        job.append(mark, 0.0, TextFormat { color, ..Default::default() });
+                        let msg: String = p.message.lines().next().unwrap_or_default().chars().take(300).collect();
+                        job.append(&format!("  {msg}"), 0.0, TextFormat { color: theme.text, ..Default::default() });
+                        job.append(
+                            &format!("  :{}:{}", p.start.line + 1, p.start.column + 1),
+                            0.0,
+                            TextFormat { color: theme.text_muted, ..Default::default() },
+                        );
+                        if ui.add(egui::Label::new(job).sense(Sense::click())).on_hover_text(&p.message).clicked() {
+                            open = Some((p.path.clone(), p.start.line, p.start.column));
+                        }
+                    }
+                });
+        }
+    });
+    if let Some((path, line, column)) = open {
+        run_command(s, st, "navigate.openLocation", &json!({ "path": path, "line": line, "column": column }));
+    }
+}
+
+fn find_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let theme = st.theme.clone();
+    let Some(find) = s.ws.find.clone() else {
+        ui.label(RichText::new("Use Find in Files (⇧⌘F) or Find Usages (⌥F7).").color(theme.text_muted));
+        return;
+    };
+    let files = {
+        let mut f: Vec<&PathBuf> = find.matches.iter().map(|m| &m.path).collect();
+        f.dedup();
+        f.len()
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&find.title).strong());
+        if find.searching {
+            ui.add(egui::Spinner::new().size(12.0));
+        } else {
+            ui.label(
+                RichText::new(format!("{} result(s) in {files} file(s)", find.matches.len())).color(theme.text_muted),
+            );
+        }
+    });
+    let mut open = None;
+    let font = FontId::monospace(12.0);
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        let mut current: Option<&PathBuf> = None;
+        for m in find.matches.iter().take(5000) {
+            if current != Some(&m.path) {
+                current = Some(&m.path);
+                let name =
+                    s.ws.project
+                        .as_ref()
+                        .map(|p| p.relative(&m.path).into_owned())
+                        .unwrap_or_else(|| m.path.display().to_string());
+                ui.label(RichText::new(name).strong().size(12.0));
+            }
+            let mut job = LayoutJob::default();
+            let fmt = |c: Color32| TextFormat { font_id: font.clone(), color: c, ..Default::default() };
+            job.append(&format!("{:>5}  ", m.line + 1), 0.0, fmt(theme.line_number_active));
+            let chars: Vec<char> = m.line_text.chars().collect();
+            let lead = chars.iter().take_while(|c| c.is_whitespace()).count().min(m.column);
+            let seg = |a: usize, b: usize| {
+                chars
+                    .get(a.min(chars.len())..b.min(chars.len()))
+                    .map(|c| c.iter().collect::<String>())
+                    .unwrap_or_default()
+            };
+            job.append(&seg(lead, m.column), 0.0, fmt(theme.text_editor));
+            let mut hl = fmt(theme.text);
+            hl.background = theme.find_match;
+            job.append(&seg(m.column, m.end_column), 0.0, hl);
+            job.append(&seg(m.end_column, chars.len()), 0.0, fmt(theme.text_editor));
+            if ui.add(egui::Label::new(job).sense(Sense::click())).clicked() {
+                open = Some((m.path.clone(), m.line, m.column));
+            }
+        }
+    });
+    if let Some((path, line, column)) = open {
+        run_command(s, st, "navigate.openLocation", &json!({ "path": path, "line": line, "column": column }));
+    }
+}
+
+fn structure_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let theme = st.theme.clone();
+    let Some((_, d)) = s.ws.active() else {
+        ui.label(RichText::new("No file is open").color(theme.text_muted));
+        return;
+    };
+    let items = codecraft_syntax::outline(d.language, &d.doc.text());
+    let path = d.path.clone();
+    let mut open = None;
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for item in &items {
+            let kind = format!("{:?}", item.kind).to_lowercase();
+            let mut job = LayoutJob::default();
+            job.append(&"    ".repeat(item.depth), 0.0, TextFormat::default());
+            job.append(
+                &format!("{kind} "),
+                0.0,
+                TextFormat { color: theme.keyword, font_id: FontId::proportional(12.0), ..Default::default() },
+            );
+            job.append(
+                &item.name,
+                0.0,
+                TextFormat { color: theme.text, font_id: FontId::proportional(13.0), ..Default::default() },
+            );
+            if ui.add(egui::Label::new(job).sense(Sense::click())).clicked() {
+                open = Some((item.line, item.column));
+            }
+        }
+    });
+    if let (Some((line, column)), Some(path)) = (open, path) {
+        run_command(s, st, "navigate.openLocation", &json!({ "path": path, "line": line, "column": column }));
+    }
+}
+
+// ---------------------------------------------------------------- Cargo / Notifications
+
+fn cargo_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let theme = st.theme.clone();
+    ui.horizontal_wrapped(|ui| {
+        for (label, cmd) in [
+            ("Check", "cargo.check"),
+            ("Clippy", "cargo.clippy"),
+            ("Build", "build.buildProject"),
+            ("Test", "cargo.test"),
+            ("Doc", "cargo.doc"),
+        ] {
+            if ui.add_enabled(s.enabled(cmd).is_ok(), egui::Button::new(label)).clicked() {
+                run_command(s, st, cmd, &Value::Null);
+            }
+        }
+    });
+    ui.separator();
+    let Some(project) = s.ws.project.clone() else { return };
+    let Some(meta) = project.cargo.clone() else {
+        ui.label(
+            RichText::new(project.cargo_error.unwrap_or_else(|| "Loading Cargo metadata…".into()))
+                .color(theme.text_muted),
+        );
+        return;
+    };
+    let mut run = None;
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for p in meta.workspace_packages() {
+            egui::CollapsingHeader::new(RichText::new(format!("📦 {} {}", p.name, p.version)).strong())
+                .id_salt(&p.id)
+                .default_open(true)
+                .show(ui, |ui| {
+                    for t in &p.targets {
+                        let kind = t.kind.join(", ");
+                        let text = RichText::new(format!("{}  ({kind})", t.name));
+                        let resp =
+                            ui.add(egui::Label::new(text).sense(Sense::click())).on_hover_text("Double-click to run");
+                        if resp.double_clicked() {
+                            run = Some((p.name.clone(), t.clone()));
+                        }
+                    }
+                    if !p.dependencies.is_empty() {
+                        egui::CollapsingHeader::new(RichText::new("Dependencies").color(theme.text_muted))
+                            .id_salt((&p.id, "deps"))
+                            .show(ui, |ui| {
+                                for d in &p.dependencies {
+                                    let kind = d.kind.as_deref().map(|k| format!(" [{k}]")).unwrap_or_default();
+                                    ui.label(
+                                        RichText::new(format!("{} {}{kind}", d.name, d.req))
+                                            .color(theme.text_muted)
+                                            .size(12.0),
+                                    );
+                                }
+                            });
+                    }
+                });
+        }
+    });
+    if let Some((package, t)) = run {
+        let kind = if t.is_bin() {
+            "bin"
+        } else if t.is_example() {
+            "example"
+        } else if t.is_test() {
+            "test"
+        } else if t.is_bench() {
+            "bench"
+        } else {
+            "lib"
+        };
+        run_command(s, st, "cargo.runTarget", &json!({ "package": package, "kind": kind, "name": t.name }));
+    }
+}
+
+fn notifications_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let theme = st.theme.clone();
+    if s.ws.notifications.is_empty() {
+        ui.label(RichText::new("No notifications").color(theme.text_muted));
+        return;
+    }
+    if ui.button("Clear All").clicked() {
+        s.ws.notifications.clear();
+        return;
+    }
+    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        for n in s.ws.notifications.iter().rev() {
+            let color = match n.level {
+                NotificationLevel::Error => theme.error,
+                NotificationLevel::Warning => theme.warning,
+                NotificationLevel::Info => theme.text,
+            };
+            Frame::new().fill(theme.editor_bg).corner_radius(6).inner_margin(8).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(&n.title).strong().color(color));
+                if !n.message.is_empty() {
+                    ui.label(RichText::new(&n.message).size(12.0));
+                }
+            });
+            ui.add_space(4.0);
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_location;
+
+    #[test]
+    fn console_locations() {
+        let (p, l, c, _) = find_location("  --> src/main.rs:12:5").unwrap();
+        assert_eq!((p.as_str(), l, c), ("src/main.rs", 12, 5));
+        let (p, l, c, _) = find_location("thread 'main' panicked at src/lib.rs:3:9:").unwrap();
+        assert_eq!((p.as_str(), l, c), ("src/lib.rs", 3, 9));
+        assert!(find_location("no location here").is_none());
+        assert!(find_location("file.rs:x").is_none());
+        let (_, l, c, _) = find_location("at /abs/path/ünï.rs:7").unwrap();
+        assert_eq!((l, c), (7, 1));
+    }
+}
