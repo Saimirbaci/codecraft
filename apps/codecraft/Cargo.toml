@@ -1,0 +1,17 @@
+[package]
+name = "codecraft"
+description = "CodeCraft desktop IDE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codecraft-engine.workspace = true
+codecraft-ui-egui.workspace = true
+eframe.workspace = true
+env_logger.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "codecraft-cli"
+description = "CodeCraft headless CLI: list and run commands, check a project, print diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "codecraft-cli"
+path = "src/main.rs"
+
+[dependencies]
+codecraft-engine.workspace = true
+codecraft-workspace.workspace = true
+serde_json.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true
