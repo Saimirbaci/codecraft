@@ -1,0 +1,19 @@
+[package]
+name = "codecraft-workspace"
+description = "CodeCraft workspace model: project, documents, editors, tool windows, run configurations, diagnostics (pure data)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+codecraft-text.workspace = true
+codecraft-syntax.workspace = true
+codecraft-fs.workspace = true
+codecraft-cargo.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
