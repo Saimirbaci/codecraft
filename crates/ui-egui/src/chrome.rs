@@ -79,6 +79,10 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if tool_button(ui, st, "🔍", "Search Everywhere (⇧⇧)", true, None) {
                     run_command(s, st, "navigate.searchEverywhere", &Value::Null);
                 }
+                if tool_button(ui, st, "✏", "Draw Feedback for an Agent (⌥⇧⌘F)", true, Some(st.theme.annotation))
+                {
+                    run_command(s, st, "feedback.toggle", &Value::Null);
+                }
                 ui.add_space(8.0);
                 let has_project = s.ws.project.is_some();
                 let running = s.ws.runs.iter().any(|r| r.is_running());
@@ -92,11 +96,10 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     run_command(s, st, "build.buildProject", &Value::Null);
                 }
                 // Run configuration selector.
-                let current = s
-                    .run_configs
-                    .get(s.selected_run_config)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| "cargo run".into());
+                let current = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()).unwrap_or_else(|| {
+                    let cargo = s.ws.project.as_ref().is_some_and(|p| p.root.join("Cargo.toml").is_file());
+                    if cargo { "cargo run".into() } else { "Current File".into() }
+                });
                 let mut selected = s.selected_run_config;
                 egui::ComboBox::from_id_salt("run-config").selected_text(current).width(180.0).show_ui(ui, |ui| {
                     for (i, c) in s.run_configs.iter().enumerate() {
@@ -168,19 +171,36 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     }
                     ui.label(small(language.into()));
                 }
-                let (lsp_text, lsp_color) = match &s.lsp_status {
-                    LspStatus::Ready => ("rust-analyzer ✓".to_string(), st.theme.success),
-                    LspStatus::Starting => ("rust-analyzer …".to_string(), muted),
-                    LspStatus::Unavailable(_) => ("rust-analyzer ✗".to_string(), st.theme.warning),
-                    LspStatus::Stopped(_) => ("rust-analyzer ✗".to_string(), st.theme.error),
-                    LspStatus::Off => (String::new(), muted),
-                };
-                if !lsp_text.is_empty() {
-                    let tip = match &s.lsp_status {
-                        LspStatus::Unavailable(m) | LspStatus::Stopped(m) => m.clone(),
-                        _ => "rust-analyzer".into(),
+                // The language server of the active file (rust-analyzer when no file is open).
+                let kind = s.ws.active().and_then(|(_, d)| codecraft_engine::server_kind(d.language)).or(s
+                    .ws
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.cargo.as_ref())
+                    .map(|_| codecraft_engine::ServerKind::RustAnalyzer));
+                if let Some(kind) = kind {
+                    let status = s.server_status(kind);
+                    let name = s.server_name(kind).unwrap_or(kind.label()).to_string();
+                    let mem = s.server_memory_mb(kind).map(|mb| format!(" {mb} MB")).unwrap_or_default();
+                    let (lsp_text, lsp_color) = match &status {
+                        LspStatus::Ready => (format!("{name} ✓{mem}"), st.theme.success),
+                        LspStatus::Starting => (format!("{name} …"), muted),
+                        LspStatus::Unavailable(_) => (format!("{name} ✗"), st.theme.warning),
+                        LspStatus::Stopped(_) => (format!("{name} ✗"), st.theme.error),
+                        LspStatus::Off => (String::new(), muted),
                     };
-                    ui.label(RichText::new(lsp_text).size(12.0).color(lsp_color)).on_hover_text(tip);
+                    if !lsp_text.is_empty() {
+                        let tip = match &status {
+                            LspStatus::Unavailable(m) | LspStatus::Stopped(m) => m.clone(),
+                            _ => format!("{name}: click to restart"),
+                        };
+                        let resp = ui.add(
+                            egui::Label::new(RichText::new(lsp_text).size(12.0).color(lsp_color)).sense(Sense::click()),
+                        );
+                        if resp.on_hover_text(tip).clicked() {
+                            run_command(s, st, "lsp.restart", &Value::Null);
+                        }
+                    }
                 }
                 let (errors, warnings) = s.ws.problem_counts();
                 if errors + warnings > 0 {
@@ -263,6 +283,7 @@ pub fn editor_area(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         } else {
             st.find_bar_was_open = false;
         }
+        crate::database_panel::console_toolbar(ui, s, st);
         match s.ws.active_editor {
             Some(eid) => editor::show(ui, s, st, eid),
             None => {

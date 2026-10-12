@@ -20,6 +20,10 @@ rfd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+# feedback overlay: composite annotations onto the screenshot and encode PNGs
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [lints]
 workspace = true

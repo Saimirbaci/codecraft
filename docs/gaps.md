@@ -4,9 +4,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 
 ## High
 
-1. **No debugger.** RustRover's Debug run, breakpoints, variables, and LLDB/GDB integration (M5).
+1. ~~No debugger~~ (landed in M2: lldb-dap for Rust/C/C++/Zig, debugpy for Python). Remaining:
+   `&str` values show the data pointer before the text; no memory/disassembly views; js-debug
+   for Node/TS only when the user installs it; no attach-to-process UI yet.
 2. **No VCS.** The Git menu is unimplemented: commit, diff, log, branches, annotate (M4).
-3. **No terminal tool window** (M3).
+3. **No terminal tool window** (M4). Needed to launch `claude` already connected to the IDE
+   (`IdeServerState::env_for_child()` provides the environment).
 4. **Highlighting is lexical only.** No semantic tokens yet: locals, parameters, mutable
    bindings, unresolved references and trait methods all look the same. No inlay hints.
 5. **Full-file re-lex on every edit** (and full-text LSP sync). Fine at a few thousand lines;
@@ -33,3 +36,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 17. No IME pre-edit (composition) rendering; committed text works.
 18. Project view lacks drag and drop, delete and rename operations, and External Libraries.
 19. No bookmarks, TODO tool window, local history, macros or live templates.
+
+## M2 follow-ups (2026-10-12)
+
+20. Ask mode for Claude Code and Codex needs the `claude-code-acp` / `codex-acp` adapters (not
+    installed here); Gemini and Grok speak ACP natively. Grok's `streaming-messages-json` stream
+    format is parsed leniently (no recorded sample yet).
+21. Gutter ▶ run/debug icons exist only for Rust; other languages run via Ctrl+Shift+R / Ctrl+Shift+D.
+22. Python and TypeScript language servers are not installed on this machine
+    (`pip install basedpyright`, `npm i -g typescript-language-server typescript`); CodeCraft
+    shows install hints and keeps highlighting/run working.
+23. Database: no in-grid editing yet; TLS for PostgreSQL is not supported.

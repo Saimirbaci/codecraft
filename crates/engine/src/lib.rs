@@ -25,16 +25,19 @@ pub mod debug;
 mod debug_cmds;
 mod edit_cmds;
 mod editor_cmds;
+pub mod feedback;
 mod feedback_cmds;
 mod file_cmds;
 mod ide_cmds;
 pub mod ide_server;
 mod jobs;
+mod lang_cmds;
 mod lsp;
 mod navigate_cmds;
 mod params;
 pub mod popup;
 mod run_cmds;
+pub mod run_configs;
 mod runs;
 mod view_cmds;
 mod window_cmds;
@@ -49,13 +52,15 @@ pub use codecraft_cargo as cargo;
 pub use codecraft_dap as dap;
 pub use codecraft_db as db;
 pub use codecraft_fs as fs;
+pub use codecraft_lsp::ServerKind;
 pub use codecraft_mcp as mcp;
 pub use codecraft_syntax as syntax;
 pub use codecraft_text as text;
 pub use codecraft_workspace as workspace;
 pub use commands::{CatalogItem, CommandError, CommandSpec, Context, Registry, Scope, registry};
+pub use lsp::server_kind;
 pub use popup::{FindBar, Popup};
-pub use runs::{RunConfig, derive_configs};
+pub use runs::{ProcessCommand, RunConfig, derive_configs};
 pub use view_cmds::IMPLEMENTED_TOOL_WINDOWS;
 
 use codecraft_text::ops::OpsConfig;
@@ -116,11 +121,18 @@ pub struct Session {
     pub db: database::DbState,
     pub agents: agents::AgentsState,
     pub ide: ide_server::IdeServerState,
+    /// The feedback overlay's draft and records (feedback track).
+    pub feedback: feedback::FeedbackState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
     last_edit: Option<Location>,
-    lsp: Option<lsp::LspState>,
+    /// Running language servers, one per kind.
+    servers: std::collections::BTreeMap<codecraft_lsp::ServerKind, lsp::LspState>,
+    /// Last known status of each server kind (including unavailable/stopped ones).
+    server_status: std::collections::BTreeMap<codecraft_lsp::ServerKind, LspStatus>,
+    server_memory_mb: std::collections::BTreeMap<codecraft_lsp::ServerKind, u64>,
+    server_memory: lsp::ServerMemory,
     runs: runs::Runs,
     jobs: jobs::Jobs,
 }
@@ -150,9 +162,13 @@ impl Session {
             db: database::DbState::default(),
             agents: agents::AgentsState::default(),
             ide: ide_server::IdeServerState::default(),
+            feedback: feedback::FeedbackState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
-            lsp: None,
+            servers: Default::default(),
+            server_status: Default::default(),
+            server_memory_mb: Default::default(),
+            server_memory: Default::default(),
             runs: runs::Runs::default(),
             jobs: jobs::Jobs::default(),
         }
@@ -205,12 +221,18 @@ impl Session {
 
     /// Whether background work is in flight (the UI keeps repainting to poll).
     pub fn busy(&self) -> bool {
-        self.lsp.is_some() || self.runs.any_running() || self.jobs.any_running()
+        !self.servers.is_empty()
+            || self.runs.any_running()
+            || self.jobs.any_running()
+            || self.agents.any_active()
+            || self.ide.busy()
+            || self.db.busy()
+            || self.debug.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
     pub fn jobs_running(&self) -> bool {
-        self.runs.any_running() || self.jobs.any_running()
+        self.runs.any_running() || self.jobs.any_running() || self.db.busy() || self.debug.settling()
     }
 
     /// Stop the language server and running processes (window closing).
@@ -221,9 +243,7 @@ impl Session {
         ide_server::shutdown(self);
         self.approvals.deny_all();
         runs::stop_all(self);
-        if let Some(lsp) = self.lsp.take() {
-            lsp.shutdown();
-        }
+        self.stop_lsp();
     }
 
     // ------------------------------------------------------------ helpers for commands

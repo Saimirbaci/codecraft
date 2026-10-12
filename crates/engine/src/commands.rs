@@ -122,6 +122,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::code_cmds::specs());
         specs.extend(crate::run_cmds::specs());
         specs.extend(crate::window_cmds::specs());
+        specs.extend(crate::lang_cmds::specs());
         specs.extend(crate::debug_cmds::specs());
         specs.extend(crate::database_cmds::specs());
         specs.extend(crate::agent_cmds::specs());

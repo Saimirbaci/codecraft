@@ -9,7 +9,7 @@ use crate::lsp::GotoKind;
 use crate::{Popup, Session};
 
 /// Tool windows CodeCraft implements (the others stay disabled in the menu until they exist).
-pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 11] = [
+pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 12] = [
     ToolWindowId::Project,
     ToolWindowId::Find,
     ToolWindowId::Run,
@@ -21,6 +21,7 @@ pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 11] = [
     ToolWindowId::Debug,
     ToolWindowId::Database,
     ToolWindowId::Agent,
+    ToolWindowId::Services,
 ];
 
 macro_rules! tool_window {
@@ -133,10 +134,11 @@ fn error_description(s: &mut Session, _: &Value) -> CmdResult {
 mod tests {
     #[test]
     fn every_implemented_tool_window_has_a_toggle() {
-        let specs = super::specs();
+        // Some toggles live with their track (Services: database_cmds.rs).
+        let reg = crate::registry();
         for tw in super::IMPLEMENTED_TOOL_WINDOWS {
             let id = format!("view.toolWindows.{}", tw.key());
-            assert!(specs.iter().any(|s| s.id == id), "{id}");
+            assert!(reg.contains(&id), "{id}");
         }
     }
 }

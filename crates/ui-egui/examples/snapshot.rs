@@ -1,7 +1,8 @@
 //! Render the IDE offscreen to a PNG (no window, no focus stealing).
 //!
 //! `cargo run -p codecraft-ui-egui --example snapshot -- <file-or-project> <out.png> [command-id ...]`
-//! Each extra argument is a command id run before rendering (e.g. `view.toolWindows.problems`).
+//! Each extra argument is a command id run before rendering (e.g. `view.toolWindows.problems`),
+//! optionally `id=<json params>`, or `wait=<ms>` to let background work (debugger, servers) progress.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -29,6 +30,16 @@ fn main() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(30));
     }
     for c in commands {
+        // `wait=<ms>`: keep the app running (pumping services) for a while, e.g. until a debug
+        // session reaches a breakpoint.
+        if let Some(ms) = c.strip_prefix("wait=").and_then(|v| v.parse::<u64>().ok()) {
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_millis(ms) {
+                h.run_steps(1);
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            continue;
+        }
         let (id, params) = match c.split_once('=') {
             Some((id, json)) => (id.to_string(), serde_json::from_str(json).map_err(|e| e.to_string())?),
             None => (c, Value::Null),

@@ -12,8 +12,10 @@
 mod agent_panel;
 mod approvals_ui;
 mod chrome;
+mod data_grid;
 mod database_panel;
 mod debug_panel;
+mod diff_view;
 mod editor;
 mod feedback;
 mod fonts;
@@ -64,6 +66,14 @@ pub struct UiState {
     pub mono_font_name: String,
     pub error: Option<String>,
     pub last_autosave: Instant,
+    /// Feedback overlay view state (tool, ink, gesture, capture).
+    pub feedback: feedback::FeedbackUi,
+    /// Agent tool window and approval cards view state.
+    pub agent: agent_panel::AgentUi,
+    /// Database tool window, result grids and data source dialog view state.
+    pub db: database_panel::DbUi,
+    /// Debug tool window view state (input fields, pane sizes).
+    pub debug: debug_panel::DebugUi,
 }
 
 impl UiState {
@@ -89,6 +99,10 @@ impl UiState {
             mono_font_name: String::new(),
             error: None,
             last_autosave: Instant::now(),
+            feedback: feedback::FeedbackUi::default(),
+            agent: agent_panel::AgentUi::default(),
+            db: database_panel::DbUi::default(),
+            debug: debug_panel::DebugUi::default(),
         }
     }
 }
@@ -154,6 +168,10 @@ impl App {
         let text_field_focused = !editor_focused && ctx.memory(|m| m.focused().is_some());
         let s = &mut self.session;
         let st = &mut self.ui;
+        // The feedback overlay takes all input while it is shown.
+        if feedback::intercept_input(ctx, s, st) {
+            return;
+        }
 
         // Double Shift → Search Everywhere.
         for ev in &events {

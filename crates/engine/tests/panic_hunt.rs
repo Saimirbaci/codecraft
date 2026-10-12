@@ -39,6 +39,13 @@ fn hostile_params(tmp: &Path) -> Vec<Value> {
 /// Commands that start long-running processes or touch paths outside the temp dir are run only
 /// with params that make them bail out early.
 fn skip(id: &str, params: &Value) -> bool {
+    // Never let the fuzzer start a coding agent (paid API usage) or submit feedback for real.
+    let launches_agent = matches!(id, "agent.start" | "agent.followUp" | "feedback.submit" | "feedback.runIteration");
+    if launches_agent
+        && (params.get("backend").is_some() || params.get("confirm").is_some() || params.get("job").is_some())
+    {
+        return true;
+    }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
         || matches!(id, "run.run" | "run.rerun" | "run.contextConfiguration" | "code.reformatCargoProjectWithRustfmt");

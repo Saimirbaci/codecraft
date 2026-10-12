@@ -293,7 +293,7 @@ fn rows(s: &Session, st: &mut UiState) -> Vec<Row> {
             .map(|(i, c)| Row {
                 title: c.name.clone(),
                 highlight: Vec::new(),
-                detail: c.invocation.command_line(),
+                detail: c.command_line(),
                 icon: "▶",
                 action: RowAction::Command { id: "run.run".into(), params: json!({ "config": i }) },
                 enabled: true,
@@ -864,6 +864,23 @@ fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 if resp.lost_focus() {
                     let v = if path.trim().is_empty() { Value::Null } else { json!(path.trim()) };
                     set.push(("rust_analyzer_path", v));
+                }
+                ui.end_row();
+                ui.label("rust-analyzer low-memory mode");
+                if ui.checkbox(&mut cfg.rust_analyzer_low_memory, "smaller caches, no eager indexing").changed() {
+                    set.push(("rust_analyzer_low_memory", json!(cfg.rust_analyzer_low_memory)));
+                }
+                ui.end_row();
+                ui.label("Restart a language server above");
+                let mut limit = cfg.lsp_memory_limit_mb;
+                let resp = ui.add(
+                    egui::Slider::new(&mut limit, 0..=16_384)
+                        .step_by(256.0)
+                        .suffix(" MiB")
+                        .custom_formatter(|v, _| if v <= 0.0 { "never".into() } else { format!("{v:.0}") }),
+                );
+                if resp.changed() {
+                    set.push(("lsp_memory_limit_mb", json!(limit)));
                 }
                 ui.end_row();
             });
