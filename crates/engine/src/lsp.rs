@@ -41,6 +41,8 @@ pub(crate) enum Pending {
     CodeActions,
     CodeActionResolve,
     ExecuteCommand,
+    SemanticTokens { doc: DocId, revision: u64, kind: ServerKind },
+    InlayHints { doc: DocId, revision: u64 },
 }
 
 /// One running language server.
@@ -53,6 +55,10 @@ pub(crate) struct LspState {
     ready: bool,
     /// Process (and process group) id, for memory supervision.
     pub(crate) pid: Option<u32>,
+    /// Semantic token legend (when the server provides semantic tokens).
+    legend: Option<lt::SemanticTokensLegend>,
+    /// The server provides inlay hints.
+    inlay: bool,
 }
 
 impl LspState {
@@ -150,6 +156,15 @@ impl Session {
         self.server_memory_mb.get(&kind).copied()
     }
 
+    /// (semantic tokens, inlay hints) support of a ready server.
+    pub(crate) fn server_decoration_support(&self, kind: ServerKind) -> (bool, bool) {
+        self.servers.get(&kind).filter(|l| l.ready).map(|l| (l.legend.is_some(), l.inlay)).unwrap_or((false, false))
+    }
+
+    pub(crate) fn server_legend(&self, kind: ServerKind) -> Option<lt::SemanticTokensLegend> {
+        self.servers.get(&kind).and_then(|l| l.legend.clone())
+    }
+
     /// Display name of a running server ("basedpyright", "clangd", …).
     pub fn server_name(&self, kind: ServerKind) -> Option<&str> {
         self.servers.get(&kind).map(|l| l.name.as_str())
@@ -245,7 +260,16 @@ impl Session {
                 let pid = client.pid();
                 self.servers.insert(
                     kind,
-                    LspState { name: name.clone(), client, events, pending: HashMap::new(), ready: false, pid },
+                    LspState {
+                        name: name.clone(),
+                        client,
+                        events,
+                        pending: HashMap::new(),
+                        ready: false,
+                        pid,
+                        legend: None,
+                        inlay: false,
+                    },
                 );
                 self.set_status(kind, LspStatus::Starting);
                 self.ws.tasks.insert(
@@ -558,6 +582,7 @@ impl Session {
             }
         }
         changed |= self.pump_server_memory();
+        self.request_decorations();
         changed
     }
 
@@ -603,9 +628,17 @@ impl Session {
     fn handle_lsp_event(&mut self, kind: ServerKind, event: ServerEvent) {
         let name = self.servers.get(&kind).map(|l| l.name.clone()).unwrap_or_else(|| kind.label().to_string());
         match event {
-            ServerEvent::Initialized(_) => {
+            ServerEvent::Initialized(caps) => {
                 if let Some(l) = self.servers.get_mut(&kind) {
                     l.ready = true;
+                    l.legend = match &caps.semantic_tokens_provider {
+                        Some(lt::SemanticTokensServerCapabilities::SemanticTokensOptions(o)) => Some(o.legend.clone()),
+                        Some(lt::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(r)) => {
+                            Some(r.semantic_tokens_options.legend.clone())
+                        }
+                        None => None,
+                    };
+                    l.inlay = caps.inlay_hint_provider.is_some();
                 }
                 self.set_status(kind, LspStatus::Ready);
                 self.ws.tasks.remove(&format!("lsp-start:{kind:?}"));
@@ -715,6 +748,13 @@ impl Session {
     }
 
     fn handle_response(&mut self, pending: Pending, result: Result<Value, ResponseError>) {
+        match pending {
+            Pending::SemanticTokens { doc, revision, kind } => {
+                return self.on_semantic_tokens(doc, revision, kind, result.ok());
+            }
+            Pending::InlayHints { doc, revision } => return self.on_inlay_hints(doc, revision, result.ok()),
+            _ => {}
+        }
         let value = match result {
             Ok(v) => v,
             Err(e) => {
@@ -781,6 +821,8 @@ impl Session {
                 }
             }
             Pending::ExecuteCommand => {}
+            // Handled before the error check above.
+            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } => {}
         }
     }
 

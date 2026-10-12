@@ -19,6 +19,7 @@ pub mod catalog;
 mod code_cmds;
 pub mod commands;
 mod convert;
+mod decorations;
 pub mod database;
 mod database_cmds;
 pub mod debug;
@@ -144,6 +145,7 @@ pub struct Session {
     server_status: std::collections::BTreeMap<codecraft_lsp::ServerKind, LspStatus>,
     server_memory_mb: std::collections::BTreeMap<codecraft_lsp::ServerKind, u64>,
     server_memory: lsp::ServerMemory,
+    decor: decorations::DecorState,
     runs: runs::Runs,
     jobs: jobs::Jobs,
 }
@@ -183,6 +185,7 @@ impl Session {
             server_status: Default::default(),
             server_memory_mb: Default::default(),
             server_memory: Default::default(),
+            decor: Default::default(),
             runs: runs::Runs::default(),
             jobs: jobs::Jobs::default(),
         }

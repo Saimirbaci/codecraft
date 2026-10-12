@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use codecraft_syntax::{FoldRange, Highlights, Language};
+use codecraft_syntax::{FoldRange, HighlightKind, Highlights, Language};
 use codecraft_text::{Document, SelectionSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -12,6 +12,35 @@ pub struct DocId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct EditorId(pub u64);
+
+/// A semantic token from the language server, in char columns within one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticSpan {
+    pub start: usize,
+    pub end: usize,
+    pub kind: HighlightKind,
+    /// Mutable binding (RustRover underlines these).
+    pub mutable: bool,
+    /// The reference does not resolve (shown like an error).
+    pub unresolved: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InlayKind {
+    Type,
+    Parameter,
+    Other,
+}
+
+/// An inline hint drawn between characters (`: i32`, `name:`), at a char offset.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayHint {
+    pub offset: usize,
+    pub label: String,
+    pub kind: InlayKind,
+    pub pad_left: bool,
+    pub pad_right: bool,
+}
 
 /// A document open in the IDE (shared by the editors that show it).
 #[derive(Debug)]
@@ -30,6 +59,10 @@ pub struct OpenDocument {
     pub lsp_synced: Option<u64>,
     highlight_cache: Option<(u64, Highlights)>,
     fold_cache: Option<(u64, Vec<FoldRange>)>,
+    /// Semantic tokens per line, for the revision they were computed at.
+    pub semantic: Option<(u64, Vec<Vec<SemanticSpan>>)>,
+    /// Inlay hints (sorted by offset), for the revision they were computed at.
+    pub inlay_hints: Option<(u64, Vec<InlayHint>)>,
 }
 
 impl OpenDocument {
@@ -46,6 +79,8 @@ impl OpenDocument {
             lsp_synced: None,
             highlight_cache: None,
             fold_cache: None,
+            semantic: None,
+            inlay_hints: None,
         }
     }
 

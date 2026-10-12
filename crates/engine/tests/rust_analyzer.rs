@@ -113,5 +113,20 @@ fn rust_analyzer_end_to_end() {
     s.execute("refactor.rename", &json!({ "newName": "salute" })).unwrap();
     wait(&mut s, "rename", 60, |s| s.ws.active().is_some_and(|(_, d)| d.doc.text().matches("salute").count() == 2));
 
+    // Semantic tokens and inlay hints arrive for the active document.
+    wait(&mut s, "semantic tokens", 60, |s| {
+        s.ws.active()
+            .is_some_and(|(_, d)| d.semantic.as_ref().is_some_and(|(r, v)| *r == d.doc.revision() && !v.is_empty()))
+    });
+    wait(&mut s, "inlay hints", 60, |s| {
+        s.ws.active().is_some_and(|(_, d)| {
+            d.inlay_hints.as_ref().is_some_and(|(_, v)| v.iter().any(|h| h.label.contains("i32")))
+        })
+    });
+    let (_, d) = s.ws.active().unwrap();
+    let line = d.doc.text().lines().position(|l| l.starts_with("fn salute")).unwrap();
+    let spans = &d.semantic.as_ref().unwrap().1;
+    assert!(spans.get(line).is_some_and(|v| v.iter().any(|sp| sp.kind == codecraft_syntax::HighlightKind::Function)));
+
     s.shutdown();
 }

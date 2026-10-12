@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use document::{DocId, Editor, EditorId, OpenDocument};
+pub use document::{DocId, Editor, EditorId, InlayHint, InlayKind, OpenDocument, SemanticSpan};
 pub use layout::{Layout, Side, ToolWindowId};
 pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
