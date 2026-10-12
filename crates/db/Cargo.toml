@@ -12,6 +12,16 @@ serde_json.workspace = true
 thiserror.workspace = true
 crossbeam-channel.workspace = true
 log.workspace = true
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "column_decltype"] }
+postgres = { version = "0.19.14", default-features = false }
+postgres-protocol = { version = "0.6.12", default-features = false }
+mysql = { version = "28.0.3", default-features = false, features = ["minimal-rust"] }
+keyring = { version = "3.6.3", features = ["apple-native"] }
+
+# PostgreSQL TLS through the platform TLS stack (Security.framework / SChannel); no OpenSSL.
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+native-tls = "0.2.18"
+postgres-native-tls = "0.5.3"
 
 [dev-dependencies]
 tempfile.workspace = true
