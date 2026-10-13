@@ -8,6 +8,11 @@ publish = false
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# app icon encoding (already in the tree through egui/image)
+png = "0.18"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -1,8 +1,13 @@
-//! Workspace automation: `cargo xtask <layers|catalog|parity>`.
+//! Workspace automation: `cargo xtask <layers|catalog|parity|bundle|dmg|package-linux|package-windows>`.
 //!
 //! - `layers`  checks crate layering (a crate may only depend on lower layers; no UI deps below L3).
 //! - `catalog` regenerates `crates/engine/src/catalog.rs` from the observed RustRover menus.
 //! - `parity`  regenerates `docs/parity-checklist.md` from the catalog and the engine's commands.
+//! - `bundle`, `dmg`, `package-linux`, `package-windows` build and package the app (see
+//!   `package.rs` and docs/development.md); options `--release`, `--layout-only`.
+
+mod icon;
+mod package;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -18,11 +23,18 @@ const PARITY_MD: &str = "docs/parity-checklist.md";
 fn main() -> ExitCode {
     let root = workspace_root();
     let task = std::env::args().nth(1).unwrap_or_default();
+    let rest: Vec<String> = std::env::args().skip(2).collect();
+    let opts = || package::Options::parse(&rest);
     let result = match task.as_str() {
         "layers" => layers(&root),
         "catalog" => catalog(&root),
         "parity" => parity(&root),
-        _ => Err("usage: cargo xtask <layers|catalog|parity>".to_string()),
+        "bundle" => opts().and_then(|o| package::bundle(&root, &o)).map(drop),
+        "dmg" => opts().and_then(|o| package::dmg(&root, &o)).map(drop),
+        "package-linux" => opts().and_then(|o| package::package_linux(&root, &o)).map(drop),
+        "package-windows" => opts().and_then(|o| package::package_windows(&root, &o)).map(drop),
+        _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|package-linux|package-windows> [--release]"
+            .to_string()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

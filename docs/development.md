@@ -35,6 +35,50 @@ The snapshot renders offscreen through egui_kittest + wgpu, after running the gi
 `cargo.check 'editor.setSelection={"anchor":30}' run.contextConfiguration`. Look at the PNG
 after UI changes.
 
+## Packaging
+
+```sh
+cargo xtask bundle [--release]           # target/bundle/CodeCraft.app, signed
+cargo xtask dmg [--release]              # target/bundle/CodeCraft-<version>.dmg (macOS, hdiutil)
+cargo xtask package-linux [--release]    # target/package/codecraft-<version>-linux-<arch>.tar.gz
+cargo xtask package-windows [--release]  # target/package/codecraft-<version>-windows-<arch>.zip
+```
+
+`--layout-only` writes the package layout without building or signing. Outputs go under the Cargo
+target directory (`CARGO_TARGET_DIR` when set).
+
+- **macOS bundle.** `Contents/MacOS/codecraft`, `Contents/Info.plist` (bundle id
+  `dev.codecraft.CodeCraft`, version from the workspace, `LSMinimumSystemVersion` 11.0,
+  `NSHighResolutionCapable`), `Contents/Resources/CodeCraft.icns` and `PkgInfo`. The icon is our
+  own, drawn by `xtask/src/icon.rs` at every icon-set size and converted with `iconutil`. The
+  bundle is signed ad hoc (`codesign --force --deep -s -`) and verified; set
+  `CODECRAFT_SIGN_IDENTITY` to sign with a Developer ID (adds the hardened runtime and a
+  timestamp; notarize separately with `xcrun notarytool`). No document types are declared yet: the
+  app takes its project from the command line or File › Open, not from Finder's open events.
+- **dmg.** The signed bundle plus an `/Applications` link, compressed (UDZO).
+- **Linux.** On Linux: `bin/codecraft`, `bin/codecraft-cli`,
+  `share/applications/dev.codecraft.CodeCraft.desktop`, `share/icons/hicolor/<size>/apps/*.png`,
+  README and licenses, as a tarball (install with `cp -r bin share ~/.local/`). Elsewhere the task
+  writes the layout only (no cross-compiling).
+- **Windows.** On Windows: `codecraft.exe`, `codecraft-cli.exe`, `codecraft.png`, README and
+  licenses, zipped with the `tar` that ships with Windows 10+. Not exercised on Windows yet;
+  elsewhere it writes the layout only.
+
+## macOS menu bar and project windows
+
+On macOS the menus live in the global menu bar (`crates/ui-egui/src/native_menu.rs`, through
+`muda`), built from the same catalog and `EXTRA` table as the in-window bar; Settings › Appearance
+can switch back to the in-window bar (`native_menu_bar`). Chords (Cmd/Ctrl, function keys,
+Alt with a non-character key) are native key equivalents; a key equivalent that fires is fed back
+to egui as the key it swallowed, so editor, text-field and terminal routing stay the same. Plain
+and Alt+character shortcuts stay egui-only (they would eat typing). Tests and snapshots never touch
+`NSApp`: only `codecraft_ui_egui::run` enables the native bar.
+
+File › Open with a project open asks This Window / New Window; a new window is an egui immediate
+viewport with its own `Session` (`project_windows.rs`), settings are shared between windows, and
+Window › Next/Previous Project Window cycle the focus. Without native viewports (kittest), project
+windows keep running but are not painted.
+
 ## Re-observing RustRover
 
 With RustRover running:
