@@ -22,6 +22,9 @@ codecraft-agent = { path = "crates/agent" }
 codecraft-mcp = { path = "crates/mcp" }
 codecraft-term = { path = "crates/term" }
 codecraft-vcs = { path = "crates/vcs" }
+codecraft-http = { path = "crates/http" }
+codecraft-remote = { path = "crates/remote" }
+codecraft-profile = { path = "crates/profile" }
 codecraft-workspace = { path = "crates/workspace" }
 codecraft-engine = { path = "crates/engine" }
 codecraft-ui-egui = { path = "crates/ui-egui" }

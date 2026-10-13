@@ -35,6 +35,11 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Hierarchy => "⊶",
         ToolWindowId::DatabaseChanges => "⇅",
         ToolWindowId::InspectionResults => "🔎",
+        ToolWindowId::Profiler => "🔥",
+        ToolWindowId::PythonConsole => "🐍",
+        ToolWindowId::PythonPackages => "📦",
+        ToolWindowId::FileTransfer => "🔃",
+        ToolWindowId::RemoteHost => "🖥",
     }
 }
 
@@ -170,7 +175,7 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Notifications => notifications_view(ui, s, st),
         ToolWindowId::Debug => crate::debug_panel::show(ui, s, st),
         ToolWindowId::Database => crate::database_panel::show(ui, s, st),
-        ToolWindowId::Services => crate::database_panel::services(ui, s, st),
+        ToolWindowId::Services => crate::services_panel::show(ui, s, st),
         ToolWindowId::Agent => crate::agent_panel::show(ui, s, st),
         ToolWindowId::Terminal => crate::terminal_panel::show(ui, s, st),
         ToolWindowId::Commit => crate::vcs_panels::show(ui, s, st),
@@ -181,6 +186,11 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Hierarchy => crate::refactor_ui::show_hierarchy(ui, s, st),
         ToolWindowId::DatabaseChanges => crate::misc_ui::show_database_changes(ui, s, st),
         ToolWindowId::InspectionResults => crate::inspections_ui::show(ui, s, st),
+        ToolWindowId::Profiler => crate::profiler_ui::show(ui, s, st),
+        ToolWindowId::PythonConsole => crate::python_ui::show_console(ui, s, st),
+        ToolWindowId::PythonPackages => crate::python_ui::show_packages(ui, s, st),
+        ToolWindowId::FileTransfer => crate::remote_ui::show_file_transfer(ui, s, st),
+        ToolWindowId::RemoteHost => crate::remote_ui::show_remote_host(ui, s, st),
     }
 }
 

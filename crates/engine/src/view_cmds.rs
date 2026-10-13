@@ -9,7 +9,7 @@ use crate::lsp::GotoKind;
 use crate::{Popup, Session};
 
 /// Tool windows CodeCraft implements (the others stay disabled in the menu until they exist).
-pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 21] = [
+pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 26] = [
     ToolWindowId::Project,
     ToolWindowId::Find,
     ToolWindowId::Run,
@@ -31,6 +31,11 @@ pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 21] = [
     ToolWindowId::Hierarchy,
     ToolWindowId::DatabaseChanges,
     ToolWindowId::InspectionResults,
+    ToolWindowId::Profiler,
+    ToolWindowId::PythonConsole,
+    ToolWindowId::PythonPackages,
+    ToolWindowId::FileTransfer,
+    ToolWindowId::RemoteHost,
 ];
 
 macro_rules! tool_window {
@@ -64,6 +69,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         tool_window!("view.toolWindows.hierarchy", "Hierarchy", ToolWindowId::Hierarchy),
         tool_window!("view.toolWindows.databaseChanges", "Database Changes", ToolWindowId::DatabaseChanges),
         tool_window!("view.toolWindows.inspectionResults", "Inspection Results", ToolWindowId::InspectionResults),
+        tool_window!("view.toolWindows.profiler", "Profiler", ToolWindowId::Profiler),
+        tool_window!("view.toolWindows.pythonConsole", "Python Console", ToolWindowId::PythonConsole),
+        tool_window!("view.toolWindows.pythonPackages", "Python Packages", ToolWindowId::PythonPackages),
+        tool_window!("view.toolWindows.fileTransfer", "File Transfer", ToolWindowId::FileTransfer),
+        tool_window!("view.toolWindows.remoteHost", "Remote Host", ToolWindowId::RemoteHost),
         spec(
             "window.activeToolWindow.hideAllWindows",
             "Hide All Windows",

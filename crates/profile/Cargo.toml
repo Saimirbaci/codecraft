@@ -1,0 +1,19 @@
+[package]
+name = "codecraft-profile"
+description = "CodeCraft profiler model: samply/gecko, speedscope and collapsed-stack parsing into call trees and flame graphs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

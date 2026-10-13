@@ -1,0 +1,20 @@
+[package]
+name = "codecraft-http"
+description = "CodeCraft HTTP Client: .http request files, environments, cURL and Postman conversion, and running requests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip", "json"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

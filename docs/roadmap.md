@@ -16,6 +16,7 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 | M8 Settings and keymaps | Full Settings dialog, Windows/Linux keymaps, colour schemes | ✅ (2026-10-13) |
 | M9 Native macOS menus, packaging | NSMenu global menu bar, signed .app/.dmg, Linux and Windows packages, project windows | ✅ (2026-10-13) |
 | M10 Daily-use depth | Session restore, snippet placeholders and completion resolve, in-place rename, whitespace/wrap rendering, inspections (Clippy) with quick-fixes, remaining cheap menu items, RustRover's lazily filled submenus. Plan: `docs/m10-plan.md` | ✅ (2026-10-13) |
+| M11 From the suite + remote | CLion debugger views (memory, disassembly, registers, watchpoints), profiler; DataGrip query history, explain plan, grid extras, SQL in Rust strings; HTTP Client; PyCharm interpreters, packages and console; Docker in Services, SSH deployment, remote run targets and Remote Development. Plan: `docs/m11-plan.md` | in progress |
 
 ## Current focus
 

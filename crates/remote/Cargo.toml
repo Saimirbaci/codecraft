@@ -1,0 +1,19 @@
+[package]
+name = "codecraft-remote"
+description = "CodeCraft remote: SSH config parsing, ssh/rsync/scp command builders and remote listing parsers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

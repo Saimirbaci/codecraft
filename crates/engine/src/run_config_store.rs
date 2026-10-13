@@ -107,6 +107,8 @@ pub struct UserRunConfig {
     pub env_file: String,
     /// Empty = the project root (the Cargo workspace root for Cargo); relative = from the project.
     pub working_dir: String,
+    /// Where it runs (M11: Docker and SSH targets).
+    pub target: crate::run_targets::RunTarget,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -430,6 +432,12 @@ impl UserRunConfig {
 
     /// The runnable configuration; Cargo runs default to `cargo_root`.
     pub fn to_run_config(&self, project: &Path, cargo_root: &Path) -> Result<RunConfig, String> {
+        let mut config = self.to_local_run_config(project, cargo_root)?;
+        config.target = self.target.clone();
+        Ok(config)
+    }
+
+    fn to_local_run_config(&self, project: &Path, cargo_root: &Path) -> Result<RunConfig, String> {
         let name = self.name.trim().to_string();
         let env = self.effective_env(project);
         let words = || split_words(&self.command).map_err(|e| format!("`{name}`: {e}"));
@@ -519,6 +527,7 @@ impl UserRunConfig {
                 env: cmd.env.clone(),
                 env_file: String::new(),
                 working_dir: rel(&cmd.cwd),
+                target: c.target.clone(),
             };
         }
         let mut quiet = c.invocation.clone();
@@ -530,6 +539,7 @@ impl UserRunConfig {
             env: c.invocation.env.clone(),
             env_file: String::new(),
             working_dir: rel(&c.invocation.cwd),
+            target: c.target.clone(),
         }
     }
 }

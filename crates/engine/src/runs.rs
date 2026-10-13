@@ -24,6 +24,9 @@ pub struct RunConfig {
     pub invocation: CargoInvocation,
     #[serde(default)]
     pub command: Option<ProcessCommand>,
+    /// Where it runs (local by default; Docker and SSH targets come from M11 tracks D and S).
+    #[serde(default)]
+    pub target: crate::run_targets::RunTarget,
 }
 
 /// A plain process run configuration.
@@ -81,12 +84,12 @@ impl ProcessCommand {
 
 impl RunConfig {
     pub fn cargo(name: impl Into<String>, invocation: CargoInvocation) -> Self {
-        Self { name: name.into(), invocation, command: None }
+        Self { name: name.into(), invocation, command: None, target: Default::default() }
     }
 
     pub fn process(name: impl Into<String>, command: ProcessCommand) -> Self {
         let invocation = CargoInvocation::new(CargoCommand::Run, command.cwd.clone());
-        Self { name: name.into(), invocation, command: Some(command) }
+        Self { name: name.into(), invocation, command: Some(command), target: Default::default() }
     }
 
     /// The Cargo invocation, for Cargo configurations only.
@@ -187,6 +190,21 @@ pub(crate) fn start_chain(
 
 /// Start any run configuration (saves all files first).
 pub(crate) fn start_config(s: &mut Session, config: &RunConfig) -> Result<RunTabId, CommandError> {
+    if !config.target.is_local() {
+        // On another machine or in a container: run the plain command line through the target.
+        let cmd = match &config.command {
+            Some(c) => c.clone(),
+            None => {
+                let inv = config.invocation.clone();
+                let mut c = ProcessCommand::new("cargo", &[], inv.cwd.clone());
+                c.args = CargoInvocation { json_messages: false, ..inv.clone() }.args();
+                c.env = inv.env;
+                c
+            }
+        };
+        let wrapped = crate::run_targets::wrap(s, &config.target, cmd)?;
+        return start_process(s, &wrapped, &config.name);
+    }
     match &config.command {
         Some(cmd) => start_process(s, cmd, &config.name),
         None => start(s, config.invocation.clone(), &config.name, false),

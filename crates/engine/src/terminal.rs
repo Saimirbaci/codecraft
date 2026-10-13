@@ -215,6 +215,27 @@ fn shell(s: &Session) -> Option<String> {
     s.terminal.shell.clone().or_else(|| (!s.lsp_enabled).then(|| "/bin/sh".to_string()))
 }
 
+/// Open a Terminal tab running `program args…` directly (e.g. `ssh host`, `docker exec -it c sh`).
+/// Returns the tab id. Used by the Docker and SSH tracks (M11).
+pub fn open_command(
+    s: &mut Session,
+    title: &str,
+    program: &str,
+    args: &[String],
+    cwd: Option<PathBuf>,
+) -> Result<u64, CommandError> {
+    open(
+        s,
+        NewTab {
+            cwd,
+            command: Some(program.to_string()),
+            args: Some(args.to_vec()),
+            title: Some(title.to_string()),
+            env: Vec::new(),
+        },
+    )
+}
+
 /// Open a tab; returns its id. Shows the Terminal tool window and asks the UI to focus it.
 pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
     if s.terminal.tabs.len() >= MAX_TABS {

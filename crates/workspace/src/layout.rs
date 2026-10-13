@@ -26,6 +26,11 @@ pub enum ToolWindowId {
     Hierarchy,
     DatabaseChanges,
     InspectionResults,
+    Profiler,
+    PythonConsole,
+    PythonPackages,
+    FileTransfer,
+    RemoteHost,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,7 +41,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 21] = [
+    pub const ALL: [ToolWindowId; 26] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -58,6 +63,11 @@ impl ToolWindowId {
         Self::Hierarchy,
         Self::DatabaseChanges,
         Self::InspectionResults,
+        Self::Profiler,
+        Self::PythonConsole,
+        Self::PythonPackages,
+        Self::FileTransfer,
+        Self::RemoteHost,
     ];
 
     pub fn title(self) -> &'static str {
@@ -83,6 +93,11 @@ impl ToolWindowId {
             Self::Hierarchy => "Hierarchy",
             Self::DatabaseChanges => "Database Changes",
             Self::InspectionResults => "Inspection Results",
+            Self::Profiler => "Profiler",
+            Self::PythonConsole => "Python Console",
+            Self::PythonPackages => "Python Packages",
+            Self::FileTransfer => "File Transfer",
+            Self::RemoteHost => "Remote Host",
         }
     }
 
@@ -94,7 +109,8 @@ impl ToolWindowId {
             | Self::Database
             | Self::Agent
             | Self::Coverage
-            | Self::Hierarchy => Side::Right,
+            | Self::Hierarchy
+            | Self::RemoteHost => Side::Right,
             _ => Side::Bottom,
         }
     }
@@ -141,6 +157,11 @@ impl ToolWindowId {
             Self::Hierarchy => "hierarchy",
             Self::DatabaseChanges => "databaseChanges",
             Self::InspectionResults => "inspectionResults",
+            Self::Profiler => "profiler",
+            Self::PythonConsole => "pythonConsole",
+            Self::PythonPackages => "pythonPackages",
+            Self::FileTransfer => "fileTransfer",
+            Self::RemoteHost => "remoteHost",
         }
     }
 

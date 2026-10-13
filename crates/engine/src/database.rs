@@ -19,7 +19,7 @@ use codecraft_db::{
     Canceller, Cell, Column, DataSourceConfig, DatabaseInfo, DbError, DbKind, ExecSummary, KeychainStore, Page,
     ResultSink, SecretStore, TableDetails, TableInfo,
 };
-use codecraft_workspace::{NotificationLevel, ToolWindowId};
+use codecraft_workspace::NotificationLevel;
 
 use crate::Session;
 
@@ -1177,7 +1177,7 @@ fn handle(s: &mut Session, ev: Event) {
                 None => db.results.push(rs),
             }
             db.active_result = Some(id);
-            s.ws.layout.show(ToolWindowId::Services);
+            crate::services::show(s, crate::services::ServicesSection::Database);
         }
         Event::Page { run, stmt, rows, last, waiting } => {
             if let Some(info) = db.runs.get_mut(&run) {
@@ -1245,7 +1245,7 @@ fn handle(s: &mut Session, ev: Event) {
             db.log(if cancelled { OutputLevel::Info } else { OutputLevel::Error }, &source, msg.clone());
             if !has_tab {
                 db.active_result = None;
-                s.ws.layout.show(ToolWindowId::Services);
+                crate::services::show(s, crate::services::ServicesSection::Database);
             }
             s.status = msg;
         }

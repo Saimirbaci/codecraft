@@ -30,6 +30,9 @@ mod database_cmds;
 pub mod debug;
 mod debug_cmds;
 mod decorations;
+pub mod docker;
+mod docker_cmds;
+pub mod docker_target;
 mod edit_cmds;
 pub mod editing;
 mod editing_cmds;
@@ -39,6 +42,8 @@ mod feedback_cmds;
 mod file_cmds;
 mod ide_cmds;
 pub mod ide_server;
+pub mod http_client;
+mod http_cmds;
 mod inspection_cmds;
 pub mod inspections;
 pub mod inline_rename;
@@ -54,21 +59,32 @@ mod navigate_cmds;
 mod params;
 pub mod refactor;
 mod refactor_cmds;
+pub mod remote;
+mod remote_cmds;
+pub mod run_targets;
 mod render_cmds;
 mod reformat;
 pub mod popup;
+pub mod profiler;
+mod profiler_cmds;
+pub mod python;
+mod python_cmds;
 mod run_cmds;
 mod run_config_cmds;
 pub mod run_config_store;
 pub mod run_configs;
 mod runs;
 pub mod scratch;
+pub mod services;
 pub mod session_store;
 pub mod settings;
 mod settings_cmds;
 pub mod snippet;
 pub mod paste;
 mod split_cmds;
+pub mod sql_lang;
+mod sql_lang_cmds;
+pub mod ssh_target;
 pub mod structure;
 pub mod templates;
 pub mod todo;
@@ -212,6 +228,20 @@ pub struct Session {
     pub clip_history: paste::ClipHistory,
     /// Highlighted usages, recent Find Usages and the Find Usages Settings dialog (M10 track G).
     pub usages: usages::UsagesState,
+    /// Docker in Services, Docker run targets, Dev Containers (M11 track D).
+    pub docker: docker::DockerState,
+    /// SSH servers, deployment, Remote Host, tunnels, Remote Development (M11 track S).
+    pub remote: remote::RemoteState,
+    /// HTTP Client requests, environments and responses (M11 track H).
+    pub http: http_client::HttpState,
+    /// Python interpreters, packages and console (M11 track Y).
+    pub python: python::PythonState,
+    /// Profiler runs and snapshots (M11 track P).
+    pub profiler: profiler::ProfilerState,
+    /// SQL in Rust strings and SQL editing (M11 track Q).
+    pub sql_lang: sql_lang::SqlLangState,
+    /// The Services tool window's selected section.
+    pub services: services::ServicesState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -272,6 +302,13 @@ impl Session {
             appearance: appearance::AppearanceState::default(),
             clip_history: paste::ClipHistory::default(),
             usages: usages::UsagesState::default(),
+            docker: docker::DockerState::default(),
+            remote: remote::RemoteState::default(),
+            http: http_client::HttpState::default(),
+            python: python::PythonState::default(),
+            profiler: profiler::ProfilerState::default(),
+            sql_lang: sql_lang::SqlLangState::default(),
+            services: services::ServicesState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -341,6 +378,12 @@ impl Session {
         changed |= inspections::fixes::pump(self);
         changed |= misc::pump(self);
         changed |= appearance::pump(self);
+        changed |= docker::pump(self);
+        changed |= remote::pump(self);
+        changed |= http_client::pump(self);
+        changed |= python::pump(self);
+        changed |= profiler::pump(self);
+        changed |= sql_lang::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -358,6 +401,12 @@ impl Session {
             || self.vcs.busy()
             || self.testing.busy()
             || self.inspections.busy()
+            || self.docker.busy()
+            || self.remote.busy()
+            || self.http.busy()
+            || self.python.busy()
+            || self.profiler.busy()
+            || self.sql_lang.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
