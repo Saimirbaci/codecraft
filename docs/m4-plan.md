@@ -1,6 +1,6 @@
 # M4: the rest of the roadmap (M3b, M6–M9 and the M2/M3 follow-ups)
 
-Status: in progress (started 2026-10-13). Tracks run in parallel in two waves; each owns its
+Status: done (2026-10-13; all seven tracks landed, 1,095 tests passing). Tracks run in parallel in two waves; each owns its
 files and talks to the rest through the contracts below. Read `AGENTS.md` and `docs/m3-plan.md`
 (same rules).
 
