@@ -45,6 +45,8 @@ pub struct DebugUi {
     edit_for: Option<u64>,
     console_follow: bool,
     console_follow_set: bool,
+    /// Scroll the Attach to Process list to the selection (after ↑/↓).
+    attach_scroll: bool,
 }
 
 /// What the user did this frame; applied after painting (the tree is drawn from `&Session`).
@@ -1157,6 +1159,96 @@ fn paint_bug(painter: &egui::Painter, c: Pos2, theme: &Theme) {
     painter.circle_filled(pos2(c.x, c.y - 3.5), 2.2, color);
     for dy in [-1.0f32, 1.5, 4.0] {
         painter.line_segment([pos2(c.x - 6.5, c.y + dy), pos2(c.x + 6.5, c.y + dy)], Stroke::new(1.0, color));
+    }
+}
+
+/// Run › Attach to Process…: the process list (filter, ↑/↓, Enter to attach, Esc to close).
+pub fn attach_window(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
+    let Some(picker) = s.debug.attach.clone() else { return };
+    let theme = st.theme.clone();
+    let mut cmds: Vec<(&'static str, Value)> = Vec::new();
+    let mut open = true;
+    let visible = picker.visible();
+    crate::windows::resizable(egui::Window::new("Attach to Process").default_size([640.0, 420.0]), st, "attach")
+        .id(egui::Id::new("attach-to-process"))
+        .open(&mut open)
+        .collapsible(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+        .show(ui.ctx(), |ui| {
+            let mut query = picker.query.clone();
+            ui.horizontal(|ui| {
+                let field = ui.add(TextEdit::singleline(&mut query).hint_text("Filter by name, command or pid").desired_width(360.0));
+                if !field.has_focus() && !ui.ctx().memory(|m| m.focused().is_some()) {
+                    field.request_focus();
+                }
+                let mut all = picker.all_users;
+                if ui.checkbox(&mut all, "All users").changed() {
+                    cmds.push(("debug.attach.refresh", json!({ "allUsers": all })));
+                }
+                if ui.button("Refresh").clicked() {
+                    cmds.push(("debug.attach.refresh", json!({ "allUsers": picker.all_users })));
+                }
+            });
+            if query != picker.query {
+                cmds.push(("debug.attach.filter", json!({ "query": query })));
+            }
+            if picker.loading {
+                ui.label(RichText::new("Listing processes…").color(theme.text_muted));
+            }
+            if let Some(e) = &picker.error {
+                ui.label(RichText::new(e).color(theme.error));
+            }
+            if !picker.loading && visible.is_empty() {
+                ui.label(RichText::new("No matching processes.").color(theme.text_muted));
+            }
+            ScrollArea::vertical().auto_shrink([false, false]).max_height(320.0).show(ui, |ui| {
+                for (row, index) in visible.iter().enumerate().take(500) {
+                    let Some(p) = picker.processes.get(*index) else { continue };
+                    let kind = match p.kind {
+                        dbg::ProcessKind::Rust => "Rust",
+                        dbg::ProcessKind::Python => "Python",
+                        dbg::ProcessKind::Native => "Native",
+                    };
+                    let text = format!("{:>7}  {}  ·  {kind}", p.pid, p.name);
+                    let resp = ui.selectable_label(row == picker.selected, text).on_hover_text(&p.command);
+                    if row == picker.selected && st.debug.attach_scroll {
+                        resp.scroll_to_me(None);
+                    }
+                    if resp.double_clicked() {
+                        cmds.push(("debug.attach.confirm", json!({ "index": row })));
+                    } else if resp.clicked() {
+                        let delta = i64::try_from(row).unwrap_or(0) - i64::try_from(picker.selected).unwrap_or(0);
+                        cmds.push(("debug.attach.move", json!({ "delta": delta })));
+                    }
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                let can = picker.selected_process().is_some();
+                if ui.add_enabled(can, egui::Button::new("Attach")).clicked() {
+                    cmds.push(("debug.attach.confirm", Value::Null));
+                }
+                if ui.button("Cancel").clicked() {
+                    cmds.push(("debug.attach.cancel", Value::Null));
+                }
+            });
+        });
+    st.debug.attach_scroll = false;
+    let (up, down, enter, escape) = ui.ctx().input(|i| {
+        (i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown), i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
+    });
+    if up || down {
+        cmds.push(("debug.attach.move", json!({ "delta": if up { -1 } else { 1 } })));
+        st.debug.attach_scroll = true;
+    }
+    if enter {
+        cmds.push(("debug.attach.confirm", Value::Null));
+    }
+    if escape || !open {
+        cmds.push(("debug.attach.cancel", Value::Null));
+    }
+    for (id, params) in cmds {
+        run_command(s, st, id, &params);
     }
 }
 

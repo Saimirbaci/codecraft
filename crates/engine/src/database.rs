@@ -4,7 +4,8 @@
 //! live in the OS keychain). Each connection runs on its own worker thread: one per data source
 //! for introspection (`meta:`), one per SQL console, one for table views. Workers report
 //! through one channel drained by [`pump`]. Result sets keep their cursor open on the worker so
-//! more rows can be fetched in pages of 500.
+//! more rows can be fetched in pages of 500. Table results with a primary key can be edited in
+//! the grid ([`edit`]): pending changes are submitted as one transaction on the result's worker.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,10 @@ use codecraft_db::{
 use codecraft_workspace::{NotificationLevel, ToolWindowId};
 
 use crate::Session;
+
+mod edit;
+
+pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
 
 /// Data sources, relative to the project root.
 pub const DATASOURCES_FILE: &str = ".codecraft/datasources.json";
@@ -141,6 +146,8 @@ pub struct ResultSet {
     /// Set for table views: sorting re-queries with ORDER BY on the column name.
     pub table: Option<TableRef>,
     pub sort: Option<SortKey>,
+    /// Pending in-grid changes (table results with a primary key).
+    pub edits: GridEdits,
     /// The query without the ORDER BY added by sorting.
     #[serde(skip)]
     pub(crate) base_sql: String,
@@ -315,6 +322,8 @@ enum Req {
     More { run: u64 },
     StopFetch,
     Meta(MetaReq),
+    /// Apply in-grid edits in one transaction.
+    Apply { result: u64, schema: String, table: String, changes: Vec<codecraft_db::edit::RowChange> },
     Close,
 }
 
@@ -328,6 +337,7 @@ enum Event {
     RunDone { run: u64 },
     Meta { worker: String, req: MetaReq, result: Result<MetaResult, String> },
     Tested { nonce: u64, result: Result<String, String> },
+    Applied { worker: String, result: u64, outcome: Result<u64, String> },
     SecretFailed(String),
 }
 
@@ -385,6 +395,10 @@ pub struct DbState {
     pub selected: Option<String>,
     /// SQL files bound to a data source (consoles are bound by their location).
     pub bindings: BTreeMap<PathBuf, String>,
+    /// Primary keys of tables opened for editing (by [`node_key`]).
+    pub table_keys: HashMap<String, KeyState>,
+    /// The SQL preview of a result's pending changes (Submit asks to confirm it).
+    pub edit_preview: Option<EditPreview>,
     root: Option<PathBuf>,
     loaded: bool,
     secrets: Arc<dyn SecretStore>,
@@ -409,6 +423,8 @@ impl Default for DbState {
             expanded: BTreeSet::new(),
             selected: None,
             bindings: BTreeMap::new(),
+            table_keys: HashMap::new(),
+            edit_preview: None,
             root: None,
             loaded: false,
             secrets: Arc::new(KeychainStore::default()),
@@ -463,7 +479,7 @@ impl DbState {
                     .schemas
                     .values()
                     .any(|n| n.loading || n.tables.as_ref().is_some_and(|t| t.iter().any(|t| t.loading || t.counting)))
-        }) || self.results.iter().any(ResultSet::is_running)
+        }) || self.results.iter().any(|r| r.is_running() || r.edits.submitting)
             || self.runs.values().any(|r| !r.waiting)
             || self.dialog.as_ref().is_some_and(|d| d.test == TestState::Running)
     }
@@ -520,6 +536,16 @@ impl DbState {
             && p.is_relative()
         {
             c.path = Some(root.join(p));
+        }
+        if let Some(root) = &self.root {
+            for k in ["sslrootcert", "sslcert", "sslkey"] {
+                if let Some(v) = c.options.get_mut(k)
+                    && !v.trim().is_empty()
+                    && Path::new(v.trim()).is_relative()
+                {
+                    *v = root.join(v.trim()).display().to_string();
+                }
+            }
         }
         c
     }
@@ -594,16 +620,10 @@ impl DbState {
         self.send(&key, Req::Meta(req))
     }
 
-    /// Run statements on a worker; returns the run id.
-    pub(crate) fn start_run(&mut self, spec: RunSpec) -> Result<u64, String> {
-        let RunSpec { worker, source, owner, title, statements, table, sort, replace, base_sql } = spec;
-        if statements.is_empty() {
-            return Err("nothing to execute".into());
-        }
-        self.ensure_worker(&worker, &source)?;
-        // A new query on the worker closes any cursor left open there. With SQLite an open read
-        // cursor on another connection would also block writes, so close those too.
-        let sqlite = self.source(&source).is_some_and(|d| d.config.kind == DbKind::Sqlite);
+    /// A new request on `worker` closes any cursor left open there. With SQLite an open read
+    /// cursor on another connection would also block writes, so close those too.
+    fn close_cursors(&mut self, worker: &str, source: &str) {
+        let sqlite = self.source(source).is_some_and(|d| d.config.kind == DbKind::Sqlite);
         let mut close: Vec<String> = Vec::new();
         for r in self.results.iter_mut().filter(|r| r.has_more && (r.worker == worker || sqlite && r.source == source))
         {
@@ -616,6 +636,16 @@ impl DbState {
         for w in close {
             let _ = self.send(&w, Req::StopFetch);
         }
+    }
+
+    /// Run statements on a worker; returns the run id.
+    pub(crate) fn start_run(&mut self, spec: RunSpec) -> Result<u64, String> {
+        let RunSpec { worker, source, owner, title, statements, table, sort, replace, base_sql } = spec;
+        if statements.is_empty() {
+            return Err("nothing to execute".into());
+        }
+        self.ensure_worker(&worker, &source)?;
+        self.close_cursors(&worker, &source);
         // A new run replaces the owner's earlier tabs (re-sorting replaces just its own tab).
         if replace.is_none() {
             let stale: Vec<u64> =
@@ -739,6 +769,11 @@ impl DbState {
                     r.status = ResultStatus::Cancelled;
                 }
             }
+        }
+        let prefix = source.map(|s| node_key(s, Some(""), None));
+        self.table_keys.retain(|k, _| prefix.as_ref().is_some_and(|p| !k.starts_with(p.as_str())));
+        for r in self.results.iter_mut().filter(|r| source.is_none_or(|s| r.source == s)) {
+            r.edits.submitting = false;
         }
         for ds in self.sources.iter_mut().filter(|d| source.is_none_or(|s| d.config.id == s)) {
             ds.status = ConnStatus::Disconnected;
@@ -1001,6 +1036,11 @@ fn worker_main(
                 .map_err(|e| e.to_string());
                 let _ = events.send(Event::Meta { worker: key.clone(), req: m, result });
             }
+            Req::Apply { result, schema, table, changes } => {
+                let outcome =
+                    codecraft_db::edit::apply(conn.as_mut(), &schema, &table, &changes).map_err(|e| e.to_string());
+                let _ = events.send(Event::Applied { worker: key.clone(), result, outcome });
+            }
             Req::Exec { run, statements } => {
                 let n = statements.len();
                 for (i, sql) in statements.iter().enumerate() {
@@ -1069,6 +1109,18 @@ fn handle(s: &mut Session, ev: Event) {
                     ds.tree = SchemaTree { error: Some(error.clone()), ..SchemaTree::default() };
                 }
             }
+            if worker.starts_with("meta:") {
+                let prefix = node_key(&source, Some(""), None);
+                for (_, k) in db.table_keys.iter_mut().filter(|(k, _)| k.starts_with(&prefix)) {
+                    if *k == KeyState::Loading {
+                        *k = KeyState::Failed(error.clone());
+                    }
+                }
+            }
+            for r in db.results.iter_mut().filter(|r| r.worker == worker && r.edits.submitting) {
+                r.edits.submitting = false;
+                r.edits.error = Some(error.clone());
+            }
             let failed_runs: Vec<u64> = db.runs.iter().filter(|(_, r)| r.worker == worker).map(|(id, _)| *id).collect();
             for id in failed_runs {
                 db.runs.remove(&id);
@@ -1114,6 +1166,7 @@ fn handle(s: &mut Session, ev: Event) {
                 elapsed_ms: None,
                 table,
                 sort,
+                edits: GridEdits::default(),
                 base_sql,
                 run,
                 stmt,
@@ -1218,6 +1271,7 @@ fn handle(s: &mut Session, ev: Event) {
             }
             s.status = msg;
         }
+        Event::Applied { worker, result, outcome } => on_applied(s, &worker, result, outcome),
         Event::SecretFailed(e) => {
             db.log(OutputLevel::Error, "", e.clone());
             s.status = e;
@@ -1226,6 +1280,19 @@ fn handle(s: &mut Session, ev: Event) {
 }
 
 fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResult, String>) {
+    if let MetaReq::Details(schema, table) = &req {
+        let k = node_key(source, Some(schema), Some(table));
+        if db.table_keys.contains_key(&k) {
+            let state = match &result {
+                Ok(MetaResult::Details(d)) => {
+                    KeyState::Ready(d.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect())
+                }
+                Ok(_) => KeyState::Failed("unexpected reply".into()),
+                Err(e) => KeyState::Failed(e.clone()),
+            };
+            db.table_keys.insert(k, state);
+        }
+    }
     let mut follow_up: Vec<MetaReq> = Vec::new();
     let mut expand: Option<String> = None;
     let Some(ds) = db.source_mut(source) else { return };
@@ -1299,6 +1366,42 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
     }
 }
 
+/// A submit finished: reload the table on success, keep the changes and say why on failure.
+fn on_applied(s: &mut Session, worker: &str, result: u64, outcome: Result<u64, String>) {
+    let db = &mut s.db;
+    let Some(r) = db.results.iter_mut().find(|r| r.id == result) else { return };
+    r.edits.submitting = false;
+    match outcome {
+        Ok(n) => {
+            r.edits = GridEdits::default();
+            let r = r.clone();
+            let msg = format!("Changes submitted: {n} row{} affected", if n == 1 { "" } else { "s" });
+            db.log(OutputLevel::Info, &r.source, msg.clone());
+            s.status = msg;
+            let reload = RunSpec {
+                worker: worker.to_string(),
+                source: r.source.clone(),
+                owner: r.owner.clone(),
+                title: r.title.clone(),
+                statements: vec![r.sql.clone()],
+                table: r.table.clone(),
+                sort: r.sort,
+                replace: Some(r.id),
+                base_sql: Some(r.base_sql.clone()),
+            };
+            if let Err(e) = s.db.start_run(reload) {
+                s.db.log(OutputLevel::Error, &r.source, format!("Cannot reload the table: {e}"));
+            }
+        }
+        Err(e) => {
+            r.edits.error = Some(e.clone());
+            let source = r.source.clone();
+            db.log(OutputLevel::Error, &source, e.clone());
+            s.notify(NotificationLevel::Error, "Cannot submit changes", e);
+        }
+    }
+}
+
 /// Stop background work (window closing): cancel running queries and close every connection.
 pub(crate) fn shutdown(s: &mut Session) {
     s.db.disconnect(None);
@@ -1356,6 +1459,7 @@ mod tests {
             elapsed_ms: Some(12),
             table: None,
             sort: None,
+            edits: GridEdits::default(),
             base_sql: String::new(),
             run: 0,
             stmt: 0,

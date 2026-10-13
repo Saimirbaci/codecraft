@@ -13,7 +13,7 @@ use postgres::{CancelToken, Client, NoTls};
 use crate::sql::count_rows;
 use crate::{
     Canceller, Cell, Column, ColumnInfo, Connection, DataSourceConfig, DatabaseInfo, DbError, DbKind, DbResult,
-    ExecSummary, ForeignKeyInfo, IndexInfo, Pager, ResultSink, SslMode, TableDetails, TableInfo, TableKind,
+    ExecSummary, ForeignKeyInfo, IndexInfo, Pager, ResultSink, SslMode, TableDetails, TableInfo, TableKind, TlsFiles,
 };
 
 #[derive(Clone)]
@@ -85,7 +85,7 @@ impl PgConn {
             pc.password(p);
         }
         let mode = cfg.ssl_mode()?;
-        let tls = make_tls(mode)?;
+        let tls = make_tls(mode, &cfg.tls_files(None)?)?;
         let connect_err = |e: postgres::Error| {
             let mut msg = e.to_string();
             if let Some(src) = e.source() {
@@ -120,24 +120,55 @@ impl PgConn {
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn make_tls(mode: SslMode) -> DbResult<Tls> {
+fn make_tls(mode: SslMode, files: &TlsFiles) -> DbResult<Tls> {
     if mode == SslMode::Disable {
         return Ok(Tls::None);
     }
+    let read = |p: &std::path::Path, what: &str| {
+        // Certificates and keys are small; refuse anything that is clearly not one.
+        match std::fs::metadata(p) {
+            Ok(m) if m.len() > 1 << 20 => {
+                return Err(DbError::Config(format!("{what} {} is too large", p.display())));
+            }
+            _ => {}
+        }
+        std::fs::read(p).map_err(|e| DbError::Config(format!("cannot read {what} {}: {e}", p.display())))
+    };
     let mut b = native_tls::TlsConnector::builder();
-    if mode != SslMode::Verify {
-        // libpq semantics: prefer/require encrypt but don't verify the server certificate.
-        b.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+    match mode {
+        // libpq semantics: prefer/require encrypt but don't verify the server certificate…
+        SslMode::Prefer | SslMode::Require => {
+            b.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+        }
+        // …verify-ca checks the chain only, verify-full the host name too.
+        SslMode::VerifyCa => {
+            b.danger_accept_invalid_hostnames(true);
+        }
+        SslMode::Verify | SslMode::Disable => {}
+    }
+    if let Some(p) = &files.root_cert {
+        let pem = read(p, "root certificate")?;
+        let cert = native_tls::Certificate::from_pem(&pem)
+            .map_err(|e| DbError::Config(format!("{} is not a PEM certificate: {e}", p.display())))?;
+        b.add_root_certificate(cert);
+    }
+    if let (Some(c), Some(k)) = (&files.client_cert, &files.client_key) {
+        let cert = read(c, "client certificate")?;
+        let key = read(k, "client key")?;
+        let id = native_tls::Identity::from_pkcs8(&cert, &key).map_err(|e| {
+            DbError::Config(format!("client certificate {} / key {}: {e} (PEM, PKCS#8 key)", c.display(), k.display()))
+        })?;
+        b.identity(id);
     }
     let connector = b.build().map_err(|e| DbError::Connect(format!("TLS setup failed: {e}")))?;
     Ok(Tls::Native(postgres_native_tls::MakeTlsConnector::new(connector)))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn make_tls(mode: SslMode) -> DbResult<Tls> {
+fn make_tls(mode: SslMode, _files: &TlsFiles) -> DbResult<Tls> {
     match mode {
         SslMode::Disable | SslMode::Prefer => Ok(Tls::None),
-        SslMode::Require | SslMode::Verify => {
+        SslMode::Require | SslMode::Verify | SslMode::VerifyCa => {
             Err(DbError::Unsupported("TLS not supported yet on this platform (sslmode=require)".into()))
         }
     }
@@ -641,6 +672,29 @@ mod tests {
         assert_eq!(interval(3_600_000_000, 2, 14), "1 year 2 mons 2 days 01:00:00");
         assert_eq!(interval(0, 0, 0), "00:00:00");
         assert_eq!(offset(-5 * 3600), "-05");
+    }
+
+    #[test]
+    fn tls_setup_reports_bad_files() {
+        assert!(matches!(make_tls(SslMode::Disable, &TlsFiles::default()), Ok(Tls::None)));
+        let dir = std::env::temp_dir().join(format!("codecraft-pg-tls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let junk = dir.join("junk.pem");
+        std::fs::write(&junk, "not a certificate").unwrap();
+        let files = TlsFiles { root_cert: Some(junk.clone()), ..TlsFiles::default() };
+        let missing = TlsFiles { root_cert: Some(dir.join("missing.pem")), ..TlsFiles::default() };
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            for mode in [SslMode::Prefer, SslMode::Require, SslMode::VerifyCa, SslMode::Verify] {
+                assert!(make_tls(mode, &TlsFiles::default()).is_ok(), "{mode:?}");
+            }
+            let e = make_tls(SslMode::Verify, &files).err().unwrap().to_string();
+            assert!(e.contains("junk.pem"), "{e}");
+            let e = make_tls(SslMode::VerifyCa, &missing).err().unwrap().to_string();
+            assert!(e.contains("cannot read root certificate"), "{e}");
+        } else {
+            assert!(make_tls(SslMode::Require, &files).is_err());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

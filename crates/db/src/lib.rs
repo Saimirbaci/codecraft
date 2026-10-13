@@ -3,7 +3,8 @@
 //! Everything here is synchronous and meant to run on worker threads: [`connect`] opens a
 //! [`Connection`]; its [`Connection::execute`] streams result pages to a sink so the caller can
 //! fetch 500 rows at a time and stop early; a [`Canceller`] obtained before running a query can
-//! cancel it from another thread. [`split`] has the statement splitter, [`secrets`] the password
+//! cancel it from another thread. [`edit`] turns in-grid edits into DML applied in one
+//! transaction. [`split`] has the statement splitter, [`secrets`] the password
 //! store (macOS Keychain), [`sql`] identifier quoting and query builders.
 #![deny(
     clippy::unwrap_used,
@@ -15,6 +16,7 @@
 )]
 
 mod config;
+pub mod edit;
 mod my;
 mod pg;
 pub mod secrets;
@@ -27,7 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub use config::{DataSourceConfig, DbKind, SslMode};
+pub use config::{DataSourceConfig, DbKind, SslMode, TlsFiles};
 pub use secrets::{KeychainStore, MemoryStore, SecretStore};
 pub use split::{Dialect, Statement, split_statements, statement_at};
 

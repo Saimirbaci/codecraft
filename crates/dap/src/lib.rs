@@ -24,6 +24,7 @@
 mod client;
 pub mod discover;
 pub mod launch;
+pub mod processes;
 mod transport;
 pub mod types;
 
@@ -230,6 +231,12 @@ impl DapClient {
     /// group if it is still there after `grace`. Returns at once; [`DapEvent::Exited`] follows.
     pub fn terminate(&self, grace: Duration) {
         self.inner.terminate(grace);
+    }
+
+    /// End an attach session: `disconnect` leaving the debuggee running (detach), then kill the
+    /// adapter's process group if it is still there after `grace`.
+    pub fn detach(&self, grace: Duration) {
+        self.inner.terminate_with(grace, false);
     }
 
     /// Kill the adapter's process group now.

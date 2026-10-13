@@ -18,8 +18,11 @@ use crate::params::{bool_or, opt_str, opt_usize, req_path, req_str, req_usize};
 use crate::popup::{CompletionItem, CompletionPopup};
 use crate::{CommandError, Popup, Session};
 
+mod edit;
+
 pub(crate) fn specs() -> Vec<CommandSpec> {
-    vec![
+    let mut v = edit::specs();
+    v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);
             ok()
@@ -182,7 +185,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             has_editor,
             complete,
         ),
-    ]
+    ]);
+    v
 }
 
 // ---------------------------------------------------------------- helpers
@@ -747,6 +751,7 @@ fn open_table(s: &mut Session, p: &Value) -> CmdResult {
         SortKey { column, desc }
     });
     let statement = sql::select_table(kind, &schema, &table, order.as_deref().map(|c| (c, desc)), None);
+    s.db.request_keys(&source, &schema, &table);
     let worker = format!("tables:{source}");
     let run =
         s.db.start_run(RunSpec {
@@ -779,6 +784,9 @@ fn sort_result(s: &mut Session, p: &Value) -> CmdResult {
     let col = r.columns.get(column).ok_or_else(|| bad(format!("no column {column}")))?.name.clone();
     if r.is_running() {
         return Err(CommandError::Disabled("the query is still running".into()));
+    }
+    if !r.edits.is_empty() || r.edits.submitting {
+        return Err(CommandError::Disabled("submit or revert the pending changes first".into()));
     }
     let sort = match p.get("desc").and_then(Value::as_bool) {
         Some(desc) => Some(SortKey { column, desc }),
@@ -857,6 +865,8 @@ fn get_result(s: &mut Session, p: &Value) -> CmdResult {
         "statusLine": r.status_line(),
         "error": r.error,
         "hasMore": r.has_more,
+        "editable": s.db.editable(r.id).is_ok(),
+        "pendingRows": r.edits.pending_rows(),
     }))
 }
 

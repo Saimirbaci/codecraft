@@ -953,7 +953,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 if let Some(v) = opt_str(p, "directory") {
                     dir = v.to_string();
                 }
-                let url = url.trim().to_string();
+                let url = codecraft_vcs::github::normalize_clone_url(&url);
                 if url.is_empty() || dir.trim().is_empty() {
                     s.vcs.dialog_error = Some("Enter a URL and a directory".into());
                     return Err(CommandError::BadParams("`url` and `directory` are required".into()));

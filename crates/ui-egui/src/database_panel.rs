@@ -895,9 +895,50 @@ fn result_view(
                 cmd.push(("db.exportCsv", json!({ "result": r.id, "path": p })));
             }
         }
+        let editable = s.db.editable(r.id);
+        if r.table.is_some() {
+            ui.separator();
+            let can = editable.is_ok();
+            let pending = !r.edits.is_empty() && !r.edits.submitting;
+            if small_button(ui, "+", "Add Row", can, st.theme.success, st) {
+                cmd.push(("db.addRow", id.clone()));
+            }
+            let selected_row = match st.db.grids.get(&r.id).and_then(|g| g.selection) {
+                Some(data_grid::Selection::Row(row) | data_grid::Selection::Cell { row, .. }) => Some(row),
+                None => None,
+            };
+            if small_button(ui, "−", "Delete Row", can && selected_row.is_some(), st.theme.error, st)
+                && let Some(row) = selected_row
+            {
+                cmd.push(("db.deleteRows", json!({ "result": r.id, "rows": [row] })));
+            }
+            if small_button(ui, "↶", "Revert All Changes", pending, st.theme.text, st) {
+                cmd.push(("db.revertChanges", id.clone()));
+            }
+            if small_button(ui, "👁", "Preview Pending Changes (SQL)", pending && can, st.theme.text, st) {
+                cmd.push(("db.previewChanges", id.clone()));
+            }
+            if small_button(ui, "⬆", "Submit Changes", pending && can, st.theme.success, st) {
+                cmd.push(("db.submitChanges", id.clone()));
+            }
+            if r.edits.submitting {
+                ui.label(RichText::new("Submitting…").color(st.theme.warning));
+            } else if let Some(e) = &r.edits.error {
+                ui.label(RichText::new("✖ Submit failed").color(st.theme.error)).on_hover_text(e);
+            } else if !r.edits.is_empty() {
+                let n = r.edits.pending_rows();
+                ui.label(
+                    RichText::new(format!("{n} pending row{}", if n == 1 { "" } else { "s" }))
+                        .color(st.theme.vcs_modified),
+                );
+            } else if let Err(why) = &editable {
+                ui.label(RichText::new("read-only").color(st.theme.text_muted)).on_hover_text(why);
+            }
+        }
         let sql: String = r.sql.split_whitespace().collect::<Vec<_>>().join(" ");
         ui.add(egui::Label::new(RichText::new(sql).monospace().size(11.5).color(st.theme.text_muted)).truncate());
     });
+    edit_preview(ui.ctx(), s, st, cmd);
     let status = r.status_line();
     let data = GridData {
         columns: &r.columns,
@@ -905,6 +946,8 @@ fn result_view(
         sort: r.sort.map(|k| (k.column, k.desc)),
         status: &status,
         status_is_error: r.status == ResultStatus::Failed,
+        edits: r.table.as_ref().map(|_| &r.edits),
+        editable: s.db.editable(r.id).is_ok(),
     };
     let grid = st.db.grids.entry(r.id).or_default();
     let actions = data_grid::show(ui, egui::Id::new(("db-grid", r.id)), grid, &data, &st.theme);
@@ -925,6 +968,46 @@ fn result_view(
                 ui.ctx().copy_text(text);
                 s.status = "Copied".into();
             }
+            GridAction::Edit { row, col, value } => {
+                cmd.push(("db.editCell", json!({ "result": r.id, "row": row, "column": col, "value": value })));
+            }
+            GridAction::AddRow => cmd.push(("db.addRow", id.clone())),
+            GridAction::DeleteRow(row) => cmd.push(("db.deleteRows", json!({ "result": r.id, "rows": [row] }))),
+            GridAction::RevertRow(row) => {
+                cmd.push(("db.revertChanges", json!({ "result": r.id, "rows": [row] })))
+            }
         }
+    }
+}
+
+/// The SQL that Submit will run, with Submit/Cancel.
+fn edit_preview(ctx: &egui::Context, s: &Session, st: &UiState, cmd: &mut Vec<(&'static str, Value)>) {
+    let Some(p) = &s.db.edit_preview else { return };
+    let mut open = true;
+    egui::Window::new("Pending Changes")
+        .id(egui::Id::new("db-edit-preview"))
+        .collapsible(false)
+        .resizable(true)
+        .default_width(560.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("These statements run in one transaction:").color(st.theme.text_muted));
+            ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                for sql in &p.statements {
+                    ui.label(RichText::new(format!("{sql};")).monospace().color(st.theme.text_editor));
+                }
+            });
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Submit").clicked() {
+                    cmd.push(("db.submitChanges", json!({ "result": p.result })));
+                }
+                if ui.button("Cancel").clicked() {
+                    cmd.push(("db.closePreview", Value::Null));
+                }
+            });
+        });
+    if !open {
+        cmd.push(("db.closePreview", Value::Null));
     }
 }

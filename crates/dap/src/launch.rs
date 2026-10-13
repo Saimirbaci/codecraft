@@ -142,9 +142,55 @@ pub fn node(launch: &NodeLaunch) -> Value {
     }))
 }
 
+/// `attach` arguments for a running native process (lldb-dap or CodeLLDB).
+pub fn native_attach(kind: AdapterKind, name: &str, pid: u32, init_commands: &[String]) -> Value {
+    match kind {
+        AdapterKind::CodeLldb => json!({
+            "name": name,
+            "type": "lldb",
+            "request": "attach",
+            "pid": pid,
+            "initCommands": init_commands,
+        }),
+        _ => json!({
+            "name": name,
+            "type": "lldb-dap",
+            "request": "attach",
+            "pid": pid,
+            "initCommands": init_commands,
+        }),
+    }
+}
+
+/// `attach` arguments for a running Python process (debugpy injects itself by process id).
+pub fn python_attach(name: &str, pid: u32, just_my_code: bool) -> Value {
+    json!({
+        "name": name,
+        "type": "python",
+        "request": "attach",
+        "processId": pid,
+        "justMyCode": just_my_code,
+        "redirectOutput": true,
+        "showReturnValue": true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attach_arguments() {
+        let v = native_attach(AdapterKind::LldbDap, "app", 42, &["command script import x".into()]);
+        assert_eq!(v["request"], json!("attach"));
+        assert_eq!(v["pid"], json!(42));
+        assert_eq!(v["type"], json!("lldb-dap"));
+        assert_eq!(v["initCommands"][0], json!("command script import x"));
+        assert_eq!(native_attach(AdapterKind::CodeLldb, "app", 1, &[])["type"], json!("lldb"));
+        let p = python_attach("py", 7, true);
+        assert_eq!(p["processId"], json!(7));
+        assert_eq!(p["request"], json!("attach"));
+    }
 
     #[test]
     fn lldb_dap_env_is_a_list_and_codelldb_env_an_object() {

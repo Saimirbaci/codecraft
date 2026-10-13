@@ -1,9 +1,13 @@
 //! A virtualized results grid: only visible rows are laid out (`ScrollArea::show_rows`), the
 //! header stays put while the body scrolls, columns resize by dragging the header edges, NULL is
 //! greyed, and a selected cell or row copies with Cmd+C. The status line shows timing.
+//!
+//! Editable table results show pending changes (edited cells, new and deleted rows) and edit a
+//! cell in place on double-click, Enter or F2; the caller turns the edits into `db.*` commands.
 
 use egui::{Align2, CornerRadius, CursorIcon, Event, FontId, Id, Key, Rect, ScrollArea, Sense, Stroke, pos2, vec2};
 
+use codecraft_engine::database::{CellView, GridEdits, RowState};
 use codecraft_engine::db::{Cell, Column};
 
 use crate::theme::Theme;
@@ -31,6 +35,16 @@ pub struct GridState {
     columns_key: Vec<String>,
     /// Scroll the selection into view next frame.
     reveal: bool,
+    /// The cell being edited in place and its text; `focus` until the text field took focus.
+    editing: Option<CellEdit>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CellEdit {
+    row: usize,
+    col: usize,
+    text: String,
+    focus: bool,
 }
 
 /// What the user asked the grid for; the caller turns these into commands.
@@ -42,6 +56,11 @@ pub enum GridAction {
     NearEnd,
     /// Text for the clipboard.
     Copy(String),
+    /// Set a cell (`None`: NULL).
+    Edit { row: usize, col: usize, value: Option<String> },
+    AddRow,
+    DeleteRow(usize),
+    RevertRow(usize),
 }
 
 /// Input for one frame of the grid.
@@ -52,6 +71,10 @@ pub struct GridData<'a> {
     pub sort: Option<(usize, bool)>,
     pub status: &'a str,
     pub status_is_error: bool,
+    /// Pending changes shown over `rows` (new rows follow the fetched ones).
+    pub edits: Option<&'a GridEdits>,
+    /// Cells can be edited in place.
+    pub editable: bool,
 }
 
 /// The display text of a cell: one line, elided.
@@ -102,11 +125,28 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
         state.columns_key = key;
         state.selection = None;
     }
-    let digits = data.rows.len().max(1).to_string().len().max(2);
+    let fetched = data.rows.len();
+    let n_rows = data.edits.map_or(fetched, |e| e.row_count(fetched));
+    let digits = n_rows.max(1).to_string().len().max(2);
     let num_w = digits as f32 * char_w + 16.0;
     let total_w = num_w + state.widths.iter().sum::<f32>();
-    let n_rows = data.rows.len();
     let n_cols = data.columns.len();
+    if !data.editable {
+        state.editing = None;
+    }
+    let view = |r: usize, c: usize| -> CellView<'_> {
+        match data.edits {
+            Some(e) => e.cell(data.rows, r, c),
+            None => data.rows.get(r).and_then(|row| row.get(c)).map(CellView::Value).unwrap_or(CellView::Missing),
+        }
+    };
+    let start_edit = |r: usize, c: usize| -> CellEdit {
+        let text = match view(r, c) {
+            CellView::Value(v) | CellView::Changed(v) => v.to_plain(),
+            CellView::Default | CellView::Missing => String::new(),
+        };
+        CellEdit { row: r, col: c, text, focus: true }
+    };
 
     // Status line at the bottom.
     let status_h = 20.0;
@@ -117,7 +157,16 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
 
     // Keyboard: Cmd+C copies, arrows move the selection (only while the grid has focus).
     let focused = ui.memory(|m| m.has_focus(id));
-    if focused {
+    if focused && data.editable && state.editing.is_none() {
+        // Consumed, so the text field that opens does not see the Enter and close again.
+        let start = ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::NONE, Key::F2)
+        });
+        if start && let Some(Selection::Cell { row, col }) = state.selection {
+            state.editing = Some(start_edit(row, col));
+        }
+    }
+    if focused && state.editing.is_none() {
         ui.memory_mut(|m| {
             m.set_focus_lock_filter(
                 id,
@@ -164,6 +213,10 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
         }
     }
 
+    // The grid itself is a focusable widget (keyboard navigation; accessibility needs a node for
+    // whatever has focus).
+    ui.interact(grid_rect, id, Sense::focusable_noninteractive());
+
     // Body.
     let body_rect = Rect::from_min_max(pos2(grid_rect.min.x, grid_rect.min.y + HEADER_H), grid_rect.max);
     let mut body_ui =
@@ -186,21 +239,32 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
     }
     let mut clicked: Option<Selection> = None;
     let mut copy_menu: Option<String> = None;
+    let mut menu_actions: Vec<GridAction> = Vec::new();
+    let mut start_editing: Option<(usize, usize)> = None;
+    // `Some(None)`: editing cancelled; `Some(Some(..))`: committed.
+    let mut edit_done: Option<Option<(usize, usize, String)>> = None;
     let out = area.show_rows(&mut body_ui, ROW_H, n_rows, |ui, range| {
         if range.end + 20 >= n_rows && n_rows > 0 {
             actions.push(GridAction::NearEnd);
         }
         let clip = ui.clip_rect();
         for r in range {
-            let Some(row) = data.rows.get(r) else { continue };
+            if r >= n_rows {
+                continue;
+            }
+            let row_state = data.edits.map_or(RowState::Unchanged, |e| e.row_state(r, fetched));
             let (rect, resp) = ui.allocate_exact_size(vec2(total_w.max(ui.available_width()), ROW_H), Sense::click());
             if !ui.is_rect_visible(rect) {
                 continue;
             }
-            let painter = ui.painter();
+            let painter = ui.painter().clone();
             let row_selected = state.selection == Some(Selection::Row(r));
             if row_selected {
                 painter.rect_filled(rect, CornerRadius::ZERO, theme.list_selection);
+            } else if row_state == RowState::Inserted {
+                painter.rect_filled(rect, CornerRadius::ZERO, theme.diff_added_bg);
+            } else if row_state == RowState::Deleted {
+                painter.rect_filled(rect, CornerRadius::ZERO, theme.diff_removed_bg);
             } else if r % 2 == 1 {
                 painter.rect_filled(rect, CornerRadius::ZERO, theme.caret_row);
             }
@@ -220,7 +284,39 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 if cell_rect.max.x < clip.min.x || cell_rect.min.x > clip.max.x {
                     continue;
                 }
-                let value = row.get(c).unwrap_or(&Cell::Null);
+                let cv = view(r, c);
+                if matches!(cv, CellView::Changed(_)) && row_state != RowState::Inserted {
+                    painter.rect_filled(cell_rect, CornerRadius::ZERO, theme.diff_modified_bg);
+                }
+                if let Some(ed) = state.editing.as_mut().filter(|e| e.row == r && e.col == c) {
+                    let edit_id = id.with(("edit", r, c));
+                    let te = egui::TextEdit::singleline(&mut ed.text)
+                        .id(edit_id)
+                        .font(font.clone())
+                        .margin(egui::Margin::symmetric(4, 2))
+                        .desired_width(cell_rect.width());
+                    let out = ui.put(cell_rect.shrink(1.0), te);
+                    let first = ed.focus;
+                    if first {
+                        out.request_focus();
+                        ed.focus = false;
+                    }
+                    let (enter, escape) = ui.input(|i| (i.key_pressed(Key::Enter), i.key_pressed(Key::Escape)));
+                    // The key that started editing is not the one that ends it.
+                    if !first && escape {
+                        edit_done = Some(None);
+                    } else if !first && (enter || out.lost_focus()) {
+                        edit_done = Some(Some((r, c, ed.text.clone())));
+                    }
+                    painter.vline(cell_rect.max.x, cell_rect.y_range(), Stroke::new(1.0, theme.separator));
+                    continue;
+                }
+                let default_cell = Cell::Null;
+                let (value, is_default) = match cv {
+                    CellView::Value(v) | CellView::Changed(v) => (v, false),
+                    CellView::Default => (&default_cell, true),
+                    CellView::Missing => (&default_cell, false),
+                };
                 if state.selection == Some(Selection::Cell { row: r, col: c }) {
                     painter.rect_filled(cell_rect.shrink(1.0), CornerRadius::same(2), theme.selection);
                     painter.rect_stroke(
@@ -237,7 +333,7 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 } else {
                     theme.text_editor
                 };
-                let text = cell_text(value);
+                let text = if is_default { "<default>".to_string() } else { cell_text(value) };
                 let p = painter.with_clip_rect(cell_rect.shrink2(vec2(4.0, 0.0)).intersect(clip));
                 if value.is_numeric() {
                     p.text(
@@ -258,23 +354,60 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 }
                 painter.vline(cell_rect.max.x, cell_rect.y_range(), Stroke::new(1.0, theme.separator));
             }
+            if row_state == RowState::Deleted {
+                let y = rect.center().y;
+                painter.hline((rect.min.x + num_w)..=x, y, Stroke::new(1.0, theme.diff_removed));
+            }
+            if resp.double_clicked()
+                && data.editable
+                && row_state != RowState::Deleted
+                && let Some(pos) = resp.interact_pointer_pos()
+                && let Selection::Cell { row, col } = hit(pos.x - rect.min.x, num_w, &state.widths, r)
+            {
+                start_editing = Some((row, col));
+            }
             if (resp.clicked() || resp.secondary_clicked())
                 && let Some(pos) = resp.interact_pointer_pos()
             {
                 clicked = Some(hit(pos.x - rect.min.x, num_w, &state.widths, r));
             }
             resp.context_menu(|ui| {
-                if ui.button("Copy Value").clicked() {
-                    let col = match state.selection {
-                        Some(Selection::Cell { row, col }) if row == r => col,
-                        _ => 0,
-                    };
-                    copy_menu = row.get(col).map(Cell::to_plain);
+                let col = match state.selection {
+                    Some(Selection::Cell { row, col }) if row == r => col,
+                    _ => 0,
+                };
+                let row = data.rows.get(r);
+                if ui.add_enabled(row.is_some(), egui::Button::new("Copy Value")).clicked() {
+                    copy_menu = row.and_then(|row| row.get(col)).map(Cell::to_plain);
                     ui.close();
                 }
-                if ui.button("Copy Row").clicked() {
-                    copy_menu = Some(row_text(row));
+                if ui.add_enabled(row.is_some(), egui::Button::new("Copy Row")).clicked() {
+                    copy_menu = row.map(|row| row_text(row));
                     ui.close();
+                }
+                if data.editable {
+                    ui.separator();
+                    let live = row_state != RowState::Deleted;
+                    if ui.add_enabled(live, egui::Button::new("Edit Value")).clicked() {
+                        start_editing = Some((r, col));
+                        ui.close();
+                    }
+                    if ui.add_enabled(live, egui::Button::new("Set NULL")).clicked() {
+                        menu_actions.push(GridAction::Edit { row: r, col, value: None });
+                        ui.close();
+                    }
+                    if ui.button("Add Row").clicked() {
+                        menu_actions.push(GridAction::AddRow);
+                        ui.close();
+                    }
+                    if ui.add_enabled(live, egui::Button::new("Delete Row")).clicked() {
+                        menu_actions.push(GridAction::DeleteRow(r));
+                        ui.close();
+                    }
+                    if ui.add_enabled(row_state != RowState::Unchanged, egui::Button::new("Revert Row")).clicked() {
+                        menu_actions.push(GridAction::RevertRow(r));
+                        ui.close();
+                    }
                 }
             });
         }
@@ -285,6 +418,18 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
     }
     if let Some(t) = copy_menu {
         actions.push(GridAction::Copy(t));
+    }
+    actions.extend(menu_actions);
+    if let Some(done) = edit_done {
+        if let Some((row, col, text)) = done {
+            actions.push(GridAction::Edit { row, col, value: Some(text) });
+        }
+        state.editing = None;
+        ui.memory_mut(|m| m.request_focus(id));
+    }
+    if let Some((row, col)) = start_editing {
+        state.selection = Some(Selection::Cell { row, col });
+        state.editing = Some(start_edit(row, col));
     }
     let offset_x = out.state.offset.x;
 
@@ -423,6 +568,67 @@ mod tests {
         );
         assert_eq!(selection_text(Some(Selection::Row(0)), &[row]).as_deref(), Some("1\t\tt"));
         assert_eq!(selection_text(Some(Selection::Row(5)), &[]), None);
+    }
+
+    #[test]
+    fn enter_edits_a_cell_in_place() {
+        use egui_kittest::Harness;
+
+        let columns = vec![
+            Column { name: "id".into(), type_name: String::new() },
+            Column { name: "name".into(), type_name: String::new() },
+        ];
+        let rows = vec![vec![Cell::Int(1), Cell::Text("ab".into())]];
+        let mut edits = GridEdits::default();
+        edits.inserted.push(vec![None, None]);
+        let theme = Theme::dark();
+        let state = (GridState::default(), Vec::new(), 0);
+        let mut h = Harness::new_ui_state(
+            move |ui, (grid, actions, frame): &mut (GridState, Vec<GridAction>, usize)| {
+                let id = Id::new("grid-test");
+                if *frame == 0 {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+                *frame += 1;
+                let data = GridData {
+                    columns: &columns,
+                    rows: &rows,
+                    sort: None,
+                    status: "",
+                    status_is_error: false,
+                    edits: Some(&edits),
+                    editable: true,
+                };
+                actions.extend(show(ui, id, grid, &data, &theme));
+            },
+            state,
+        );
+        h.run_steps(2);
+        // (Widths are computed on the first frame, which resets the selection.)
+        h.state_mut().0.selection = Some(Selection::Cell { row: 0, col: 1 });
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().0.editing.is_some(), "Enter starts editing");
+        h.event(Event::Text("z".into()));
+        h.run_steps(1);
+        h.key_press(Key::Enter);
+        h.run_steps(2);
+        let edit = h.state().1.iter().find_map(|a| match a {
+            GridAction::Edit { row, col, value } => Some((*row, *col, value.clone())),
+            _ => None,
+        });
+        let (row, col, value) = edit.expect("an edit action");
+        assert_eq!((row, col), (0, 1));
+        assert!(value.as_deref().is_some_and(|v| v.contains('z')), "{value:?}");
+        assert!(h.state().0.editing.is_none());
+        // Escape cancels.
+        h.key_press(Key::F2);
+        h.run_steps(2);
+        assert!(h.state().0.editing.is_some());
+        h.key_press(Key::Escape);
+        h.run_steps(2);
+        assert!(h.state().0.editing.is_none());
+        assert_eq!(h.state().1.iter().filter(|a| matches!(a, GridAction::Edit { .. })).count(), 1);
     }
 
     #[test]

@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
+use codecraft_vcs::github::{GhRepo, PullRequestRequest};
 use codecraft_vcs::lines::{self, LineChange};
+use codecraft_vcs::worktree::Worktree;
 use codecraft_vcs::ops::{PullRequest, PushRequest, ResetMode};
 use codecraft_vcs::{
     Blame, Branch, CancelToken, Commit, CommitDetails, ConsoleLine, FileState, FileStatus, Git, GitError, GraphRow,
@@ -249,6 +251,26 @@ pub enum Dialog {
         rev: String,
         branch: bool,
     },
+    /// Git › New Worktree…
+    NewWorktree {
+        path: String,
+        branch: String,
+        new_branch: bool,
+        /// Start point of a new branch (empty: `HEAD`).
+        base: String,
+    },
+    /// Git › Worktrees…: the list is in [`VcsState::worktrees`].
+    Worktrees {
+        selected: Option<PathBuf>,
+    },
+    /// Git › GitHub › Create Pull Request…
+    CreatePullRequest {
+        title: String,
+        body: String,
+        /// Target branch (empty: the repository's default branch).
+        base: String,
+        draft: bool,
+    },
 }
 
 /// The operation running now.
@@ -276,6 +298,16 @@ enum OpKind {
     Patch {
         clipboard: bool,
     },
+    /// A work tree was added or removed: reload the list (and open the new one).
+    Worktrees {
+        open: Option<PathBuf>,
+    },
+    /// The summary is the new pull request's URL.
+    PullRequest {
+        open: bool,
+    },
+    /// A hunk was staged or unstaged: close its popup.
+    Hunk,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -306,6 +338,9 @@ struct Markers {
     seen_at: Option<Instant>,
 }
 
+/// A conflicted file's (base, ours, theirs) versions.
+type MergeVersions = (Option<String>, Option<String>, Option<String>);
+
 /// Branches, tags, remotes and stashes.
 type Refs = (Vec<Branch>, Vec<Tag>, Vec<Remote>, Vec<Stash>);
 
@@ -328,6 +363,9 @@ enum Event {
     Outgoing { branch: String, result: Result<Vec<Commit>, GitError> },
     Blame { doc: DocId, revision: u64, result: Result<Blame, GitError> },
     OpDone { label: String, kind: OpKind, result: Result<String, GitError> },
+    Worktrees(Result<Vec<Worktree>, GitError>),
+    GhRepos(Result<Vec<GhRepo>, GitError>),
+    MergeLoaded { rel: String, labels: (String, String), result: Result<MergeVersions, GitError> },
     Generated(Result<String, String>),
 }
 
@@ -363,6 +401,22 @@ pub struct VcsState {
     pub op: Option<RunningOp>,
     /// Annotations per document (Git › Current File › Annotate).
     pub blame: HashMap<DocId, BlameView>,
+    /// The three-way merge view of a conflicted file.
+    pub merge: Option<crate::vcs_merge::MergeView>,
+    /// The file whose merge view is loading.
+    pub merge_loading: Option<String>,
+    /// Linked work trees (Git › Worktrees…), the main one first.
+    pub worktrees: Vec<Worktree>,
+    pub worktrees_loading: bool,
+    /// The GitHub CLI (`gh` on `PATH` by default; tests point it at a fake).
+    pub gh_program: PathBuf,
+    /// The user's GitHub repositories for the Clone dialog (`None`: not loaded).
+    pub github_repos: Option<Result<Vec<GhRepo>, String>>,
+    pub github_loading: bool,
+    /// The Clone dialog was opened from Git › GitHub (lists the user's repositories).
+    pub clone_github: bool,
+    /// The last pull request created.
+    pub last_pull_request: Option<String>,
     markers: HashMap<DocId, Markers>,
     heads: HashMap<String, HeadText>,
     head_oid: Option<String>,
@@ -410,6 +464,15 @@ impl Default for VcsState {
             generating: false,
             op: None,
             blame: HashMap::new(),
+            merge: None,
+            merge_loading: None,
+            worktrees: Vec::new(),
+            worktrees_loading: false,
+            gh_program: PathBuf::from("gh"),
+            github_repos: None,
+            github_loading: false,
+            clone_github: false,
+            last_pull_request: None,
             markers: HashMap::new(),
             heads: HashMap::new(),
             head_oid: None,
@@ -477,6 +540,9 @@ impl VcsState {
             || self.refreshing
             || self.discovering
             || self.log.loading
+            || self.merge_loading.is_some()
+            || self.worktrees_loading
+            || self.github_loading
             || self.markers.values().any(|m| m.pending || m.seen_at.is_some())
             || self.blame.values().any(|b| b.loading || b.seen_at.is_some())
     }
@@ -658,7 +724,8 @@ fn discover_if_needed(s: &mut Session) -> bool {
     }
     // The project changed: forget the old repository.
     let env = std::mem::take(&mut s.vcs.git_env);
-    let open_dialog_free = VcsState { git_env: env, ..VcsState::default() };
+    let gh_program = std::mem::take(&mut s.vcs.gh_program);
+    let open_dialog_free = VcsState { git_env: env, gh_program, ..VcsState::default() };
     let old_console = std::mem::take(&mut s.vcs.console);
     if let Some(op) = s.vcs.op.take() {
         op.cancel.cancel();
@@ -841,6 +908,43 @@ fn handle(s: &mut Session, ev: Event) {
             }
         }
         Event::OpDone { label, kind, result } => op_done(s, &label, kind, result),
+        Event::Worktrees(result) => {
+            s.vcs.worktrees_loading = false;
+            match result {
+                Ok(list) => s.vcs.worktrees = list,
+                Err(e) => s.vcs.dialog_error = Some(err_text(&e)),
+            }
+        }
+        Event::GhRepos(result) => {
+            s.vcs.github_loading = false;
+            s.vcs.github_repos = Some(result.map_err(|e| err_text(&e)));
+        }
+        Event::MergeLoaded { rel, labels, result } => {
+            if s.vcs.merge_loading.as_deref() != Some(rel.as_str()) {
+                return;
+            }
+            s.vcs.merge_loading = None;
+            let Some(abs) = s.vcs.abs(&rel) else { return };
+            match result {
+                Ok((base, Some(ours), Some(theirs))) => {
+                    s.vcs.dialog = None;
+                    s.vcs.merge = Some(crate::vcs_merge::MergeView::new(
+                        rel,
+                        abs,
+                        base.unwrap_or_default(),
+                        ours,
+                        theirs,
+                        labels,
+                    ));
+                }
+                // Deleted on one side, or binary: only Accept Yours/Theirs apply.
+                Ok(_) => {
+                    s.vcs.dialog_error =
+                        Some(format!("{rel} was deleted on one side or is binary: accept yours or theirs"));
+                }
+                Err(e) => s.vcs.dialog_error = Some(err_text(&e)),
+            }
+        }
     }
 }
 
@@ -1384,6 +1488,26 @@ fn op_done(s: &mut Session, label: &str, kind: OpKind, result: Result<String, Gi
             return;
         }
         OpKind::MayConflict => s.vcs.show_conflicts_after_refresh = true,
+        OpKind::Worktrees { open } => {
+            load_worktrees(s);
+            if let (Ok(_), Some(path)) = (&result, open) {
+                s.vcs.dialog = None;
+                if let Err(e) = s.execute("file.open", &serde_json::json!({ "path": path })) {
+                    s.status = e.to_string();
+                }
+                return;
+            }
+        }
+        OpKind::PullRequest { open } => {
+            if let Ok(url) = &result {
+                s.vcs.dialog = None;
+                s.vcs.last_pull_request = Some(url.clone());
+                if open {
+                    s.effects.push(Effect::OpenUrl(url.clone()));
+                }
+            }
+        }
+        OpKind::Hunk if result.is_ok() => s.vcs.hunk = None,
         _ => {}
     }
     request_refresh(s, true);
@@ -1649,4 +1773,164 @@ pub fn show_git_window(s: &mut Session, tab: GitTab) {
     if tab == GitTab::Log && !s.vcs.log.loaded {
         load_log(s, true);
     }
+}
+
+// ---------------------------------------------------------------- hunk staging, merge, worktrees, GitHub
+
+impl VcsState {
+    /// The installed `gh` (GitHub CLI), if any. Looks on `PATH`; starts no process.
+    pub fn gh_path(&self) -> Option<PathBuf> {
+        codecraft_vcs::github::find_program(&self.gh_program, std::env::var_os("PATH").as_deref())
+    }
+
+    /// The first remote on github.com.
+    pub fn github_remote(&self) -> Option<&Remote> {
+        self.remotes.iter().find(|r| {
+            codecraft_vcs::github::is_github_url(&r.fetch_url) || codecraft_vcs::github::is_github_url(&r.push_url)
+        })
+    }
+
+    fn gh_in(&self, program: PathBuf, dir: &Path) -> codecraft_vcs::github::Gh {
+        let mut gh = codecraft_vcs::github::Gh::new(program, dir);
+        for (k, v) in &self.git_env {
+            gh = gh.with_env(k, v);
+        }
+        gh
+    }
+}
+
+/// Stage (or unstage) the change at `line` of a document: only those lines go into (or out of)
+/// the index; the work tree and the rest of the file are untouched.
+pub fn stage_hunk(s: &mut Session, doc: DocId, line: usize, stage: bool) -> Result<(), CommandError> {
+    let change = change_at(s, doc, line).ok_or_else(|| CommandError::Failed("no change on this line".into()))?;
+    let od = s.ws.doc(doc).ok_or_else(|| CommandError::Failed("the document is closed".into()))?;
+    let path = od.path.clone().ok_or_else(|| CommandError::Failed("the file is not saved".into()))?;
+    let text = od.doc.to_disk_text();
+    let rel = s.vcs.rel(&path).ok_or_else(|| CommandError::Failed("the file is outside the repository".into()))?;
+    let label = if stage { "Stage Hunk" } else { "Unstage Hunk" };
+    start_op(s, label, OpKind::Hunk, move |git| {
+        let done = if stage {
+            codecraft_vcs::hunks::stage_hunk(git, &rel, &text, change.start..change.end)?
+        } else {
+            codecraft_vcs::hunks::unstage_hunk(git, &rel, change.old_start..change.old_end)?
+        };
+        if !done {
+            let why = if stage { "These lines are already staged" } else { "These lines are not staged" };
+            return Err(GitError::Invalid(why.into()));
+        }
+        let n = change.end.saturating_sub(change.start).max(1);
+        Ok(format!("{n} line{} of {rel} {}", if n == 1 { "" } else { "s" }, if stage { "staged" } else { "unstaged" }))
+    })
+}
+
+/// Load the three versions of a conflicted file and open the merge view when they arrive.
+pub fn open_merge(s: &mut Session, rel: String) -> Result<(), CommandError> {
+    let git = s.vcs.git().ok_or_else(|| CommandError::Failed("the project is not a Git repository".into()))?;
+    if s.vcs.status.file(&rel).and_then(|f| f.conflict).is_none() {
+        return Err(CommandError::Failed(format!("{rel} has no conflict")));
+    }
+    let theirs = match s.vcs.state {
+        RepoState::Merging => "MERGE_HEAD",
+        RepoState::Rebasing => "REBASE_HEAD",
+        RepoState::CherryPicking => "CHERRY_PICK_HEAD",
+        RepoState::Reverting => "REVERT_HEAD",
+        RepoState::Normal => "theirs",
+    };
+    let labels = ("HEAD".to_string(), theirs.to_string());
+    s.vcs.merge_loading = Some(rel.clone());
+    s.vcs.dialog_error = None;
+    let tx = s.vcs.tx.clone();
+    spawn("merge", move || {
+        let result = codecraft_vcs::ops::conflict_versions(&git, &rel);
+        let _ = tx.send(Event::MergeLoaded { rel, labels, result });
+    });
+    Ok(())
+}
+
+/// Reload the work tree list in the background.
+pub fn load_worktrees(s: &mut Session) {
+    let Some(git) = s.vcs.git() else { return };
+    s.vcs.worktrees_loading = true;
+    let tx = s.vcs.tx.clone();
+    spawn("worktrees", move || {
+        let _ = tx.send(Event::Worktrees(codecraft_vcs::worktree::list(&git)));
+    });
+}
+
+pub fn add_worktree(
+    s: &mut Session,
+    path: PathBuf,
+    branch: String,
+    new_branch: bool,
+    base: Option<String>,
+    open: bool,
+) -> Result<(), CommandError> {
+    let open_path = open.then(|| path.clone());
+    start_op(s, "New Worktree", OpKind::Worktrees { open: open_path }, move |git| {
+        codecraft_vcs::worktree::add(git, &path, &branch, new_branch, base.as_deref())?;
+        Ok(format!("Work tree for {branch} created at {}", path.display()))
+    })
+}
+
+pub fn remove_worktree(s: &mut Session, path: PathBuf, force: bool) -> Result<(), CommandError> {
+    let main = s.vcs.worktrees.first().map(|w| w.path.clone());
+    let root = s.vcs.repo.as_ref().map(|r| (r.root.clone(), r.toplevel.clone()));
+    let is_current = root.is_some_and(|(a, b)| path == a || path == b);
+    if main.as_deref() == Some(path.as_path()) || is_current {
+        return Err(CommandError::Failed("The main or current work tree cannot be removed".into()));
+    }
+    start_op(s, "Remove Worktree", OpKind::Worktrees { open: None }, move |git| {
+        codecraft_vcs::worktree::remove(git, &path, force)?;
+        Ok(format!("Work tree {} removed", path.display()))
+    })
+}
+
+/// Load the user's GitHub repositories (Clone dialog) through `gh`.
+pub fn load_github_repos(s: &mut Session) -> Result<(), CommandError> {
+    let program = s.vcs.gh_path().ok_or_else(|| CommandError::Failed(codecraft_vcs::github::GH_INSTALL_HINT.into()))?;
+    let dir = s.project_root().or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_else(std::env::temp_dir);
+    let gh = s.vcs.gh_in(program, &dir);
+    s.vcs.github_loading = true;
+    let tx = s.vcs.tx.clone();
+    spawn("gh-repos", move || {
+        let _ = tx.send(Event::GhRepos(codecraft_vcs::github::list_repos(&gh, 100)));
+    });
+    Ok(())
+}
+
+/// Push the current branch if the remote lacks commits, then `gh pr create`.
+pub fn create_pull_request(s: &mut Session, mut req: PullRequestRequest, open: bool) -> Result<(), CommandError> {
+    let program = s.vcs.gh_path().ok_or_else(|| CommandError::Failed(codecraft_vcs::github::GH_INSTALL_HINT.into()))?;
+    let remote = s
+        .vcs
+        .github_remote()
+        .map(|r| r.name.clone())
+        .ok_or_else(|| CommandError::Failed("The repository has no GitHub remote (Git › Manage Remotes…)".into()))?;
+    let branch =
+        s.vcs.branch_name().map(str::to_string).ok_or_else(|| CommandError::Failed("Check out a branch first".into()))?;
+    if req.title.trim().is_empty() {
+        return Err(CommandError::BadParams("enter a title".into()));
+    }
+    req.head = branch.clone();
+    let root = s.vcs.repo.as_ref().map(|r| r.root.clone()).unwrap_or_default();
+    let gh = s.vcs.gh_in(program, &root);
+    let upstream = s.vcs.status.branch.upstream.clone();
+    let ahead = s.vcs.status.branch.ahead;
+    start_op(s, "Create Pull Request", OpKind::PullRequest { open }, move |git| {
+        if upstream.is_none() || ahead > 0 {
+            let (r, rb) = match upstream.as_deref().and_then(|u| u.split_once('/')) {
+                Some((r, b)) => (r.to_string(), b.to_string()),
+                None => (remote, branch.clone()),
+            };
+            let push = PushRequest {
+                remote: r,
+                branch,
+                remote_branch: Some(rb),
+                set_upstream: upstream.is_none(),
+                ..PushRequest::default()
+            };
+            codecraft_vcs::ops::push(git, &push)?;
+        }
+        codecraft_vcs::github::create_pull_request(&gh, &req)
+    })
 }

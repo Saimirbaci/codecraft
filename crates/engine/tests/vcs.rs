@@ -71,6 +71,8 @@ impl Env {
         let mut s = Session::new();
         s.lsp_enabled = false;
         s.vcs.set_git_env(self.env());
+        // Never the real GitHub CLI.
+        s.vcs.gh_program = self.root.join("no-gh-here");
         s.execute("file.open", &json!({ "path": self.root })).unwrap();
         settle(&mut s, "repository", |s| s.vcs.repo.is_some() && s.vcs.status.branch.head.is_some());
         s

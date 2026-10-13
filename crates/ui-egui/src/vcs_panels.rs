@@ -944,6 +944,7 @@ pub fn overlays(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     dialogs(ctx, s, st);
     compare_window(ctx, s, st);
     hunk_popup(ctx, s, st);
+    crate::vcs_merge_ui::merge_window(ctx, s, st);
     if s.vcs.busy() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -1005,6 +1006,12 @@ fn hunk_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         }
                         if ui.small_button("Rollback").on_hover_text("Rollback Lines (⌥⌘Z)").clicked() {
                             cmd = Some(("vcs.rollbackHunk", Value::Null));
+                        }
+                        if ui.small_button("Unstage").on_hover_text("Take these lines out of the index").clicked() {
+                            cmd = Some(("vcs.unstageHunk", Value::Null));
+                        }
+                        if ui.small_button("Stage").on_hover_text("Stage only these lines").clicked() {
+                            cmd = Some(("vcs.stageHunk", Value::Null));
                         }
                     });
                 });
@@ -1102,6 +1109,9 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         Dialog::Conflicts { .. } => "Conflicts".into(),
         Dialog::Compare { branch: true, .. } => "Compare with Branch".into(),
         Dialog::Compare { .. } => "Compare with Revision".into(),
+        Dialog::NewWorktree { .. } => "New Worktree".into(),
+        Dialog::Worktrees { .. } => "Worktrees".into(),
+        Dialog::CreatePullRequest { .. } => "Create Pull Request".into(),
     };
     let field_w = 360.0;
     crate::windows::resizable(egui::Window::new(title).default_width(480.0), st, "vcs-dialog")
@@ -1467,6 +1477,11 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         ui.add(TextEdit::singleline(directory).desired_width(field_w));
                         ui.end_row();
                     });
+                    if s.vcs.clone_github
+                        && let Some(a) = crate::vcs_merge_ui::github_repos(ui, s, &theme, url)
+                    {
+                        action = Some(a);
+                    }
                     if let Some(op) = &busy {
                         ui.horizontal(|ui| {
                             ui.add(egui::Spinner::new().size(12.0));
@@ -1527,11 +1542,21 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                             action = Some(("vcs.acceptTheirs", p.clone()));
                         }
                         if ui
-                            .add_enabled(can, egui::Button::new("Merge…"))
+                            .add_enabled(can && s.vcs.merge_loading.is_none(), egui::Button::new("Merge…"))
+                            .on_hover_text("Resolve the conflicts in the three-way merge view")
+                            .clicked()
+                        {
+                            action = Some(("vcs.mergeView", p.clone()));
+                        }
+                        if ui
+                            .add_enabled(can, egui::Button::new("Open File"))
                             .on_hover_text("Open the file with its conflict markers")
                             .clicked()
                         {
                             action = Some(("vcs.mergeConflict", p.clone()));
+                        }
+                        if s.vcs.merge_loading.is_some() {
+                            ui.add(egui::Spinner::new().size(12.0));
                         }
                         if ui.add_enabled(can, egui::Button::new("Mark Resolved")).clicked() {
                             action = Some(("vcs.markResolved", p));
@@ -1573,6 +1598,11 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                             },
                         );
                     });
+                }
+                other @ (Dialog::NewWorktree { .. } | Dialog::Worktrees { .. } | Dialog::CreatePullRequest { .. }) => {
+                    let r = crate::vcs_merge_ui::more_dialogs(ui, s, &theme, other, busy.is_some(), enter);
+                    action = r.0;
+                    close |= r.1;
                 }
                 Dialog::Compare { path, rev, branch } => {
                     ui.label(RichText::new(path.as_str()).strong());

@@ -213,10 +213,32 @@ pub fn rust_sysroot(rustc: Option<&Path>) -> Option<PathBuf> {
     output_of(&rustc, &["--print", "sysroot"]).map(PathBuf::from).filter(|p| p.is_dir())
 }
 
+/// The directory with Rust's LLDB formatters (`lldb_lookup.py`, `lldb_commands`): the toolchain's
+/// own `lib/rustlib/etc`, else (a toolchain installed without them) the newest sibling rustup
+/// toolchain's, which is what `rust-lldb` would need too.
+pub fn rust_formatters_dir(sysroot: &Path) -> Option<PathBuf> {
+    let etc_of = |root: &Path| root.join("lib").join("rustlib").join("etc");
+    let own = etc_of(sysroot);
+    if own.join("lldb_lookup.py").is_file() {
+        return Some(own);
+    }
+    let toolchains = sysroot.parent()?;
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(toolchains)
+        .ok()?
+        .flatten()
+        .map(|e| etc_of(&e.path()))
+        .filter(|etc| etc.join("lldb_lookup.py").is_file())
+        .take(64)
+        .collect();
+    // Toolchain directories are named by version or channel; the last in order is the newest.
+    candidates.sort();
+    candidates.pop()
+}
+
 /// LLDB commands that load Rust's pretty printers (so `Vec`, `String`, `Option`… display their
 /// contents), from the toolchain's `lib/rustlib/etc`.
 pub fn rust_lldb_init_commands(sysroot: &Path) -> Vec<String> {
-    let etc = sysroot.join("lib").join("rustlib").join("etc");
+    let Some(etc) = rust_formatters_dir(sysroot) else { return Vec::new() };
     let mut commands = Vec::new();
     let lookup = etc.join("lldb_lookup.py");
     if lookup.is_file() {
@@ -245,6 +267,28 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert!(commands[0].starts_with("command script import"));
         assert!(commands[1].contains("lldb_commands"));
+    }
+
+    #[test]
+    fn formatters_fall_back_to_a_sibling_toolchain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("1.90-aarch64-apple-darwin");
+        std::fs::create_dir_all(bare.join("lib/rustlib/etc")).unwrap();
+        assert_eq!(rust_formatters_dir(&bare), None);
+        for v in ["1.85-x", "1.86-x"] {
+            let etc = tmp.path().join(v).join("lib/rustlib/etc");
+            std::fs::create_dir_all(&etc).unwrap();
+            std::fs::write(etc.join("lldb_lookup.py"), "").unwrap();
+        }
+        assert_eq!(rust_formatters_dir(&bare), Some(tmp.path().join("1.86-x/lib/rustlib/etc")));
+        let commands = rust_lldb_init_commands(&bare);
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("1.86-x"), "{commands:?}");
+        // The toolchain's own formatters win.
+        let own = bare.join("lib/rustlib/etc");
+        std::fs::write(own.join("lldb_lookup.py"), "").unwrap();
+        assert_eq!(rust_formatters_dir(&bare), Some(own));
+        assert_eq!(rust_formatters_dir(Path::new("/")), None);
     }
 
     #[test]

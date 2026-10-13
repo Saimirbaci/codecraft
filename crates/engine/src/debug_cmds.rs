@@ -259,6 +259,82 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             s.debug.console.clear();
             ok()
         }),
+        // ----- attach to process
+        spec(
+            "run.attachToProcess",
+            "Attach to Process…",
+            None,
+            "{pid?: int, kind?: native|rust|python, name?: string} — with `pid`, attach to that process; \
+             without, open the process list",
+            Context::Global,
+            always,
+            attach_to_process,
+        ),
+        spec(
+            "debug.attach.refresh",
+            "Refresh Process List",
+            None,
+            "{allUsers?: bool} — list the processes again (all users' with `allUsers`)",
+            Context::Global,
+            attach_open,
+            |s, p| {
+                let all = s.debug.attach.as_ref().is_some_and(|a| a.all_users);
+                debug::open_attach_picker(s);
+                if let Some(a) = &mut s.debug.attach {
+                    a.all_users = bool_or(p, "allUsers", all);
+                }
+                ok()
+            },
+        ),
+        spec(
+            "debug.attach.filter",
+            "Filter Process List",
+            None,
+            "{query: string} — show the processes whose name, command line or pid match",
+            Context::Global,
+            attach_open,
+            |s, p| {
+                let query = req_str(p, "query")?.to_owned();
+                if let Some(a) = &mut s.debug.attach {
+                    a.query = query;
+                    a.selected = 0;
+                }
+                Ok(attach_list(s))
+            },
+        ),
+        spec(
+            "debug.attach.move",
+            "Move in Process List",
+            None,
+            "{delta: int} — move the selection",
+            Context::Global,
+            attach_open,
+            |s, p| {
+                let delta = p.get("delta").and_then(Value::as_i64).unwrap_or(1);
+                if let Some(a) = &mut s.debug.attach {
+                    let len = a.visible().len();
+                    if len > 0 {
+                        let len = i64::try_from(len).unwrap_or(i64::MAX);
+                        let cur = i64::try_from(a.selected).unwrap_or(0);
+                        a.selected = usize::try_from(cur.saturating_add(delta).clamp(0, len - 1)).unwrap_or(0);
+                    }
+                }
+                ok()
+            },
+        ),
+        spec(
+            "debug.attach.confirm",
+            "Attach to Selected Process",
+            None,
+            "{index?: int} — attach to the selected (or given visible) process",
+            Context::Global,
+            attach_open,
+            attach_confirm,
+        ),
+        spec("debug.attach.cancel", "Close Process List", None, "", Context::Global, always, |s, _| {
+            s.debug.attach = None;
+            ok()
+        }),
         spec(
             "debug.state",
             "Debugger State",
@@ -287,6 +363,10 @@ fn running(s: &Session) -> Result<(), String> {
 
 fn has_session(s: &Session) -> Result<(), String> {
     if s.debug.is_active() { Ok(()) } else { Err("start debugging first".into()) }
+}
+
+fn attach_open(s: &Session) -> Result<(), String> {
+    if s.debug.attach.is_some() { Ok(()) } else { Err("the process list is not open".into()) }
 }
 
 fn has_last_target(s: &Session) -> Result<(), String> {
@@ -424,6 +504,50 @@ fn debug_executable(s: &mut Session, p: &Value) -> CmdResult {
     };
     debug::start(s, target)?;
     started(s, &name)
+}
+
+fn attach_to_process(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(pid) = p.get("pid") else {
+        debug::open_attach_picker(s);
+        return ok();
+    };
+    let pid = pid
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| CommandError::BadParams("`pid` must be a process id".into()))?;
+    let process = match opt_str(p, "kind") {
+        None => debug::ProcessKind::Native,
+        Some(k) => serde_json::from_value(json!(k))
+            .map_err(|_| CommandError::BadParams(format!("unknown kind `{k}` (native, rust or python)")))?,
+    };
+    let name = opt_str(p, "name").map_or_else(|| format!("Attach to {pid}"), str::to_owned);
+    attach(s, pid, process, name)
+}
+
+fn attach(s: &mut Session, pid: u32, process: debug::ProcessKind, name: String) -> CmdResult {
+    s.debug.attach = None;
+    debug::start(s, DebugTarget::Attach { name: name.clone(), pid, process })?;
+    started(s, &name)
+}
+
+fn attach_confirm(s: &mut Session, p: &Value) -> CmdResult {
+    let index = opt_usize(p, "index")?;
+    let Some(picker) = &s.debug.attach else { return ok() };
+    let process = match index {
+        Some(i) => picker.visible().get(i).and_then(|i| picker.processes.get(*i)),
+        None => picker.selected_process(),
+    };
+    let Some(process) = process.cloned() else {
+        return Err(CommandError::Failed("no process is selected".into()));
+    };
+    attach(s, process.pid, process.kind, format!("{} ({})", process.name, process.pid))
+}
+
+/// The visible processes (for agents driving the list).
+fn attach_list(s: &Session) -> Value {
+    let Some(a) = &s.debug.attach else { return Value::Null };
+    let items: Vec<&debug::ProcessInfo> = a.visible().iter().filter_map(|i| a.processes.get(*i)).take(200).collect();
+    json!({ "loading": a.loading, "error": a.error, "selected": a.selected, "processes": items })
 }
 
 /// What to debug for a file and line: Rust tests and `main` (via the run context), Python files,

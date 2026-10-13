@@ -163,3 +163,75 @@ fn postgres_bad_credentials_fail_cleanly() {
     cfg.port = Some(1);
     assert!(connect(&cfg, None).is_err());
 }
+
+#[test]
+fn postgres_grid_edits_apply_in_one_transaction() {
+    use codecraft_db::edit::{RowChange, apply};
+    let Some(mut conn) = server() else { return };
+    let schema = format!("codecraft_edit_{}", std::process::id());
+    let guard = Schema(conn.as_mut(), schema.clone());
+    let c = &mut *guard.0;
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!(
+            "CREATE TABLE {schema}.\"T x\" (id int, k text, v text, flag boolean, raw bytea, n numeric DEFAULT 7, \
+             PRIMARY KEY (id, k))"
+        ),
+        format!("INSERT INTO {schema}.\"T x\" VALUES (1, 'a', 'one', true, NULL), (2, 'b', 'two', false, NULL)"),
+    ] {
+        query_all(c, &sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+    let key = |id: i64, k: &str| vec![("id".to_string(), Cell::Int(id)), ("k".to_string(), Cell::Text(k.into()))];
+    let changes = vec![
+        RowChange::Update {
+            key: key(1, "a"),
+            set: vec![
+                ("v".into(), Cell::Text("it's \\ back".into())),
+                ("flag".into(), Cell::Bool(false)),
+                ("raw".into(), Cell::Bytes(vec![0, 0xff])),
+            ],
+        },
+        RowChange::Delete { key: key(2, "b") },
+        RowChange::Insert { values: vec![("id".into(), Cell::Int(3)), ("k".into(), Cell::Text("c".into()))] },
+    ];
+    assert_eq!(apply(c, &schema, "T x", &changes).unwrap(), 3);
+    let (_, rows, _) =
+        query_all(c, &format!("SELECT id, v, flag, raw, n::text FROM {schema}.\"T x\" ORDER BY id")).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], Cell::Text("it's \\ back".into()));
+    assert_eq!(rows[0][2], Cell::Bool(false));
+    assert_eq!(rows[0][3], Cell::Bytes(vec![0, 0xff]));
+    assert_eq!(rows[1][4], Cell::Text("7".into()));
+    // A stale key rolls the whole batch back.
+    let e = apply(c, &schema, "T x", &[RowChange::Delete { key: key(3, "c") }, RowChange::Delete { key: key(2, "b") }])
+        .unwrap_err();
+    assert!(e.to_string().contains("changed or deleted"), "{e}");
+    let (_, rows, _) = query_all(c, &format!("SELECT count(*) FROM {schema}.\"T x\"")).unwrap();
+    assert_eq!(rows[0][0], Cell::Int(2));
+}
+
+#[test]
+fn postgres_sslmode() {
+    let Some(mut conn) = server() else { return };
+    let (_, rows, _) = query_all(conn.as_mut(), "SHOW ssl").unwrap();
+    let ssl_on = rows.first().and_then(|r| r.first()) == Some(&Cell::Text("on".into()));
+    let with = |mode: &str| {
+        let mut cfg = config();
+        cfg.options.insert("sslmode".into(), mode.into());
+        connect(&cfg, std::env::var("CODECRAFT_TEST_PG_PASSWORD").ok().as_deref())
+    };
+    // prefer falls back to plain text when the server has no TLS; disable never tries.
+    assert!(with("prefer").is_ok());
+    assert!(with("disable").is_ok());
+    match with("require") {
+        Ok(_) => assert!(ssl_on, "require connected to a server without TLS"),
+        Err(e) => assert!(!ssl_on || cfg!(not(any(target_os = "macos", target_os = "windows"))), "{e}"),
+    }
+    // A missing root certificate is a configuration error, not a panic.
+    let mut cfg = config();
+    cfg.options.insert("sslmode".into(), "verify-full".into());
+    cfg.options.insert("sslrootcert".into(), "/nonexistent/root.pem".into());
+    let e = connect(&cfg, None).err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(e.contains("root.pem") || e.contains("not supported"), "{e}");
+}

@@ -353,6 +353,10 @@ impl Inner {
     /// sure the adapter and its process group are gone within `grace`. Never blocks: the waiting
     /// happens on a helper thread. Only the first call does anything.
     pub(crate) fn terminate(self: &Arc<Self>, grace: Duration) {
+        self.terminate_with(grace, true);
+    }
+
+    pub(crate) fn terminate_with(self: &Arc<Self>, grace: Duration, terminate_debuggee: bool) {
         if self.stop_requested.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -362,7 +366,7 @@ impl Inner {
                 "seq": seq,
                 "type": "request",
                 "command": "disconnect",
-                "arguments": { "restart": false, "terminateDebuggee": true },
+                "arguments": { "restart": false, "terminateDebuggee": terminate_debuggee },
             })));
         }
         let me = Arc::clone(self);

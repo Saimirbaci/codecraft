@@ -27,6 +27,7 @@ use codecraft_text::SelectionSet;
 use codecraft_workspace::{NotificationLevel, ToolWindowId};
 
 use crate::{CommandError, Session};
+pub use codecraft_dap::processes::{ProcessInfo, ProcessKind};
 
 /// The debug console keeps at most this many lines.
 pub const MAX_CONSOLE_LINES: usize = 20_000;
@@ -337,6 +338,15 @@ pub enum DebugTarget {
         #[serde(default)]
         cwd: Option<PathBuf>,
     },
+    /// A running process (Run › Attach to Process…): lldb-dap for native and Rust programs,
+    /// debugpy for Python. Stopping detaches and leaves the process running.
+    #[serde(rename_all = "camelCase")]
+    Attach {
+        name: String,
+        pid: u32,
+        #[serde(default)]
+        process: ProcessKind,
+    },
 }
 
 fn yes() -> bool {
@@ -351,9 +361,100 @@ impl DebugTarget {
             | Self::Python { name, .. }
             | Self::Zig { name, .. }
             | Self::ZigFile { name, .. }
-            | Self::Node { name, .. } => name,
+            | Self::Node { name, .. }
+            | Self::Attach { name, .. } => name,
         }
     }
+}
+
+/// The Attach to Process list: the machine's processes (the user's own first), filtered by a
+/// query on the name, command line or pid.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPicker {
+    pub processes: Vec<ProcessInfo>,
+    pub query: String,
+    /// Index into [`AttachPicker::visible`].
+    pub selected: usize,
+    /// `ps` is still running.
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Show other users' processes too.
+    pub all_users: bool,
+    pub user: Option<String>,
+}
+
+impl AttachPicker {
+    /// Indices of the processes that match the query (and the user filter).
+    pub fn visible(&self) -> Vec<usize> {
+        let q = self.query.trim().to_lowercase();
+        self.processes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| self.all_users || self.user.as_ref().is_none_or(|u| &p.user == u))
+            .filter(|(_, p)| {
+                q.is_empty()
+                    || p.name.to_lowercase().contains(&q)
+                    || p.command.to_lowercase().contains(&q)
+                    || p.pid.to_string().starts_with(&q)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selected_process(&self) -> Option<&ProcessInfo> {
+        self.visible().get(self.selected).and_then(|i| self.processes.get(*i))
+    }
+}
+
+/// Open the Attach to Process list and list the processes on a worker thread.
+pub(crate) fn open_attach_picker(s: &mut Session) {
+    let previous = s.debug.attach.take().unwrap_or_default();
+    s.debug.attach = Some(AttachPicker {
+        loading: true,
+        query: previous.query,
+        all_users: previous.all_users,
+        user: dap::processes::current_user(),
+        ..AttachPicker::default()
+    });
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let spawned = std::thread::Builder::new().name("debug-ps".into()).spawn(move || {
+        let _ = tx.send(dap::processes::list_processes());
+    });
+    match spawned {
+        Ok(_) => s.debug.attach_rx = Some(rx),
+        Err(e) => {
+            if let Some(p) = &mut s.debug.attach {
+                p.loading = false;
+                p.error = Some(format!("cannot start a worker thread: {e}"));
+            }
+        }
+    }
+}
+
+fn pump_attach(s: &mut Session) -> bool {
+    let Some(rx) = &s.debug.attach_rx else { return false };
+    let result = match rx.try_recv() {
+        Ok(r) => r,
+        Err(crossbeam_channel::TryRecvError::Empty) => return false,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => Err("the process list failed".into()),
+    };
+    s.debug.attach_rx = None;
+    let me = std::process::id();
+    if let Some(p) = &mut s.debug.attach {
+        p.loading = false;
+        match result {
+            Ok(mut list) => {
+                list.retain(|x| x.pid != me);
+                // Newest (highest pid) first, like the most recently started programs.
+                list.sort_by_key(|a| std::cmp::Reverse(a.pid));
+                p.processes = list;
+                p.selected = 0;
+                p.error = None;
+            }
+            Err(e) => p.error = Some(e),
+        }
+    }
+    true
 }
 
 /// The debugger's state on the [`Session`].
@@ -376,6 +477,9 @@ pub struct DebugState {
     pub break_on_panic: bool,
     /// The last target debugged (Rerun).
     pub last_target: Option<DebugTarget>,
+    /// Run › Attach to Process…'s process list while it is open.
+    pub attach: Option<AttachPicker>,
+    attach_rx: Option<Receiver<Result<Vec<ProcessInfo>, String>>>,
     next_id: u64,
     /// The project whose breakpoints are loaded (`Some(None)`: none open, loaded nothing).
     loaded_for: Option<Option<PathBuf>>,
@@ -400,6 +504,8 @@ impl Default for DebugState {
             choosing: false,
             break_on_panic: true,
             last_target: None,
+            attach: None,
+            attach_rx: None,
             next_id: 1,
             loaded_for: None,
             anchors: HashMap::new(),
@@ -425,7 +531,7 @@ impl DebugState {
 
     /// Background work is in flight (the UI keeps polling).
     pub fn busy(&self) -> bool {
-        self.rt.is_some()
+        self.rt.is_some() || self.attach_rx.is_some()
     }
 
     /// Something will change without user input: building, starting, running, or answers still
@@ -552,6 +658,7 @@ enum RunSpec {
     Native { program: Option<PathBuf>, rust: bool },
     Python { program: Option<PathBuf>, module: Option<String>, python: Option<PathBuf>, just_my_code: bool },
     Node { program: PathBuf },
+    Attach { pid: u32, process: ProcessKind },
 }
 
 struct Prepared {
@@ -673,6 +780,26 @@ impl Runtime {
             project_root,
             canonical_root,
             launch_args: None,
+        }
+    }
+
+    /// A Rust program under an LLDB adapter (values get Rust's formatting clean-up).
+    fn is_rust(&self) -> bool {
+        matches!(
+            self.plan.run,
+            RunSpec::Native { rust: true, .. } | RunSpec::Attach { process: ProcessKind::Rust, .. }
+        )
+    }
+
+    /// Attached to a process we did not start: stopping detaches and never kills it.
+    fn attached(&self) -> bool {
+        matches!(self.plan.run, RunSpec::Attach { .. })
+    }
+
+    /// End the session with `disconnect`: detach from an attached process, else terminate.
+    fn end(&self, grace: Duration) {
+        if let Some(client) = self.client() {
+            if self.attached() { client.detach(grace) } else { client.terminate(grace) }
         }
     }
 
@@ -819,6 +946,19 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                 run: RunSpec::Native { program: None, rust: false },
                 args: args.clone(),
                 cwd: Some(dir),
+                env: Vec::new(),
+            })
+        }
+        DebugTarget::Attach { name, pid, process } => {
+            if *pid == 0 || *pid == std::process::id() {
+                return Err(format!("cannot attach to process {pid}"));
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::Attach { pid: *pid, process: *process },
+                args: Vec::new(),
+                cwd: None,
                 env: Vec::new(),
             })
         }
@@ -970,6 +1110,22 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
             });
             (adapter, launch)
         }
+        RunSpec::Attach { pid, process: ProcessKind::Python } => {
+            let adapter = dap::discover::find_debugpy(None).map_err(|e| e.to_string())?;
+            (adapter, dap::launch::python_attach(&plan.name, *pid, true))
+        }
+        RunSpec::Attach { pid, process } => {
+            let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
+            let init_commands = if *process == ProcessKind::Rust && adapter.kind == AdapterKind::LldbDap {
+                dap::discover::rust_sysroot(None)
+                    .map(|s| dap::discover::rust_lldb_init_commands(&s))
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let args = dap::launch::native_attach(adapter.kind, &plan.name, *pid, &init_commands);
+            (adapter, args)
+        }
         RunSpec::Node { program } => {
             let adapter = dap::discover::find_js_debug().map_err(|e| e.to_string())?;
             let launch = dap::launch::node(&dap::launch::NodeLaunch {
@@ -994,6 +1150,20 @@ fn adapter_id(kind: AdapterKind) -> &'static str {
         AdapterKind::Debugpy => "debugpy",
         AdapterKind::JsDebug => "pwa-node",
         AdapterKind::Other => "codecraft",
+    }
+}
+
+/// A Rust value as RustRover shows it. lldb-dap prints a pointer-typed value with a summary as
+/// `0x000000010000c1f0 "hello"` (a `&str` whose formatter gives the text): keep the summary only.
+/// Values without a summary (plain pointers, numbers) are unchanged.
+pub fn rust_value(raw: String) -> String {
+    let Some(rest) = raw.strip_prefix("0x") else { return raw };
+    let digits = rest.chars().take_while(char::is_ascii_hexdigit).count();
+    match rest.get(digits..).and_then(|r| r.strip_prefix(' ')) {
+        Some(summary) if digits > 0 && (summary.starts_with(['"', '\'']) || summary.starts_with("size=")) => {
+            summary.to_owned()
+        }
+        _ => raw,
     }
 }
 
@@ -1079,8 +1249,8 @@ pub(crate) fn stop(s: &mut Session) -> bool {
             true
         }
         Phase::Prepare { .. } => true,
-        Phase::Live { client, .. } => {
-            client.terminate(TERMINATE_GRACE);
+        Phase::Live { .. } => {
+            rt.end(TERMINATE_GRACE);
             if !rt.exited
                 && let Some(pid) = pid
             {
@@ -1139,6 +1309,7 @@ pub(crate) fn shutdown(s: &mut Session) {
 /// Drain background events; true if anything changed.
 pub(crate) fn pump(s: &mut Session) -> bool {
     let mut changed = ensure_loaded(s);
+    changed |= pump_attach(s);
     changed |= follow_edits(s);
     let Some(rt) = s.debug.rt.as_mut() else { return changed };
     match &mut rt.phase {
@@ -1295,7 +1466,8 @@ fn on_response(s: &mut Session, response: dap::Response) {
             Ok(body) => {
                 rt.capabilities = dap::types::parse(&body).unwrap_or_default();
                 let args = rt.launch_args.take().unwrap_or(Value::Null);
-                if !rt.request(Pending::Launch, |c| c.launch(args)) {
+                let attach = args.get("request").and_then(Value::as_str) == Some("attach");
+                if !rt.request(Pending::Launch, |c| if attach { c.attach(args) } else { c.launch(args) }) {
                     fail(s, "the debug adapter stopped answering");
                 }
             }
@@ -1307,6 +1479,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                     started(s);
                 }
             }
+            Err(e) if rt.attached() => fail(s, &format!("could not attach: {e}")),
             Err(e) => fail(s, &format!("could not start the program: {e}")),
         },
         Pending::ConfigurationDone => match response.result {
@@ -1387,6 +1560,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
             if epoch != epoch_now {
                 return;
             }
+            let rust = rt.is_rust();
             let Some(session) = s.debug.session.as_mut() else { return };
             session.loading.remove(&reference);
             let vars: Vec<VariableInfo> = match response.result {
@@ -1397,7 +1571,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                     .take(MAX_CHILDREN)
                     .map(|v| VariableInfo {
                         name: v.name,
-                        value: v.value,
+                        value: if rust { rust_value(v.value) } else { v.value },
                         type_name: v.type_.filter(|t| !t.is_empty()),
                         reference: v.variables_reference,
                         evaluate_name: v.evaluate_name,
@@ -1484,9 +1658,7 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
         "terminated" => {
             if let Some(rt) = s.debug.rt.as_mut() {
                 rt.stopping = true;
-                if let Some(client) = rt.client() {
-                    client.terminate(TERMINATE_GRACE);
-                }
+                rt.end(TERMINATE_GRACE);
             }
             end_session(s, DebugStatus::Exited { code: None }, "Debugging finished");
         }
@@ -1527,6 +1699,10 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
         }
         "process" => {
             let ev: dap::ProcessEvent = dap::types::parse(body).unwrap_or_default();
+            // An attached process is not ours to kill when the session ends.
+            if s.debug.rt.as_ref().is_some_and(Runtime::attached) {
+                return;
+            }
             if let (Some(session), Some(pid)) =
                 (&mut s.debug.session, ev.system_process_id.and_then(|p| u32::try_from(p).ok()))
             {
@@ -1811,7 +1987,14 @@ fn request_variables(s: &mut Session, reference: i64, path: String) {
 }
 
 fn on_evaluate(s: &mut Session, current: bool, purpose: EvalPurpose, result: Result<Value, String>) {
-    let parsed = result.map(|body| dap::types::parse::<dap::EvaluateBody>(&body).unwrap_or_default());
+    let rust = s.debug.rt.as_ref().is_some_and(Runtime::is_rust);
+    let parsed = result.map(|body| {
+        let mut body = dap::types::parse::<dap::EvaluateBody>(&body).unwrap_or_default();
+        if rust {
+            body.result = rust_value(std::mem::take(&mut body.result));
+        }
+        body
+    });
     match purpose {
         EvalPurpose::Watch(expression) => {
             if !current {
@@ -2431,6 +2614,66 @@ pub(crate) fn snapshot(s: &Session) -> Value {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rust_values_drop_the_pointer_before_a_summary() {
+        assert_eq!(rust_value("0x000000010000c1f0 \"hello\"".into()), "\"hello\"");
+        assert_eq!(rust_value("0x10 'c'".into()), "'c'");
+        assert_eq!(rust_value("0x0000600000c04000 size=3".into()), "size=3");
+        // Plain pointers, numbers and strings stay as they are.
+        assert_eq!(rust_value("0x000000016fdfe9a0".into()), "0x000000016fdfe9a0");
+        assert_eq!(rust_value("0x \"x\"".into()), "0x \"x\"");
+        assert_eq!(rust_value("0xzz \"x\"".into()), "0xzz \"x\"");
+        assert_eq!(rust_value("42".into()), "42");
+        assert_eq!(rust_value("\"0x1 a\"".into()), "\"0x1 a\"");
+        assert_eq!(rust_value("0x1é \"x\"".into()), "0x1é \"x\"");
+        assert_eq!(rust_value(String::new()), "");
+    }
+
+    #[test]
+    fn attach_picker_filters_by_user_and_query() {
+        let p = |pid: u32, user: &str, cmd: &str| ProcessInfo {
+            pid,
+            user: user.into(),
+            name: cmd.split('/').next_back().unwrap_or(cmd).into(),
+            command: cmd.into(),
+            kind: dap::processes::guess_kind(cmd),
+        };
+        let mut picker = AttachPicker {
+            processes: vec![p(10, "me", "/a/target/debug/app"), p(11, "root", "/sbin/launchd"), p(120, "me", "/usr/bin/python3")],
+            user: Some("me".into()),
+            ..AttachPicker::default()
+        };
+        assert_eq!(picker.visible(), vec![0, 2]);
+        picker.all_users = true;
+        assert_eq!(picker.visible(), vec![0, 1, 2]);
+        picker.query = "PYTHON".into();
+        assert_eq!(picker.visible(), vec![2]);
+        picker.query = "1".into();
+        assert_eq!(picker.visible(), vec![0, 1, 2]);
+        picker.query = "12".into();
+        assert_eq!(picker.selected_process().map(|x| x.pid), Some(120));
+        picker.selected = 5;
+        assert!(picker.selected_process().is_none());
+    }
+
+    #[test]
+    fn attach_commands_never_panic_on_bad_params() {
+        let mut s = Session::new();
+        s.lsp_enabled = false;
+        assert!(s.execute("run.attachToProcess", &json!({ "pid": -1 })).is_err());
+        assert!(s.execute("run.attachToProcess", &json!({ "pid": 99999999999u64 })).is_err());
+        assert!(s.execute("run.attachToProcess", &json!({ "pid": 5, "kind": "cobol" })).is_err());
+        assert!(s.execute("run.attachToProcess", &json!({ "pid": 0 })).is_err());
+        assert!(s.execute("debug.attach.confirm", &json!({})).is_err(), "disabled while closed");
+        s.debug.attach = Some(AttachPicker::default());
+        assert!(s.execute("debug.attach.confirm", &json!({ "index": 99 })).is_err());
+        s.execute("debug.attach.move", &json!({ "delta": -99 })).unwrap();
+        s.execute("debug.attach.move", &json!({ "delta": i64::MAX })).unwrap();
+        s.execute("debug.attach.filter", &json!({ "query": "x" })).unwrap();
+        s.execute("debug.attach.cancel", &Value::Null).unwrap();
+        assert!(s.debug.attach.is_none());
+    }
+
     fn var(name: &str, value: &str) -> VariableInfo {
         VariableInfo { name: name.into(), value: value.into(), type_name: None, reference: 0, evaluate_name: None }
     }
@@ -2532,6 +2775,15 @@ mod tests {
             serde_json::from_value(json!({"kind": "executable", "name": "x", "program": "/bin/ls"})).unwrap();
         assert!(matches!(exe, DebugTarget::Executable { ref args, .. } if args.is_empty()));
         assert!(serde_json::from_value::<DebugTarget>(json!({"kind": "nope"})).is_err());
+        let attach: DebugTarget =
+            serde_json::from_value(json!({"kind": "attach", "name": "a", "pid": 42, "process": "rust"})).unwrap();
+        assert_eq!(attach, DebugTarget::Attach { name: "a".into(), pid: 42, process: ProcessKind::Rust });
+        let plan = plan_for(&attach).unwrap();
+        assert!(matches!(plan.run, RunSpec::Attach { pid: 42, process: ProcessKind::Rust }));
+        assert!(plan.build.is_none());
+        let own = DebugTarget::Attach { name: "me".into(), pid: std::process::id(), process: ProcessKind::Native };
+        assert!(plan_for(&own).is_err());
+        assert!(plan_for(&DebugTarget::Attach { name: "0".into(), pid: 0, process: ProcessKind::Native }).is_err());
     }
 
     #[test]

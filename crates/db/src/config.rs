@@ -61,13 +61,27 @@ impl DbKind {
 }
 
 /// PostgreSQL `sslmode`, with libpq's meaning: `prefer` and `require` encrypt without verifying
-/// the certificate, `verify-ca`/`verify-full` verify it.
+/// the certificate, `verify-ca` verifies the certificate chain and `verify-full` (`Verify`) also
+/// the host name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SslMode {
     Disable,
     Prefer,
     Require,
+    /// `verify-full`.
     Verify,
+    /// `verify-ca`: a trusted chain, any host name.
+    VerifyCa,
+}
+
+/// TLS files from the data source options (libpq names), as paths.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// `sslrootcert`: PEM certificates trusted in addition to the system roots.
+    pub root_cert: Option<PathBuf>,
+    /// `sslcert` + `sslkey`: client certificate and PKCS#8 key (PEM).
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
 }
 
 /// A data source as stored in `.codecraft/datasources.json`. Passwords are not part of it.
@@ -88,7 +102,8 @@ pub struct DataSourceConfig {
     /// SQLite database file (absolute, or relative to the project).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// Driver options: `sslmode` (disable|prefer|require), `connect_timeout` (seconds).
+    /// Driver options: `sslmode` (disable|prefer|require|verify-ca|verify-full), `sslrootcert`,
+    /// `sslcert`, `sslkey` (PEM files), `connect_timeout` (seconds).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub options: BTreeMap<String, String>,
     /// A password for this data source is kept in the secret store.
@@ -121,9 +136,30 @@ impl DataSourceConfig {
             None | Some("") | Some("prefer") | Some("allow") => Ok(SslMode::Prefer),
             Some("disable") => Ok(SslMode::Disable),
             Some("require") => Ok(SslMode::Require),
-            Some("verify-ca") | Some("verify-full") => Ok(SslMode::Verify),
+            Some("verify-ca") => Ok(SslMode::VerifyCa),
+            Some("verify-full") => Ok(SslMode::Verify),
             Some(other) => Err(DbError::Config(format!("unknown sslmode `{other}`"))),
         }
+    }
+
+    /// The TLS files named in the options; relative paths resolve against `base` (the project).
+    pub fn tls_files(&self, base: Option<&std::path::Path>) -> DbResult<TlsFiles> {
+        let get = |k: &str| -> Option<PathBuf> {
+            let v = self.options.get(k)?.trim();
+            if v.is_empty() {
+                return None;
+            }
+            let p = PathBuf::from(v);
+            Some(match base {
+                Some(b) if p.is_relative() => b.join(p),
+                _ => p,
+            })
+        };
+        let files = TlsFiles { root_cert: get("sslrootcert"), client_cert: get("sslcert"), client_key: get("sslkey") };
+        if files.client_cert.is_some() != files.client_key.is_some() {
+            return Err(DbError::Config("a client certificate needs both `sslcert` and `sslkey`".into()));
+        }
+        Ok(files)
     }
 
     pub fn connect_timeout(&self) -> std::time::Duration {
@@ -179,6 +215,19 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.options.insert("sslmode".into(), "require".into());
         assert_eq!(cfg.ssl_mode().unwrap(), SslMode::Require);
+        cfg.options.insert("sslmode".into(), "verify-ca".into());
+        assert_eq!(cfg.ssl_mode().unwrap(), SslMode::VerifyCa);
+        cfg.options.insert("sslmode".into(), "Verify-Full".into());
+        assert_eq!(cfg.ssl_mode().unwrap(), SslMode::Verify);
+        cfg.options.insert("sslrootcert".into(), "certs/root.pem".into());
+        let files = cfg.tls_files(Some(std::path::Path::new("/p"))).unwrap();
+        assert_eq!(files.root_cert, Some(PathBuf::from("/p/certs/root.pem")));
+        cfg.options.insert("sslcert".into(), "/abs/client.pem".into());
+        assert!(cfg.tls_files(None).is_err());
+        cfg.options.insert("sslkey".into(), "key.pem".into());
+        let files = cfg.tls_files(None).unwrap();
+        assert_eq!(files.client_cert, Some(PathBuf::from("/abs/client.pem")));
+        assert_eq!(files.client_key, Some(PathBuf::from("key.pem")));
         cfg.options.insert("sslmode".into(), "bogus".into());
         assert!(cfg.ssl_mode().is_err());
         assert_eq!(DbKind::parse("PostgreSQL"), Some(DbKind::Postgres));

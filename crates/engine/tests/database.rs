@@ -278,3 +278,82 @@ fn hostile_params_fail_cleanly() {
     assert!(s.db.output.iter().any(|l| l.text.contains("is not valid")));
     s.shutdown();
 }
+
+#[test]
+fn sqlite_grid_editing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    make_db(&root.join("lib.db"));
+    let mut s = session(&root);
+    let id = add_sqlite(&mut s);
+    s.execute("db.openTable", &json!({ "dataSource": id, "schema": "main", "table": "authors" })).unwrap();
+    let rid = wait_result(&mut s, None);
+    pump_until(&mut s, "primary key", |s| s.db.editable(rid).is_ok());
+    let changes = s.execute("db.getChanges", &json!({ "result": rid })).unwrap();
+    assert_eq!((changes["editable"].as_bool(), changes["pendingRows"].as_u64()), (Some(true), Some(0)));
+    assert!(s.execute("db.previewChanges", &json!({ "result": rid })).is_err());
+    assert!(s.execute("db.submitChanges", &json!({ "result": rid })).is_err());
+
+    // Edit, add, delete; an edit back to the original value is no edit.
+    s.execute("db.editCell", &json!({ "result": rid, "row": 0, "column": 1, "value": "Ann O'Hara" })).unwrap();
+    s.execute("db.editCell", &json!({ "result": rid, "row": 1, "column": 1, "value": "Bobby" })).unwrap();
+    s.execute("db.editCell", &json!({ "result": rid, "row": 1, "column": 1, "value": "Bob" })).unwrap();
+    let new = s.execute("db.addRow", &json!({ "result": rid })).unwrap()["row"].as_u64().unwrap();
+    assert_eq!(new, 2);
+    s.execute("db.editCell", &json!({ "result": rid, "row": 2, "column": 1, "value": "Cy" })).unwrap();
+    let extra = s.execute("db.addRow", &json!({ "result": rid })).unwrap()["row"].as_u64().unwrap();
+    s.execute("db.deleteRows", &json!({ "result": rid, "rows": [extra] })).unwrap();
+    // Bad params fail cleanly.
+    assert!(s.execute("db.editCell", &json!({ "result": rid, "row": 99, "column": 1, "value": "x" })).is_err());
+    assert!(s.execute("db.editCell", &json!({ "result": rid, "row": 0, "column": 9, "value": "x" })).is_err());
+    assert!(s.execute("db.editCell", &json!({ "result": rid, "row": 0, "column": 1, "value": [1] })).is_err());
+    assert!(s.execute("db.editCell", &json!({ "result": rid, "row": 0, "column": 1 })).is_err());
+    assert!(s.execute("db.deleteRows", &json!({ "result": rid, "rows": "all" })).is_err());
+    assert!(s.execute("db.sortResult", &json!({ "result": rid, "column": 1 })).is_err());
+
+    let preview = s.execute("db.previewChanges", &json!({ "result": rid })).unwrap();
+    let statements: Vec<&str> = preview["statements"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(
+        statements,
+        [
+            "UPDATE \"main\".\"authors\" SET \"name\" = 'Ann O''Hara' WHERE \"id\" = 1",
+            "INSERT INTO \"main\".\"authors\" (\"name\") VALUES ('Cy')",
+        ]
+    );
+    assert!(s.db.edit_preview.is_some());
+
+    // A failing submit (NOT NULL) keeps the changes and reports the error.
+    s.execute("db.addRow", &json!({ "result": rid })).unwrap();
+    s.execute("db.submitChanges", &json!({ "result": rid })).unwrap();
+    assert!(s.db.edit_preview.is_none());
+    pump_until(&mut s, "failed submit", |s| s.db.result(rid).is_some_and(|r| !r.edits.submitting));
+    let r = s.db.result(rid).unwrap();
+    assert!(r.edits.error.as_deref().is_some_and(|e| e.contains("NOT NULL")), "{:?}", r.edits.error);
+    assert_eq!(r.edits.pending_rows(), 3);
+    s.execute("db.revertChanges", &json!({ "result": rid, "rows": [3] })).unwrap();
+
+    // Submit: one transaction, then the table reloads with the new data.
+    s.execute("db.submitChanges", &json!({ "result": rid })).unwrap();
+    pump_until(&mut s, "submitted", |s| {
+        s.db.result(rid).is_some_and(|r| !r.edits.submitting && !r.is_running() && r.rows.len() == 3)
+    });
+    let r = s.db.result(rid).unwrap();
+    assert!(r.edits.is_empty());
+    assert_eq!(r.rows[0][1], Cell::Text("Ann O'Hara".into()));
+    assert_eq!(r.rows[2][1], Cell::Text("Cy".into()));
+
+    // Delete a row; NULL through the grid.
+    s.execute("db.editCell", &json!({ "result": rid, "row": 1, "column": 1, "value": null })).unwrap();
+    s.execute("db.revertChanges", &json!({ "result": rid })).unwrap();
+    s.execute("db.deleteRows", &json!({ "result": rid, "rows": [2] })).unwrap();
+    s.execute("db.submitChanges", &json!({ "result": rid })).unwrap();
+    pump_until(&mut s, "deleted", |s| {
+        s.db.result(rid).is_some_and(|r| !r.edits.submitting && !r.is_running() && r.rows.len() == 2)
+    });
+
+    // Query results and read-only data sources are not editable.
+    s.execute("db.execute", &json!({ "dataSource": id, "sql": "select * from authors" })).unwrap();
+    let q = wait_result(&mut s, Some(rid));
+    assert!(s.execute("db.editCell", &json!({ "result": q, "row": 0, "column": 1, "value": "x" })).is_err());
+    assert!(s.execute("db.getChanges", &json!({ "result": q })).unwrap()["reason"].as_str().is_some());
+}

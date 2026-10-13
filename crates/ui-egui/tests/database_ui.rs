@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Key, Modifiers};
 use egui_kittest::Harness;
+use egui_kittest::kittest::Queryable;
 use serde_json::{Value, json};
 
 use codecraft_engine::Popup;
@@ -103,6 +104,46 @@ fn console_executes_with_cmd_enter_and_completes_with_ctrl_space() {
     h.run_steps(5);
     assert!(h.state().session.db.dialog.is_some());
     h.state_mut().session.execute("db.closeDialog", &Value::Null).unwrap();
+    h.run_steps(2);
+    h.state_mut().session.shutdown();
+}
+
+#[test]
+fn table_grid_shows_pending_changes_and_submits_from_the_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    project(&root);
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe({
+        let root = root.clone();
+        move |_| App::ephemeral(Some(root))
+    });
+    settle(&mut h, "project", |a| a.session.ws.project.as_ref().is_some_and(|p| !p.tree.is_empty()));
+    h.state_mut().session.db.set_secret_store(Arc::new(MemoryStore::default()));
+    let s = &mut h.state_mut().session;
+    s.execute("db.addDataSource", &json!({ "kind": "sqlite", "name": "Lib", "path": "lib.db" })).unwrap();
+    s.execute("db.openTable", &json!({ "dataSource": "lib", "schema": "main", "table": "books" })).unwrap();
+    settle(&mut h, "editable table", |a| a.session.db.active().is_some_and(|r| a.session.db.editable(r.id).is_ok()));
+    let rid = h.state().session.db.active_result.unwrap();
+
+    // Edited, new and deleted rows render; the preview lists the SQL and submits it.
+    let s = &mut h.state_mut().session;
+    s.execute("db.editCell", &json!({ "result": rid, "row": 0, "column": 2, "value": "edited" })).unwrap();
+    let new = s.execute("db.addRow", &json!({ "result": rid })).unwrap()["row"].as_u64().unwrap();
+    s.execute("db.editCell", &json!({ "result": rid, "row": new, "column": 1, "value": "Odyssey" })).unwrap();
+    s.execute("db.deleteRows", &json!({ "result": rid, "rows": [1] })).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("3 pending rows").is_some());
+    h.state_mut().session.execute("db.previewChanges", &json!({ "result": rid })).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("UPDATE \"main\".\"books\" SET \"note\" = 'edited'").is_some());
+    h.get_by_label("Submit").click();
+    settle(&mut h, "submitted", |a| {
+        a.session.db.result(rid).is_some_and(|r| r.edits.is_empty() && !r.edits.submitting && !r.is_running())
+            && a.session.db.edit_preview.is_none()
+    });
+    settle(&mut h, "reloaded", |a| a.session.db.result(rid).is_some_and(|r| r.rows.len() == 2 && !r.is_running()));
+    let r = h.state().session.db.result(rid).unwrap();
+    assert_eq!(r.rows[1][1], codecraft_engine::db::Cell::Text("Odyssey".into()));
     h.run_steps(2);
     h.state_mut().session.shutdown();
 }
