@@ -41,7 +41,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.update",
             "Edit Run Configuration",
             None,
-            "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?} — change a user configuration",
+            "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?, target?: {kind: local|docker|ssh, …}|null} — change a user configuration",
             Context::Global,
             has_project,
             update,
@@ -192,6 +192,13 @@ fn fill(c: &mut UserRunConfig, p: &Value) -> Result<(), String> {
         c.working_dir = match v {
             Value::Null => String::new(),
             v => v.as_str().ok_or("`workingDir` must be text")?.trim().to_string(),
+        };
+    }
+    // M11: `{kind: "local"}`, `{kind: "docker", image, …}` or `{kind: "ssh", …}`; null = local.
+    if let Some(v) = p.get("target") {
+        c.target = match v {
+            Value::Null => Default::default(),
+            v => serde_json::from_value(v.clone()).map_err(|e| format!("bad `target`: {e}"))?,
         };
     }
     Ok(())

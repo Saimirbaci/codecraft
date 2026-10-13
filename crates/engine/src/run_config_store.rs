@@ -40,6 +40,20 @@ pub enum RunKind {
     Zig,
     /// `command` is the arguments of the project's package manager (`run dev`, `test`).
     Npm,
+    /// `command` is the arguments of `manage.py` (`runserver 8000`), run by the project's Python.
+    Django,
+    /// `command` is the arguments of uvicorn (`main:app --reload`), run by the project's Python.
+    #[serde(rename = "fastapi")]
+    FastApi,
+    /// `command` is the arguments of `flask` (`--app app run --debug`), run by the project's Python.
+    Flask,
+    /// `command` is a Dockerfile, then `docker run` options, then optionally `--` and the
+    /// container's command: built and run with `--rm` (M11 track D).
+    Dockerfile,
+    /// `command` is an optional compose file, then `docker compose` arguments (`up`, `up web`,
+    /// `down`; default `up`) (M11 track D).
+    #[serde(rename = "compose")]
+    DockerCompose,
 }
 
 impl RunKind {
@@ -51,7 +65,14 @@ impl RunKind {
             "cpp" | "c" | "c++" | "c/c++" | "cc" => Ok(Self::Cpp),
             "zig" => Ok(Self::Zig),
             "npm" | "node" | "js" => Ok(Self::Npm),
-            other => Err(format!("unknown configuration type `{other}` (cargo, command, python, cpp, zig or npm)")),
+            "django" => Ok(Self::Django),
+            "fastapi" | "uvicorn" => Ok(Self::FastApi),
+            "flask" => Ok(Self::Flask),
+            "dockerfile" | "docker" => Ok(Self::Dockerfile),
+            "compose" | "docker-compose" | "dockercompose" => Ok(Self::DockerCompose),
+            other => Err(format!(
+                "unknown configuration type `{other}` (cargo, command, python, cpp, zig, npm, django, fastapi, flask, dockerfile or compose)"
+            )),
         }
     }
 
@@ -63,11 +84,28 @@ impl RunKind {
             Self::Cpp => "C/C++",
             Self::Zig => "Zig",
             Self::Npm => "Npm",
+            Self::Django => "Django",
+            Self::FastApi => "FastAPI",
+            Self::Flask => "Flask",
+            Self::Dockerfile => "Dockerfile",
+            Self::DockerCompose => "Docker Compose",
         }
     }
 
     /// Every kind, in the order the UI offers them.
-    pub const ALL: [RunKind; 6] = [Self::Cargo, Self::Command, Self::Python, Self::Cpp, Self::Zig, Self::Npm];
+    pub const ALL: [RunKind; 11] = [
+        Self::Cargo,
+        Self::Command,
+        Self::Python,
+        Self::Cpp,
+        Self::Zig,
+        Self::Npm,
+        Self::Django,
+        Self::FastApi,
+        Self::Flask,
+        Self::Dockerfile,
+        Self::DockerCompose,
+    ];
 
     /// What the Command field of a new configuration of this kind starts with.
     pub fn default_command(self) -> &'static str {
@@ -78,6 +116,11 @@ impl RunKind {
             Self::Cpp => "main.c",
             Self::Zig => "build run",
             Self::Npm => "run dev",
+            Self::Django => "runserver",
+            Self::FastApi => "main:app --reload",
+            Self::Flask => "--app app run --debug",
+            Self::Dockerfile => "Dockerfile",
+            Self::DockerCompose => "compose.yaml up",
         }
     }
 
@@ -90,6 +133,11 @@ impl RunKind {
             Self::Cpp => "main.c util.c -O2 -- --arg",
             Self::Zig => "build run   or   run src/main.zig",
             Self::Npm => "run dev   or   test",
+            Self::Django => "runserver 8000   or   migrate",
+            Self::FastApi => "main:app --reload --port 8000",
+            Self::Flask => "--app app run --debug",
+            Self::Dockerfile => "Dockerfile -p 8080:80 -- app --port 80",
+            Self::DockerCompose => "compose.yaml up web   or   down",
         }
     }
 }
@@ -479,6 +527,24 @@ impl UserRunConfig {
                     return Err(format!("`{name}`: the command is empty"));
                 }
                 process(crate::run_configs::package_manager(project).into(), args)
+            }
+            RunKind::Django | RunKind::FastApi | RunKind::Flask => {
+                let args = words()?;
+                if args.is_empty() {
+                    return Err(format!("`{name}`: the command is empty"));
+                }
+                let (program, args) =
+                    crate::python_project::framework_command(self.kind, crate::run_configs::python_for(project), args);
+                process(program, args)
+            }
+            RunKind::Dockerfile => {
+                let cmd = crate::docker::run::dockerfile_command(&name, &words()?, project, &self.cwd(project, project), &env)
+                    .map_err(|e| format!("`{name}`: {e}"))?;
+                Ok(RunConfig::process(name, cmd))
+            }
+            RunKind::DockerCompose => {
+                let cmd = crate::docker::run::compose_command(&words()?, project, &self.cwd(project, project), &env);
+                Ok(RunConfig::process(name, cmd))
             }
             RunKind::Cpp => {
                 let words = words()?;

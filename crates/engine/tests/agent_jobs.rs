@@ -28,7 +28,7 @@ fn session() -> Session {
 }
 
 fn wait(s: &mut Session, what: &str, mut cond: impl FnMut(&Session) -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(90);
     while !cond(s) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         s.pump();

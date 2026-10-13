@@ -317,3 +317,91 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     the "All Programs" actions act on the one debug session CodeCraft runs; Active Tool Window's
     tab, maximize and resize actions, Layouts, Tasks & Contexts, Reset Frame and Compile and
     Reload Modified Files are not implemented.
+
+## M11 suite features, Docker, SSH and remote (2026-10-13)
+
+28. Debugger depth (track A): Memory, Disassembly and Registers tabs in the Debug tool window,
+    watchpoints from the Variables view, an LLDB console with history, core-dump and remote
+    (`gdb-remote`) debugging from Run › Debug…, Code › Show Assembly. Xcode's lldb-dap (lldb-1600)
+    lacks `readMemory`/`writeMemory`/`dataBreakpointInfo`/stepping granularity and misaligns
+    `disassemble`, so CodeCraft checks the adapter's capabilities and falls back to LLDB console
+    commands. Remaining: core-dump and remote debugging are not run configuration kinds; the
+    console disassembly fallback shows only the current function; watchpoints last for the
+    session (no conditions or hit counts); older consoles need `p`/`expr` for expressions; no
+    search in the Memory view and bytes are edited through a hex field; Show Assembly has no
+    source-to-asm mapping, LLVM IR/MIR views or target choice; on this machine only the console
+    fallbacks run against a real adapter (native DAP paths are tested with a scripted adapter).
+29. Database depth (track B): query history and saved queries, parameter prompts, Explain Plan /
+    Explain Analyze trees, filter row, transposed view, value viewer, selection aggregates, Copy
+    As / Export (CSV, TSV, JSON, SQL INSERT, Markdown), CSV/TSV/JSON import, data source colour,
+    read-only, production confirmation, manual commit, SSH tunnels. Remaining: no DuckDB (needs a
+    new dependency); the value viewer decodes PNG only; in Execute All, a positional `?1` shares
+    one value across statements; plans are a tree only (no diagram, comparison or collapsing);
+    MySQL/MariaDB explain parsing is tested on fixtures only; the transposed view shows the first
+    1000 records read-only; import has no type conversion or "new table"; manual commit is per
+    data source, not per console; the production guard classifies statements by keyword; in
+    SQLite manual mode an open console transaction can make grid submits wait for the 5 s busy
+    timeout.
+30. HTTP Client (track H): `.http`/`.rest` files with environments, file and dynamic variables,
+    gutter ▶ per request, responses and history in Services › HTTP Requests, cURL conversion both
+    ways, Postman import, highlighting and completion. Remaining: response-handler and
+    pre-request scripts (`> {% %}`, `< {% %}`) are shown but never run; no Auth Configuration or
+    OAuth2 `$auth.token`; HTTP/1.1 only (no WebSocket, gRPC, GraphQL request types), no cookie
+    jar, proxy or client certificates, and a running request can't be cancelled; the
+    environment choice is global and lives in Services (no `.http` editor toolbar); `<>`
+    previous-response references are skipped; Postman scripts, OAuth/digest and environment
+    files aren't imported; no `.http` icon in the Project view.
+31. Docker (track D): Services › Docker (contexts, containers, Compose projects, images, volumes,
+    networks; start/stop/restart/pause/remove, streamed logs, inspect, exec in a Terminal tab,
+    prune), Dockerfile and Docker Compose run configurations with gutter ▶, Docker as a run
+    target, Dev Containers, Docker Registry login status, Dockerfile highlighting. Remaining: no
+    dialogs for adding a TCP/SSH Docker connection or container options; pull/build/compose
+    output appears when they finish; no per-service Compose actions or logs, no volume or
+    container file browser; no registry browsing or push; Dev Containers ignore features, mounts,
+    customizations and hooks other than `postCreateCommand`, and Compose-based ones need the
+    `devcontainer` CLI; Dockerfile run configurations take one command field; no Dockerfile
+    completion or inspections.
+32. SSH and remote (track S): SSH servers from `~/.ssh/config` plus `$CODECRAFT_HOME/ssh.json`
+    (keys/agent only), Start SSH Session, all of Tools › Deployment (upload, download, sync with
+    preview, compare with deployed, automatic upload), File Transfer and Remote Host tool
+    windows, SSH as a run target, SSH tunnels for data sources, File › Remote Development… (a
+    mirrored local copy with automatic upload). Remaining: Automatic Upload shows no menu
+    checkmark; the scp fallback ignores exclusions and has no sync preview; rsync/scp remote
+    paths are limited to a safe character set; stopping an SSH run doesn't stop the remote
+    process; tunnels connect through 127.0.0.1, so PostgreSQL `verify-full` fails its hostname
+    check; the SSH run target's server is a text field; Remote Host has no drag and drop or
+    multi-select; `Match` blocks in `~/.ssh/config` aren't evaluated; BatchMode means no password
+    or passphrase prompts (accept host keys once via Start SSH Session); Remote Development opens
+    the mirror in the current window, with no remote language server or file watching; no WSL.
+33. Python (track Y): interpreter detection (venv, uv, poetry, conda, pyenv, system), a status-bar
+    interpreter switcher and Create Virtualenv driving runs, debugpy, pytest and the language
+    server; the Python Packages tool window; an "Install package" quick-fix; the Python Console
+    with a Variables view; mypy/pyright in Inspect Code; Django/FastAPI/Flask run configurations;
+    doctest runs; Create setup.py / Run setup.py Task. Remaining: doctest output isn't parsed into
+    the test tree; console interrupt is Unix-only and children of console code survive Stop; no
+    console completion or debug-console switching; the Variables view doesn't expand objects;
+    package search filters installed packages only (no PyPI search); no pipenv, hatch, Windows
+    registry, remote, WSL or Docker interpreters; the install quick-fix needs a running Python
+    language server; mypy/pyright findings offer suppression only; Create setup.py has no dialog.
+34. Profiler (track P): Run › Profile (samply, `perf` on Linux, py-spy for Python), Attach
+    Profiler to Process…, Open Profiler Snapshot (samply/Firefox, Gecko, speedscope, collapsed
+    stacks, `perf script`, DTrace; gzip), and a Profiler tool window with flame graph, call tree,
+    method list and thread filter. Remaining: profiling a Cargo configuration records `cargo
+    run`, including build time; the Run window's Stop sends SIGTERM, so samply may not save (the
+    Profiler window's Stop works); no symbolication; snapshots are parsed whole into memory; no
+    profiling on Docker/SSH targets; no timeline, memory profiling, snapshot diff or Chrome trace
+    format; macOS attach needs `samply setup` and py-spy may need root; speedscope files with
+    mixed units keep only the first unit's profiles.
+35. SQL in Rust strings (track Q): SQL detected in sqlx/diesel/rusqlite/postgres calls and after
+    `// language=SQL`, highlighted, completed from the chosen data source (alias-aware) and
+    checked for unknown tables/columns; an SQL formatter for `.sql` files, consoles and injected
+    strings. Remaining: no Settings page for SQL (`sql.settings`, `sql.chooseDataSource`,
+    `.codecraft/sql.json`); detection is by call name, so SQL built with `format!` or
+    concatenation isn't found; column checks skip subqueries, table functions and CTEs, and
+    there are no quick-fixes; each edit re-scans the whole Rust file; the formatter doesn't wrap
+    by width and keeps CASE and select lists inline; completion has no SQL functions or join
+    conditions.
+36. Tests and per-user files: `Session::isolate_home(dir)` keeps scratches, templates, profiler
+    snapshots, query history and SSH state under `dir`; the panic-hunting test uses it (an early
+    M11 run had written HTTP scratch files and a profiler list into `~/.codecraft`). New
+    per-user files must be added there.

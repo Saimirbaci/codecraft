@@ -37,7 +37,8 @@ fn comment_prefixes(language: Language) -> &'static [&'static str] {
         | Language::TypeScript
         | Language::JavaScript
         | Language::Json => &["//"],
-        Language::Python | Language::Shell | Language::Yaml | Language::Toml => &["#"],
+        Language::Python | Language::Shell | Language::Yaml | Language::Toml | Language::Dockerfile => &["#"],
+        Language::Http => &["#", "//"],
         Language::Sql => &["--"],
         Language::Markdown => &["<!--"],
         Language::PlainText => &["//", "#"],

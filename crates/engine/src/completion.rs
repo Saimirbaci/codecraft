@@ -638,6 +638,16 @@ pub(crate) fn after_typed(s: &mut Session, typed: char) {
         }
         return;
     }
+    if crate::http_client::is_http_editor(s) {
+        if s.ws.settings.completion_auto_popup && !s.power_save() {
+            crate::http_client::after_typed(s, typed);
+        }
+        return;
+    }
+    // SQL in a Rust string (M11 track Q): its own completion, not the language server's.
+    if crate::sql_lang::after_typed(s, typed) {
+        return;
+    }
     // File › Power Save Mode (track F) turns the auto-popup off too.
     if !s.ws.settings.completion_auto_popup
         || s.power_save()

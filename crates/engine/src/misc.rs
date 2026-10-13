@@ -108,7 +108,7 @@ impl Session {
 // ---------------------------------------------------------------- file types
 
 /// Every language, for Associate with File Type.
-pub const LANGUAGES: [Language; 14] = [
+pub const LANGUAGES: [Language; 16] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
@@ -122,6 +122,8 @@ pub const LANGUAGES: [Language; 14] = [
     Language::TypeScript,
     Language::JavaScript,
     Language::Sql,
+    Language::Dockerfile,
+    Language::Http,
     Language::PlainText,
 ];
 

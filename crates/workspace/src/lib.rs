@@ -310,6 +310,8 @@ pub struct Workspace {
     view_revs: BTreeMap<EditorId, (u64, usize)>,
     lsp_problems: BTreeMap<PathBuf, Vec<Problem>>,
     cargo_problems: BTreeMap<PathBuf, Vec<Problem>>,
+    /// CodeCraft's own inspections (unresolved names in SQL, …): per inspection, per file.
+    inspection_problems: BTreeMap<String, BTreeMap<PathBuf, Vec<Problem>>>,
     pub runs: Vec<RunTab>,
     pub active_run: Option<RunTabId>,
     pub find: Option<FindResults>,
@@ -778,6 +780,20 @@ impl Workspace {
         }
     }
 
+    /// Replace the problems one of CodeCraft's own inspections found in `path`.
+    pub fn set_inspection_problems(&mut self, inspection: &str, path: PathBuf, problems: Vec<Problem>) {
+        let files = self.inspection_problems.entry(inspection.to_string()).or_default();
+        if problems.is_empty() {
+            files.remove(&path);
+        } else {
+            files.insert(path, problems);
+        }
+    }
+
+    fn inspection_problems_for(&self, path: &Path) -> Vec<&Problem> {
+        self.inspection_problems.values().filter_map(|files| files.get(path)).flatten().collect()
+    }
+
     pub fn clear_cargo_problems(&mut self) {
         self.cargo_problems.clear();
     }
@@ -797,6 +813,7 @@ impl Workspace {
             .into_iter()
             .flatten()
             .chain(self.cargo_problems.get(path).into_iter().flatten())
+            .chain(self.inspection_problems_for(path))
             .collect();
         v.sort_by_key(|p| (p.start, p.severity));
         v
@@ -805,7 +822,8 @@ impl Workspace {
     /// Every problem, grouped by file (sorted by path).
     pub fn all_problems(&self) -> BTreeMap<&Path, Vec<&Problem>> {
         let mut out: BTreeMap<&Path, Vec<&Problem>> = BTreeMap::new();
-        for (path, list) in self.lsp_problems.iter().chain(self.cargo_problems.iter()) {
+        let inspections = self.inspection_problems.values().flat_map(|files| files.iter());
+        for (path, list) in self.lsp_problems.iter().chain(self.cargo_problems.iter()).chain(inspections) {
             out.entry(path.as_path()).or_default().extend(list.iter());
         }
         for list in out.values_mut() {
@@ -815,7 +833,8 @@ impl Workspace {
     }
 
     pub fn problem_counts(&self) -> (usize, usize) {
-        let all = self.lsp_problems.values().chain(self.cargo_problems.values()).flatten();
+        let inspections = self.inspection_problems.values().flat_map(|files| files.values());
+        let all = self.lsp_problems.values().chain(self.cargo_problems.values()).chain(inspections).flatten();
         all.fold((0, 0), |(e, w), p| match p.severity {
             Severity::Error => (e + 1, w),
             Severity::Warning => (e, w + 1),
@@ -1178,6 +1197,14 @@ mod tests {
         let lines: Vec<usize> = ws.problems_for(Path::new("/x.rs")).iter().map(|p| p.start.line).collect();
         assert_eq!(lines, vec![1, 3, 5]);
         ws.set_lsp_problems("/x.rs".into(), Vec::new());
+        assert_eq!(ws.problem_counts(), (1, 0));
+        // Inspection problems join in, per inspection.
+        let warning = Problem { source: ProblemSource::Inspection, ..p(Severity::Warning, 2) };
+        ws.set_inspection_problems("sql", "/x.rs".into(), vec![warning]);
+        assert_eq!(ws.problem_counts(), (1, 1));
+        assert_eq!(ws.problems_for(Path::new("/x.rs")).len(), 2);
+        assert_eq!(ws.all_problems().get(Path::new("/x.rs")).map(Vec::len), Some(2));
+        ws.set_inspection_problems("sql", "/x.rs".into(), Vec::new());
         assert_eq!(ws.problem_counts(), (1, 0));
     }
 }

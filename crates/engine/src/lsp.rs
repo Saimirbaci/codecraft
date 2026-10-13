@@ -271,8 +271,8 @@ impl Session {
                 config.configuration = Some(settings);
             }
             ServerKind::Python => {
-                // Point pyright/basedpyright at the project's virtualenv when there is one.
-                let venv = [".venv/bin/python", "venv/bin/python"].iter().map(|p| root.join(p)).find(|p| p.is_file());
+                // Point pyright/basedpyright at the project's interpreter (selected, else its virtualenv).
+                let venv = crate::python_env::project_python(root);
                 if let Some(py) = venv {
                     config.configuration = Some(json!({ "pythonPath": py, "analysis": { "autoSearchPaths": true } }));
                 }
@@ -567,7 +567,8 @@ impl Session {
     pub(crate) fn apply_code_action(&mut self, payload: &Value) -> Result<(), CommandError> {
         // Refactor This lists engine commands (Rename…, Move File…) next to the server's actions.
         if let Some(id) = payload.get("codecraftCommand").and_then(Value::as_str) {
-            return self.execute(id, &Value::Null).map(|_| ());
+            let params = payload.get("codecraftParams").cloned().unwrap_or(Value::Null);
+            return self.execute(id, &params).map(|_| ());
         }
         if payload.get("edit").is_none() && payload.get("data").is_some() {
             let p = payload.clone();
@@ -1131,6 +1132,10 @@ impl Session {
                 Some(ActionItem { title, kind, payload: a })
             })
             .collect();
+        // Python: "Install package X" for unresolved imports at the caret.
+        let items: Vec<ActionItem> = crate::python::install_actions(self).into_iter().chain(items).collect();
+        // SQL in a Rust string: Reformat SQL, Choose SQL Data Source….
+        let items: Vec<ActionItem> = items.into_iter().chain(crate::sql_lang::context_actions(self)).collect();
         if let Some(Popup::Actions { items: target, pending, .. }) = &mut self.popup {
             if items.is_empty() {
                 self.popup = None;

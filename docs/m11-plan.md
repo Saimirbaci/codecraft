@@ -1,6 +1,6 @@
 # M11: from the rest of the suite (CLion, DataGrip, PyCharm) plus remote, SSH and Docker
 
-Status: in progress (2026-10-13). After M10 the RustRover menus are at core parity; this milestone
+Status: done (2026-10-13; all eight tracks landed; remaining depth is in `docs/gaps.md` items 28–36). After M10 the RustRover menus are at core parity; this milestone
 borrows the features from JetBrains' other IDEs that help Rust developers too, and adds working
 on other machines and in containers. Same rules and process as M4/M10: read `AGENTS.md` and
 `docs/clean-room.md` (behaviour from public documentation and the running apps only; never their

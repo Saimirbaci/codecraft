@@ -1,7 +1,7 @@
 use super::*;
 use crate::highlight;
 
-const ALL: [Language; 14] = [
+const ALL: [Language; 16] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
@@ -15,6 +15,8 @@ const ALL: [Language; 14] = [
     Language::TypeScript,
     Language::JavaScript,
     Language::Sql,
+    Language::Dockerfile,
+    Language::Http,
     Language::PlainText,
 ];
 
@@ -81,6 +83,10 @@ const JAVASCRIPT: &str = "// comment\nconst re = /[/]x/i, d = a / b;\nlet s = 'q
 
 const SQL: &str = "-- comment\nCREATE TABLE users (\n  id INT PRIMARY KEY,\n  name TEXT NOT NULL\n);\n/* block\n comment */\nSELECT u.name, 'str''q' FROM users u WHERE id = 1;\nCREATE FUNCTION f() RETURNS int AS $$\nBEGIN\n  RETURN 1;\nEND;\n$$ LANGUAGE plpgsql;\n";
 
+const DOCKERFILE: &str = "# syntax=docker/dockerfile:1\nFROM rust:1 AS build\nWORKDIR /app\nCOPY . .\nRUN cargo build --release && \\\n    strip target/release/app\nENV RUST_LOG=info\nCMD [\"/app/target/release/app\"]\n";
+
+const HTTP: &str = "@host = localhost\n### Users\n# @name list\nGET http://{{host}}/users HTTP/1.1\nAccept: application/json\n\n###\nPOST /x\nContent-Type: application/json\n\n{\"a\": \"{{$uuid}}\"}\n\n> {%\n  client.log(1);\n%}\n";
+
 const PLAIN: &str = "just some text\nwith lines\n\nand more\n";
 
 fn sample(language: Language) -> &'static str {
@@ -98,6 +104,8 @@ fn sample(language: Language) -> &'static str {
         Language::TypeScript => TYPESCRIPT,
         Language::JavaScript => JAVASCRIPT,
         Language::Sql => SQL,
+        Language::Dockerfile => DOCKERFILE,
+        Language::Http => HTTP,
         Language::PlainText => PLAIN,
     }
 }

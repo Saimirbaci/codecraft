@@ -15,8 +15,10 @@ mod approvals_ui;
 mod bookmarks_panel;
 mod chrome;
 mod data_grid;
+mod database_dialogs;
 mod database_panel;
 mod debug_panel;
+mod debug_views_ui;
 mod diff_view;
 mod docker_ui;
 mod editor;
@@ -366,7 +368,9 @@ impl App {
         if bookmarks_panel::wants_keyboard(s)
             || history_ui::wants_keyboard(s)
             || misc_ui::wants_keyboard(s)
+            || remote_ui::wants_keyboard(s)
             || appearance_ui::wants_keyboard(s)
+            || python_ui::wants_keyboard(s)
         {
             return;
         }
@@ -558,6 +562,10 @@ impl App {
         history_ui::windows(ui, s, st);
         inspections_ui::windows(ui, s, st);
         misc_ui::windows(ui, s, st);
+        remote_ui::windows(ui, s, st);
+        python_ui::windows(ui, s, st);
+        profiler_ui::windows(ui, s, st);
+        http_ui::windows(ui, s, st);
         appearance_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);

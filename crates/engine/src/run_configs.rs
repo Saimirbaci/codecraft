@@ -12,15 +12,10 @@ use crate::runs::{ProcessCommand, RunConfig};
 /// CLion's default CMake build directory for the Debug profile.
 pub const CMAKE_BUILD_DIR: &str = "cmake-build-debug";
 
-/// The Python interpreter to use: the project's virtualenv, else `python3`.
+/// The Python interpreter to use: the project's selected interpreter (Python status bar widget),
+/// else its virtualenv, else `python3`.
 pub fn python_for(root: &Path) -> String {
-    for venv in [".venv/bin/python", "venv/bin/python", ".env/bin/python"] {
-        let p = root.join(venv);
-        if p.is_file() {
-            return p.display().to_string();
-        }
-    }
-    "python3".into()
+    crate::python_env::project_python(root).map(|p| p.display().to_string()).unwrap_or_else(|| "python3".into())
 }
 
 /// The JavaScript package manager from the lockfile.
@@ -167,6 +162,7 @@ pub fn derive_polyglot(root: &Path) -> Vec<RunConfig> {
                 out.push(RunConfig::process(format!("Run {main}"), ProcessCommand::new(py.clone(), &[main], root)));
             }
         }
+        out.extend(crate::python_project::framework_configs(root, &py));
     }
     out
 }
@@ -219,6 +215,9 @@ fn is_zig_test(line: &str) -> bool {
 /// C/C++ `main`, Python `if __name__ == "__main__":` and pytest test functions and classes, Zig
 /// `pub fn main` and `test` blocks, jest/vitest `test`/`it`/`describe` calls in test files.
 pub fn gutter_run_lines(path: &Path, text: &str) -> Vec<usize> {
+    if let Some(lines) = crate::docker::run::gutter_run_lines(path, text) {
+        return lines;
+    }
     let language = Language::from_path(path);
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let mut out = Vec::new();
@@ -270,6 +269,8 @@ pub fn gutter_run_lines(path: &Path, text: &str) -> Vec<usize> {
                 }
             }
         }
+        // HTTP Client: one ▶ per request.
+        Language::Http => out = codecraft_http::parse::request_lines(text),
         _ => {}
     }
     out
@@ -322,6 +323,9 @@ fn js_test_command(root: &Path, file: &str, test: Option<&str>) -> (String, Proc
 
 /// What to run for a line of a non-Rust file (the Rust case is in `run_cmds.rs`).
 pub fn context_config(root: &Path, path: &Path, text: &str, line: usize) -> Option<RunConfig> {
+    if let Some(config) = crate::docker::run::context_config(root, path, text, line) {
+        return Some(config);
+    }
     let language = Language::from_path(path);
     let file = path.display().to_string();
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();

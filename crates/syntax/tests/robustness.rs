@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use codecraft_syntax::{FoldRange, Highlights, Language, folding_ranges, highlight, matching_bracket, outline};
 
-const LANGUAGES: [Language; 14] = [
+const LANGUAGES: [Language; 16] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
@@ -22,6 +22,8 @@ const LANGUAGES: [Language; 14] = [
     Language::TypeScript,
     Language::JavaScript,
     Language::Sql,
+    Language::Dockerfile,
+    Language::Http,
     Language::PlainText,
 ];
 

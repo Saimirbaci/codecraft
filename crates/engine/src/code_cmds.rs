@@ -20,7 +20,15 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         editor("code.moveLineDown", "Move Line Down", |s, _| move_lines(s, false)),
         editor("code.moveStatementUp", "Move Statement Up", |s, _| move_lines(s, true)),
         editor("code.moveStatementDown", "Move Statement Down", |s, _| move_lines(s, false)),
-        spec("code.codeCompletion.basic", "Basic", None, "", Context::Editor, has_lsp_editor, basic_completion),
+        spec(
+            "code.codeCompletion.basic",
+            "Basic",
+            None,
+            "",
+            Context::Editor,
+            |s| crate::http_client::or_http_editor(s, |s| crate::sql_lang::or_in_injection(s, has_lsp_editor)),
+            basic_completion,
+        ),
         spec("code.reformatCode", "Reformat Code", None, "", Context::Editor, has_editor, reformat),
         spec("code.reformatFile", "Reformat File…", None, "", Context::Editor, has_editor, reformat),
         spec(
@@ -114,6 +122,12 @@ fn move_lines(s: &mut Session, up: bool) -> CmdResult {
 }
 
 fn basic_completion(s: &mut Session, _: &Value) -> CmdResult {
+    if crate::http_client::is_http_editor(s) {
+        return crate::http_client::complete(s, false);
+    }
+    if crate::sql_lang::in_injection(s) {
+        return crate::sql_lang::complete(s, false);
+    }
     let Some((e, d)) = s.ws.active() else { return ok() };
     let caret = e.selections.primary().head;
     let mut anchor = caret;
@@ -132,6 +146,8 @@ fn reformat(s: &mut Session, _: &Value) -> CmdResult {
         s.lsp_format()?;
     } else if lang == codecraft_syntax::Language::Rust {
         s.start_rustfmt(did).map_err(CommandError::Failed)?;
+    } else if lang == codecraft_syntax::Language::Sql {
+        crate::sql_lang::reformat_document(s)?;
     } else {
         s.status = "No formatter for this file type".into();
     }

@@ -29,7 +29,10 @@ pub mod database;
 mod database_cmds;
 pub mod debug;
 mod debug_cmds;
+pub mod debug_views;
+pub mod asm;
 mod decorations;
+pub mod deployment;
 pub mod docker;
 mod docker_cmds;
 pub mod docker_target;
@@ -69,6 +72,10 @@ pub mod profiler;
 mod profiler_cmds;
 pub mod python;
 mod python_cmds;
+pub mod python_console;
+pub mod python_env;
+mod python_lint;
+pub mod python_project;
 mod run_cmds;
 mod run_config_cmds;
 pub mod run_config_store;
@@ -85,6 +92,7 @@ mod split_cmds;
 pub mod sql_lang;
 mod sql_lang_cmds;
 pub mod ssh_target;
+pub mod ssh_tunnel;
 pub mod structure;
 pub mod templates;
 pub mod todo;
@@ -354,6 +362,18 @@ impl Session {
         }
     }
 
+    /// Keep every per-user file under `dir` instead of `$CODECRAFT_HOME` (default `~/.codecraft`):
+    /// scratches, live templates, profiler snapshots, query history, SSH servers and remote
+    /// caches. For tests and embedders that must never touch the user's real files.
+    pub fn isolate_home(&mut self, dir: &std::path::Path) {
+        self.scratch.dir_override = Some(dir.join("scratches"));
+        self.editing.templates.set_path(dir.join("templates.json"));
+        self.profiler.dir_override = Some(dir.join("profiler"));
+        self.db.history.set_dir(dir.join("database").join("history"));
+        self.remote.home_override = Some(dir.to_path_buf());
+        self.remote.ssh_config_override = Some(dir.join("ssh_config"));
+    }
+
     /// Drain background services. Returns true if anything changed (the UI should repaint).
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
@@ -428,6 +448,10 @@ impl Session {
         terminal::shutdown(self);
         vcs::shutdown(self);
         inspections::shutdown(self);
+        remote::shutdown(self);
+        docker::shutdown(self);
+        python::shutdown(self);
+        profiler::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);
@@ -609,6 +633,7 @@ impl Session {
             self.lsp_did_save(p);
         }
         local_history::after_save(self, &saved_paths);
+        remote::after_save(self, &saved_paths);
         if !errors.is_empty() {
             let msg = errors.join("\n");
             self.notify(NotificationLevel::Error, "Cannot save files", msg.clone());

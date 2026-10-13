@@ -45,7 +45,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Some("Ctrl+Shift+R"),
             "{path?: string, line?: int} — run the test or main function at the caret (or given line)",
             Context::Editor,
-            has_project,
+            |s| crate::http_client::or_http_editor(s, has_project),
             run_at_caret,
         ),
         spec(
@@ -282,6 +282,9 @@ fn run_at_caret(s: &mut Session, p: &Value) -> CmdResult {
             (path, d.doc.char_to_line(e.selections.primary().head))
         }
     };
+    if codecraft_http::is_http_file(&path) {
+        return crate::http_client::run_at(s, &path, line);
+    }
     if let Some((title, inv)) = context_invocation(s, &path, line) {
         let tab = crate::runs::start(s, inv, &title, false)?;
         return Ok(json!({ "tab": tab.0, "title": title }));

@@ -38,6 +38,8 @@ struct RunForm {
     env: String,
     env_file: String,
     working_dir: String,
+    /// Where it runs (M11: Local, Docker, SSH).
+    target: codecraft_engine::run_targets::RunTarget,
 }
 
 // ---------------------------------------------------------------- applying settings
@@ -733,6 +735,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 env: env_text(&c.env),
                 env_file: c.env_file.clone(),
                 working_dir: c.working_dir.clone(),
+                target: c.target.clone(),
             });
             st.prefs.run_error = None;
         }
@@ -867,6 +870,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             "env": new.env,
             "envFile": new.env_file,
             "workingDir": new.working_dir,
+            "target": new.target,
         });
         st.prefs.run_error = s.execute("runConfig.update", &params).err().map(|e| e.to_string());
         st.prefs.run_form = form;
@@ -879,6 +883,42 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     }
 }
 
+/// "Run on:" Local / Docker (M11 track D; track S adds SSH here) and the target's fields.
+fn run_target_row(ui: &mut egui::Ui, target: &mut codecraft_engine::run_targets::RunTarget) {
+    use codecraft_engine::run_targets::RunTarget;
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Run on:");
+        let current = match target {
+            RunTarget::Local => "Local machine",
+            RunTarget::Docker(_) => "Docker",
+            RunTarget::Ssh(_) => "SSH",
+        };
+        egui::ComboBox::from_id_salt("run-config-target").selected_text(current).show_ui(ui, |ui| {
+            if ui.selectable_label(target.is_local(), "Local machine").clicked() {
+                *target = RunTarget::Local;
+            }
+            if ui.selectable_label(matches!(target, RunTarget::Docker(_)), "Docker").clicked()
+                && !matches!(target, RunTarget::Docker(_))
+            {
+                *target = RunTarget::Docker(codecraft_engine::docker_target::DockerTarget {
+                    image: "rust:1".into(),
+                    ..Default::default()
+                });
+            }
+            if ui.selectable_label(matches!(target, RunTarget::Ssh(_)), "SSH").clicked() && !matches!(target, RunTarget::Ssh(_)) {
+                *target = RunTarget::Ssh(Default::default());
+            }
+        });
+    });
+    if let RunTarget::Docker(t) = target {
+        crate::docker_ui::target_fields(ui, t);
+    }
+    if let RunTarget::Ssh(t) = target {
+        crate::remote_ui::ssh_target_fields(ui, t);
+    }
+}
+
 /// The id `runConfig.create/update` take for a kind.
 fn run_kind_id(kind: RunKind) -> &'static str {
     match kind {
@@ -888,6 +928,11 @@ fn run_kind_id(kind: RunKind) -> &'static str {
         RunKind::Cpp => "cpp",
         RunKind::Zig => "zig",
         RunKind::Npm => "npm",
+        RunKind::Django => "django",
+        RunKind::FastApi => "fastapi",
+        RunKind::Flask => "flask",
+        RunKind::Dockerfile => "dockerfile",
+        RunKind::DockerCompose => "compose",
     }
 }
 
@@ -928,6 +973,7 @@ fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path:
         );
         ui.end_row();
     });
+    run_target_row(ui, &mut f.target);
     ui.add_space(6.0);
     let probe =
         UserRunConfig { name: "preview".into(), kind: f.kind, command: f.command.clone(), ..Default::default() };

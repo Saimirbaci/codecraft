@@ -1074,6 +1074,10 @@ mod tests {
         assert!(s.execute("processes.stop", &json!({ "kind": "nope", "id": "1" })).is_err());
         assert_eq!(s.execute("window.processes.autoShow", &json!({})).unwrap()["on"], true);
         s.execute("processes.close", &json!({})).unwrap();
+        // Opening the project starts background work of its own (e.g. interpreter detection);
+        // auto show reacts to tasks appearing, so start from none.
+        pump_until(&mut s, |s| s.ws.tasks.is_empty());
+        s.pump();
         s.ws.tasks.insert("t".into(), codecraft_workspace::BackgroundTask {
             title: "Indexing".into(),
             message: None,

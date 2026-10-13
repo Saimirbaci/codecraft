@@ -50,6 +50,24 @@ fn skip(id: &str, params: &Value) -> bool {
     if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
         return true;
     }
+    // Docker commands run the real `docker` CLI (docker_cmds tests fuzz them with a fake one).
+    if id.starts_with("docker.")
+        || id.starts_with("tools.services.docker")
+        || matches!(
+            id,
+            "tools.services.devContainers.showDevContainers"
+                | "tools.services.devContainers.manageDevContainerBackends"
+        )
+    {
+        return true;
+    }
+    // Profiling runs the real samply/perf/py-spy, and Clear Recent edits the real profiler state
+    // (profiler_cmds tests fuzz them with fakes and a temp dir).
+    if id.starts_with("run.profile")
+        || matches!(id, "run.attachProfilerToProcess" | "profiler.install" | "profiler.clearRecent")
+    {
+        return true;
+    }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
         || matches!(
@@ -94,6 +112,7 @@ fn no_command_panics_without_anything_open() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = Session::new();
     s.lsp_enabled = false;
+    s.isolate_home(&tmp.path().join("home"));
     check_all(&mut s, tmp.path(), "empty");
     s.shutdown();
 }
@@ -105,6 +124,7 @@ fn no_command_panics_with_an_editor_open() {
     std::fs::write(&file, "fn main() {\n    let x = (1, [2, 3]);\n}\n\n// 😀 ünïcode\r\n\tlet y = \"str\";\n").unwrap();
     let mut s = Session::new();
     s.lsp_enabled = false;
+    s.isolate_home(&tmp.path().join("home"));
     s.execute("file.open", &json!({ "path": tmp.path() })).unwrap();
     wait_idle(&mut s);
     s.execute("file.open", &json!({ "path": file })).unwrap();
@@ -123,6 +143,7 @@ fn no_command_panics_with_popups_open() {
     std::fs::write(&file, "struct A;\nimpl A { fn f(&self) {} }\n").unwrap();
     let mut s = Session::new();
     s.lsp_enabled = false;
+    s.isolate_home(&tmp.path().join("home"));
     s.execute("file.open", &json!({ "path": tmp.path() })).unwrap();
     wait_idle(&mut s);
     for opener in [

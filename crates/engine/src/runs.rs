@@ -128,6 +128,11 @@ impl Runs {
     pub(crate) fn is_running(&self, tab: RunTabId) -> bool {
         self.procs.iter().any(|p| p.tab == tab)
     }
+
+    /// The process id behind a running tab (it leads its own process group on Unix).
+    pub(crate) fn pid(&self, tab: RunTabId) -> Option<u32> {
+        self.procs.iter().find(|p| p.tab == tab).map(|p| p.handle.pid())
+    }
 }
 
 /// Run configurations for a Cargo workspace: one `cargo run` per binary target, plus

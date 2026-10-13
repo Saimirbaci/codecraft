@@ -23,6 +23,8 @@
 
 mod c;
 mod common;
+mod dockerfile;
+mod http;
 mod incremental;
 mod js;
 mod json;
@@ -33,6 +35,9 @@ mod regions;
 mod rust;
 mod shell;
 mod sql;
+pub mod sql_format;
+pub mod sql_inject;
+pub mod sql_scope;
 mod toml;
 mod yaml;
 mod zig;
@@ -61,6 +66,9 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Sql,
+    Dockerfile,
+    /// HTTP Client request files (`.http`, `.rest`).
+    Http,
     #[default]
     PlainText,
 }
@@ -86,9 +94,12 @@ impl Language {
             "ts" | "tsx" | "mts" | "cts" => Self::TypeScript,
             "js" | "jsx" | "mjs" | "cjs" => Self::JavaScript,
             "sql" | "ddl" | "dml" | "psql" | "pgsql" => Self::Sql,
+            "dockerfile" | "containerfile" => Self::Dockerfile,
+            "http" | "rest" => Self::Http,
             _ => match path.file_name().and_then(|n| n.to_str()) {
                 Some("Cargo.lock") => Self::Toml,
                 Some("BUILD" | "WORKSPACE" | "SConstruct" | "SConscript") => Self::Python,
+                Some(n) if n.starts_with("Dockerfile") || n.starts_with("Containerfile") => Self::Dockerfile,
                 _ => Self::PlainText,
             },
         }
@@ -110,6 +121,8 @@ impl Language {
             Self::TypeScript => "TypeScript",
             Self::JavaScript => "JavaScript",
             Self::Sql => "SQL",
+            Self::Dockerfile => "Dockerfile",
+            Self::Http => "HTTP Request",
             Self::PlainText => "Plain text",
         }
     }
@@ -130,6 +143,8 @@ impl Language {
             Self::TypeScript => "typescript",
             Self::JavaScript => "javascript",
             Self::Sql => "sql",
+            Self::Dockerfile => "dockerfile",
+            Self::Http => "http",
             Self::PlainText => "plaintext",
         }
     }
@@ -139,7 +154,7 @@ impl Language {
             Self::Rust | Self::Json | Self::C | Self::Cpp | Self::Zig | Self::TypeScript | Self::JavaScript => {
                 Some("//")
             }
-            Self::Toml | Self::Yaml | Self::Shell | Self::Python => Some("#"),
+            Self::Toml | Self::Yaml | Self::Shell | Self::Python | Self::Dockerfile | Self::Http => Some("#"),
             Self::Sql => Some("--"),
             Self::Markdown | Self::PlainText => None,
         }
@@ -263,6 +278,8 @@ fn lexical_spans(language: Language, doc: &Doc) -> Vec<Span> {
         Language::TypeScript => js::spans(doc, true),
         Language::JavaScript => js::spans(doc, false),
         Language::Sql => sql::spans(doc),
+        Language::Dockerfile => dockerfile::spans(doc),
+        Language::Http => http::spans(doc),
         Language::Rust | Language::PlainText => Vec::new(),
     }
 }
@@ -355,6 +372,8 @@ fn language_folds(language: Language, text: &str) -> Vec<FoldRange> {
         Language::TypeScript => js::folding_ranges(&Doc::new(text), true),
         Language::JavaScript => js::folding_ranges(&Doc::new(text), false),
         Language::Sql => sql::folding_ranges(&Doc::new(text)),
+        Language::Dockerfile => dockerfile::folding_ranges(&Doc::new(text)),
+        Language::Http => http::folding_ranges(&Doc::new(text)),
         Language::PlainText => Vec::new(),
     }
 }
@@ -413,6 +432,8 @@ pub fn outline(language: Language, text: &str) -> Vec<OutlineItem> {
         Language::TypeScript => js::outline(&Doc::new(text), true),
         Language::JavaScript => js::outline(&Doc::new(text), false),
         Language::Sql => sql::outline(&Doc::new(text)),
+        Language::Dockerfile => dockerfile::outline(&Doc::new(text)),
+        Language::Http => http::outline(&Doc::new(text)),
         Language::Json | Language::Yaml | Language::Shell | Language::PlainText => Vec::new(),
     }
 }
@@ -444,6 +465,11 @@ mod tests {
             ("index.tsx", Language::TypeScript),
             ("index.mjs", Language::JavaScript),
             ("schema.sql", Language::Sql),
+            ("Dockerfile", Language::Dockerfile),
+            ("Dockerfile.dev", Language::Dockerfile),
+            ("api.dockerfile", Language::Dockerfile),
+            ("api.http", Language::Http),
+            ("users.REST", Language::Http),
             ("LICENSE", Language::PlainText),
             ("", Language::PlainText),
         ];
