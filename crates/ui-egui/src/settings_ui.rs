@@ -1,0 +1,911 @@
+//! Settings (Cmd+,) with its searchable page tree, the keymap editor, the colour scheme editor,
+//! View › Quick Switch Scheme (Ctrl+`) and Run › Edit Configurations. Thin: every change is an
+//! engine command (`settings.*`, `keymap.*`, `colorScheme.*`, `quickSwitch.*`, `runConfig.*`);
+//! the engine keeps the drafts behind Apply / OK / Cancel.
+
+use egui::{Align, Align2, Color32, Event, FontId, Key, Layout, Modifiers, RichText, ScrollArea, TextEdit, vec2};
+use serde_json::{Value, json};
+
+use codecraft_engine::run_config_store::{RunKind, Selection, env_text};
+use codecraft_engine::settings::{self, Kind, QuickLevel, SettingDef};
+use codecraft_engine::{Popup, Session, keymaps, registry};
+use codecraft_workspace::Settings;
+
+use crate::theme::Theme;
+use crate::{UiState, keymap, run_command};
+
+/// View state of the settings UI.
+#[derive(Default)]
+pub struct PrefsUi {
+    /// Settings that the theme, fonts and bindings were last built from.
+    sig: String,
+    /// The command waiting for a key press in the keymap editor.
+    recording: Option<&'static str>,
+    /// A recorded shortcut that other commands use: `(command, shortcut, others)`.
+    conflict: Option<(&'static str, String, Vec<&'static str>)>,
+    keymap_filter: String,
+    /// The Edit Configurations form being typed into.
+    run_form: Option<RunForm>,
+    run_error: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RunForm {
+    index: usize,
+    name: String,
+    kind: RunKind,
+    command: String,
+    env: String,
+    working_dir: String,
+}
+
+// ---------------------------------------------------------------- applying settings
+
+/// Rebuild the theme, UI font size and key bindings when the settings they depend on change.
+pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let w = &s.ws.settings;
+    let sig = serde_json::to_string(&(
+        &w.theme,
+        &w.color_scheme,
+        &w.user_schemes,
+        w.ui_font_size,
+        &w.keymap,
+        &w.keymap_overrides,
+    ))
+    .unwrap_or_default();
+    if sig == st.prefs.sig {
+        return;
+    }
+    st.prefs.sig = sig;
+    st.theme = Theme::from_settings(w);
+    st.theme.apply(ctx);
+    apply_ui_font_size(ctx, w.ui_font_size);
+    keymap::set_active(w);
+    st.bindings = keymap::bindings_for(w);
+    s.terminal.set_palette(crate::terminal_panel::palette(&st.theme));
+    // Widgets laid out this frame still use the old style.
+    ctx.request_repaint();
+}
+
+/// Scale egui's text styles so that 13 pt is the default look.
+fn apply_ui_font_size(ctx: &egui::Context, size: f32) {
+    let scale = if size.is_finite() { (size / 13.0).clamp(0.5, 3.0) } else { 1.0 };
+    let mut style = (*ctx.global_style()).clone();
+    style.text_styles = egui::Style::default()
+        .text_styles
+        .into_iter()
+        .map(|(k, mut f)| {
+            f.size *= scale;
+            (k, f)
+        })
+        .collect();
+    ctx.set_global_style(style);
+}
+
+// ---------------------------------------------------------------- keyboard
+
+/// The Settings dialog, Edit Configurations and Quick Switch are modal: they take the keyboard.
+pub(crate) fn wants_keyboard(s: &Session) -> bool {
+    s.prefs.quick_switch.is_some() || matches!(s.popup, Some(Popup::Settings)) || s.run_store.dialog.is_some()
+}
+
+fn consume_keys(ctx: &egui::Context) {
+    ctx.input_mut(|i| i.events.retain(|e| !matches!(e, Event::Key { .. } | Event::Text(_))));
+}
+
+pub(crate) fn handle_keys(ctx: &egui::Context, events: &[Event], s: &mut Session, st: &mut UiState) {
+    // Recording a shortcut: the next key press is it (Escape alone cancels).
+    if let Some(id) = st.prefs.recording {
+        let press = events.iter().find_map(|e| match e {
+            Event::Key { key, pressed: true, modifiers, .. } => Some((*key, *modifiers)),
+            _ => None,
+        });
+        consume_keys(ctx);
+        if let Some((key, m)) = press {
+            st.prefs.recording = None;
+            if !(key == Key::Escape && m.is_none())
+                && let Some(sc) = keymap::from_event(key, &m)
+            {
+                add_shortcut(s, st, id, &sc, false);
+            }
+        }
+        return;
+    }
+    if s.prefs.quick_switch.is_some() {
+        let pressed = |k: Key| ctx.input_mut(|i| i.consume_key(Modifiers::NONE, k));
+        if pressed(Key::Escape) || pressed(Key::ArrowLeft) || pressed(Key::Backspace) {
+            run_command(s, st, "quickSwitch.back", &Value::Null);
+        } else if pressed(Key::ArrowDown) {
+            run_command(s, st, "quickSwitch.move", &json!({ "delta": 1 }));
+        } else if pressed(Key::ArrowUp) {
+            run_command(s, st, "quickSwitch.move", &json!({ "delta": -1 }));
+        } else if pressed(Key::Enter) || pressed(Key::ArrowRight) {
+            run_command(s, st, "quickSwitch.accept", &Value::Null);
+        } else {
+            let digit = events.iter().find_map(|e| match e {
+                Event::Text(t) => t.chars().next().and_then(|c| c.to_digit(10)).filter(|d| *d >= 1),
+                _ => None,
+            });
+            if let Some(d) = digit {
+                run_command(s, st, "quickSwitch.accept", &json!({ "index": d - 1 }));
+            }
+        }
+        consume_keys(ctx);
+        return;
+    }
+    if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+        if s.run_store.dialog.is_some() {
+            run_command(s, st, "runConfig.cancel", &Value::Null);
+        } else {
+            run_command(s, st, "settings.dialog.cancel", &Value::Null);
+        }
+    }
+    // Everything else belongs to the dialog's own fields; no IDE shortcuts while it is open.
+}
+
+// ---------------------------------------------------------------- windows
+
+pub(crate) fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let ctx = ui.ctx().clone();
+    if matches!(s.popup, Some(Popup::Settings)) {
+        if s.prefs.dialog.is_none() {
+            run_command(s, st, "app.settings", &Value::Null);
+        }
+        settings_window(&ctx, s, st);
+    } else {
+        st.prefs.recording = None;
+        st.prefs.conflict = None;
+    }
+    if s.prefs.quick_switch.is_some() {
+        quick_switch(&ctx, s, st);
+    }
+    if s.run_store.dialog.is_some() {
+        run_configs_window(&ctx, s, st);
+    } else {
+        st.prefs.run_form = None;
+        st.prefs.run_error = None;
+    }
+}
+
+/// Commands to run after a window is painted (`id`, params).
+type Cmds = Vec<(&'static str, Value)>;
+
+fn settings_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let Some(dialog) = s.prefs.dialog.clone() else { return };
+    let mut open = true;
+    let mut cmds: Cmds = Vec::new();
+    let theme = st.theme.clone();
+    crate::windows::resizable(egui::Window::new("Settings").default_size([880.0, 600.0]), st, "settings")
+        .id(egui::Id::new("settings-window"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            egui::Panel::bottom("settings-buttons").resizable(false).show(ui, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if let Some(e) = &dialog.error {
+                        ui.label(RichText::new(e).color(theme.error));
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let changed = dialog.draft != s.ws.settings;
+                        if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
+                            cmds.push(("settings.dialog.apply", Value::Null));
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cmds.push(("settings.dialog.cancel", Value::Null));
+                        }
+                        if ui.button("OK").clicked() {
+                            cmds.push(("settings.dialog.ok", Value::Null));
+                        }
+                    });
+                });
+            });
+            egui::Panel::left("settings-tree").resizable(true).default_size(230.0).show(ui, |ui| {
+                let mut query = dialog.query.clone();
+                let resp = ui
+                    .add(TextEdit::singleline(&mut query).hint_text("🔍 Search settings").desired_width(f32::INFINITY));
+                if resp.changed() {
+                    cmds.push(("settings.dialog.search", json!({ "query": query })));
+                }
+                ui.add_space(4.0);
+                ScrollArea::vertical().id_salt("settings-tree-scroll").show(ui, |ui| {
+                    page_tree(ui, &dialog.page, &dialog.query, &theme, &mut cmds);
+                });
+            });
+            ScrollArea::vertical().id_salt("settings-page").show(ui, |ui| {
+                ui.add_space(2.0);
+                ui.label(RichText::new(&dialog.page).strong().size(15.0));
+                ui.add_space(6.0);
+                page(ui, s, st, &dialog.page, &dialog.draft, &dialog.query, &mut cmds);
+            });
+        });
+    if !open {
+        cmds.push(("settings.dialog.cancel", Value::Null));
+    }
+    for (id, p) in cmds {
+        run_command(s, st, id, &p);
+    }
+}
+
+fn page_tree(ui: &mut egui::Ui, current: &str, query: &str, theme: &Theme, cmds: &mut Cmds) {
+    let visible = settings::matching_pages(query);
+    let mut last_group = "";
+    for page in settings::PAGES.iter().copied().filter(|p| visible.contains(p)) {
+        let (group, leaf) = page.split_once(" › ").unwrap_or(("", page));
+        if !group.is_empty() && group != last_group {
+            ui.label(RichText::new(group).color(theme.text_muted));
+        }
+        last_group = group;
+        ui.horizontal(|ui| {
+            if !group.is_empty() {
+                ui.add_space(14.0);
+            }
+            if ui.add(egui::Button::selectable(page == current, leaf).frame_when_inactive(false)).clicked() {
+                cmds.push(("settings.dialog.page", json!({ "page": page })));
+            }
+        });
+    }
+    if visible.is_empty() {
+        ui.label(RichText::new("Nothing found").color(theme.text_muted));
+    }
+}
+
+fn page(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    st: &mut UiState,
+    page: &str,
+    draft: &Settings,
+    query: &str,
+    cmds: &mut Cmds,
+) {
+    match page {
+        settings::PAGE_KEYMAP => keymap_page(ui, st, draft, cmds),
+        settings::PAGE_COLOR_SCHEME => color_scheme_page(ui, st, draft, query, cmds),
+        settings::PAGE_LIVE_TEMPLATES => templates_page(ui, s, st),
+        settings::PAGE_TOOLS => tools_page(ui, s, st, cmds),
+        settings::PAGE_FONT => {
+            setting_grid(ui, st, page, draft, query, cmds);
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(format!("Editor font: {}", st.mono_font_name)).color(st.theme.text_muted).size(11.0),
+            );
+        }
+        _ => setting_grid(ui, st, page, draft, query, cmds),
+    }
+}
+
+/// The page's settings as a two-column grid (only those matching a search, when some do).
+fn setting_grid(ui: &mut egui::Ui, st: &UiState, page: &str, draft: &Settings, query: &str, cmds: &mut Cmds) {
+    let defs: Vec<&SettingDef> = settings::SETTINGS
+        .iter()
+        .filter(|d| d.page == page && !matches!(d.kind, Kind::KeymapOverrides | Kind::UserSchemes))
+        // The global menu bar exists only on macOS.
+        .filter(|d| d.key != "native_menu_bar" || cfg!(target_os = "macos"))
+        .collect();
+    let hits: Vec<&SettingDef> = defs.iter().copied().filter(|d| settings::matches(d, query)).collect();
+    let shown = if hits.is_empty() { defs } else { hits };
+    egui::Grid::new(("settings-grid", page)).num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
+        for d in shown {
+            ui.label(d.label).on_hover_text(d.description);
+            if let Some(v) = widget(ui, st, d, draft) {
+                cmds.push(("settings.set", json!({ "key": d.key, "value": v })));
+            }
+            ui.end_row();
+        }
+    });
+}
+
+/// One setting's editor; returns the new value when the user changed it.
+fn widget(ui: &mut egui::Ui, st: &UiState, d: &SettingDef, draft: &Settings) -> Option<Value> {
+    let current = settings::get_value(draft, d.key).unwrap_or(Value::Null);
+    match d.kind {
+        Kind::Bool => {
+            let mut on = current.as_bool().unwrap_or(false);
+            ui.checkbox(&mut on, "").on_hover_text(d.description).changed().then(|| json!(on))
+        }
+        Kind::Int { min, max } => {
+            let mut n = current.as_i64().unwrap_or(min);
+            let mut w = egui::DragValue::new(&mut n).range(min..=max);
+            if d.key == "lsp_memory_limit_mb" {
+                w = w.speed(16.0).custom_formatter(|v, _| if v <= 0.0 { "never".into() } else { format!("{v:.0}") });
+            }
+            ui.add(w).changed().then(|| json!(n))
+        }
+        Kind::Float { min, max } => {
+            let mut n = current.as_f64().unwrap_or(min);
+            ui.add(egui::DragValue::new(&mut n).range(min..=max).speed(0.1).max_decimals(2)).changed().then(|| json!(n))
+        }
+        Kind::Text => {
+            let mut t = current.as_str().unwrap_or_default().to_string();
+            let hint = match d.key {
+                "commit_ai_model" => codecraft_engine::commit_ai::Provider::from_id(&draft.commit_ai_provider)
+                    .map(|p| p.default_model())
+                    .unwrap_or("provider default"),
+                _ => "",
+            };
+            ui.add(TextEdit::singleline(&mut t).hint_text(hint).desired_width(320.0)).changed().then(|| json!(t))
+        }
+        Kind::OptPath => {
+            let mut t = current.as_str().unwrap_or_default().to_string();
+            ui.add(TextEdit::singleline(&mut t).hint_text("auto-detect").desired_width(320.0))
+                .changed()
+                .then(|| if t.trim().is_empty() { Value::Null } else { json!(t) })
+        }
+        Kind::Provider => {
+            use codecraft_engine::commit_ai::Provider;
+            let id = current.as_str().unwrap_or_default().to_string();
+            let mut chosen = id.clone();
+            let label = Provider::from_id(&id).map(|p| p.label().to_string()).unwrap_or(id.clone());
+            egui::ComboBox::from_id_salt(("setting", d.key)).selected_text(label).show_ui(ui, |ui| {
+                for p in Provider::ALL {
+                    ui.selectable_value(&mut chosen, p.id().to_string(), p.label());
+                }
+            });
+            (chosen != id).then(|| json!(chosen))
+        }
+        Kind::Theme => choice(ui, d.key, current.as_str().unwrap_or("Dark"), &settings::THEMES.map(String::from)),
+        Kind::Keymap => {
+            let cur = keymaps::active(draft);
+            choice(ui, d.key, cur, &keymaps::NAMES.map(String::from))
+        }
+        Kind::ColorScheme => {
+            let cur = settings::effective_scheme(draft);
+            choice(ui, d.key, &cur, &settings::scheme_names(draft))
+        }
+        Kind::Secrets => {
+            use codecraft_engine::commit_ai::Provider;
+            let provider = Provider::from_id(&draft.commit_ai_provider);
+            let Some((p, var)) = provider.and_then(|p| Some((p, p.key_env()?))) else {
+                ui.label(RichText::new("not needed for this provider").color(st.theme.text_muted));
+                return None;
+            };
+            let mut keys = draft.commit_ai_keys.clone();
+            let mut key = keys.get(p.id()).cloned().unwrap_or_default();
+            let resp = ui.add(
+                TextEdit::singleline(&mut key).password(true).hint_text(format!("or set {var}")).desired_width(320.0),
+            );
+            resp.changed().then(|| {
+                keys.insert(p.id().to_string(), key);
+                json!(keys)
+            })
+        }
+        Kind::KeymapOverrides | Kind::UserSchemes => None,
+    }
+}
+
+fn choice(ui: &mut egui::Ui, key: &str, current: &str, options: &[String]) -> Option<Value> {
+    let mut chosen = current.to_string();
+    egui::ComboBox::from_id_salt(("setting", key)).selected_text(current).width(220.0).show_ui(ui, |ui| {
+        for o in options {
+            ui.selectable_value(&mut chosen, o.clone(), o.as_str());
+        }
+    });
+    (chosen != current).then(|| json!(chosen))
+}
+
+// ---------------------------------------------------------------- keymap page
+
+fn add_shortcut(s: &mut Session, st: &mut UiState, id: &'static str, sc: &str, remove: bool) {
+    let params = json!({ "id": id, "shortcut": sc, "removeConflicts": remove });
+    match s.execute("keymap.addShortcut", &params) {
+        Ok(v) => {
+            let others: Vec<&'static str> = v["conflicts"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|x| registry().get(x.as_str()?)).map(|c| c.id).collect())
+                .unwrap_or_default();
+            st.prefs.conflict = (!others.is_empty()).then(|| (id, sc.to_string(), others));
+        }
+        Err(e) => s.status = e.to_string(),
+    }
+}
+
+fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut Cmds) {
+    let theme = st.theme.clone();
+    let active = keymaps::active(draft);
+    ui.horizontal(|ui| {
+        ui.label("Keymap:");
+        if let Some(v) = choice(ui, "keymap", active, &keymaps::NAMES.map(String::from)) {
+            cmds.push(("keymap.select", json!({ "name": v })));
+        }
+        let changes = keymaps::overrides(draft, active).map(|o| o.len()).unwrap_or(0);
+        if ui
+            .add_enabled(changes > 0, egui::Button::new("Reset All"))
+            .on_hover_text("Drop every shortcut change in this keymap")
+            .clicked()
+        {
+            cmds.push(("keymap.reset", Value::Null));
+        }
+        if changes > 0 {
+            ui.label(RichText::new(format!("{changes} changed")).color(theme.text_muted));
+        }
+    });
+    ui.add(
+        TextEdit::singleline(&mut st.prefs.keymap_filter)
+            .hint_text("🔍 Search actions or shortcuts")
+            .desired_width(f32::INFINITY),
+    );
+    if let Some((id, sc, others)) = st.prefs.conflict.clone() {
+        egui::Frame::new().fill(theme.hover).inner_margin(6.0).corner_radius(4.0).show(ui, |ui| {
+            let names: Vec<&str> = others.iter().map(|o| registry().get(o).map(|c| c.label).unwrap_or(o)).collect();
+            ui.label(
+                RichText::new(format!("{} is also assigned to: {}", keymap::display(&sc), names.join(", ")))
+                    .color(theme.warning),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Remove Other Assignments").clicked() {
+                    cmds.push(("keymap.addShortcut", json!({ "id": id, "shortcut": sc, "removeConflicts": true })));
+                    st.prefs.conflict = None;
+                }
+                if ui.button("Leave").clicked() {
+                    st.prefs.conflict = None;
+                }
+            });
+        });
+    }
+    if let Some(id) = st.prefs.recording {
+        let label = registry().get(id).map(|c| c.label).unwrap_or(id);
+        ui.label(RichText::new(format!("Press the shortcut for “{label}” (Escape cancels)…")).color(theme.accent));
+    }
+    ui.add_space(4.0);
+    let q = st.prefs.keymap_filter.trim().to_lowercase();
+    let rows: Vec<(&'static str, &'static str, String, Vec<String>, bool)> = registry()
+        .all()
+        .iter()
+        .filter_map(|c| {
+            let shortcuts = keymaps::shortcuts(draft, c.id);
+            let menu = registry().menu_path(c.id).map(|m| m.join(" › ")).unwrap_or_default();
+            let hit = q.is_empty()
+                || c.label.to_lowercase().contains(&q)
+                || c.id.to_lowercase().contains(&q)
+                || menu.to_lowercase().contains(&q)
+                || shortcuts
+                    .iter()
+                    .any(|s| s.to_lowercase().contains(&q) || keymap::display(s).to_lowercase().contains(&q));
+            hit.then(|| (c.id, c.label, menu, shortcuts, keymaps::is_overridden(draft, c.id)))
+        })
+        .collect();
+    let row_h = 24.0;
+    ScrollArea::vertical().id_salt("keymap-rows").max_height(ui.available_height().max(200.0)).show_rows(
+        ui,
+        row_h,
+        rows.len(),
+        |ui, range| {
+            for (id, label, menu, shortcuts, overridden) in rows.get(range).unwrap_or_default() {
+                ui.horizontal(|ui| {
+                    ui.set_min_height(row_h);
+                    let text = RichText::new(*label).color(if *overridden { theme.link } else { theme.text });
+                    ui.allocate_ui_with_layout(vec2(260.0, row_h), Layout::left_to_right(Align::Center), |ui| {
+                        ui.set_width(260.0);
+                        ui.add(egui::Label::new(text).truncate()).on_hover_text(format!("{id}\n{menu}"));
+                    });
+                    for sc in shortcuts {
+                        let chip = egui::Button::new(
+                            RichText::new(format!("{}  ×", keymap::display(sc))).monospace().size(11.5),
+                        );
+                        if ui.add(chip).on_hover_text("Remove this shortcut").clicked() {
+                            cmds.push(("keymap.removeShortcut", json!({ "id": id, "shortcut": sc })));
+                        }
+                    }
+                    let recording = st.prefs.recording == Some(*id);
+                    if ui
+                        .add(egui::Button::selectable(recording, "+"))
+                        .on_hover_text("Add Keyboard Shortcut: press the keys")
+                        .clicked()
+                    {
+                        st.prefs.recording = if recording { None } else { Some(*id) };
+                        st.prefs.conflict = None;
+                    }
+                    if *overridden && ui.small_button("Reset").on_hover_text("Restore the keymap's shortcuts").clicked()
+                    {
+                        cmds.push(("keymap.reset", json!({ "id": id })));
+                    }
+                });
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------- colour scheme page
+
+fn color_scheme_page(ui: &mut egui::Ui, st: &UiState, draft: &Settings, query: &str, cmds: &mut Cmds) {
+    let theme = &st.theme;
+    let current = settings::effective_scheme(draft);
+    let user = draft.user_schemes.iter().find(|u| u.name == current);
+    ui.horizontal(|ui| {
+        ui.label("Scheme:");
+        if let Some(v) = choice(ui, "color_scheme", &current, &settings::scheme_names(draft)) {
+            cmds.push(("colorScheme.select", json!({ "name": v })));
+        }
+        if ui.button("Duplicate…").on_hover_text("Copy this scheme into an editable one").clicked() {
+            cmds.push(("colorScheme.duplicate", json!({ "from": current })));
+        }
+        if user.is_some() && ui.button("Delete").clicked() {
+            cmds.push(("colorScheme.delete", json!({ "name": current })));
+        }
+    });
+    let preview = Theme::from_settings(&Settings { color_scheme: current.clone(), ..draft.clone() });
+    ui.add_space(6.0);
+    egui::Frame::new().fill(preview.editor_bg).inner_margin(8.0).corner_radius(4.0).show(ui, |ui| {
+        let font = FontId::monospace(13.0);
+        let line = |ui: &mut egui::Ui, parts: &[(&str, Color32)]| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (t, c) in parts {
+                    ui.label(RichText::new(*t).font(font.clone()).color(*c));
+                }
+            });
+        };
+        line(ui, &[("/// Adds one.", preview.doc_comment)]);
+        line(ui, &[("#[inline]", preview.attribute)]);
+        line(
+            ui,
+            &[
+                ("pub fn ", preview.keyword),
+                ("add_one", preview.function),
+                ("<'a>(x: ", preview.text_editor),
+                ("u32", preview.type_),
+                (") -> ", preview.text_editor),
+                ("u32", preview.type_),
+                (" {", preview.text_editor),
+            ],
+        );
+        line(
+            ui,
+            &[
+                ("    ", preview.text_editor),
+                ("println!", preview.macro_),
+                ("(", preview.text_editor),
+                ("\"x = {x}\\n\"", preview.string),
+                (");", preview.text_editor),
+                ("  // note", preview.comment),
+            ],
+        );
+        line(
+            ui,
+            &[
+                ("    x + ", preview.text_editor),
+                ("1", preview.number),
+                ("  ", preview.text_editor),
+                ("MAX", preview.constant),
+            ],
+        );
+        line(ui, &[("}", preview.text_editor)]);
+    });
+    ui.add_space(6.0);
+    let Some(user) = user else {
+        ui.label(
+            RichText::new("Built-in schemes are read-only: Duplicate one to change its colours.")
+                .color(theme.text_muted),
+        );
+        return;
+    };
+    let q = query.trim().to_lowercase();
+    egui::Grid::new("scheme-colors").num_columns(3).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
+        for token in settings::COLOR_TOKENS.iter().filter(|t| q.is_empty() || t.contains(&q)) {
+            let Some(mut c) = preview.token(token) else { continue };
+            let changed = user.colors.contains_key(*token);
+            ui.label(RichText::new(*token).color(if changed { theme.link } else { theme.text }));
+            if egui::color_picker::color_edit_button_srgba(ui, &mut c, egui::color_picker::Alpha::Opaque).changed() {
+                cmds.push(("colorScheme.setColor", json!({ "token": token, "color": crate::theme::to_hex(c) })));
+            }
+            if changed && ui.small_button("Reset").clicked() {
+                cmds.push(("colorScheme.resetColor", json!({ "token": token })));
+            } else if !changed {
+                ui.label("");
+            }
+            ui.end_row();
+        }
+    });
+}
+
+// ---------------------------------------------------------------- live templates and tools
+
+fn templates_page(ui: &mut egui::Ui, s: &mut Session, st: &UiState) {
+    let theme = &st.theme;
+    let user = s.editing.templates.user_templates().to_vec();
+    let path = s.editing.templates.path();
+    ui.label(
+        RichText::new(match &path {
+            Some(p) => {
+                format!("User templates are stored in {}. Add one with Code › Save as Live Template.", p.display())
+            }
+            None => "User templates: set CODECRAFT_HOME to store them.".into(),
+        })
+        .color(theme.text_muted),
+    );
+    if let Some(e) = &s.editing.templates.error {
+        ui.label(RichText::new(e).color(theme.error));
+    }
+    ui.add_space(4.0);
+    let builtins = codecraft_engine::templates::builtins();
+    let rows: Vec<(bool, &codecraft_engine::templates::Template)> =
+        user.iter().map(|t| (true, t)).chain(builtins.iter().map(|t| (false, t))).collect();
+    egui::Grid::new("templates-grid").num_columns(3).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
+        ui.label(RichText::new("Abbreviation").strong());
+        ui.label(RichText::new("Description").strong());
+        ui.label(RichText::new("Languages").strong());
+        ui.end_row();
+        for (is_user, t) in rows {
+            let abbr = RichText::new(&t.abbreviation).monospace().color(if is_user { theme.link } else { theme.text });
+            ui.label(abbr).on_hover_text(&t.text);
+            ui.label(&t.description);
+            ui.label(RichText::new(t.languages.join(", ")).color(theme.text_muted));
+            ui.end_row();
+        }
+    });
+}
+
+fn tools_page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut Cmds) {
+    let theme = &st.theme;
+    ui.label(RichText::new("These apply immediately.").color(theme.text_muted));
+    ui.add_space(4.0);
+    egui::Grid::new("tools-grid").num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
+        ui.label("Claude Code IDE integration");
+        let mut on = s.ide.is_enabled();
+        if ui.checkbox(&mut on, "").changed() {
+            cmds.push((if on { "ide.enable" } else { "ide.disable" }, Value::Null));
+        }
+        ui.end_row();
+        ui.label("Use the Claude subscription").on_hover_text("Remove ANTHROPIC_API_KEY from agents' environment");
+        let mut scrub = s.agents.settings.scrub_api_keys;
+        if ui.checkbox(&mut scrub, "").changed() {
+            cmds.push(("agent.settings", json!({ "scrubApiKeys": scrub })));
+        }
+        ui.end_row();
+        ui.label("Agent worktrees");
+        let mut dir = s.agents.settings.worktrees_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        if ui.add(TextEdit::singleline(&mut dir).hint_text("~/.codecraft/worktrees").desired_width(320.0)).lost_focus()
+        {
+            let v = if dir.trim().is_empty() { Value::Null } else { json!(dir.trim()) };
+            cmds.push(("agent.settings", json!({ "worktreesDir": v })));
+        }
+        ui.end_row();
+    });
+}
+
+// ---------------------------------------------------------------- quick switch
+
+fn quick_switch(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let Some(q) = s.prefs.quick_switch.clone() else { return };
+    let items = settings::quick_items(&s.ws.settings, q.level);
+    let title = match q.level {
+        QuickLevel::Root => "Switch…",
+        QuickLevel::ColorScheme => "Editor Color Scheme",
+        QuickLevel::Keymap => "Keymap",
+        QuickLevel::Theme => "Theme",
+    };
+    let theme = st.theme.clone();
+    let mut clicked: Option<usize> = None;
+    let resp = egui::Area::new(egui::Id::new("quick-switch"))
+        .order(egui::Order::Foreground)
+        .anchor(Align2::CENTER_TOP, vec2(0.0, 120.0))
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(theme.popup_bg)
+                .stroke(egui::Stroke::new(1.0, theme.separator))
+                .corner_radius(8.0)
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.set_min_width(300.0);
+                    ui.label(RichText::new(title).strong());
+                    ui.separator();
+                    for (i, item) in items.iter().enumerate() {
+                        let mark = if item.current { "✓ " } else { "   " };
+                        let more = if q.level == QuickLevel::Root { "  ›" } else { "" };
+                        let text = format!("{mark}{}. {}{more}", i + 1, item.label);
+                        if ui.add(egui::Button::selectable(i == q.selected, text).frame_when_inactive(false)).clicked()
+                        {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+        });
+    if let Some(i) = clicked {
+        run_command(s, st, "quickSwitch.accept", &json!({ "index": i }));
+    } else if ctx.input(|i| i.pointer.any_pressed()) && !resp.response.contains_pointer() {
+        run_command(s, st, "quickSwitch.close", &Value::Null);
+    }
+}
+
+// ---------------------------------------------------------------- edit configurations
+
+fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let Some(dialog) = s.run_store.dialog.clone() else { return };
+    let root = s.run_store.root().map(std::path::Path::to_path_buf).unwrap_or_default();
+    let derived: Vec<(String, String)> =
+        s.run_store.derived.iter().map(|c| (c.name.clone(), c.command_line())).collect();
+    // The form follows the selected user configuration.
+    let selected_user = dialog.selected.filter(|sel| !sel.derived).map(|sel| sel.index);
+    match (selected_user, &st.prefs.run_form) {
+        (Some(i), Some(f)) if f.index == i => {}
+        (Some(i), _) => {
+            st.prefs.run_form = dialog.draft.get(i).map(|c| RunForm {
+                index: i,
+                name: c.name.clone(),
+                kind: c.kind,
+                command: c.command.clone(),
+                env: env_text(&c.env),
+                working_dir: c.working_dir.clone(),
+            });
+            st.prefs.run_error = None;
+        }
+        (None, _) => st.prefs.run_form = None,
+    }
+    let theme = st.theme.clone();
+    let mut open = true;
+    let mut cmds: Cmds = Vec::new();
+    let mut form = st.prefs.run_form.clone();
+    crate::windows::resizable(
+        egui::Window::new("Run/Debug Configurations").default_size([820.0, 480.0]),
+        st,
+        "run-configs",
+    )
+    .id(egui::Id::new("run-configs-window"))
+    .open(&mut open)
+    .collapsible(false)
+    .show(ctx, |ui| {
+        egui::Panel::bottom("run-configs-buttons").resizable(false).show(ui, |ui| {
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if let Some(e) = &dialog.error {
+                    ui.label(RichText::new(e).color(theme.error));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let changed = dialog.draft != s.run_store.user;
+                    if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
+                        cmds.push(("runConfig.apply", Value::Null));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cmds.push(("runConfig.cancel", Value::Null));
+                    }
+                    if ui.button("OK").clicked() {
+                        cmds.push(("runConfig.ok", Value::Null));
+                    }
+                });
+            });
+        });
+        egui::Panel::left("run-configs-list").resizable(true).default_size(260.0).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Cargo").on_hover_text("New Cargo configuration").clicked() {
+                    cmds.push(("runConfig.create", json!({ "name": "Cargo", "kind": "cargo", "command": "run" })));
+                }
+                if ui.button("+ Command").on_hover_text("New command-line configuration").clicked() {
+                    cmds.push(("runConfig.create", json!({ "name": "Command", "kind": "command", "command": "make" })));
+                }
+                let can_copy = dialog.selected.is_some();
+                if ui.add_enabled(can_copy, egui::Button::new("Copy")).on_hover_text("Copy Configuration").clicked()
+                    && let Some(sel) = dialog.selected
+                {
+                    cmds.push(("runConfig.copy", json!({ "index": sel.index, "derived": sel.derived })));
+                }
+                if ui
+                    .add_enabled(selected_user.is_some(), egui::Button::new("Delete"))
+                    .on_hover_text("Delete Configuration")
+                    .clicked()
+                    && let Some(i) = selected_user
+                {
+                    cmds.push(("runConfig.delete", json!({ "index": i })));
+                }
+            });
+            ui.separator();
+            ScrollArea::vertical().id_salt("run-configs-scroll").show(ui, |ui| {
+                ui.label(RichText::new("Configurations").color(theme.text_muted));
+                if dialog.draft.is_empty() {
+                    ui.label(RichText::new("  none yet").color(theme.text_disabled));
+                }
+                for (i, c) in dialog.draft.iter().enumerate() {
+                    let sel = dialog.selected == Some(Selection { derived: false, index: i });
+                    let icon = if c.kind == RunKind::Cargo { "◆" } else { "▶" };
+                    if ui
+                        .add(egui::Button::selectable(sel, format!("{icon} {}", c.name)).frame_when_inactive(false))
+                        .clicked()
+                    {
+                        cmds.push(("runConfig.select", json!({ "index": i })));
+                    }
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("From the project").color(theme.text_muted));
+                for (i, (name, _)) in derived.iter().enumerate() {
+                    let sel = dialog.selected == Some(Selection { derived: true, index: i });
+                    let text = RichText::new(format!("⚙ {name}")).color(theme.text_muted);
+                    if ui.add(egui::Button::selectable(sel, text).frame_when_inactive(false)).clicked() {
+                        cmds.push(("runConfig.select", json!({ "index": i, "derived": true })));
+                    }
+                }
+            });
+        });
+        ui.add_space(4.0);
+        match (dialog.selected, form.as_mut()) {
+            (Some(Selection { derived: false, .. }), Some(f)) => {
+                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref());
+            }
+            (Some(Selection { derived: true, index }), _) => {
+                if let Some((name, line)) = derived.get(index) {
+                    ui.label(RichText::new(name).strong().size(15.0));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(line).monospace());
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Derived from the project's Cargo targets and build files; copy it to edit.")
+                            .color(theme.text_muted),
+                    );
+                    if ui.button("Copy to Editable Configuration").clicked() {
+                        cmds.push(("runConfig.copy", json!({ "index": index, "derived": true })));
+                    }
+                }
+            }
+            _ => {
+                ui.label(
+                    RichText::new("Add a configuration with + Cargo or + Command, or copy one from the project.")
+                        .color(theme.text_muted),
+                );
+            }
+        }
+    });
+    // Field edits go to the draft as they are typed; an invalid value stays in the form with its
+    // error until it is fixed.
+    if let (Some(new), Some(old)) = (&form, &st.prefs.run_form)
+        && new != old
+    {
+        let params = json!({
+            "index": new.index,
+            "name": new.name,
+            "kind": match new.kind { RunKind::Cargo => "cargo", RunKind::Command => "command" },
+            "command": new.command,
+            "env": new.env,
+            "workingDir": new.working_dir,
+        });
+        st.prefs.run_error = s.execute("runConfig.update", &params).err().map(|e| e.to_string());
+        st.prefs.run_form = form;
+    }
+    if !open {
+        cmds.push(("runConfig.cancel", Value::Null));
+    }
+    for (id, p) in cmds {
+        run_command(s, st, id, &p);
+    }
+}
+
+fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path::Path, error: Option<&str>) {
+    egui::Grid::new("run-config-form").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+        ui.label("Name:");
+        ui.add(TextEdit::singleline(&mut f.name).desired_width(f32::INFINITY));
+        ui.end_row();
+        ui.label("Type:");
+        egui::ComboBox::from_id_salt("run-config-kind").selected_text(f.kind.label()).show_ui(ui, |ui| {
+            ui.selectable_value(&mut f.kind, RunKind::Cargo, RunKind::Cargo.label());
+            ui.selectable_value(&mut f.kind, RunKind::Command, RunKind::Command.label());
+        });
+        ui.end_row();
+        ui.label("Command:");
+        let hint = match f.kind {
+            RunKind::Cargo => "run --package app --bin app -- --arg",
+            RunKind::Command => "make test   or   sh -c 'a && b'",
+        };
+        ui.add(
+            TextEdit::singleline(&mut f.command)
+                .hint_text(hint)
+                .font(FontId::monospace(13.0))
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
+        ui.label("Environment variables:");
+        ui.add(TextEdit::singleline(&mut f.env).hint_text("RUST_LOG=debug;PORT=8080").desired_width(f32::INFINITY));
+        ui.end_row();
+        ui.label("Working directory:");
+        ui.add(
+            TextEdit::singleline(&mut f.working_dir).hint_text(root.display().to_string()).desired_width(f32::INFINITY),
+        );
+        ui.end_row();
+    });
+    ui.add_space(6.0);
+    let preview = match f.kind {
+        RunKind::Cargo => format!("cargo {}", f.command.trim()),
+        RunKind::Command => f.command.trim().to_string(),
+    };
+    ui.label(RichText::new(preview).monospace().color(theme.text_muted));
+    if let Some(e) = error {
+        ui.label(RichText::new(e).color(theme.error));
+    }
+}
