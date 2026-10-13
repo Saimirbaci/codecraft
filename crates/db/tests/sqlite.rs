@@ -193,3 +193,70 @@ fn script_runs_statement_by_statement() {
     }
     assert_eq!(last, vec![vec![Cell::Int(4)]]);
 }
+
+#[test]
+fn explain_query_plan_and_transaction_state() {
+    let (_dir, mut conn) = setup();
+    let plan = codecraft_db::explain::explain(
+        conn.as_mut(),
+        "select b.title, a.name from books b join authors a on a.id = b.author_id order by b.title;",
+        true,
+    )
+    .unwrap();
+    assert!(!plan.analyzed);
+    assert!(plan.note.as_deref().is_some_and(|n| n.contains("cannot analyze")));
+    let relations: Vec<_> = plan.roots.iter().filter_map(|n| n.relation.clone()).collect();
+    assert!(relations.iter().any(|r| r == "b" || r == "a"), "{:?}", plan.roots);
+    assert!(codecraft_db::explain::explain(conn.as_mut(), "select * from nope", false).is_err());
+
+    assert_eq!(conn.in_transaction(), Some(false));
+    query_all(conn.as_mut(), "begin").unwrap();
+    assert_eq!(conn.in_transaction(), Some(true));
+    query_all(conn.as_mut(), "rollback").unwrap();
+    assert_eq!(conn.in_transaction(), Some(false));
+}
+
+#[test]
+fn import_csv_in_one_transaction() {
+    use codecraft_db::import::{ImportOptions, auto_mapping, insert_statements, read_file, run_import};
+    let (dir, mut conn) = setup();
+    let csv = dir.path().join("authors.csv");
+    std::fs::write(&csv, "name,born\nCy,1950\n\"D, Jr.\",\nEve,1970\n").unwrap();
+    let data = read_file(&csv, &ImportOptions::default()).unwrap();
+    let table = vec!["id".to_string(), "name".to_string(), "born".to_string()];
+    let mapping = auto_mapping(&data.columns, &table);
+    assert_eq!(mapping, [None, Some(0), Some(1)]);
+    let statements = insert_statements(DbKind::Sqlite, "main", "authors", &table, &mapping, &data, 2).unwrap();
+    assert_eq!(statements.len(), 2);
+    let mut seen = Vec::new();
+    let n = run_import(conn.as_mut(), &statements, &mut |i| seen.push(i)).unwrap();
+    assert_eq!((n, seen), (3, vec![1, 2]));
+    let (_, rows, _) = query_all(conn.as_mut(), "select name, born from authors order by id").unwrap();
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[3], [Cell::Text("D, Jr.".into()), Cell::Null]);
+    assert_eq!(rows[4][1], Cell::Int(1970));
+
+    // A failing batch (NOT NULL) rolls back everything.
+    std::fs::write(&csv, "name\nZed\n\n\"\"\n").unwrap();
+    let data = read_file(&csv, &ImportOptions::default()).unwrap();
+    let statements =
+        insert_statements(DbKind::Sqlite, "main", "authors", &table, &[None, Some(0), None], &data, 1).unwrap();
+    let e = run_import(conn.as_mut(), &statements, &mut |_| {}).unwrap_err();
+    assert!(e.to_string().contains("nothing was imported"), "{e}");
+    let (_, rows, _) = query_all(conn.as_mut(), "select count(*) from authors").unwrap();
+    assert_eq!(rows[0][0], Cell::Int(5));
+    assert_eq!(conn.in_transaction(), Some(false));
+    assert!(read_file(&dir.path().join("missing.csv"), &ImportOptions::default()).is_err());
+}
+
+#[test]
+fn read_only_sqlite_rejects_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ro.db");
+    query_all(connect(&config(&path), None).unwrap().as_mut(), "create table t (a)").unwrap();
+    let mut cfg = config(&path);
+    cfg.read_only = true;
+    let mut conn = connect(&cfg, None).unwrap();
+    assert!(query_all(conn.as_mut(), "insert into t values (1)").is_err());
+    assert!(query_all(conn.as_mut(), "select * from t").is_ok());
+}

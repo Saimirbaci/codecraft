@@ -15,10 +15,17 @@ use crate::{Cell, Connection, DbError, DbKind, DbResult, ResultSink};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
 pub enum RowChange {
-    Update { key: Vec<(String, Cell)>, set: Vec<(String, Cell)> },
+    Update {
+        key: Vec<(String, Cell)>,
+        set: Vec<(String, Cell)>,
+    },
     /// Columns left out take their default.
-    Insert { values: Vec<(String, Cell)> },
-    Delete { key: Vec<(String, Cell)> },
+    Insert {
+        values: Vec<(String, Cell)>,
+    },
+    Delete {
+        key: Vec<(String, Cell)>,
+    },
 }
 
 /// A value as an SQL literal for `kind`.
@@ -149,7 +156,8 @@ pub fn statements(kind: DbKind, schema: &str, table: &str, changes: &[RowChange]
     changes.iter().map(|c| statement(kind, schema, table, c)).collect()
 }
 
-fn begin(kind: DbKind) -> &'static str {
+/// The statement that opens a transaction.
+pub fn begin_statement(kind: DbKind) -> &'static str {
     match kind {
         DbKind::Mysql | DbKind::Mariadb => "START TRANSACTION",
         DbKind::Sqlite | DbKind::Postgres => "BEGIN",
@@ -175,7 +183,7 @@ pub fn apply(conn: &mut dyn Connection, schema: &str, table: &str, changes: &[Ro
     if sqls.is_empty() {
         return Ok(0);
     }
-    conn.execute(begin(kind), 1, &mut Discard)?;
+    conn.execute(begin_statement(kind), 1, &mut Discard)?;
     let mut total = 0u64;
     let mut failure = None;
     for (sql, change) in sqls.iter().zip(changes) {
@@ -257,10 +265,11 @@ mod tests {
             statement(DbKind::Mysql, "db", "users", &up).unwrap(),
             "UPDATE `db`.`users` SET `na\"me` = 'O''Neil' WHERE `id` = 3"
         );
-        let del = RowChange::Delete {
-            key: vec![("a".into(), Cell::Int(1)), ("b".into(), Cell::Text("x".into()))],
-        };
-        assert_eq!(statement(DbKind::Sqlite, "", "t", &del).unwrap(), "DELETE FROM \"t\" WHERE \"a\" = 1 AND \"b\" = 'x'");
+        let del = RowChange::Delete { key: vec![("a".into(), Cell::Int(1)), ("b".into(), Cell::Text("x".into()))] };
+        assert_eq!(
+            statement(DbKind::Sqlite, "", "t", &del).unwrap(),
+            "DELETE FROM \"t\" WHERE \"a\" = 1 AND \"b\" = 'x'"
+        );
         let ins = RowChange::Insert { values: vec![("a".into(), Cell::Int(1)), ("b".into(), Cell::Null)] };
         assert_eq!(
             statement(DbKind::Sqlite, "main", "t", &ins).unwrap(),
@@ -275,11 +284,8 @@ mod tests {
 
     fn sqlite() -> (tempfile::TempDir, Box<dyn Connection>) {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = crate::DataSourceConfig {
-            kind: DbKind::Sqlite,
-            path: Some(dir.path().join("t.db")),
-            ..Default::default()
-        };
+        let cfg =
+            crate::DataSourceConfig { kind: DbKind::Sqlite, path: Some(dir.path().join("t.db")), ..Default::default() };
         let mut conn = crate::connect(&cfg, None).unwrap();
         crate::query_all(conn.as_mut(), "create table t (id integer primary key, name text, n real default 1.5)")
             .unwrap();
@@ -319,10 +325,8 @@ mod tests {
         assert!(e.to_string().contains("changed or deleted"), "{e}");
         assert_eq!(rows(conn.as_mut()), before);
         // A failing statement (constraint) rolls back as well.
-        let changes = vec![
-            RowChange::Delete { key: key(1) },
-            RowChange::Insert { values: vec![("id".into(), Cell::Int(2))] },
-        ];
+        let changes =
+            vec![RowChange::Delete { key: key(1) }, RowChange::Insert { values: vec![("id".into(), Cell::Int(2))] }];
         let e = apply(conn.as_mut(), "main", "t", &changes).unwrap_err();
         assert!(e.to_string().contains("INSERT INTO"), "{e}");
         assert_eq!(rows(conn.as_mut()), before);

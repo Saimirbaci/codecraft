@@ -6,6 +6,11 @@
 //! through one channel drained by [`pump`]. Result sets keep their cursor open on the worker so
 //! more rows can be fetched in pages of 500. Table results with a primary key can be edited in
 //! the grid ([`edit`]): pending changes are submitted as one transaction on the result's worker.
+//!
+//! Consoles keep a query [`history`] (with saved queries) per data source, prompt for query
+//! parameters and confirm writes on production data sources ([`exec`]), explain plans, run in
+//! manual-commit mode (Commit/Rollback) when the data source asks for it, and [`import`] loads
+//! CSV/JSON files into tables.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,8 +29,15 @@ use codecraft_workspace::NotificationLevel;
 use crate::Session;
 
 mod edit;
+pub mod exec;
+pub mod history;
+pub mod import;
 
+pub use codecraft_db::explain::{Plan, PlanNode};
 pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
+pub use exec::{ConfirmPrompt, ExecAction, ParamField, ParamPrompt};
+pub use history::{HistoryEntry, HistoryPopup, HistoryStore, SavedQuery};
+pub use import::{ImportDialog, ImportState};
 
 /// Data sources, relative to the project root.
 pub const DATASOURCES_FILE: &str = ".codecraft/datasources.json";
@@ -115,6 +127,21 @@ pub struct TableRef {
     pub table: String,
 }
 
+/// The grid's filter row: a WHERE condition and an ORDER BY clause typed by the user.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ResultFilter {
+    #[serde(rename = "where")]
+    pub where_: String,
+    pub order_by: String,
+}
+
+impl ResultFilter {
+    pub fn is_empty(&self) -> bool {
+        self.where_.trim().is_empty() && self.order_by.trim().is_empty()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SortKey {
     /// Column index (0-based).
@@ -148,6 +175,12 @@ pub struct ResultSet {
     pub sort: Option<SortKey>,
     /// Pending in-grid changes (table results with a primary key).
     pub edits: GridEdits,
+    /// An Explain Plan tab shows this tree instead of rows.
+    pub plan: Option<Plan>,
+    /// The filter row applied to this result.
+    pub filter: ResultFilter,
+    /// Rows shown as columns (record view).
+    pub transposed: bool,
     /// The query without the ORDER BY added by sorting.
     #[serde(skip)]
     pub(crate) base_sql: String,
@@ -165,6 +198,16 @@ impl ResultSet {
         let n = self.rows.len();
         let rows = if n == 1 { "1 row".to_string() } else { format!("{n} rows") };
         let time = self.elapsed_ms.map(|t| format!(" in {t} ms")).unwrap_or_default();
+        if let Some(p) = &self.plan {
+            let mut s = format!("{} plan steps", p.roots.iter().map(PlanNode::count).sum::<usize>());
+            if let Some(ms) = p.execution_ms {
+                s.push_str(&format!("; executed in {} ms", codecraft_db::value::format_number(ms)));
+            }
+            if let Some(note) = &p.note {
+                s.push_str(&format!(" ({note})"));
+            }
+            return s;
+        }
         match self.status {
             ResultStatus::Running => "Executing…".into(),
             ResultStatus::Fetching => format!("{rows} fetched, fetching more…"),
@@ -214,6 +257,14 @@ pub struct DataSourceForm {
     /// `key=value` pairs separated by `;` (e.g. `sslmode=require; connect_timeout=5`).
     pub options: String,
     pub read_only: bool,
+    /// A colour name (empty: none).
+    pub color: String,
+    /// Production guard: confirm statements that modify data.
+    pub confirm_writes: bool,
+    /// Manual-commit transactions in consoles.
+    pub manual_commit: bool,
+    /// SSH server to tunnel through (empty: connect directly).
+    pub ssh_tunnel: String,
 }
 
 impl DataSourceForm {
@@ -251,6 +302,10 @@ impl DataSourceForm {
             path: cfg.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             options: cfg.options.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "),
             read_only: cfg.read_only,
+            color: cfg.color.clone().unwrap_or_default(),
+            confirm_writes: cfg.confirm_writes,
+            manual_commit: cfg.manual_commit,
+            ssh_tunnel: cfg.ssh_tunnel.clone().unwrap_or_default(),
         }
     }
 
@@ -318,27 +373,103 @@ enum MetaResult {
 }
 
 enum Req {
-    Exec { run: u64, statements: Vec<String> },
-    More { run: u64 },
+    /// Run statements; `manual` opens a transaction first when none is open.
+    Exec {
+        run: u64,
+        statements: Vec<String>,
+        manual: bool,
+    },
+    /// Explain one statement (`analyze` runs it).
+    Explain {
+        run: u64,
+        sql: String,
+        analyze: bool,
+        manual: bool,
+    },
+    /// End the connection's transaction.
+    Tx {
+        commit: bool,
+    },
+    More {
+        run: u64,
+    },
     StopFetch,
     Meta(MetaReq),
     /// Apply in-grid edits in one transaction.
-    Apply { result: u64, schema: String, table: String, changes: Vec<codecraft_db::edit::RowChange> },
+    Apply {
+        result: u64,
+        schema: String,
+        table: String,
+        changes: Vec<codecraft_db::edit::RowChange>,
+    },
     Close,
 }
 
 enum Event {
-    Connected { worker: String, version: String, canceller: Arc<dyn Canceller> },
-    ConnectFailed { worker: String, error: String },
-    Columns { run: u64, stmt: usize, columns: Vec<Column> },
-    Page { run: u64, stmt: usize, rows: Vec<Vec<Cell>>, last: bool, waiting: bool },
-    StmtDone { run: u64, stmt: usize, summary: ExecSummary },
-    StmtFailed { run: u64, stmt: usize, error: DbError },
-    RunDone { run: u64 },
-    Meta { worker: String, req: MetaReq, result: Result<MetaResult, String> },
-    Tested { nonce: u64, result: Result<String, String> },
-    Applied { worker: String, result: u64, outcome: Result<u64, String> },
+    Connected {
+        worker: String,
+        version: String,
+        canceller: Arc<dyn Canceller>,
+    },
+    ConnectFailed {
+        worker: String,
+        error: String,
+    },
+    Columns {
+        run: u64,
+        stmt: usize,
+        columns: Vec<Column>,
+    },
+    Page {
+        run: u64,
+        stmt: usize,
+        rows: Vec<Vec<Cell>>,
+        last: bool,
+        waiting: bool,
+    },
+    StmtDone {
+        run: u64,
+        stmt: usize,
+        summary: ExecSummary,
+    },
+    StmtFailed {
+        run: u64,
+        stmt: usize,
+        error: DbError,
+    },
+    RunDone {
+        run: u64,
+    },
+    Meta {
+        worker: String,
+        req: MetaReq,
+        result: Result<MetaResult, String>,
+    },
+    Tested {
+        nonce: u64,
+        result: Result<String, String>,
+    },
+    Applied {
+        worker: String,
+        result: u64,
+        outcome: Result<u64, String>,
+    },
     SecretFailed(String),
+    Plan {
+        run: u64,
+        result: Result<Plan, String>,
+    },
+    /// Whether the worker's connection has an open transaction.
+    TxState {
+        worker: String,
+        open: bool,
+    },
+    TxDone {
+        worker: String,
+        commit: bool,
+        result: Result<(), String>,
+    },
+    Import(import::ImportEvent),
 }
 
 struct Worker {
@@ -346,9 +477,12 @@ struct Worker {
     source: String,
     canceller: Option<Arc<dyn Canceller>>,
     connected: bool,
+    /// A transaction is open on this connection.
+    in_tx: bool,
 }
 
 /// What to run: see [`DbState::start_run`].
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RunSpec {
     /// The connection: `console:<path>`, `tables:<source>`, `query:<source>`.
     pub worker: String,
@@ -363,6 +497,12 @@ pub(crate) struct RunSpec {
     pub replace: Option<u64>,
     /// The unsorted query, when `statements` is a re-sorted form of it.
     pub base_sql: Option<String>,
+    /// The filter row the statements apply.
+    pub filter: ResultFilter,
+    /// Open a transaction before the first statement (manual-commit mode).
+    pub manual: bool,
+    /// Explain the (single) statement instead of running it; `true` analyzes.
+    pub explain: Option<bool>,
 }
 
 struct RunInfo {
@@ -376,6 +516,7 @@ struct RunInfo {
     table: Option<TableRef>,
     sort: Option<SortKey>,
     base_sql: Option<String>,
+    filter: ResultFilter,
     started: Instant,
     cancel_requested: bool,
     /// The last statement's cursor is open, waiting for `More` (not running).
@@ -399,6 +540,18 @@ pub struct DbState {
     pub table_keys: HashMap<String, KeyState>,
     /// The SQL preview of a result's pending changes (Submit asks to confirm it).
     pub edit_preview: Option<EditPreview>,
+    /// Query history and saved queries per data source.
+    pub history: HistoryStore,
+    /// The query history popup.
+    pub history_popup: Option<HistoryPopup>,
+    /// Values asked for before running statements with parameters.
+    pub param_prompt: Option<ParamPrompt>,
+    /// Data-modifying statements waiting for confirmation (production guard).
+    pub confirm: Option<ConfirmPrompt>,
+    /// The Import Data dialog.
+    pub import: Option<ImportDialog>,
+    /// Parameter values remembered per console (worker key → name → value).
+    pub param_values: HashMap<String, BTreeMap<String, String>>,
     root: Option<PathBuf>,
     loaded: bool,
     secrets: Arc<dyn SecretStore>,
@@ -409,6 +562,8 @@ pub struct DbState {
     workers: HashMap<String, Worker>,
     runs: HashMap<u64, RunInfo>,
     next_id: u64,
+    /// SSH tunnels of data sources with `ssh_tunnel` (track S, `ssh_tunnel.rs`).
+    pub(crate) tunnels: crate::ssh_tunnel::Tunnels,
 }
 
 impl Default for DbState {
@@ -425,6 +580,12 @@ impl Default for DbState {
             bindings: BTreeMap::new(),
             table_keys: HashMap::new(),
             edit_preview: None,
+            history: HistoryStore::default(),
+            history_popup: None,
+            param_prompt: None,
+            confirm: None,
+            import: None,
+            param_values: HashMap::new(),
             root: None,
             loaded: false,
             secrets: Arc::new(KeychainStore::default()),
@@ -434,7 +595,16 @@ impl Default for DbState {
             workers: HashMap::new(),
             runs: HashMap::new(),
             next_id: 0,
+            tunnels: Default::default(),
         }
+    }
+}
+
+/// The connection key of an SQL console document (`console:<path>`).
+pub fn console_worker(path: Option<&Path>, doc: u64) -> String {
+    match path {
+        Some(p) => format!("console:{}", p.display()),
+        None => format!("console:untitled-{doc}"),
     }
 }
 
@@ -482,6 +652,7 @@ impl DbState {
         }) || self.results.iter().any(|r| r.is_running() || r.edits.submitting)
             || self.runs.values().any(|r| !r.waiting)
             || self.dialog.as_ref().is_some_and(|d| d.test == TestState::Running)
+            || self.import.as_ref().is_some_and(ImportDialog::is_busy)
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -491,6 +662,31 @@ impl DbState {
 
     pub fn project_root(&self) -> Option<&Path> {
         self.root.as_deref()
+    }
+
+    /// Whether the connection `worker` has an open transaction.
+    pub fn transaction_open(&self, worker: &str) -> bool {
+        self.workers.get(worker).is_some_and(|w| w.in_tx)
+    }
+
+    /// Connections with an open transaction (of one data source, or all).
+    pub fn open_transactions(&self, source: Option<&str>) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .workers
+            .iter()
+            .filter(|(_, w)| w.in_tx && source.is_none_or(|s| w.source == s))
+            .map(|(k, _)| k.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// End the transaction on `worker` (Commit or Rollback); the outcome arrives as an event.
+    pub(crate) fn end_transaction(&mut self, worker: &str, commit: bool) -> Result<(), String> {
+        let source = self.workers.get(worker).map(|w| w.source.clone()).ok_or("the connection is closed")?;
+        self.close_cursors(worker, &source);
+        self.log(OutputLevel::Sql, &source, if commit { "COMMIT" } else { "ROLLBACK" });
+        self.send(worker, Req::Tx { commit })
     }
 
     fn next(&mut self) -> u64 {
@@ -561,6 +757,7 @@ impl DbState {
         }
         let ds = self.source(source).ok_or_else(|| format!("no data source `{source}`"))?;
         let cfg = self.resolved(&ds.config);
+        let tunnel = self.tunnels.plan(&cfg)?;
         let password = self.worker_password(source);
         let secrets = self.secrets.clone();
         let events = self.tx.clone();
@@ -568,10 +765,17 @@ impl DbState {
         let name = key.to_string();
         std::thread::Builder::new()
             .name(format!("db-{}", key.chars().take(40).collect::<String>()))
-            .spawn(move || worker_main(name, cfg, password, secrets, rx, events))
+            .spawn(move || match crate::ssh_tunnel::route(tunnel, cfg) {
+                Ok(cfg) => worker_main(name, cfg, password, secrets, rx, events),
+                Err(error) => {
+                    let _ = events.send(Event::ConnectFailed { worker: name, error });
+                }
+            })
             .map_err(|e| format!("cannot start a database thread: {e}"))?;
-        self.workers
-            .insert(key.to_string(), Worker { tx, source: source.to_string(), canceller: None, connected: false });
+        self.workers.insert(
+            key.to_string(),
+            Worker { tx, source: source.to_string(), canceller: None, connected: false, in_tx: false },
+        );
         if key.starts_with("meta:")
             && let Some(ds) = self.source_mut(source)
             && !matches!(ds.status, ConnStatus::Connected(_))
@@ -640,7 +844,20 @@ impl DbState {
 
     /// Run statements on a worker; returns the run id.
     pub(crate) fn start_run(&mut self, spec: RunSpec) -> Result<u64, String> {
-        let RunSpec { worker, source, owner, title, statements, table, sort, replace, base_sql } = spec;
+        let RunSpec {
+            worker,
+            source,
+            owner,
+            title,
+            statements,
+            table,
+            sort,
+            replace,
+            base_sql,
+            filter,
+            manual,
+            explain,
+        } = spec;
         if statements.is_empty() {
             return Err("nothing to execute".into());
         }
@@ -671,12 +888,19 @@ impl DbState {
                 table,
                 sort,
                 base_sql,
+                filter,
                 started: Instant::now(),
                 cancel_requested: false,
                 waiting: false,
             },
         );
-        if let Err(e) = self.send(&worker, Req::Exec { run, statements }) {
+        let req = match explain {
+            Some(analyze) => {
+                Req::Explain { run, sql: statements.into_iter().next().unwrap_or_default(), analyze, manual }
+            }
+            None => Req::Exec { run, statements, manual },
+        };
+        if let Err(e) = self.send(&worker, req) {
             self.runs.remove(&run);
             return Err(e);
         }
@@ -746,10 +970,15 @@ impl DbState {
 
     /// Close every connection of a data source (or all of them).
     pub(crate) fn disconnect(&mut self, source: Option<&str>) {
+        self.tunnels.close(source);
         let keys: Vec<String> =
             self.workers.iter().filter(|(_, w)| source.is_none_or(|s| w.source == s)).map(|(k, _)| k.clone()).collect();
         for k in keys {
             if let Some(w) = self.workers.remove(&k) {
+                if w.in_tx {
+                    let msg = format!("{k}: the open transaction was rolled back (disconnected)");
+                    self.log(OutputLevel::Info, &w.source, msg);
+                }
                 if self.runs.values().any(|r| r.worker == k)
                     && let Some(c) = w.canceller
                 {
@@ -785,16 +1014,26 @@ impl DbState {
     pub(crate) fn test(&mut self, cfg: DataSourceConfig, password: Option<String>) -> u64 {
         let nonce = self.next();
         let cfg = self.resolved(&cfg);
+        let tunnel = self.tunnels.plan(&cfg).map(|t| t.map(|t| t.keyed(format!("test:{nonce}"))));
+        let tunnels = self.tunnels.clone();
         let password = password.or_else(|| self.worker_password(&cfg.id));
         let secrets = self.secrets.clone();
         let events = self.tx.clone();
         let spawned = std::thread::Builder::new().name("db-test".into()).spawn(move || {
+            let cfg = match tunnel.and_then(|t| crate::ssh_tunnel::route(t, cfg)) {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = events.send(Event::Tested { nonce, result: Err(e) });
+                    return;
+                }
+            };
             let pw = match password {
                 Some(p) => Some(p),
                 None if cfg.password_saved => secrets.get(&cfg.id).ok().flatten(),
                 None => None,
             };
             let result = codecraft_db::test_connection(&cfg, pw.as_deref()).map_err(|e| e.to_string());
+            tunnels.close(Some(&format!("test:{nonce}")));
             let _ = events.send(Event::Tested { nonce, result });
         });
         if let Err(e) = spawned {
@@ -863,6 +1102,12 @@ impl DbState {
         self.expanded.clear();
         self.selected = None;
         self.dialog = None;
+        self.history_popup = None;
+        self.param_prompt = None;
+        self.confirm = None;
+        self.import = None;
+        self.param_values.clear();
+        self.history.set_project(root.clone());
         self.passwords.clear();
         self.root = root.clone();
         self.loaded = true;
@@ -1014,6 +1259,8 @@ fn worker_main(
     };
     let version = conn.server_version().unwrap_or_else(|_| cfg.kind.label().to_string());
     let _ = events.send(Event::Connected { worker: key.clone(), version, canceller: conn.canceller() });
+    let dialect = cfg.kind.dialect();
+    let mut in_tx = false;
     let mut deferred: Option<Req> = None;
     loop {
         let req = match deferred.take() {
@@ -1041,7 +1288,30 @@ fn worker_main(
                     codecraft_db::edit::apply(conn.as_mut(), &schema, &table, &changes).map_err(|e| e.to_string());
                 let _ = events.send(Event::Applied { worker: key.clone(), result, outcome });
             }
-            Req::Exec { run, statements } => {
+            Req::Tx { commit } => {
+                let sql = if commit { "COMMIT" } else { "ROLLBACK" };
+                let result = codecraft_db::query_all(conn.as_mut(), sql).map(|_| ()).map_err(|e| e.to_string());
+                in_tx = conn.in_transaction().unwrap_or(false);
+                let _ = events.send(Event::TxDone { worker: key.clone(), commit, result });
+                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
+            }
+            Req::Explain { run, sql, analyze, manual } => {
+                let result = open_transaction(conn.as_mut(), manual, &mut in_tx).and_then(|()| {
+                    codecraft_db::explain::explain(conn.as_mut(), &sql, analyze).map_err(|e| e.to_string())
+                });
+                if let Some(open) = conn.in_transaction() {
+                    in_tx = open;
+                }
+                let _ = events.send(Event::Plan { run, result });
+                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
+                let _ = events.send(Event::RunDone { run });
+            }
+            Req::Exec { run, statements, manual } => {
+                if let Err(e) = open_transaction(conn.as_mut(), manual, &mut in_tx) {
+                    let _ = events.send(Event::StmtFailed { run, stmt: 0, error: DbError::Query(e) });
+                    let _ = events.send(Event::RunDone { run });
+                    continue;
+                }
                 let n = statements.len();
                 for (i, sql) in statements.iter().enumerate() {
                     let mut sink = WorkerSink {
@@ -1053,6 +1323,16 @@ fn worker_main(
                         deferred: &mut deferred,
                     };
                     let r = conn.execute(sql, codecraft_db::PAGE_SIZE, &mut sink);
+                    if r.is_ok() {
+                        match codecraft_db::transaction_effect(sql, dialect) {
+                            codecraft_db::TxEffect::Begin => in_tx = true,
+                            codecraft_db::TxEffect::End => in_tx = false,
+                            codecraft_db::TxEffect::None => {}
+                        }
+                    }
+                    if let Some(open) = conn.in_transaction() {
+                        in_tx = open;
+                    }
                     let stop = r.is_err();
                     let _ = events.send(match r {
                         Ok(summary) => Event::StmtDone { run, stmt: i, summary },
@@ -1062,10 +1342,22 @@ fn worker_main(
                         break;
                     }
                 }
+                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
                 let _ = events.send(Event::RunDone { run });
             }
         }
     }
+}
+
+/// In manual-commit mode, open a transaction unless one is open.
+fn open_transaction(conn: &mut dyn codecraft_db::Connection, manual: bool, in_tx: &mut bool) -> Result<(), String> {
+    if !manual || *in_tx {
+        return Ok(());
+    }
+    let begin = codecraft_db::edit::begin_statement(conn.kind());
+    codecraft_db::query_all(conn, begin).map_err(|e| format!("cannot start a transaction: {e}"))?;
+    *in_tx = true;
+    Ok(())
 }
 
 // ---------------------------------------------------------------- pump
@@ -1078,6 +1370,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
         handle(s, ev);
     }
+    s.db.history.flush();
     changed
 }
 
@@ -1138,19 +1431,21 @@ fn handle(s: &mut Session, ev: Event) {
             let sql = info.statements.get(stmt).cloned().unwrap_or_default();
             let multi = info.statements.len() > 1;
             let title = if multi { format!("{} [{}]", info.title, stmt + 1) } else { info.title.clone() };
-            let (source, owner, worker, table, sort, replace) = (
+            let (source, owner, worker, table, sort, replace, filter) = (
                 info.source.clone(),
                 info.owner.clone(),
                 info.worker.clone(),
                 info.table.clone(),
                 info.sort,
                 info.replace.filter(|_| stmt == 0),
+                info.filter.clone(),
             );
             let base_sql = info.base_sql.clone().unwrap_or_else(|| sql.clone());
             let id = match replace.filter(|r| db.result(*r).is_some()) {
                 Some(r) => r,
                 None => db.next(),
             };
+            let transposed = db.result(id).is_some_and(|r| r.transposed);
             let rs = ResultSet {
                 id,
                 title,
@@ -1167,6 +1462,9 @@ fn handle(s: &mut Session, ev: Event) {
                 table,
                 sort,
                 edits: GridEdits::default(),
+                plan: None,
+                filter,
+                transposed,
                 base_sql,
                 run,
                 stmt,
@@ -1272,6 +1570,24 @@ fn handle(s: &mut Session, ev: Event) {
             s.status = msg;
         }
         Event::Applied { worker, result, outcome } => on_applied(s, &worker, result, outcome),
+        Event::Plan { run, result } => on_plan(s, run, result),
+        Event::TxState { worker, open } => {
+            if let Some(w) = db.workers.get_mut(&worker) {
+                w.in_tx = open;
+            }
+        }
+        Event::TxDone { worker, commit, result } => {
+            let source = db.workers.get(&worker).map(|w| w.source.clone()).unwrap_or_default();
+            let msg = match result {
+                Ok(()) if commit => "Transaction committed".to_string(),
+                Ok(()) => "Transaction rolled back".to_string(),
+                Err(e) => format!("{} failed: {e}", if commit { "Commit" } else { "Rollback" }),
+            };
+            let level = if msg.contains("failed") { OutputLevel::Error } else { OutputLevel::Info };
+            db.log(level, &source, msg.clone());
+            s.status = msg;
+        }
+        Event::Import(ev) => import::on_event(s, ev),
         Event::SecretFailed(e) => {
             db.log(OutputLevel::Error, "", e.clone());
             s.status = e;
@@ -1366,6 +1682,59 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
     }
 }
 
+/// An Explain Plan finished: show the plan in its own result tab (one per console).
+fn on_plan(s: &mut Session, run: u64, result: Result<Plan, String>) {
+    let db = &mut s.db;
+    let Some(info) = db.runs.get(&run) else { return };
+    let (source, worker, title) = (info.source.clone(), info.worker.clone(), info.title.clone());
+    let sql = info.statements.first().cloned().unwrap_or_default();
+    let elapsed = u64::try_from(info.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    match result {
+        Ok(plan) => {
+            let owner = format!("plan:{worker}");
+            let stale: Vec<u64> = db.results.iter().filter(|r| r.owner == owner).map(|r| r.id).collect();
+            db.results.retain(|r| !stale.contains(&r.id));
+            let id = db.next();
+            let msg =
+                format!("Plan of {} steps in {elapsed} ms", plan.roots.iter().map(PlanNode::count).sum::<usize>());
+            db.results.push(ResultSet {
+                id,
+                title: format!("Plan: {title}"),
+                source: source.clone(),
+                owner,
+                sql: sql.clone(),
+                columns: Vec::new(),
+                rows: Vec::new(),
+                status: ResultStatus::Done,
+                error: None,
+                has_more: false,
+                truncated: false,
+                elapsed_ms: Some(elapsed),
+                table: None,
+                sort: None,
+                edits: GridEdits::default(),
+                plan: Some(plan),
+                filter: ResultFilter::default(),
+                transposed: false,
+                base_sql: sql,
+                run,
+                stmt: 0,
+                worker,
+            });
+            db.active_result = Some(id);
+            db.log(OutputLevel::Info, &source, msg.clone());
+            s.status = msg;
+            crate::services::show(s, crate::services::ServicesSection::Database);
+        }
+        Err(e) => {
+            db.log(OutputLevel::Error, &source, e.clone());
+            db.active_result = None;
+            s.status = e;
+            crate::services::show(s, crate::services::ServicesSection::Database);
+        }
+    }
+}
+
 /// A submit finished: reload the table on success, keep the changes and say why on failure.
 fn on_applied(s: &mut Session, worker: &str, result: u64, outcome: Result<u64, String>) {
     let db = &mut s.db;
@@ -1388,6 +1757,8 @@ fn on_applied(s: &mut Session, worker: &str, result: u64, outcome: Result<u64, S
                 sort: r.sort,
                 replace: Some(r.id),
                 base_sql: Some(r.base_sql.clone()),
+                filter: r.filter.clone(),
+                ..RunSpec::default()
             };
             if let Err(e) = s.db.start_run(reload) {
                 s.db.log(OutputLevel::Error, &r.source, format!("Cannot reload the table: {e}"));
@@ -1460,6 +1831,9 @@ mod tests {
             table: None,
             sort: None,
             edits: GridEdits::default(),
+            plan: None,
+            filter: ResultFilter::default(),
+            transposed: false,
             base_sql: String::new(),
             run: 0,
             stmt: 0,

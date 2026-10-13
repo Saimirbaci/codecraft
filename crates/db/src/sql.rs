@@ -43,6 +43,41 @@ pub fn order_query(query: &str, column: usize, desc: bool) -> String {
     format!("SELECT * FROM ({inner}\n) AS q ORDER BY {}{}", column.max(1), if desc { " DESC" } else { "" })
 }
 
+/// Table data with the grid's filter row: `SELECT * FROM t [WHERE (filter)] [ORDER BY order]`.
+/// `filter` and `order` are SQL typed by the user (empty: none).
+pub fn select_table_where(kind: DbKind, schema: &str, table: &str, filter: &str, order: &str) -> String {
+    let mut sql = format!("SELECT * FROM {}", qualified(kind, schema, table));
+    push_filter(&mut sql, filter, order);
+    sql
+}
+
+/// Filter and order an arbitrary query's rows: `SELECT * FROM (query) AS q WHERE … ORDER BY …`.
+pub fn filter_query(query: &str, filter: &str, order: &str) -> String {
+    let inner = query.trim().trim_end_matches(';').trim_end();
+    if filter.trim().is_empty() && order.trim().is_empty() {
+        return inner.to_string();
+    }
+    let mut sql = format!("SELECT * FROM ({inner}\n) AS q");
+    push_filter(&mut sql, filter, order);
+    sql
+}
+
+fn push_filter(sql: &mut String, filter: &str, order: &str) {
+    let clean = |s: &str| s.trim().trim_end_matches(';').trim_end().to_string();
+    let (filter, order) = (clean(filter), clean(order));
+    if !filter.is_empty() {
+        sql.push_str(&format!(" WHERE ({filter})"));
+    }
+    if !order.is_empty() {
+        sql.push_str(&format!(" ORDER BY {order}"));
+    }
+}
+
+/// `"col" [DESC]`, for an ORDER BY clause.
+pub fn order_by_column(kind: DbKind, column: &str, desc: bool) -> String {
+    format!("{}{}", quote_ident(kind, column), if desc { " DESC" } else { "" })
+}
+
 /// `SELECT count(*) FROM schema.table`.
 pub fn count_rows(kind: DbKind, schema: &str, table: &str) -> String {
     format!("SELECT count(*) FROM {}", qualified(kind, schema, table))
@@ -68,5 +103,16 @@ mod tests {
         );
         assert_eq!(select_table(DbKind::Mysql, "db", "t", None, None), "SELECT * FROM `db`.`t`");
         assert_eq!(order_query("select a from t;", 2, false), "SELECT * FROM (select a from t\n) AS q ORDER BY 2");
+        assert_eq!(
+            select_table_where(DbKind::Sqlite, "main", "t", " a > 1 or b = 2; ", "a desc"),
+            "SELECT * FROM \"main\".\"t\" WHERE (a > 1 or b = 2) ORDER BY a desc"
+        );
+        assert_eq!(select_table_where(DbKind::Mysql, "", "t", "", ""), "SELECT * FROM `t`");
+        assert_eq!(filter_query("select * from t;", "", ""), "select * from t");
+        assert_eq!(
+            filter_query("select * from t", "x = 1", ""),
+            "SELECT * FROM (select * from t\n) AS q WHERE (x = 1)"
+        );
+        assert_eq!(order_by_column(DbKind::Postgres, "Name", true), "\"Name\" DESC");
     }
 }

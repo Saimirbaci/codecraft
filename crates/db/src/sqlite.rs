@@ -195,4 +195,8 @@ impl Connection for SqliteConn {
         let n: i64 = self.conn.query_row(&count_rows(DbKind::Sqlite, schema, table), [], |r| r.get(0)).map_err(err)?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
+
+    fn in_transaction(&mut self) -> Option<bool> {
+        Some(!self.conn.is_autocommit())
+    }
 }

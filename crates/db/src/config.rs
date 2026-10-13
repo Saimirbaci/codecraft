@@ -111,7 +111,27 @@ pub struct DataSourceConfig {
     pub password_saved: bool,
     #[serde(default)]
     pub read_only: bool,
+    /// Connect through an SSH tunnel to this SSH server (`ssh -N -L`, M11 track S).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_tunnel: Option<String>,
+    /// A colour name from [`DATA_SOURCE_COLORS`], shown on the tree node, consoles and results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Production guard: confirm before running statements that modify data or schema.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub confirm_writes: bool,
+    /// Consoles use manual commit: the first statement opens a transaction that Commit or
+    /// Rollback ends.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manual_commit: bool,
 }
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Data source colours (names; the UI maps them to theme colours).
+pub const DATA_SOURCE_COLORS: [&str; 7] = ["red", "orange", "yellow", "green", "blue", "violet", "gray"];
 
 impl DataSourceConfig {
     pub fn validate(&self) -> DbResult<()> {
@@ -125,6 +145,15 @@ impl DataSourceConfig {
         } else {
             Ok(())
         }
+    }
+
+    /// The colour, if it is one of [`DATA_SOURCE_COLORS`].
+    pub fn color_name(&self) -> Option<&'static str> {
+        let c = self.color.as_deref()?.trim().to_ascii_lowercase();
+        DATA_SOURCE_COLORS
+            .iter()
+            .copied()
+            .find(|k| *k == c || c == "grey" && *k == "gray" || c == "purple" && *k == "violet")
     }
 
     pub fn port_or_default(&self) -> u16 {
@@ -228,6 +257,12 @@ mod tests {
         let files = cfg.tls_files(None).unwrap();
         assert_eq!(files.client_cert, Some(PathBuf::from("/abs/client.pem")));
         assert_eq!(files.client_key, Some(PathBuf::from("key.pem")));
+        cfg.color = Some("Purple".into());
+        assert_eq!(cfg.color_name(), Some("violet"));
+        cfg.color = Some("chartreuse".into());
+        assert_eq!(cfg.color_name(), None);
+        let json = serde_json::to_string(&DataSourceConfig { confirm_writes: true, ..Default::default() }).unwrap();
+        assert!(json.contains("\"confirm_writes\":true") && !json.contains("manual_commit"), "{json}");
         cfg.options.insert("sslmode".into(), "bogus".into());
         assert!(cfg.ssl_mode().is_err());
         assert_eq!(DbKind::parse("PostgreSQL"), Some(DbKind::Postgres));

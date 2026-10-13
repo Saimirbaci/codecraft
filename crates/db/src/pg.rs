@@ -96,7 +96,7 @@ impl PgConn {
             }
             DbError::Connect(msg)
         };
-        let client = match &tls {
+        let mut client = match &tls {
             Tls::None => {
                 pc.ssl_mode(postgres::config::SslMode::Disable);
                 pc.connect(NoTls).map_err(connect_err)?
@@ -111,6 +111,12 @@ impl PgConn {
                 pc.connect(t.clone()).map_err(connect_err)?
             }
         };
+        if cfg.read_only {
+            // The server enforces read-only too (statements the IDE does not recognise as writes).
+            client
+                .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY")
+                .map_err(|e| DbError::Connect(format!("cannot make the session read-only: {e}")))?;
+        }
         Ok(Self { client, tls })
     }
 

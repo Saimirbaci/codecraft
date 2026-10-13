@@ -235,3 +235,42 @@ fn postgres_sslmode() {
     let e = connect(&cfg, None).err().map(|e| e.to_string()).unwrap_or_default();
     assert!(e.contains("root.pem") || e.contains("not supported"), "{e}");
 }
+
+#[test]
+fn postgres_explain_and_read_only_sessions() {
+    let Some(mut conn) = server() else { return };
+    let schema = format!("codecraft_explain_{}", std::process::id());
+    let guard = Schema(conn.as_mut(), schema.clone());
+    let c = &mut *guard.0;
+    for sql in [
+        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+        format!("CREATE SCHEMA {schema}"),
+        format!("CREATE TABLE {schema}.t (id int PRIMARY KEY, v text)"),
+        format!("INSERT INTO {schema}.t SELECT g, 'v' || g FROM generate_series(1, 50) g"),
+    ] {
+        query_all(c, &sql).unwrap();
+    }
+    let sql = format!("SELECT * FROM {schema}.t WHERE v LIKE 'v1%' ORDER BY v");
+    let plan = codecraft_db::explain::explain(c, &sql, false).unwrap();
+    assert!(!plan.analyzed);
+    let root = &plan.roots[0];
+    assert!(root.total_cost.is_some() && root.rows.is_some(), "{root:?}");
+    let mut stack = vec![root];
+    let mut relations = Vec::new();
+    while let Some(n) = stack.pop() {
+        relations.extend(n.relation.clone());
+        stack.extend(n.children.iter());
+    }
+    assert!(relations.iter().any(|r| r.contains(".t") || r == "t"), "{relations:?}");
+    let analyzed = codecraft_db::explain::explain(c, &sql, true).unwrap();
+    assert!(analyzed.analyzed && analyzed.execution_ms.is_some());
+    assert!(analyzed.roots[0].actual_rows.is_some());
+
+    // A read-only data source cannot write, even with statements the IDE does not classify.
+    let mut cfg = config();
+    cfg.read_only = true;
+    let mut ro = connect(&cfg, std::env::var("CODECRAFT_TEST_PG_PASSWORD").ok().as_deref()).unwrap();
+    let e = query_all(ro.as_mut(), &format!("INSERT INTO {schema}.t VALUES (999, 'x')")).unwrap_err();
+    assert!(e.to_string().contains("read-only"), "{e}");
+    assert!(query_all(ro.as_mut(), &format!("SELECT count(*) FROM {schema}.t")).is_ok());
+}

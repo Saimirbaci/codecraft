@@ -103,7 +103,14 @@ impl GridEdits {
     }
 
     /// Set a cell. Setting a fetched cell back to its original value drops the edit.
-    pub(crate) fn set(&mut self, rows: &[Vec<Cell>], columns: usize, row: usize, col: usize, value: Cell) -> Result<(), String> {
+    pub(crate) fn set(
+        &mut self,
+        rows: &[Vec<Cell>],
+        columns: usize,
+        row: usize,
+        col: usize,
+        value: Cell,
+    ) -> Result<(), String> {
         if col >= columns {
             return Err(format!("no column {col}"));
         }
@@ -186,9 +193,7 @@ impl GridEdits {
         let name = |c: usize| columns.get(c).map(|c| c.name.clone()).ok_or_else(|| format!("no column {c}"));
         let key_of = |row: usize| -> Result<Vec<(String, Cell)>, String> {
             let r = rows.get(row).ok_or_else(|| format!("no row {row}"))?;
-            keys.iter()
-                .map(|k| Ok((name(*k)?, r.get(*k).cloned().ok_or_else(|| format!("no column {k}"))?)))
-                .collect()
+            keys.iter().map(|k| Ok((name(*k)?, r.get(*k).cloned().ok_or_else(|| format!("no column {k}"))?))).collect()
         };
         let mut out = Vec::new();
         for r in &self.deleted {

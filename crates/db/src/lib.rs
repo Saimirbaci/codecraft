@@ -5,7 +5,10 @@
 //! fetch 500 rows at a time and stop early; a [`Canceller`] obtained before running a query can
 //! cancel it from another thread. [`edit`] turns in-grid edits into DML applied in one
 //! transaction. [`split`] has the statement splitter, [`secrets`] the password
-//! store (macOS Keychain), [`sql`] identifier quoting and query builders.
+//! store (macOS Keychain), [`sql`] identifier quoting and query builders. [`params`] finds query
+//! parameters, [`explain`] builds and parses query plans, [`export`] formats results,
+//! [`import`] loads CSV/JSON files into tables and [`value`] feeds the value viewer and the
+//! aggregate footer.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -17,21 +20,27 @@
 
 mod config;
 pub mod edit;
+pub mod explain;
+pub mod export;
+pub mod import;
+mod lex;
 mod my;
+pub mod params;
 mod pg;
 pub mod secrets;
 pub mod split;
 pub mod sql;
 mod sqlite;
+pub mod value;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub use config::{DataSourceConfig, DbKind, SslMode, TlsFiles};
+pub use config::{DATA_SOURCE_COLORS, DataSourceConfig, DbKind, SslMode, TlsFiles};
 pub use secrets::{KeychainStore, MemoryStore, SecretStore};
-pub use split::{Dialect, Statement, split_statements, statement_at};
+pub use split::{Dialect, Statement, TxEffect, is_modifying, split_statements, statement_at, transaction_effect};
 
 /// Rows per page when fetching results.
 pub const PAGE_SIZE: usize = 500;
@@ -260,6 +269,10 @@ pub trait Connection: Send {
     fn tables(&mut self, schema: &str) -> DbResult<Vec<TableInfo>>;
     fn table_details(&mut self, schema: &str, table: &str) -> DbResult<TableDetails>;
     fn row_count(&mut self, schema: &str, table: &str) -> DbResult<u64>;
+    /// Whether a transaction is open, when the driver can tell (SQLite); `None` otherwise.
+    fn in_transaction(&mut self) -> Option<bool> {
+        None
+    }
 }
 
 /// Open a connection. `password` comes from the secret store (never from config files).

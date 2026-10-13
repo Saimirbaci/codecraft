@@ -176,6 +176,58 @@ pub fn first_keyword(sql: &str) -> Option<String> {
     None
 }
 
+/// Whether a statement may change data or schema (the production guard and read-only data
+/// sources check this). Statements known to only read are allowed; anything else counts as a
+/// modification, so an unfamiliar command is guarded rather than let through.
+pub fn is_modifying(sql: &str, dialect: Dialect) -> bool {
+    let words = crate::lex::words(sql, dialect);
+    let Some(first) = words.first() else { return false };
+    let has = |set: &[&str]| words.iter().skip(1).any(|w| set.contains(&w.as_str()));
+    match first.as_str() {
+        "SELECT" => has(&["INTO"]) && !has_mysql_variable_into(sql),
+        "WITH" => has(&["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"]),
+        "EXPLAIN" => {
+            // EXPLAIN ANALYZE runs the statement.
+            let analyze = words.iter().skip(1).take(6).any(|w| w == "ANALYZE" || w == "ANALYSE");
+            analyze && has(&["INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP", "ALTER", "TRUNCATE"])
+        }
+        "PRAGMA" => sql.contains('='),
+        "SHOW" | "DESCRIBE" | "DESC" | "VALUES" | "TABLE" | "BEGIN" | "START" | "COMMIT" | "ROLLBACK" | "END"
+        | "SAVEPOINT" | "RELEASE" | "SET" | "USE" | "FETCH" | "CLOSE" | "DECLARE" | "MOVE" | "LISTEN" | "UNLISTEN"
+        | "DISCARD" | "RESET" | "HELP" | "ABORT" | "PREPARE" | "DEALLOCATE" => false,
+        _ => true,
+    }
+}
+
+/// `SELECT … INTO @var` (MySQL user variables) reads only.
+fn has_mysql_variable_into(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.split("INTO").skip(1).all(|rest| rest.trim_start().starts_with('@'))
+}
+
+/// How a statement changes the connection's transaction state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxEffect {
+    None,
+    Begin,
+    End,
+}
+
+/// `BEGIN`/`START TRANSACTION` open a transaction; `COMMIT`/`ROLLBACK`/`END` close it (not
+/// `ROLLBACK TO SAVEPOINT`). In MySQL, DDL commits implicitly.
+pub fn transaction_effect(sql: &str, dialect: Dialect) -> TxEffect {
+    let words = crate::lex::words(sql, dialect);
+    let second = words.get(1).map(String::as_str);
+    match words.first().map(String::as_str) {
+        Some("BEGIN") if dialect != Dialect::Postgres || second != Some("ATOMIC") => TxEffect::Begin,
+        Some("START") if second == Some("TRANSACTION") => TxEffect::Begin,
+        Some("COMMIT" | "END") => TxEffect::End,
+        Some("ROLLBACK" | "ABORT") if !words.iter().any(|w| w == "TO") => TxEffect::End,
+        Some("CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME") if dialect == Dialect::Mysql => TxEffect::End,
+        _ => TxEffect::None,
+    }
+}
+
 fn is_trigger(words: &[String]) -> bool {
     let w: Vec<&str> = words.iter().map(String::as_str).collect();
     matches!(w.as_slice(), ["CREATE", "TRIGGER", ..] | ["CREATE", "TEMP" | "TEMPORARY", "TRIGGER", ..])
@@ -202,14 +254,14 @@ pub(crate) fn is_ident_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
-fn skip_line(chars: &[char], mut i: usize) -> usize {
+pub(crate) fn skip_line(chars: &[char], mut i: usize) -> usize {
     while i < chars.len() && chars.get(i) != Some(&'\n') {
         i += 1;
     }
     i
 }
 
-fn skip_block_comment(chars: &[char], start: usize, nested: bool) -> usize {
+pub(crate) fn skip_block_comment(chars: &[char], start: usize, nested: bool) -> usize {
     let mut depth = 0usize;
     let mut i = start;
     while i < chars.len() {
@@ -232,7 +284,7 @@ fn skip_block_comment(chars: &[char], start: usize, nested: bool) -> usize {
 }
 
 /// Skip a quoted run starting at `start` (the opening quote); doubled closing quotes escape.
-fn skip_quoted(chars: &[char], start: usize, close: char, backslash: bool) -> usize {
+pub(crate) fn skip_quoted(chars: &[char], start: usize, close: char, backslash: bool) -> usize {
     let mut i = start + 1;
     while i < chars.len() {
         let c = chars.get(i).copied().unwrap_or(' ');
@@ -253,7 +305,7 @@ fn skip_quoted(chars: &[char], start: usize, close: char, backslash: bool) -> us
 }
 
 /// `$tag$ … $tag$`: returns the offset after the closing tag, or None if `$` doesn't open a tag.
-fn skip_dollar_quoted(chars: &[char], start: usize) -> Option<usize> {
+pub(crate) fn skip_dollar_quoted(chars: &[char], start: usize) -> Option<usize> {
     let mut i = start + 1;
     if let Some(c) = chars.get(i)
         && !(c.is_alphabetic() || *c == '_' || *c == '$')
@@ -283,6 +335,56 @@ mod tests {
 
     fn texts(sql: &str, d: Dialect) -> Vec<String> {
         split_statements(sql, d).into_iter().map(|s| s.text).collect()
+    }
+
+    #[test]
+    fn classifies_statements() {
+        let m = |s: &str| is_modifying(s, Dialect::Generic);
+        for read in [
+            "select * from t",
+            "  -- c\n SELECT 1",
+            "with x as (select 1) select * from x",
+            "explain select 1",
+            "explain (analyze, format json) select 1",
+            "show tables",
+            "pragma table_info(t)",
+            "begin",
+            "commit",
+            "select 'insert into' from t",
+            "",
+        ] {
+            assert!(!m(read), "{read}");
+        }
+        for write in [
+            "insert into t values (1)",
+            "UPDATE t SET a = 1",
+            "delete from t",
+            "with x as (delete from t returning *) select * from x",
+            "explain analyze delete from t",
+            "create table t (a int)",
+            "drop table t",
+            "select * into t2 from t",
+            "pragma foreign_keys = on",
+            "vacuum",
+            "frobnicate",
+        ] {
+            assert!(m(write), "{write}");
+        }
+        assert!(!is_modifying("select a into @x from t", Dialect::Mysql));
+    }
+
+    #[test]
+    fn transaction_effects() {
+        let e = |s: &str, d| transaction_effect(s, d);
+        assert_eq!(e("BEGIN", Dialect::Postgres), TxEffect::Begin);
+        assert_eq!(e("begin immediate transaction", Dialect::Sqlite), TxEffect::Begin);
+        assert_eq!(e("start transaction read only", Dialect::Mysql), TxEffect::Begin);
+        assert_eq!(e("commit", Dialect::Generic), TxEffect::End);
+        assert_eq!(e("rollback", Dialect::Generic), TxEffect::End);
+        assert_eq!(e("rollback to savepoint a", Dialect::Generic), TxEffect::None);
+        assert_eq!(e("create table t (a int)", Dialect::Mysql), TxEffect::End);
+        assert_eq!(e("create table t (a int)", Dialect::Postgres), TxEffect::None);
+        assert_eq!(e("select 1", Dialect::Generic), TxEffect::None);
     }
 
     #[test]

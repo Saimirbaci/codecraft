@@ -61,6 +61,7 @@ fn console_executes_with_cmd_enter_and_completes_with_ctrl_space() {
     });
     settle(&mut h, "project", |a| a.session.ws.project.as_ref().is_some_and(|p| !p.tree.is_empty()));
     h.state_mut().session.db.set_secret_store(Arc::new(MemoryStore::default()));
+    h.state_mut().session.db.history.set_dir(root.join(".codecraft/test-history"));
     let s = &mut h.state_mut().session;
     s.execute("db.addDataSource", &json!({ "kind": "sqlite", "name": "Lib", "path": "lib.db" })).unwrap();
     s.execute("db.newConsole", &json!({ "dataSource": "lib" })).unwrap();
@@ -144,6 +145,137 @@ fn table_grid_shows_pending_changes_and_submits_from_the_preview() {
     settle(&mut h, "reloaded", |a| a.session.db.result(rid).is_some_and(|r| r.rows.len() == 2 && !r.is_running()));
     let r = h.state().session.db.result(rid).unwrap();
     assert_eq!(r.rows[1][1], codecraft_engine::db::Cell::Text("Odyssey".into()));
+    h.run_steps(2);
+    h.state_mut().session.shutdown();
+}
+
+fn app(root: &Path) -> Harness<'static, App> {
+    let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe({
+        let root = root.to_path_buf();
+        move |_| App::ephemeral(Some(root))
+    });
+    settle(&mut h, "project", |a| a.session.ws.project.as_ref().is_some_and(|p| !p.tree.is_empty()));
+    h.state_mut().session.db.set_secret_store(Arc::new(MemoryStore::default()));
+    h.state_mut().session.db.history.set_dir(root.join(".codecraft/test-history"));
+    h
+}
+
+#[test]
+fn parameters_plan_history_and_transactions_in_the_console() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    project(&root);
+    let mut h = app(&root);
+    let s = &mut h.state_mut().session;
+    s.execute("db.addDataSource", &json!({ "kind": "sqlite", "name": "Lib", "path": "lib.db", "color": "green" }))
+        .unwrap();
+    s.execute("db.newConsole", &json!({ "dataSource": "lib" })).unwrap();
+    s.execute("editor.type", &json!({ "text": "select title from books where id = :id" })).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Explain").is_some(), "the console toolbar has Explain");
+
+    // Cmd+Enter opens the parameter dialog; typing a value and Execute runs it.
+    h.key_press_modifiers(CMD, Key::Enter);
+    h.run_steps(3);
+    assert!(h.state().session.db.param_prompt.is_some());
+    assert!(h.query_by_label_contains("Query Parameters").is_some());
+    h.state_mut().session.db.param_prompt.as_mut().unwrap().params[0].value = "2".into();
+    h.run_steps(1);
+    h.get_by_label("Execute").click();
+    settle(&mut h, "result", |a| a.session.db.active().is_some_and(|r| !r.is_running() && r.rows.len() == 1));
+    assert!(h.state().session.db.param_prompt.is_none());
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("WHERE").is_some(), "the filter row shows");
+
+    // Explain Plan renders a tree.
+    h.state_mut().session.execute("db.explainPlan", &json!({ "params": { ":id": "1" } })).unwrap();
+    settle(&mut h, "plan", |a| a.session.db.active().is_some_and(|r| r.plan.is_some()));
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Operation").is_some());
+    assert!(h.query_by_label_contains("Explain Plan").is_some());
+
+    // The history popup lists the query; clicking it inserts it into the console.
+    h.state_mut().session.execute("db.showHistory", &Value::Null).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Query History").is_some());
+    h.get_by_label("select title from books where id = :id").click();
+    h.run_steps(3);
+    assert!(h.state().session.db.history_popup.is_none());
+    let text = h.state().session.ws.active().unwrap().1.doc.text();
+    assert!(text.ends_with(";\nselect title from books where id = :id"), "{text}");
+
+    // Manual commit: the toolbar shows the pending transaction; Commit ends it.
+    let s = &mut h.state_mut().session;
+    s.execute("db.setTransactionMode", &json!({ "manual": true })).unwrap();
+    s.execute("db.execute", &json!({ "params": { ":id": "1" } })).unwrap();
+    settle(&mut h, "transaction", |a| !a.session.db.busy() && !a.session.db.open_transactions(None).is_empty());
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("pending transaction").is_some());
+    h.get_by_label("✔").click();
+    settle(&mut h, "committed", |a| a.session.db.open_transactions(None).is_empty() && !a.session.db.busy());
+    h.run_steps(2);
+    h.state_mut().session.shutdown();
+}
+
+#[test]
+fn grid_extras_value_viewer_transpose_and_import_dialog() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    project(&root);
+    std::fs::write(root.join("more.csv"), "title,note\nIliad,old\n").unwrap();
+    let mut h = app(&root);
+    let s = &mut h.state_mut().session;
+    s.execute("db.addDataSource", &json!({ "kind": "sqlite", "name": "Lib", "path": "lib.db", "confirmWrites": true }))
+        .unwrap();
+    s.execute(
+        "db.execute",
+        &json!({ "dataSource": "lib", "sql": "select id, title, '{\"k\": 1}' as doc from books order by id" }),
+    )
+    .unwrap();
+    settle(&mut h, "result", |a| a.session.db.active().is_some_and(|r| !r.is_running() && r.rows.len() == 2));
+    let rid = h.state().session.db.active_result.unwrap();
+
+    // The value viewer pretty-prints JSON of the selected cell.
+    h.state_mut().ui.db.value_viewer = true;
+    h.run_steps(2);
+    h.state_mut().ui.db.grids.get_mut(&rid).unwrap().select_cell(0, 2);
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("JSON").is_some(), "value viewer kind");
+
+    // Transposed (records as columns, read-only) renders, with the value viewer still mapped.
+    h.state_mut().session.execute("db.transposeResult", &json!({ "result": rid })).unwrap();
+    h.run_steps(2);
+    h.state_mut().ui.db.grids.get_mut(&rid).unwrap().select_cell(2, 1);
+    h.run_steps(3);
+    assert!(h.state().session.db.result(rid).unwrap().transposed);
+    assert!(h.query_by_label_contains("JSON").is_some(), "transposed (2, 1) is the doc of record 1");
+
+    // The production guard asks before an UPDATE.
+    h.state_mut()
+        .session
+        .execute("db.execute", &json!({ "dataSource": "lib", "sql": "update books set note = 'n' where id = 1" }))
+        .unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("production data source").is_some());
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert!(h.state().session.db.confirm.is_none());
+
+    // Import dialog with the mapping preview.
+    h.state_mut()
+        .session
+        .execute(
+            "db.importData",
+            &json!({ "dataSource": "lib", "schema": "main", "table": "books", "path": "more.csv" }),
+        )
+        .unwrap();
+    settle(&mut h, "import read", |a| a.session.db.import.as_ref().is_some_and(|d| !d.is_busy()));
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Import Data into books").is_some());
+    h.get_by_label("Import").click();
+    settle(&mut h, "imported", |a| {
+        a.session.db.import.as_ref().is_some_and(|d| d.state == codecraft_engine::database::ImportState::Done(1))
+    });
     h.run_steps(2);
     h.state_mut().session.shutdown();
 }

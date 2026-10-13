@@ -1,7 +1,9 @@
 //! The Database tool window, data source dialog, SQL console toolbar and result grids. OWNED BY the database track.
 //!
 //! Everything the user does here goes through `db.*` commands; this module only paints the
-//! engine's [`codecraft_engine::database::DbState`] and keeps view state (grid widths, selection).
+//! engine's [`codecraft_engine::database::DbState`] and keeps view state (grid widths, selection,
+//! the filter row's text, the value viewer). Query plans show as a tree; the console toolbar has
+//! Explain, the query history and the transaction mode with Commit/Rollback.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,9 +17,11 @@ use serde_json::{Value, json};
 
 use codecraft_engine::Session;
 use codecraft_engine::database::{
-    CONSOLES_DIR, ConnStatus, DataSourceForm, OutputLevel, ResultSet, ResultStatus, TestState, node_key,
+    CONSOLES_DIR, ConnStatus, DataSourceForm, OutputLevel, Plan, PlanNode, ResultFilter, ResultSet, ResultStatus,
+    TestState, console_worker, node_key,
 };
-use codecraft_engine::db::{DbKind, TableKind};
+use codecraft_engine::db::value::{ValueKind, format_number};
+use codecraft_engine::db::{Cell, Column, DATA_SOURCE_COLORS, DbKind, TableKind};
 use codecraft_syntax::Language;
 
 use crate::data_grid::{self, GridAction, GridData, GridState};
@@ -32,6 +36,44 @@ pub struct DbUi {
     pub dialog_error: Option<String>,
     /// A fetch was requested for this result (avoid asking again every frame).
     pub fetch_requested: Option<(u64, usize)>,
+    /// The filter row's text per result.
+    pub filters: HashMap<u64, FilterEdit>,
+    /// The value viewer panel is open.
+    pub value_viewer: bool,
+    /// The value viewer's decoded image: (result, row, column) → texture (`None`: not decodable).
+    viewer_image: Option<((u64, usize, usize), Option<egui::TextureHandle>)>,
+    /// A transposed result: (result, rows, columns) → columns and rows.
+    transposed: Option<TransposedCache>,
+    /// The name typed in the history popup's Save field.
+    pub save_name: String,
+}
+
+type TransposedCache = ((u64, usize, usize), Vec<Column>, Vec<Vec<Cell>>);
+
+/// The filter row being edited, and the applied filter it started from.
+#[derive(Clone, Debug, Default)]
+pub struct FilterEdit {
+    pub where_: String,
+    pub order_by: String,
+    applied: ResultFilter,
+}
+
+/// Records shown in a transposed grid.
+const MAX_TRANSPOSED: usize = 1000;
+
+/// A data source colour name as a theme colour.
+fn source_color(name: Option<&str>, st: &UiState) -> Option<Color32> {
+    let t = &st.theme;
+    Some(match name? {
+        "red" => t.error,
+        "orange" => t.warning,
+        "yellow" => t.attribute,
+        "green" => t.success,
+        "blue" => t.link,
+        "violet" => t.constant,
+        "gray" => t.text_muted,
+        _ => return None,
+    })
 }
 
 fn repaint_while_busy(ui: &egui::Ui, s: &Session) {
@@ -86,6 +128,8 @@ struct Row {
     source: String,
     schema: Option<String>,
     table: Option<String>,
+    /// The data source colour, drawn as a bar at the row's left edge.
+    stripe: Option<Color32>,
 }
 
 impl Row {
@@ -105,6 +149,7 @@ impl Row {
             source: source.to_string(),
             schema: None,
             table: None,
+            stripe: None,
         }
     }
 }
@@ -134,6 +179,13 @@ fn build_rows(s: &Session, st: &UiState) -> Vec<Row> {
             ConnStatus::Connected(v) => v.clone(),
             _ => ds.config.summary(),
         };
+        if ds.config.read_only {
+            r.detail.push_str(" · read-only");
+        }
+        if ds.config.confirm_writes {
+            r.detail.push_str(" · production");
+        }
+        r.stripe = source_color(ds.config.color_name(), st);
         r.tooltip = format!("{} · {}", ds.config.kind.label(), ds.config.summary());
         rows.push(r);
         if !expanded {
@@ -402,6 +454,10 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 } else if resp.hovered() && row.kind != Kind::Message {
                     ui.painter().rect_filled(rect, CornerRadius::same(4), theme.hover);
                 }
+                if let Some(c) = row.stripe {
+                    let bar = egui::Rect::from_min_size(rect.min, vec2(3.0, rect.height()));
+                    ui.painter().rect_filled(bar, CornerRadius::same(1), c);
+                }
                 let x0 = rect.left() + 4.0 + row.depth as f32 * 16.0;
                 let cy = rect.center().y;
                 if row.expandable {
@@ -515,6 +571,7 @@ fn context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
             ui.separator();
             item(ui, "Open Query Console", "db.newConsole", ds.clone());
             item(ui, "New Query Console", "db.newConsole", json!({ "dataSource": row.source, "new": true }));
+            item(ui, "Query History", "db.showHistory", ds.clone());
             ui.separator();
             item(ui, "Test Connection", "db.testConnection", ds.clone());
             item(ui, "Properties…", "db.editDataSource", ds.clone());
@@ -527,7 +584,21 @@ fn context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
         Kind::Table => {
             let t = json!({ "dataSource": row.source, "schema": row.schema, "table": row.table });
             item(ui, "Open Data", "db.openTable", t.clone());
-            item(ui, "Count Rows", "db.rowCount", t);
+            item(ui, "Count Rows", "db.rowCount", t.clone());
+            if ui.button("Import Data from File…").clicked() {
+                ui.close();
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import Data")
+                    .add_filter("CSV, TSV, JSON", &["csv", "tsv", "tab", "txt", "json"])
+                    .pick_file()
+                {
+                    let mut p = t;
+                    if let Some(o) = p.as_object_mut() {
+                        o.insert("path".into(), json!(path));
+                    }
+                    actions.push(TreeAction::Cmd("db.importData", p));
+                }
+            }
             if ui.button("Copy Name").clicked() {
                 ui.ctx().copy_text(row.label.clone());
                 ui.close();
@@ -632,7 +703,34 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                             .desired_width(300.0),
                     );
                     ui.end_row();
+                    ui.label("");
+                    ui.checkbox(&mut f.read_only, "Read-only");
+                    ui.end_row();
+                    ui.label("SSH tunnel");
+                    ui.add(
+                        TextEdit::singleline(&mut f.ssh_tunnel)
+                            .hint_text("SSH server name (empty: connect directly)")
+                            .desired_width(300.0),
+                    )
+                    .on_hover_text("A server from ~/.ssh/config or Tools › Deployment; the connection goes through `ssh -L`");
+                    ui.end_row();
                 }
+                ui.label("Colour");
+                let current = if f.color.is_empty() { "None".to_string() } else { f.color.clone() };
+                egui::ComboBox::from_id_salt("db-color").selected_text(current).width(120.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut f.color, String::new(), "None");
+                    for c in DATA_SOURCE_COLORS {
+                        ui.selectable_value(&mut f.color, c.to_string(), c);
+                    }
+                });
+                ui.end_row();
+                ui.label("");
+                ui.checkbox(&mut f.confirm_writes, "Production: confirm data modifications")
+                    .on_hover_text("Ask before running statements that change data or schema");
+                ui.end_row();
+                ui.label("Transactions");
+                ui.checkbox(&mut f.manual_commit, "Manual commit (Commit / Rollback in consoles)");
+                ui.end_row();
             });
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -706,6 +804,7 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
 /// which floats above the window. Returns quickly when the active document isn't SQL.
 pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     dialog(ui.ctx(), s, st);
+    crate::database_dialogs::show(ui.ctx(), s, st);
     let Some((_, d)) = s.ws.active() else { return };
     if d.language != Language::Sql {
         return;
@@ -718,8 +817,10 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         _ => false,
     };
     let running = s.enabled("db.cancel").is_ok() && s.db.running();
+    let worker = console_worker(path.as_deref(), d.id.0);
+    let tx_open = s.db.transaction_open(&worker);
     let mut cmd: Option<(&'static str, Value)> = None;
-    Frame::new()
+    let frame = Frame::new()
         .fill(st.theme.header_bg)
         .inner_margin(Margin::symmetric(8, 3))
         .stroke(Stroke::new(1.0, st.theme.border))
@@ -740,7 +841,48 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if small_button(ui, "■", "Cancel", running, st.theme.error, st) {
                     cmd = Some(("db.cancel", Value::Null));
                 }
+                ui.add_enabled_ui(can_run, |ui| {
+                    ui.menu_button(RichText::new("Explain").size(12.5).color(st.theme.text), |ui| {
+                        if ui.button("Explain Plan").clicked() {
+                            cmd = Some(("db.explainPlan", Value::Null));
+                            ui.close();
+                        }
+                        if ui.button("Explain Analyze").on_hover_text("Runs the statement").clicked() {
+                            cmd = Some(("db.explainAnalyze", Value::Null));
+                            ui.close();
+                        }
+                    })
+                    .response
+                    .on_hover_text("Explain Plan for the statement at the caret");
+                });
+                if small_button(ui, "🕘", "Query History", can_run, st.theme.text, st) {
+                    cmd = Some(("db.showHistory", Value::Null));
+                }
                 ui.separator();
+                if let Some(ds) = source.as_ref().and_then(|id| s.db.source(id)) {
+                    let manual = ds.config.manual_commit;
+                    let mut chosen = manual;
+                    egui::ComboBox::from_id_salt("db-tx-mode")
+                        .selected_text(if manual { "Tx: Manual" } else { "Tx: Auto" })
+                        .width(92.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut chosen, false, "Auto-commit");
+                            ui.selectable_value(&mut chosen, true, "Manual commit");
+                        });
+                    if chosen != manual {
+                        cmd = Some(("db.setTransactionMode", json!({ "manual": chosen, "dataSource": ds.config.id })));
+                    }
+                    if small_button(ui, "✔", "Commit", tx_open, st.theme.success, st) {
+                        cmd = Some(("db.commit", json!({ "connection": worker })));
+                    }
+                    if small_button(ui, "↶", "Rollback", tx_open, st.theme.error, st) {
+                        cmd = Some(("db.rollback", json!({ "connection": worker })));
+                    }
+                    if tx_open {
+                        ui.label(RichText::new("● pending transaction").size(12.0).color(st.theme.warning));
+                    }
+                    ui.separator();
+                }
                 let current = source.as_ref().and_then(|id| s.db.source(id));
                 let (dot, label) = match current {
                     Some(ds) => (status_color(&ds.status, st), ds.config.name.clone()),
@@ -769,6 +911,13 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if let Some(ConnStatus::Failed(e)) = current.map(|d| &d.status) {
                     ui.label(RichText::new("connection failed").color(st.theme.error)).on_hover_text(e);
                 }
+                if current.is_some_and(|d| d.config.read_only) {
+                    ui.label(RichText::new("read-only").size(12.0).color(st.theme.text_muted));
+                }
+                if current.is_some_and(|d| d.config.confirm_writes) {
+                    ui.label(RichText::new("production").size(12.0).color(st.theme.warning))
+                        .on_hover_text("Data modifications ask for confirmation");
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if running {
                         ui.spinner();
@@ -776,6 +925,11 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 });
             });
         });
+    let color = source.as_ref().and_then(|id| s.db.source(id)).and_then(|d| source_color(d.config.color_name(), st));
+    if let Some(c) = color {
+        let r = frame.response.rect;
+        ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width(), 2.0)), CornerRadius::ZERO, c);
+    }
     if let Some((id, params)) = cmd {
         run_command(s, st, id, &params);
     }
@@ -806,7 +960,15 @@ pub fn services(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             for r in &s.db.results {
                 let sel = s.db.active_result == Some(r.id);
                 let (icon, color) = result_icon(r, st);
+                let (icon, color) = if r.plan.is_some() { ("⑂", st.theme.keyword) } else { (icon, color) };
                 let mut job = egui::text::LayoutJob::default();
+                if let Some(c) = s.db.source(&r.source).and_then(|d| source_color(d.config.color_name(), st)) {
+                    job.append(
+                        "● ",
+                        0.0,
+                        egui::TextFormat { color: c, font_id: FontId::proportional(10.0), ..Default::default() },
+                    );
+                }
                 job.append(
                     icon,
                     0.0,
@@ -878,6 +1040,10 @@ fn result_view(
     cmd: &mut Vec<(&'static str, Value)>,
 ) {
     let id = json!({ "result": r.id });
+    if let Some(plan) = &r.plan {
+        plan_view(ui, st, r, plan, cmd);
+        return;
+    }
     ui.horizontal(|ui| {
         if small_button(ui, "■", "Cancel", r.is_running() || r.has_more, st.theme.error, st) {
             cmd.push(("db.cancel", id.clone()));
@@ -885,20 +1051,51 @@ fn result_view(
         if small_button(ui, "⬇", "Fetch the next page (500 rows)", r.has_more, st.theme.text, st) {
             cmd.push(("db.fetchMore", id.clone()));
         }
-        if small_button(ui, "💾", "Export to CSV…", !r.columns.is_empty(), st.theme.text, st) {
-            let name = format!("{}.csv", r.title.replace(['/', '\\', ' '], "_"));
-            let mut dlg = rfd::FileDialog::new().set_title("Export to CSV").set_file_name(name);
-            if let Some(root) = s.db.project_root() {
-                dlg = dlg.set_directory(root);
-            }
-            if let Some(p) = dlg.save_file() {
-                cmd.push(("db.exportCsv", json!({ "result": r.id, "path": p })));
-            }
+        let has_rows = !r.columns.is_empty();
+        ui.add_enabled_ui(has_rows, |ui| {
+            ui.menu_button(RichText::new("💾").size(14.0).color(st.theme.text), |ui| {
+                ui.label(RichText::new("Export to file").color(st.theme.text_muted));
+                for (format, label) in data_grid::COPY_FORMATS {
+                    if ui.button(format!("{label}…")).clicked() {
+                        ui.close();
+                        let ext = match format {
+                            "markdown" => "md",
+                            other => other,
+                        };
+                        let name = format!("{}.{ext}", r.title.replace(['/', '\\', ' '], "_"));
+                        let mut dlg = rfd::FileDialog::new().set_title("Export Data").set_file_name(name);
+                        if let Some(root) = s.db.project_root() {
+                            dlg = dlg.set_directory(root);
+                        }
+                        if let Some(p) = dlg.save_file() {
+                            cmd.push(("db.exportResult", json!({ "result": r.id, "path": p, "format": format })));
+                        }
+                    }
+                }
+                ui.separator();
+                ui.label(RichText::new("Copy all rows as").color(st.theme.text_muted));
+                for (format, label) in data_grid::COPY_FORMATS {
+                    if ui.button(label).clicked() {
+                        cmd.push(("db.copyResult", json!({ "result": r.id, "format": format })));
+                        ui.close();
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Export / Copy As");
+        });
+        let t_color = if r.transposed { st.theme.accent } else { st.theme.text };
+        if small_button(ui, "⇄", "Transpose (rows as columns)", has_rows, t_color, st) {
+            cmd.push(("db.transposeResult", id.clone()));
+        }
+        let v_color = if st.db.value_viewer { st.theme.accent } else { st.theme.text };
+        if small_button(ui, "🔍", "Value viewer", has_rows, v_color, st) {
+            st.db.value_viewer = !st.db.value_viewer;
         }
         let editable = s.db.editable(r.id);
-        if r.table.is_some() {
+        if let Some(t) = &r.table {
             ui.separator();
-            let can = editable.is_ok();
+            let can = editable.is_ok() && !r.transposed;
             let pending = !r.edits.is_empty() && !r.edits.submitting;
             if small_button(ui, "+", "Add Row", can, st.theme.success, st) {
                 cmd.push(("db.addRow", id.clone()));
@@ -921,6 +1118,18 @@ fn result_view(
             if small_button(ui, "⬆", "Submit Changes", pending && can, st.theme.success, st) {
                 cmd.push(("db.submitChanges", id.clone()));
             }
+            let read_only = s.db.source(&r.source).is_some_and(|d| d.config.read_only);
+            if small_button(ui, "⤓", "Import Data from File…", !read_only, st.theme.text, st)
+                && let Some(path) = rfd::FileDialog::new()
+                    .set_title("Import Data")
+                    .add_filter("CSV, TSV, JSON", &["csv", "tsv", "tab", "txt", "json"])
+                    .pick_file()
+            {
+                cmd.push((
+                    "db.importData",
+                    json!({ "dataSource": r.source, "schema": t.schema, "table": t.table, "path": path }),
+                ));
+            }
             if r.edits.submitting {
                 ui.label(RichText::new("Submitting…").color(st.theme.warning));
             } else if let Some(e) = &r.edits.error {
@@ -938,28 +1147,61 @@ fn result_view(
         let sql: String = r.sql.split_whitespace().collect::<Vec<_>>().join(" ");
         ui.add(egui::Label::new(RichText::new(sql).monospace().size(11.5).color(st.theme.text_muted)).truncate());
     });
+    if !r.columns.is_empty() || !r.filter.is_empty() {
+        filter_row(ui, st, r, cmd);
+    }
     edit_preview(ui.ctx(), s, st, cmd);
+    if st.db.value_viewer && !r.columns.is_empty() {
+        egui::Panel::right(egui::Id::new(("db-value-viewer", r.id)))
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(160.0..=1200.0)
+            .frame(Frame::new().inner_margin(Margin::same(6)))
+            .show(ui, |ui| value_viewer(ui, st, r));
+    }
     let status = r.status_line();
-    let data = GridData {
-        columns: &r.columns,
-        rows: &r.rows,
-        sort: r.sort.map(|k| (k.column, k.desc)),
-        status: &status,
-        status_is_error: r.status == ResultStatus::Failed,
-        edits: r.table.as_ref().map(|_| &r.edits),
-        editable: s.db.editable(r.id).is_ok(),
+    // A transposed grid shows each column as a row (records as columns, read-only).
+    if r.transposed {
+        let key = (r.id, r.rows.len(), r.columns.len());
+        if st.db.transposed.as_ref().is_none_or(|(k, _, _)| *k != key) {
+            let (cols, rows) = transpose(&r.columns, &r.rows);
+            st.db.transposed = Some((key, cols, rows));
+        }
+    }
+    let transposed = st.db.transposed.as_ref().filter(|_| r.transposed).map(|(_, c, rows)| (c, rows));
+    let data = if let Some((t_cols, t_rows)) = transposed {
+        GridData {
+            columns: t_cols,
+            rows: t_rows,
+            sort: None,
+            status: &status,
+            status_is_error: r.status == ResultStatus::Failed,
+            edits: None,
+            editable: false,
+        }
+    } else {
+        GridData {
+            columns: &r.columns,
+            rows: &r.rows,
+            sort: r.sort.map(|k| (k.column, k.desc)),
+            status: &status,
+            status_is_error: r.status == ResultStatus::Failed,
+            edits: r.table.as_ref().map(|_| &r.edits),
+            editable: s.db.editable(r.id).is_ok(),
+        }
     };
+    let grid_id = egui::Id::new(("db-grid", r.id, r.transposed));
     let grid = st.db.grids.entry(r.id).or_default();
-    let actions = data_grid::show(ui, egui::Id::new(("db-grid", r.id)), grid, &data, &st.theme);
+    let actions = data_grid::show(ui, grid_id, grid, &data, &st.theme);
     for a in actions {
         match a {
-            GridAction::Sort(c) if !r.is_running() => {
+            GridAction::Sort(c) if !r.is_running() && !r.transposed => {
                 cmd.push(("db.sortResult", json!({ "result": r.id, "column": c })))
             }
             GridAction::Sort(_) => {}
             GridAction::NearEnd => {
                 let marker = (r.id, r.rows.len());
-                if r.has_more && st.db.fetch_requested != Some(marker) {
+                if r.has_more && st.db.fetch_requested != Some(marker) && !r.transposed {
                     st.db.fetch_requested = Some(marker);
                     cmd.push(("db.fetchMore", id.clone()));
                 }
@@ -973,11 +1215,251 @@ fn result_view(
             }
             GridAction::AddRow => cmd.push(("db.addRow", id.clone())),
             GridAction::DeleteRow(row) => cmd.push(("db.deleteRows", json!({ "result": r.id, "rows": [row] }))),
-            GridAction::RevertRow(row) => {
-                cmd.push(("db.revertChanges", json!({ "result": r.id, "rows": [row] })))
+            GridAction::RevertRow(row) => cmd.push(("db.revertChanges", json!({ "result": r.id, "rows": [row] }))),
+            GridAction::CopyAs { format, rect } => {
+                // In a transposed grid rows are columns and columns (after the first) are records.
+                let (rows, cols) = if r.transposed {
+                    if rect.cols.1 == 0 {
+                        continue;
+                    }
+                    ((rect.cols.0.max(1) - 1, rect.cols.1 - 1), rect.rows)
+                } else {
+                    (rect.rows, rect.cols)
+                };
+                let last_row = r.rows.len().saturating_sub(1);
+                let p = json!({
+                    "result": r.id,
+                    "format": format,
+                    "rowRange": [rows.0.min(last_row), rows.1.min(last_row)],
+                    "columnRange": [cols.0, cols.1.min(r.columns.len().saturating_sub(1))],
+                });
+                cmd.push(("db.copyResult", p));
+            }
+            GridAction::ShowValue => st.db.value_viewer = true,
+        }
+    }
+}
+
+/// Columns become rows: the first column names the original column, then one per record.
+fn transpose(columns: &[Column], rows: &[Vec<Cell>]) -> (Vec<Column>, Vec<Vec<Cell>>) {
+    let records = rows.len().min(MAX_TRANSPOSED);
+    let mut cols = vec![Column { name: "column".into(), type_name: String::new() }];
+    cols.extend((1..=records).map(|i| Column { name: format!("#{i}"), type_name: String::new() }));
+    let out = columns
+        .iter()
+        .enumerate()
+        .map(|(c, col)| {
+            let mut line = Vec::with_capacity(records + 1);
+            line.push(Cell::Text(col.name.clone()));
+            line.extend(rows.iter().take(records).map(|row| row.get(c).cloned().unwrap_or(Cell::Null)));
+            line
+        })
+        .collect();
+    (cols, out)
+}
+
+/// WHERE and ORDER BY typed above the grid; Enter re-queries.
+fn filter_row(ui: &mut egui::Ui, st: &mut UiState, r: &ResultSet, cmd: &mut Vec<(&'static str, Value)>) {
+    let edit = st.db.filters.entry(r.id).or_default();
+    if edit.applied != r.filter {
+        *edit = FilterEdit {
+            where_: r.filter.where_.clone(),
+            order_by: r.filter.order_by.clone(),
+            applied: r.filter.clone(),
+        };
+    }
+    let theme = &st.theme;
+    let mut apply = false;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("WHERE").monospace().size(11.5).color(theme.keyword));
+        let w = ui.add(
+            TextEdit::singleline(&mut edit.where_)
+                .id(egui::Id::new(("db-filter-where", r.id)))
+                .font(egui::TextStyle::Monospace)
+                .hint_text("condition")
+                .desired_width((ui.available_width() * 0.55).max(120.0)),
+        );
+        ui.label(RichText::new("ORDER BY").monospace().size(11.5).color(theme.keyword));
+        let o = ui.add(
+            TextEdit::singleline(&mut edit.order_by)
+                .id(egui::Id::new(("db-filter-order", r.id)))
+                .font(egui::TextStyle::Monospace)
+                .hint_text("columns")
+                .desired_width((ui.available_width() - 30.0).max(80.0)),
+        );
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        apply = (w.lost_focus() || o.lost_focus()) && enter;
+        let dirty = edit.where_ != r.filter.where_ || edit.order_by != r.filter.order_by;
+        if ui
+            .add_enabled(dirty && !r.is_running(), egui::Button::new(RichText::new("↵").color(theme.text)).frame(false))
+            .on_hover_text("Apply the filter (Enter)")
+            .clicked()
+        {
+            apply = true;
+        }
+    });
+    if apply && !r.is_running() {
+        cmd.push(("db.filterResult", json!({ "result": r.id, "where": edit.where_, "orderBy": edit.order_by })));
+    }
+}
+
+/// The selected cell, mapped back from a transposed grid.
+fn selected_cell(st: &UiState, r: &ResultSet) -> Option<(usize, usize)> {
+    let grid = st.db.grids.get(&r.id)?;
+    let (row, col) = match grid.selection? {
+        data_grid::Selection::Cell { row, col } => (row, col),
+        data_grid::Selection::Row(row) => (row, 0),
+    };
+    if r.transposed { Some((col.checked_sub(1)?, row)) } else { Some((row, col)) }
+}
+
+/// The value viewer: the selected cell as text, pretty JSON, a hex dump or an image.
+fn value_viewer(ui: &mut egui::Ui, st: &mut UiState, r: &ResultSet) {
+    let theme = st.theme.clone();
+    let Some((row, col)) = selected_cell(st, r) else {
+        ui.label(RichText::new("Select a cell to see its value").color(theme.text_muted));
+        return;
+    };
+    let (Some(cell), Some(column)) = (r.rows.get(row).and_then(|x| x.get(col)), r.columns.get(col)) else {
+        ui.label(RichText::new("No value").color(theme.text_muted));
+        return;
+    };
+    let view = codecraft_engine::db::value::view(cell);
+    let kind = match view.kind {
+        ValueKind::Null => "NULL",
+        ValueKind::Text => "text",
+        ValueKind::Number => "number",
+        ValueKind::Json => "JSON",
+        ValueKind::Binary => "binary",
+        ValueKind::Image => "image",
+    };
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(&column.name).strong().color(theme.text));
+        ui.label(RichText::new(format!("{} · {kind} · {} bytes", column.type_name, view.len)).color(theme.text_muted));
+    });
+    if let (Some(info), Cell::Bytes(bytes)) = (&view.image, cell) {
+        ui.label(
+            RichText::new(format!("{} image, {}×{}", info.format.to_uppercase(), info.width, info.height))
+                .color(theme.text_muted),
+        );
+        let key = (r.id, row, col);
+        if st.db.viewer_image.as_ref().is_none_or(|(k, _)| *k != key) {
+            let texture = decode_image(bytes).map(|img| {
+                ui.ctx().load_texture(format!("db-value-{}-{row}-{col}", r.id), img, egui::TextureOptions::LINEAR)
+            });
+            st.db.viewer_image = Some((key, texture));
+        }
+        match st.db.viewer_image.as_ref().and_then(|(_, t)| t.as_ref()) {
+            Some(t) => {
+                let size = t.size_vec2();
+                let scale = (ui.available_width() / size.x.max(1.0)).min(1.0);
+                ui.image((t.id(), size * scale));
+            }
+            None => {
+                ui.label(RichText::new("Preview is available for PNG images").color(theme.text_muted));
             }
         }
     }
+    if view.kind == ValueKind::Null {
+        ui.label(RichText::new("<null>").monospace().color(theme.text_disabled));
+        return;
+    }
+    let mut text = view.text.clone();
+    ScrollArea::both().id_salt(("db-value-text", r.id)).auto_shrink([false, false]).show(ui, |ui| {
+        ui.add(
+            TextEdit::multiline(&mut text)
+                .font(egui::TextStyle::Monospace)
+                .desired_width(f32::INFINITY)
+                .interactive(true)
+                .code_editor(),
+        );
+    });
+}
+
+/// PNG bytes as an egui image (other formats show their size only).
+fn decode_image(bytes: &[u8]) -> Option<egui::ColorImage> {
+    if bytes.len() > 32 * 1024 * 1024 {
+        return None;
+    }
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?;
+    if img.width() > 8192 || img.height() > 8192 {
+        return None;
+    }
+    let rgba = img.to_rgba8();
+    let size = [usize::try_from(rgba.width()).ok()?, usize::try_from(rgba.height()).ok()?];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
+/// An Explain Plan: steps as an indented tree with cost, rows and actual times.
+fn plan_view(ui: &mut egui::Ui, st: &UiState, r: &ResultSet, plan: &Plan, cmd: &mut Vec<(&'static str, Value)>) {
+    let theme = &st.theme;
+    ui.horizontal(|ui| {
+        if small_button(ui, "⎘", "Copy the plan", true, theme.text, st) {
+            cmd.push(("db.copyResult", json!({ "result": r.id })));
+        }
+        let mut info = vec![if plan.analyzed { "Explain Analyze".to_string() } else { "Explain Plan".to_string() }];
+        if let Some(ms) = plan.planning_ms {
+            info.push(format!("planning {} ms", format_number(ms)));
+        }
+        if let Some(ms) = plan.execution_ms {
+            info.push(format!("execution {} ms", format_number(ms)));
+        }
+        ui.label(RichText::new(info.join(" · ")).color(theme.text_muted));
+        if let Some(n) = &plan.note {
+            ui.label(RichText::new(n).color(theme.warning));
+        }
+        let sql: String = r.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        ui.add(egui::Label::new(RichText::new(sql).monospace().size(11.5).color(theme.text_muted)).truncate());
+    });
+    ui.add(egui::Separator::default().spacing(2.0));
+    let mut lines: Vec<(usize, &PlanNode)> = Vec::new();
+    fn walk<'a>(n: &'a PlanNode, depth: usize, out: &mut Vec<(usize, &'a PlanNode)>) {
+        out.push((depth, n));
+        if depth < 64 {
+            for c in &n.children {
+                walk(c, depth + 1, out);
+            }
+        }
+    }
+    for root in &plan.roots {
+        walk(root, 0, &mut lines);
+    }
+    let num = |v: Option<f64>| v.map(format_number).unwrap_or_default();
+    let cost = |n: &PlanNode| match (n.startup_cost, n.total_cost) {
+        (Some(a), Some(b)) => format!("{}..{}", format_number(a), format_number(b)),
+        (None, Some(b)) => format_number(b),
+        _ => String::new(),
+    };
+    ScrollArea::both().id_salt(("db-plan", r.id)).auto_shrink([false, false]).show(ui, |ui| {
+        egui::Grid::new(("db-plan-grid", r.id)).striped(true).spacing([14.0, 4.0]).show(ui, |ui| {
+            for h in ["Operation", "Relation", "Cost", "Rows"] {
+                ui.label(RichText::new(h).strong());
+            }
+            if plan.analyzed {
+                for h in ["Actual ms", "Actual rows", "Loops"] {
+                    ui.label(RichText::new(h).strong());
+                }
+            }
+            ui.label(RichText::new("Details").strong());
+            ui.end_row();
+            for (depth, n) in &lines {
+                let indent = "   ".repeat(*depth);
+                let arrow = if *depth == 0 { "" } else { "└ " };
+                ui.label(RichText::new(format!("{indent}{arrow}{}", n.operation)).monospace().color(theme.keyword));
+                ui.label(RichText::new(n.relation.clone().unwrap_or_default()).monospace().color(theme.text));
+                ui.label(RichText::new(cost(n)).monospace().color(theme.number));
+                ui.label(RichText::new(num(n.rows)).monospace().color(theme.number));
+                if plan.analyzed {
+                    ui.label(RichText::new(num(n.actual_time_ms)).monospace().color(theme.number));
+                    ui.label(RichText::new(num(n.actual_rows)).monospace().color(theme.number));
+                    ui.label(RichText::new(num(n.loops)).monospace().color(theme.number));
+                }
+                ui.add(egui::Label::new(RichText::new(&n.detail).size(12.0).color(theme.text_muted)).truncate())
+                    .on_hover_text(&n.detail);
+                ui.end_row();
+            }
+        });
+    });
 }
 
 /// The SQL that Submit will run, with Submit/Cancel.

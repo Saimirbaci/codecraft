@@ -4,6 +4,9 @@
 //!
 //! Editable table results show pending changes (edited cells, new and deleted rows) and edit a
 //! cell in place on double-click, Enter or F2; the caller turns the edits into `db.*` commands.
+//!
+//! Shift+click and Shift+arrows extend the selection to a block of cells (or rows); the status
+//! line then shows count/sum/avg/min/max of the block, and Copy As offers several formats.
 
 use egui::{Align2, CornerRadius, CursorIcon, Event, FontId, Id, Key, Rect, ScrollArea, Sense, Stroke, pos2, vec2};
 
@@ -26,11 +29,32 @@ pub enum Selection {
     Row(usize),
 }
 
+/// A block of cells, inclusive on both ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelRect {
+    pub rows: (usize, usize),
+    pub cols: (usize, usize),
+}
+
+impl SelRect {
+    pub fn contains(&self, row: usize, col: usize) -> bool {
+        (self.rows.0..=self.rows.1).contains(&row) && (self.cols.0..=self.cols.1).contains(&col)
+    }
+
+    pub fn cells(&self) -> usize {
+        (self.rows.1 - self.rows.0 + 1).saturating_mul(self.cols.1 - self.cols.0 + 1)
+    }
+}
+
 /// Per-grid view state (kept by the shell, keyed by result id).
 #[derive(Clone, Debug, Default)]
 pub struct GridState {
     pub widths: Vec<f32>,
     pub selection: Option<Selection>,
+    /// The other corner of a block selection (Shift+click, Shift+arrows).
+    pub extent: Option<(usize, usize)>,
+    /// The aggregate footer of the last block (`rect`, rows fetched) and its text.
+    agg_cache: Option<(SelRect, usize, String)>,
     /// Column names the widths were computed for (reset when the columns change).
     columns_key: Vec<String>,
     /// Scroll the selection into view next frame.
@@ -57,10 +81,48 @@ pub enum GridAction {
     /// Text for the clipboard.
     Copy(String),
     /// Set a cell (`None`: NULL).
-    Edit { row: usize, col: usize, value: Option<String> },
+    Edit {
+        row: usize,
+        col: usize,
+        value: Option<String>,
+    },
     AddRow,
     DeleteRow(usize),
     RevertRow(usize),
+    /// Copy the block in a format (`csv`, `tsv`, `json`, `sql`, `markdown`).
+    CopyAs {
+        format: &'static str,
+        rect: SelRect,
+    },
+    /// Open the value viewer for the selected cell.
+    ShowValue,
+}
+
+/// Formats offered by Copy As (`db.copyResult` names and menu labels).
+pub const COPY_FORMATS: [(&str, &str); 5] =
+    [("csv", "CSV"), ("tsv", "TSV"), ("json", "JSON"), ("sql", "SQL INSERT"), ("markdown", "Markdown")];
+
+impl GridState {
+    /// Select one cell (tests and the shell).
+    pub fn select_cell(&mut self, row: usize, col: usize) {
+        self.selection = Some(Selection::Cell { row, col });
+        self.extent = None;
+    }
+
+    /// The selected block (`n_cols` columns): a cell, a row, or what Shift extended them to.
+    pub fn selected_rect(&self, n_cols: usize) -> Option<SelRect> {
+        let last_col = n_cols.checked_sub(1)?;
+        let order = |a: usize, b: usize| (a.min(b), a.max(b));
+        match (self.selection?, self.extent) {
+            (Selection::Cell { row, col }, None) => Some(SelRect { rows: (row, row), cols: (col, col) }),
+            (Selection::Cell { row, col }, Some((r2, c2))) => {
+                Some(SelRect { rows: order(row, r2), cols: order(col.min(last_col), c2.min(last_col)) })
+            }
+            (Selection::Row(row), extent) => {
+                Some(SelRect { rows: order(row, extent.map_or(row, |e| e.0)), cols: (0, last_col) })
+            }
+        }
+    }
 }
 
 /// Input for one frame of the grid.
@@ -124,6 +186,7 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
         state.widths = initial_widths(data.columns, data.rows, char_w);
         state.columns_key = key;
         state.selection = None;
+        state.extent = None;
     }
     let fetched = data.rows.len();
     let n_rows = data.edits.map_or(fetched, |e| e.row_count(fetched));
@@ -173,7 +236,7 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 egui::EventFilter { horizontal_arrows: true, vertical_arrows: true, tab: false, escape: false },
             )
         });
-        let (copy, moves) = ui.input(|i| {
+        let (copy, moves, shift) = ui.input(|i| {
             let copy = i.events.iter().any(|e| {
                 matches!(e, Event::Copy)
                     || matches!(e, Event::Key { key: Key::C, pressed: true, modifiers, .. } if modifiers.command)
@@ -194,13 +257,24 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                     }
                 }
             }
-            (copy, moves)
+            (copy, moves, i.modifiers.shift)
         });
-        if copy && let Some(text) = selection_text(state.selection, data.rows) {
+        if copy && let Some(text) = state.selected_rect(n_cols).and_then(|r| rect_text(&r, data.rows)) {
             actions.push(GridAction::Copy(text));
         }
-        if moves != (0, 0) && n_rows > 0 {
-            let clamp = |v: i64, n: usize| usize::try_from(v.clamp(0, n.saturating_sub(1) as i64)).unwrap_or(0);
+        let clamp = |v: i64, n: usize| usize::try_from(v.clamp(0, n.saturating_sub(1) as i64)).unwrap_or(0);
+        if moves != (0, 0) && n_rows > 0 && shift && state.selection.is_some() {
+            // Shift+arrows move the block's far corner.
+            let (r, c) = match (state.extent, state.selection) {
+                (Some(e), _) => e,
+                (None, Some(Selection::Cell { row, col })) => (row, col),
+                (None, Some(Selection::Row(row))) => (row, n_cols.saturating_sub(1)),
+                (None, None) => (0, 0),
+            };
+            state.extent = Some((clamp(r as i64 + moves.0, n_rows), clamp(c as i64 + moves.1, n_cols.max(1))));
+            state.reveal = true;
+        } else if moves != (0, 0) && n_rows > 0 {
+            state.extent = None;
             state.selection = Some(match state.selection {
                 Some(Selection::Cell { row, col }) => Selection::Cell {
                     row: clamp(row as i64 + moves.0, n_rows),
@@ -258,7 +332,12 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 continue;
             }
             let painter = ui.painter().clone();
-            let row_selected = state.selection == Some(Selection::Row(r));
+            let block = state.selected_rect(n_cols);
+            let row_selected = matches!(state.selection, Some(Selection::Row(_)))
+                && block.is_some_and(|b| (b.rows.0..=b.rows.1).contains(&r));
+            let in_block = |c: usize| {
+                matches!(state.selection, Some(Selection::Cell { .. })) && block.is_some_and(|b| b.contains(r, c))
+            };
             if row_selected {
                 painter.rect_filled(rect, CornerRadius::ZERO, theme.list_selection);
             } else if row_state == RowState::Inserted {
@@ -317,6 +396,9 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                     CellView::Default => (&default_cell, true),
                     CellView::Missing => (&default_cell, false),
                 };
+                if in_block(c) && state.selection != Some(Selection::Cell { row: r, col: c }) {
+                    painter.rect_filled(cell_rect, CornerRadius::ZERO, theme.selection);
+                }
                 if state.selection == Some(Selection::Cell { row: r, col: c }) {
                     painter.rect_filled(cell_rect.shrink(1.0), CornerRadius::same(2), theme.selection);
                     painter.rect_stroke(
@@ -385,6 +467,24 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                     copy_menu = row.map(|row| row_text(row));
                     ui.close();
                 }
+                let menu_rect = state
+                    .selected_rect(n_cols)
+                    .filter(|b| (b.rows.0..=b.rows.1).contains(&r))
+                    .unwrap_or(SelRect { rows: (r, r), cols: (0, n_cols.saturating_sub(1)) });
+                ui.add_enabled_ui(r < fetched && n_cols > 0, |ui| {
+                    ui.menu_button("Copy As", |ui| {
+                        for (format, label) in COPY_FORMATS {
+                            if ui.button(label).clicked() {
+                                menu_actions.push(GridAction::CopyAs { format, rect: menu_rect });
+                                ui.close();
+                            }
+                        }
+                    });
+                });
+                if ui.add_enabled(row.is_some(), egui::Button::new("Show Value")).clicked() {
+                    menu_actions.push(GridAction::ShowValue);
+                    ui.close();
+                }
                 if data.editable {
                     ui.separator();
                     let live = row_state != RowState::Deleted;
@@ -413,7 +513,20 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
         }
     });
     if let Some(sel) = clicked {
-        state.selection = Some(sel);
+        let shift = ui.input(|i| i.modifiers.shift);
+        let corner = match sel {
+            Selection::Cell { row, col } => (row, col),
+            Selection::Row(row) => (row, n_cols.saturating_sub(1)),
+        };
+        // A right-click inside the block keeps it (for Copy As).
+        let keep = ui.input(|i| i.pointer.secondary_clicked())
+            && state.selected_rect(n_cols).is_some_and(|b| b.contains(corner.0, corner.1));
+        if shift && state.selection.is_some() {
+            state.extent = Some(corner);
+        } else if !keep {
+            state.selection = Some(sel);
+            state.extent = None;
+        }
         ui.memory_mut(|m| m.request_focus(id));
     }
     if let Some(t) = copy_menu {
@@ -429,6 +542,7 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
     }
     if let Some((row, col)) = start_editing {
         state.selection = Some(Selection::Cell { row, col });
+        state.extent = None;
         state.editing = Some(start_edit(row, col));
     }
     let offset_x = out.state.offset.x;
@@ -507,6 +621,15 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
         FontId::proportional(12.0),
         color,
     );
+    if let Some(footer) = aggregate_footer(state, data.rows, n_cols) {
+        sp.text(
+            pos2(status_rect.max.x - 8.0, status_rect.center().y),
+            Align2::RIGHT_CENTER,
+            footer,
+            FontId::proportional(12.0),
+            theme.text_muted,
+        );
+    }
     if n_cols == 0 && n_rows == 0 {
         ui.painter_at(body_rect).text(
             body_rect.center(),
@@ -534,6 +657,38 @@ fn hit(x: f32, num_w: f32, widths: &[f32], row: usize) -> Selection {
     Selection::Cell { row, col: widths.len().saturating_sub(1) }
 }
 
+/// Count/sum/avg/min/max of a block of more than one cell (cached while the block is unchanged).
+fn aggregate_footer(state: &mut GridState, rows: &[Vec<Cell>], n_cols: usize) -> Option<String> {
+    let rect = state.selected_rect(n_cols).filter(|r| r.cells() > 1)?;
+    if let Some((r, n, text)) = &state.agg_cache
+        && *r == rect
+        && *n == rows.len()
+    {
+        return Some(text.clone());
+    }
+    let last = rect.rows.1.min(rows.len().checked_sub(1)?);
+    let cells = rows
+        .get(rect.rows.0..=last)
+        .unwrap_or(&[])
+        .iter()
+        .flat_map(|row| row.get(rect.cols.0..=rect.cols.1.min(row.len().saturating_sub(1))).unwrap_or(&[]));
+    let text = codecraft_engine::db::value::aggregate(cells).summary();
+    state.agg_cache = Some((rect, rows.len(), text.clone()));
+    Some(text)
+}
+
+/// A block as tab-separated lines (NULL as an empty field), for Copy.
+fn rect_text(rect: &SelRect, rows: &[Vec<Cell>]) -> Option<String> {
+    let last = rect.rows.1.min(rows.len().checked_sub(1)?);
+    let lines: Vec<String> = rows
+        .get(rect.rows.0..=last)?
+        .iter()
+        .map(|row| row_text(row.get(rect.cols.0..=rect.cols.1.min(row.len().saturating_sub(1))).unwrap_or(&[])))
+        .collect();
+    Some(lines.join("\n"))
+}
+
+#[cfg(test)]
 fn selection_text(sel: Option<Selection>, rows: &[Vec<Cell>]) -> Option<String> {
     match sel? {
         Selection::Cell { row, col } => rows.get(row)?.get(col).map(Cell::to_plain),
@@ -629,6 +784,29 @@ mod tests {
         h.run_steps(2);
         assert!(h.state().0.editing.is_none());
         assert_eq!(h.state().1.iter().filter(|a| matches!(a, GridAction::Edit { .. })).count(), 1);
+    }
+
+    #[test]
+    fn blocks_select_copy_and_aggregate() {
+        let rows: Vec<Vec<Cell>> =
+            (1..=4).map(|i| vec![Cell::Int(i), Cell::Text(format!("t{i}")), Cell::Null]).collect();
+        let mut st = GridState { selection: Some(Selection::Cell { row: 2, col: 0 }), ..GridState::default() };
+        assert_eq!(st.selected_rect(3), Some(SelRect { rows: (2, 2), cols: (0, 0) }));
+        assert_eq!(aggregate_footer(&mut st, &rows, 3), None, "one cell has no footer");
+        st.extent = Some((0, 1));
+        let rect = st.selected_rect(3).unwrap();
+        assert_eq!(rect, SelRect { rows: (0, 2), cols: (0, 1) });
+        assert_eq!(rect.cells(), 6);
+        assert_eq!(rect_text(&rect, &rows).as_deref(), Some("1\tt1\n2\tt2\n3\tt3"));
+        assert_eq!(aggregate_footer(&mut st, &rows, 3).as_deref(), Some("Count: 6  Sum: 6  Avg: 2  Min: 1  Max: 3"));
+        st.selection = Some(Selection::Row(3));
+        st.extent = Some((1, 0));
+        assert_eq!(st.selected_rect(3), Some(SelRect { rows: (1, 3), cols: (0, 2) }));
+        // Out-of-range blocks (rows still loading) are clipped, never indexed past the end.
+        st.extent = Some((99, 0));
+        assert!(rect_text(&st.selected_rect(3).unwrap(), &rows).is_some());
+        assert_eq!(st.selected_rect(0), None);
+        assert_eq!(rect_text(&SelRect { rows: (0, 0), cols: (0, 0) }, &[]), None);
     }
 
     #[test]

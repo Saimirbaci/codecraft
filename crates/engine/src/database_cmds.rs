@@ -10,18 +10,26 @@ use codecraft_syntax::Language;
 use codecraft_workspace::ToolWindowId;
 
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_editor, ok, simple, spec};
+pub(super) use crate::database::console_worker;
+use crate::database::exec::{ExecAction, PendingRun};
 use crate::database::{
-    CONSOLES_DIR, ConnStatus, DataSourceDialog, DataSourceForm, MetaReq, ResultSet, RunSpec, SortKey, TableRef,
-    node_key, parse_options, sync_project,
+    CONSOLES_DIR, ConnStatus, DataSourceDialog, DataSourceForm, MetaReq, ResultFilter, ResultSet, RunSpec, SortKey,
+    TableRef, node_key, parse_options, sync_project,
 };
 use crate::params::{bool_or, opt_str, opt_usize, req_path, req_str, req_usize};
 use crate::popup::{CompletionItem, CompletionPopup};
 use crate::{CommandError, Popup, Session};
 
+mod console;
 mod edit;
+mod grid;
+mod import;
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     let mut v = edit::specs();
+    v.extend(console::specs());
+    v.extend(grid::specs());
+    v.extend(import::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);
@@ -32,7 +40,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "Add Data Source…",
             None,
             "{name?, kind: sqlite|postgres|mysql|mariadb, host?, port?, database?, user?, password?, \
-             savePassword?: bool, path?, options?: {key: value}, readOnly?: bool} — without params opens the dialog",
+             savePassword?: bool, path?, options?: {key: value}, readOnly?: bool, color?: red|orange|yellow|green|blue|violet|gray, \
+             confirmWrites?: bool (production: confirm data modifications), manualCommit?: bool, \
+             sshTunnel?: SSH server name (empty: direct)} — without params opens the dialog",
             Context::Global,
             always,
             add_data_source,
@@ -111,7 +121,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "db.execute",
             "Execute",
             Some("Cmd+Enter"),
-            "{sql?, dataSource?} — the selection or the statement at the caret of the active SQL console",
+            "{sql?, dataSource?, params?: {name: sqlText}, confirm?: bool} — the selection or the statement at the caret \
+             of the active SQL console; statements with parameters (?, $1, :name, ${name}) open the parameter prompt unless \
+             `params` has values; on a production data source data modifications ask first unless `confirm`",
             Context::Editor,
             always,
             |s, p| run_sql(s, p, false),
@@ -120,7 +132,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "db.executeAll",
             "Execute All Statements",
             None,
-            "{dataSource?} — every statement of the active SQL console",
+            "{dataSource?, params?, confirm?} — every statement of the active SQL console",
             Context::Global,
             always,
             |s, p| run_sql(s, p, true),
@@ -130,7 +142,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "db.openTable",
             "Open Table Data",
             None,
-            "{dataSource, schema, table, orderBy?: column, desc?: bool}",
+            "{dataSource, schema, table, orderBy?: column, desc?: bool, where?: sql, order?: sql} — `where`/`order` \
+             fill the grid's filter row",
             Context::Global,
             always,
             open_table,
@@ -302,7 +315,25 @@ fn config_from_params(
         Some(Value::String(o)) => cfg.options = parse_options(o),
         Some(_) => return Err(bad("`options` must be an object")),
     }
+    if let Some(v) = text("sshTunnel")? {
+        cfg.ssh_tunnel = (!v.is_empty()).then_some(v);
+    }
     cfg.read_only = bool_or(p, "readOnly", cfg.read_only);
+    cfg.confirm_writes = bool_or(p, "confirmWrites", cfg.confirm_writes);
+    cfg.manual_commit = bool_or(p, "manualCommit", cfg.manual_commit);
+    match p.get("color") {
+        None => {}
+        Some(Value::Null) => cfg.color = None,
+        Some(Value::String(c)) if c.trim().is_empty() || c.trim().eq_ignore_ascii_case("none") => cfg.color = None,
+        Some(Value::String(c)) => {
+            let probe = DataSourceConfig { color: Some(c.clone()), ..Default::default() };
+            let name = probe.color_name().ok_or_else(|| {
+                bad(format!("unknown colour `{c}` ({})", codecraft_db::DATA_SOURCE_COLORS.join(", ")))
+            })?;
+            cfg.color = Some(name.to_string());
+        }
+        Some(_) => return Err(bad("`color` must be a string")),
+    }
     if cfg.kind.is_file_based() {
         cfg.host.clear();
         cfg.port = None;
@@ -633,29 +664,28 @@ fn set_data_source(s: &mut Session, p: &Value) -> CmdResult {
 
 // ---------------------------------------------------------------- execution
 
-fn run_sql(s: &mut Session, p: &Value, all: bool) -> CmdResult {
+/// The statements a console command acts on: `sql` (on the data source's query connection), or
+/// the active SQL console's selection, statement at the caret, or every statement (`all`).
+/// `None`: nothing to run.
+pub(super) fn console_run(
+    s: &mut Session,
+    p: &Value,
+    all: bool,
+    action: ExecAction,
+) -> Result<Option<PendingRun>, CommandError> {
     sync_project(s);
     if let Some(sql_text) = opt_str(p, "sql") {
         let source = target_source(s, p)?;
         let stmts: Vec<String> =
             split_statements(sql_text, dialect_of(s, Some(&source))).into_iter().map(|st| st.text).collect();
-        let n = stmts.len();
         let worker = format!("query:{source}");
-        let run =
-            s.db.start_run(RunSpec {
-                worker: worker.clone(),
-                source: source.clone(),
-                owner: worker,
-                title: "Query".into(),
-                statements: stmts,
-                table: None,
-                sort: None,
-                replace: None,
-                base_sql: None,
-            })
-            .map_err(failed)?;
-        s.ws.layout.show(ToolWindowId::Services);
-        return Ok(json!({ "run": run, "statements": n, "dataSource": source }));
+        return Ok((!stmts.is_empty()).then(|| PendingRun {
+            action,
+            source,
+            worker,
+            title: "Query".into(),
+            statements: stmts,
+        }));
     }
     let Some((e, d)) = s.ws.active() else {
         return Err(CommandError::Disabled("open an SQL console (db.newConsole) or pass `sql`".into()));
@@ -686,36 +716,66 @@ fn run_sql(s: &mut Session, p: &Value, all: bool) -> CmdResult {
         statement_at(&text, dialect, sel.head).map(|st| vec![st.text]).unwrap_or_default()
     };
     if stmts.is_empty() {
-        s.status = "Nothing to execute".into();
-        return ok();
+        return Ok(None);
     }
     let title = path
         .as_ref()
         .and_then(|p| p.file_stem())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "console".into());
-    let worker = match &path {
-        Some(p) => format!("console:{}", p.display()),
-        None => format!("console:untitled-{}", d.id.0),
+    Ok(Some(PendingRun { action, source, worker: console_worker(path.as_deref(), d.id.0), title, statements: stmts }))
+}
+
+/// `{name: value}` from `params` (numbers and booleans as their SQL text).
+pub(super) fn param_values(p: &Value) -> Result<Option<std::collections::BTreeMap<String, String>>, CommandError> {
+    match p.get("params") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(m)) => Ok(Some(
+            m.iter()
+                .map(|(k, v)| {
+                    let text = match v {
+                        Value::String(t) => t.clone(),
+                        Value::Null => "NULL".into(),
+                        other => other.to_string(),
+                    };
+                    (k.clone(), text)
+                })
+                .collect(),
+        )),
+        Some(_) => Err(bad("`params` must be an object {name: value}")),
+    }
+}
+
+/// Run (or explain) what a console command selects, through the parameter prompt and guards.
+pub(super) fn run_console(s: &mut Session, p: &Value, all: bool, action: ExecAction) -> CmdResult {
+    let Some(mut run) = console_run(s, p, all, action)? else {
+        s.status = "Nothing to execute".into();
+        return ok();
     };
-    let n = stmts.len();
-    let run =
-        s.db.start_run(RunSpec {
-            worker: worker.clone(),
-            source: source.clone(),
-            owner: worker,
-            title,
-            statements: stmts,
-            table: None,
-            sort: None,
-            replace: None,
-            base_sql: None,
-        })
-        .map_err(failed)?;
-    let _ = ensure_connected(s, &source);
-    s.ws.layout.show(ToolWindowId::Services);
-    s.status = format!("Executing {n} statement{}…", if n == 1 { "" } else { "s" });
-    Ok(json!({ "run": run, "statements": n, "dataSource": source }))
+    if matches!(action, ExecAction::Explain { .. }) {
+        run.statements.truncate(1);
+    }
+    let from_console = opt_str(p, "sql").is_none();
+    let source = run.source.clone();
+    let n = run.statements.len();
+    let values = param_values(p)?;
+    let out = crate::database::exec::submit(s, run, values.as_ref(), bool_or(p, "confirm", false)).map_err(failed)?;
+    if from_console {
+        let _ = ensure_connected(s, &source);
+    }
+    if out.get("run").is_some() {
+        s.ws.layout.show(ToolWindowId::Services);
+        s.status = match action {
+            ExecAction::Execute => format!("Executing {n} statement{}…", if n == 1 { "" } else { "s" }),
+            ExecAction::Explain { analyze: false } => "Explaining…".into(),
+            ExecAction::Explain { analyze: true } => "Explaining (analyze)…".into(),
+        };
+    }
+    Ok(out)
+}
+
+fn run_sql(s: &mut Session, p: &Value, all: bool) -> CmdResult {
+    run_console(s, p, all, ExecAction::Execute)
 }
 
 fn can_cancel(s: &Session) -> Result<(), String> {
@@ -750,7 +810,21 @@ fn open_table(s: &mut Session, p: &Value) -> CmdResult {
                 .unwrap_or(0);
         SortKey { column, desc }
     });
-    let statement = sql::select_table(kind, &schema, &table, order.as_deref().map(|c| (c, desc)), None);
+    let filter = ResultFilter {
+        where_: opt_str(p, "where").unwrap_or_default().to_string(),
+        order_by: opt_str(p, "order").unwrap_or_default().to_string(),
+    };
+    let statement = if filter.is_empty() {
+        sql::select_table(kind, &schema, &table, order.as_deref().map(|c| (c, desc)), None)
+    } else {
+        let ord = if filter.order_by.trim().is_empty() {
+            order.as_deref().map(|c| sql::order_by_column(kind, c, desc)).unwrap_or_default()
+        } else {
+            filter.order_by.clone()
+        };
+        sql::select_table_where(kind, &schema, &table, &filter.where_, &ord)
+    };
+    let sort = if filter.order_by.trim().is_empty() { sort } else { None };
     s.db.request_keys(&source, &schema, &table);
     let worker = format!("tables:{source}");
     let run =
@@ -762,8 +836,8 @@ fn open_table(s: &mut Session, p: &Value) -> CmdResult {
             statements: vec![statement.clone()],
             table: Some(TableRef { schema, table }),
             sort,
-            replace: None,
-            base_sql: None,
+            filter,
+            ..RunSpec::default()
         })
         .map_err(failed)?;
     s.ws.layout.show(ToolWindowId::Services);
@@ -781,12 +855,11 @@ fn result_param(s: &Session, p: &Value) -> Result<ResultSet, CommandError> {
 fn sort_result(s: &mut Session, p: &Value) -> CmdResult {
     let r = result_param(s, p)?;
     let column = req_usize(p, "column")?;
-    let col = r.columns.get(column).ok_or_else(|| bad(format!("no column {column}")))?.name.clone();
-    if r.is_running() {
-        return Err(CommandError::Disabled("the query is still running".into()));
+    if column >= r.columns.len() {
+        return Err(bad(format!("no column {column}")));
     }
-    if !r.edits.is_empty() || r.edits.submitting {
-        return Err(CommandError::Disabled("submit or revert the pending changes first".into()));
+    if r.plan.is_some() {
+        return Err(CommandError::Disabled("a plan cannot be sorted".into()));
     }
     let sort = match p.get("desc").and_then(Value::as_bool) {
         Some(desc) => Some(SortKey { column, desc }),
@@ -796,27 +869,9 @@ fn sort_result(s: &mut Session, p: &Value) -> CmdResult {
             _ => Some(SortKey { column, desc: false }),
         },
     };
-    let kind = kind_of(s, &r.source);
-    let statement = match (&r.table, sort) {
-        (Some(t), Some(k)) => sql::select_table(kind, &t.schema, &t.table, Some((&col, k.desc)), None),
-        (Some(t), None) => sql::select_table(kind, &t.schema, &t.table, None, None),
-        (None, Some(k)) => sql::order_query(&r.base_sql, k.column + 1, k.desc),
-        (None, None) => r.base_sql.clone(),
-    };
-    let run =
-        s.db.start_run(RunSpec {
-            worker: r.worker.clone(),
-            source: r.source.clone(),
-            owner: r.owner.clone(),
-            title: r.title.clone(),
-            statements: vec![statement.clone()],
-            table: r.table.clone(),
-            sort,
-            replace: Some(r.id),
-            base_sql: Some(r.base_sql.clone()),
-        })
-        .map_err(failed)?;
-    Ok(json!({ "run": run, "sql": statement }))
+    // Sorting by a header replaces a typed ORDER BY.
+    let filter = ResultFilter { order_by: String::new(), ..r.filter.clone() };
+    grid::requery(s, &r, filter, sort)
 }
 
 fn fetch_more(s: &mut Session, p: &Value) -> CmdResult {
@@ -840,6 +895,9 @@ fn close_result(s: &mut Session, p: &Value) -> CmdResult {
 fn export_csv(s: &mut Session, p: &Value) -> CmdResult {
     let r = result_param(s, p)?;
     let path = req_path(p, "path")?;
+    if r.plan.is_some() {
+        return Err(CommandError::Disabled("a plan has no rows; copy it with db.copyResult".into()));
+    }
     let mut out = Vec::new();
     codecraft_db::write_csv(&mut out, &r.columns, &r.rows).map_err(|e| failed(e.to_string()))?;
     std::fs::write(&path, out).map_err(|e| failed(format!("{}: {e}", path.display())))?;
@@ -867,6 +925,9 @@ fn get_result(s: &mut Session, p: &Value) -> CmdResult {
         "hasMore": r.has_more,
         "editable": s.db.editable(r.id).is_ok(),
         "pendingRows": r.edits.pending_rows(),
+        "filter": r.filter,
+        "transposed": r.transposed,
+        "plan": r.plan,
     }))
 }
 
@@ -882,6 +943,11 @@ fn list_data_sources(s: &mut Session, _: &Value) -> CmdResult {
                     "kind": d.config.kind,
                     "summary": d.config.summary(),
                     "status": d.status,
+                    "color": d.config.color_name(),
+                    "readOnly": d.config.read_only,
+                    "confirmWrites": d.config.confirm_writes,
+                    "manualCommit": d.config.manual_commit,
+                    "openTransactions": s.db.open_transactions(Some(&d.config.id)),
                     "schemas": d.tree.schemas.iter().map(|(name, n)| json!({
                         "name": name,
                         "tables": n.tables.as_ref().map(|t| t.iter().map(|t| t.info.name.clone()).collect::<Vec<_>>()),
@@ -889,12 +955,20 @@ fn list_data_sources(s: &mut Session, _: &Value) -> CmdResult {
                 })
             })
             .collect();
-    let results: Vec<Value> = s
-        .db
-        .results
-        .iter()
-        .map(|r| json!({ "id": r.id, "title": r.title, "dataSource": r.source, "status": r.status, "rows": r.rows.len() }))
-        .collect();
+    let results: Vec<Value> =
+        s.db.results
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id,
+                    "title": r.title,
+                    "dataSource": r.source,
+                    "status": r.status,
+                    "rows": r.rows.len(),
+                    "plan": r.plan.is_some(),
+                })
+            })
+            .collect();
     Ok(json!({ "dataSources": sources, "results": results }))
 }
 

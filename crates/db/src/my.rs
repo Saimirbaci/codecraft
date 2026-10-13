@@ -132,7 +132,12 @@ impl MyConn {
             .prefer_socket(false)
             .tcp_connect_timeout(Some(cfg.connect_timeout()));
         let opts = Opts::from(builder);
-        let conn = Conn::new(opts.clone()).map_err(|e| DbError::Connect(e.to_string()))?;
+        let mut conn = Conn::new(opts.clone()).map_err(|e| DbError::Connect(e.to_string()))?;
+        if cfg.read_only {
+            // The server enforces read-only too (statements the IDE does not recognise as writes).
+            conn.query_drop("SET SESSION TRANSACTION READ ONLY")
+                .map_err(|e| DbError::Connect(format!("cannot make the session read-only: {e}")))?;
+        }
         Ok(Self { conn, opts, kind: cfg.kind, default_db: db })
     }
 
