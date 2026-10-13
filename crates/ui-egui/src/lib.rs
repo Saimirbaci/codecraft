@@ -11,6 +11,7 @@
 
 mod agent_panel;
 mod approvals_ui;
+mod bookmarks_panel;
 mod chrome;
 mod data_grid;
 mod database_panel;
@@ -24,8 +25,10 @@ mod markdown;
 mod menus;
 mod panels;
 mod popups;
+mod refactor_ui;
 mod state;
 mod terminal_panel;
+mod testing_panel;
 pub mod theme;
 mod vcs_panels;
 mod windows;

@@ -26,6 +26,7 @@ pub mod debug;
 mod debug_cmds;
 mod decorations;
 mod edit_cmds;
+mod editing_cmds;
 mod editor_cmds;
 pub mod feedback;
 mod feedback_cmds;
@@ -37,12 +38,17 @@ mod lang_cmds;
 mod lsp;
 mod navigate_cmds;
 mod params;
+pub mod refactor;
+mod refactor_cmds;
 pub mod popup;
 mod run_cmds;
 pub mod run_configs;
 mod runs;
+mod split_cmds;
 pub mod terminal;
 mod terminal_cmds;
+pub mod testing;
+mod testing_cmds;
 pub mod vcs;
 mod vcs_cmds;
 mod view_cmds;
@@ -136,6 +142,10 @@ pub struct Session {
     watch: watch::Watch,
     /// The feedback overlay's draft and records (feedback track).
     pub feedback: feedback::FeedbackState,
+    /// Test tree, history and coverage (M6).
+    pub testing: testing::TestingState,
+    /// Refactoring previews and hierarchies (M7).
+    pub refactor: refactor::RefactorState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -180,6 +190,8 @@ impl Session {
             vcs: vcs::VcsState::default(),
             watch: watch::Watch::default(),
             feedback: feedback::FeedbackState::default(),
+            testing: testing::TestingState::default(),
+            refactor: refactor::RefactorState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -237,6 +249,8 @@ impl Session {
         changed |= terminal::pump(self);
         changed |= vcs::pump(self);
         changed |= watch::pump(self);
+        changed |= testing::pump(self);
+        changed |= refactor::pump(self);
         changed
     }
 

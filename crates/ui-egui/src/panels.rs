@@ -29,7 +29,10 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Terminal => ">_",
         ToolWindowId::Commit => "✓",
         ToolWindowId::Git => "🔀",
-        _ => "•",
+        ToolWindowId::Bookmarks => "🔖",
+        ToolWindowId::Todo => "☑",
+        ToolWindowId::Coverage => "☂",
+        ToolWindowId::Hierarchy => "⊶",
     }
 }
 
@@ -169,9 +172,10 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Terminal => crate::terminal_panel::show(ui, s, st),
         ToolWindowId::Commit => crate::vcs_panels::show(ui, s, st),
         ToolWindowId::Git => crate::vcs_panels::show_git(ui, s, st),
-        other => {
-            ui.label(RichText::new(format!("{} is not implemented yet.", other.title())).color(st.theme.text_muted));
-        }
+        ToolWindowId::Bookmarks => crate::bookmarks_panel::show_bookmarks(ui, s, st),
+        ToolWindowId::Todo => crate::bookmarks_panel::show_todo(ui, s, st),
+        ToolWindowId::Coverage => crate::testing_panel::show_coverage(ui, s, st),
+        ToolWindowId::Hierarchy => crate::refactor_ui::show_hierarchy(ui, s, st),
     }
 }
 
