@@ -16,12 +16,14 @@
 )]
 
 mod change;
+pub mod column;
 mod document;
 pub mod movement;
 pub mod ops;
 pub mod search;
 mod selection;
 mod util;
+pub mod wrap;
 
 #[cfg(test)]
 mod fuzz_tests;

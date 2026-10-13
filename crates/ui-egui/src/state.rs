@@ -88,7 +88,11 @@ impl PersistedState {
         self.last_project = s.ws.project.as_ref().map(|p| p.root.clone());
         self.window_sizes = ui.window_sizes.clone();
         self.open_files =
-            s.ws.tabs.iter().filter_map(|t| s.ws.editor(*t)).filter_map(|e| s.ws.doc(e.doc)?.path.clone()).collect();
+            s.ws.all_tabs()
+                .iter()
+                .filter_map(|t| s.ws.editor(*t))
+                .filter_map(|e| s.ws.doc(e.doc)?.path.clone())
+                .collect();
     }
 }
 

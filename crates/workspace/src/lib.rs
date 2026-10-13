@@ -18,6 +18,7 @@ mod layout;
 mod problems;
 mod project;
 mod run;
+mod splits;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,7 @@ pub use layout::{Layout, Side, ToolWindowId};
 pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
 pub use run::{ConsoleKind, ConsoleLine, RunStatus, RunTab, RunTabId, TestRecord};
+pub use splits::{EditorGroup, GroupId, MIN_RATIO, SplitAxis, SplitNode, Stretch};
 
 use codecraft_fs::FileMatch;
 use codecraft_text::search::SearchQuery;
@@ -85,6 +87,8 @@ pub struct Settings {
     pub tab_size: usize,
     pub show_whitespace: bool,
     pub soft_wrap: bool,
+    /// Edit › Find › Scroll to Results During Typing: select the first match as the query is typed.
+    pub find_scroll_to_results: bool,
     pub show_line_numbers: bool,
     pub show_inlay_hints: bool,
     /// Run `cargo check` (or clippy) on save, like RustRover's external linter.
@@ -105,6 +109,27 @@ pub struct Settings {
     pub ollama_url: String,
     /// API keys by provider id. An empty entry falls back to the provider's environment variable.
     pub commit_ai_keys: BTreeMap<String, String>,
+    /// Active keymap (`macOS` or `Windows/Linux`); empty = the platform's default.
+    pub keymap: String,
+    /// User shortcut changes: keymap name → command id → the command's shortcuts (an empty list
+    /// removes all of them).
+    pub keymap_overrides: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// Editor colour scheme (a built-in or user scheme name); empty = the one matching `theme`.
+    pub color_scheme: String,
+    /// User colour schemes (Settings › Editor › Color Scheme).
+    pub user_schemes: Vec<ColorScheme>,
+    /// Show the menus in the macOS global menu bar instead of inside the window (macOS only).
+    pub native_menu_bar: bool,
+}
+
+/// A user colour scheme: a built-in scheme plus colour overrides by token name (`keyword`,
+/// `editor_bg`, …) as `#RRGGBB`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColorScheme {
+    pub name: String,
+    pub base: String,
+    pub colors: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -116,6 +141,7 @@ impl Default for Settings {
             tab_size: 4,
             show_whitespace: false,
             soft_wrap: false,
+            find_scroll_to_results: true,
             show_line_numbers: true,
             show_inlay_hints: true,
             check_on_save: false,
@@ -128,6 +154,11 @@ impl Default for Settings {
             commit_ai_model: String::new(),
             ollama_url: "http://localhost:11434".into(),
             commit_ai_keys: BTreeMap::new(),
+            keymap: String::new(),
+            keymap_overrides: BTreeMap::new(),
+            color_scheme: String::new(),
+            user_schemes: Vec::new(),
+            native_menu_bar: cfg!(target_os = "macos"),
         }
     }
 }
@@ -138,9 +169,15 @@ pub struct Workspace {
     pub project: Option<Project>,
     docs: BTreeMap<DocId, OpenDocument>,
     editors: BTreeMap<EditorId, Editor>,
-    /// Editor tabs in display order.
-    pub tabs: Vec<EditorId>,
-    pub active_editor: Option<EditorId>,
+    /// Editor groups (split editors) and their layout; read through [`Workspace::tabs`],
+    /// [`Workspace::active_editor`] and the split accessors.
+    groups: BTreeMap<GroupId, EditorGroup>,
+    split: SplitNode,
+    focused: GroupId,
+    next_group: u64,
+    /// Per editor: the document revision its view was last synced to and the char offset of
+    /// its first visible line then (see `sync_views`).
+    view_revs: BTreeMap<EditorId, (u64, usize)>,
     lsp_problems: BTreeMap<PathBuf, Vec<Problem>>,
     cargo_problems: BTreeMap<PathBuf, Vec<Problem>>,
     pub runs: Vec<RunTab>,
@@ -216,26 +253,46 @@ impl Workspace {
 
     // ------------------------------------------------------------ editors
 
-    /// Show `doc` in a tab: reuse an existing editor for it, else open a new tab after the active one.
+    /// Show `doc` in a tab: reuse its editor in the focused group, else focus another group
+    /// that shows it (like RustRover), else open a new tab after the active one in the focused
+    /// group.
     pub fn open_editor(&mut self, doc: DocId) -> Option<EditorId> {
         if !self.docs.contains_key(&doc) {
             return None;
         }
-        if let Some(e) = self.editors.values().find(|e| e.doc == doc) {
-            let id = e.id;
-            self.active_editor = Some(id);
+        if let Some(id) = self.editor_for_doc(doc) {
+            self.set_active_editor(id);
             return Some(id);
         }
+        let id = self.new_editor(doc, None)?;
+        self.insert_tab(self.focused, id);
+        Some(id)
+    }
+
+    /// A new editor for `doc`, copying the view state (carets, scroll, folds) of `like`.
+    fn new_editor(&mut self, doc: DocId, like: Option<EditorId>) -> Option<EditorId> {
+        let rev = self.docs.get(&doc)?.doc.revision();
         self.next_editor += 1;
         let id = EditorId(self.next_editor);
-        self.editors.insert(id, Editor::new(id, doc));
-        let at = self.active_editor.and_then(|a| self.tabs.iter().position(|t| *t == a)).map(|i| i + 1);
-        match at {
-            Some(i) if i <= self.tabs.len() => self.tabs.insert(i, id),
-            _ => self.tabs.push(id),
-        }
-        self.active_editor = Some(id);
+        let editor = match like.and_then(|l| self.editors.get(&l)) {
+            Some(l) => Editor { id, pinned: false, reveal_caret: true, ..l.clone() },
+            None => Editor::new(id, doc),
+        };
+        let top = self.docs.get(&doc).map(|d| top_offset(&d.doc, editor.scroll_line)).unwrap_or(0);
+        self.editors.insert(id, editor);
+        self.view_revs.insert(id, (rev, top));
         Some(id)
+    }
+
+    /// Put `id` in group `g` after its active tab, and make it active there.
+    fn insert_tab(&mut self, g: GroupId, id: EditorId) {
+        let group = self.groups.entry(g).or_default();
+        let at = group.active.and_then(|a| group.tabs.iter().position(|t| *t == a)).map(|i| i + 1);
+        match at {
+            Some(i) if i <= group.tabs.len() => group.tabs.insert(i, id),
+            _ => group.tabs.push(id),
+        }
+        group.active = Some(id);
     }
 
     pub fn editor(&self, id: EditorId) -> Option<&Editor> {
@@ -246,15 +303,40 @@ impl Workspace {
         self.editors.get_mut(&id)
     }
 
+    /// Tabs of the focused group, in display order.
+    pub fn tabs(&self) -> &[EditorId] {
+        self.groups.get(&self.focused).map(|g| g.tabs.as_slice()).unwrap_or(&[])
+    }
+
+    /// The focused group's selected editor.
+    pub fn active_editor(&self) -> Option<EditorId> {
+        self.groups.get(&self.focused).and_then(|g| g.active)
+    }
+
+    /// Select an editor's tab and focus its group. False if no group shows it.
+    pub fn set_active_editor(&mut self, id: EditorId) -> bool {
+        let Some(g) = self.group_of(id) else { return false };
+        self.focused = g;
+        if let Some(group) = self.groups.get_mut(&g) {
+            group.active = Some(id);
+        }
+        true
+    }
+
+    /// Every tab of every group, groups in display order.
+    pub fn all_tabs(&self) -> Vec<EditorId> {
+        self.split.leaves().iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.tabs.iter().copied()).collect()
+    }
+
     pub fn active(&self) -> Option<(&Editor, &OpenDocument)> {
-        let e = self.editors.get(&self.active_editor?)?;
+        let e = self.editors.get(&self.active_editor()?)?;
         let d = self.docs.get(&e.doc)?;
         Some((e, d))
     }
 
     /// The active editor and its document, mutably.
     pub fn active_mut(&mut self) -> Option<(&mut Editor, &mut OpenDocument)> {
-        let id = self.active_editor?;
+        let id = self.active_editor()?;
         let e = self.editors.get_mut(&id)?;
         let d = self.docs.get_mut(&e.doc)?;
         Some((e, d))
@@ -262,22 +344,298 @@ impl Workspace {
 
     /// Close a tab. Returns the closed document if no other editor shows it (so the caller can
     /// notify the language server). Activates the neighbouring tab like RustRover (the one to
-    /// the left, or the new first tab).
+    /// the left, or the new first tab); a split group that loses its last tab goes away and its
+    /// neighbour takes the space (and the focus, if it had it).
     pub fn close_editor(&mut self, id: EditorId) -> Option<OpenDocument> {
         let editor = self.editors.remove(&id)?;
-        let idx = self.tabs.iter().position(|t| *t == id);
-        self.tabs.retain(|t| *t != id);
-        if self.active_editor == Some(id) {
-            self.active_editor = match idx {
-                Some(i) if i > 0 => self.tabs.get(i - 1).copied(),
-                _ => self.tabs.first().copied(),
-            };
+        self.view_revs.remove(&id);
+        if let Some(g) = self.group_of(id) {
+            self.detach_tab(g, id);
+            if self.groups.get(&g).is_some_and(|gr| gr.tabs.is_empty()) {
+                self.remove_group(g);
+            }
         }
         self.drop_doc_if_unused(editor.doc)
     }
 
+    /// Take `id` out of group `g`'s tabs, selecting the neighbour if it was selected.
+    fn detach_tab(&mut self, g: GroupId, id: EditorId) {
+        let Some(group) = self.groups.get_mut(&g) else { return };
+        let idx = group.tabs.iter().position(|t| *t == id);
+        group.tabs.retain(|t| *t != id);
+        if group.active == Some(id) {
+            group.active = match idx {
+                Some(i) if i > 0 => group.tabs.get(i - 1).copied(),
+                _ => group.tabs.first().copied(),
+            };
+        }
+    }
+
+    /// Drop an (empty) split group; the last group always stays.
+    fn remove_group(&mut self, g: GroupId) {
+        let order = self.split.leaves();
+        if order.len() < 2 || !self.split.remove_leaf(g) {
+            return;
+        }
+        self.groups.remove(&g);
+        if self.focused == g {
+            let idx = order.iter().position(|x| *x == g).unwrap_or(0);
+            let left = self.split.leaves();
+            self.focused = left.get(idx.saturating_sub(1)).or_else(|| left.first()).copied().unwrap_or_default();
+        }
+    }
+
+    /// An editor showing `doc`: the focused group's, else the first in display order.
     pub fn editor_for_doc(&self, doc: DocId) -> Option<EditorId> {
-        self.editors.values().find(|e| e.doc == doc).map(|e| e.id)
+        self.editors_for_doc(doc).into_iter().next()
+    }
+
+    /// Every editor showing `doc`, the focused group's first.
+    pub fn editors_for_doc(&self, doc: DocId) -> Vec<EditorId> {
+        let mut order = self.split.leaves();
+        order.retain(|g| *g != self.focused);
+        order.insert(0, self.focused);
+        order
+            .iter()
+            .filter_map(|g| self.groups.get(g))
+            .flat_map(|g| g.tabs.iter().copied())
+            .filter(|id| self.editors.get(id).is_some_and(|e| e.doc == doc))
+            .collect()
+    }
+
+    // ------------------------------------------------------------ editor groups (splits)
+
+    pub fn focused_group(&self) -> GroupId {
+        self.focused
+    }
+
+    /// Focus a group (its selected tab becomes the active editor). False if there is no such group.
+    pub fn focus_group(&mut self, g: GroupId) -> bool {
+        if !self.split.contains(g) {
+            return false;
+        }
+        self.focused = g;
+        true
+    }
+
+    pub fn group(&self, g: GroupId) -> Option<&EditorGroup> {
+        self.groups.get(&g)
+    }
+
+    /// Groups in display order (left to right, top to bottom).
+    pub fn group_ids(&self) -> Vec<GroupId> {
+        self.split.leaves()
+    }
+
+    pub fn group_of(&self, id: EditorId) -> Option<GroupId> {
+        self.split.leaves().into_iter().find(|g| self.groups.get(g).is_some_and(|gr| gr.tabs.contains(&id)))
+    }
+
+    pub fn split_layout(&self) -> &SplitNode {
+        &self.split
+    }
+
+    pub fn is_split(&self) -> bool {
+        self.split.is_split()
+    }
+
+    /// Split Right / Split Down (and … and Move): a new group next to the focused one showing
+    /// its active document. With `move_tab` the tab moves there (when the group has others);
+    /// otherwise the new group gets a second view of the document. Focuses the new group.
+    pub fn split_editor(&mut self, axis: SplitAxis, move_tab: bool) -> Option<GroupId> {
+        let active = self.active_editor()?;
+        let doc = self.editors.get(&active)?.doc;
+        let from = self.focused;
+        self.next_group += 1;
+        let g = GroupId(self.next_group);
+        if !self.split.split_leaf(from, g, axis) {
+            return None;
+        }
+        let alone = self.groups.get(&from).is_none_or(|gr| gr.tabs.len() < 2);
+        let id = if move_tab && !alone {
+            self.detach_tab(from, active);
+            active
+        } else {
+            self.new_editor(doc, Some(active))?
+        };
+        self.groups.insert(g, EditorGroup { tabs: vec![id], active: Some(id) });
+        self.focused = g;
+        Some(g)
+    }
+
+    /// Unsplit: the focused group absorbs its sibling(s) under the nearest splitter. Tabs whose
+    /// document it already shows are closed; the others move over with their view state.
+    pub fn unsplit(&mut self) -> bool {
+        let SplitNode::Split { .. } = &self.split else { return false };
+        let siblings = sibling_leaves(&self.split, self.focused);
+        if siblings.is_empty() {
+            return false;
+        }
+        self.merge_into_focused(&siblings);
+        true
+    }
+
+    /// Unsplit All: every group merges into the focused one.
+    pub fn unsplit_all(&mut self) -> bool {
+        let others: Vec<GroupId> = self.split.leaves().into_iter().filter(|g| *g != self.focused).collect();
+        if others.is_empty() {
+            return false;
+        }
+        self.merge_into_focused(&others);
+        true
+    }
+
+    fn merge_into_focused(&mut self, from: &[GroupId]) {
+        let target = self.focused;
+        for g in from {
+            let Some(group) = self.groups.remove(g) else {
+                self.split.remove_leaf(*g);
+                continue;
+            };
+            for id in group.tabs {
+                let doc = self.editors.get(&id).map(|e| e.doc);
+                let shown = self
+                    .groups
+                    .get(&target)
+                    .is_some_and(|t| t.tabs.iter().any(|t| self.editors.get(t).map(|e| e.doc) == doc && doc.is_some()));
+                if shown {
+                    self.editors.remove(&id);
+                    self.view_revs.remove(&id);
+                } else {
+                    let t = self.groups.entry(target).or_default();
+                    t.tabs.push(id);
+                    if t.active.is_none() {
+                        t.active = Some(id);
+                    }
+                }
+            }
+            self.split.remove_leaf(*g);
+        }
+    }
+
+    /// Go to Next/Previous Splitter: focus the group `delta` steps away in display order (wrapping).
+    pub fn cycle_group(&mut self, delta: isize) -> bool {
+        let order = self.split.leaves();
+        if order.len() < 2 {
+            return false;
+        }
+        let idx = order.iter().position(|g| *g == self.focused).unwrap_or(0);
+        let next = (idx as isize + delta).rem_euclid(order.len() as isize) as usize;
+        if let Some(g) = order.get(next) {
+            self.focused = *g;
+        }
+        true
+    }
+
+    /// Change Splitter Orientation of the splitter around the focused group.
+    pub fn flip_split(&mut self) -> bool {
+        self.split.flip_parent(self.focused)
+    }
+
+    /// Maximize Editor / Normalize Splits: give the focused group (almost) all the space, or,
+    /// when it already has it, make every split even again. Returns true when maximized.
+    pub fn toggle_maximize(&mut self) -> bool {
+        if self.split.is_maximized(self.focused) {
+            self.split.normalize();
+            false
+        } else {
+            self.split.maximize(self.focused);
+            true
+        }
+    }
+
+    /// Stretch Editor to …: move the focused group's edge on that side by `step` (a share of
+    /// the splitter). False when no splitter is on that side.
+    pub fn stretch_editor(&mut self, side: Stretch, step: f32) -> bool {
+        self.split.stretch(self.focused, side, step)
+    }
+
+    /// Drag a splitter (pre-order index, see [`SplitNode::splitter_count`]).
+    pub fn set_split_ratio(&mut self, index: usize, ratio: f32) -> bool {
+        self.split.set_ratio(index, ratio)
+    }
+
+    /// Move a tab to another group at `index` (drag and drop between tab bars). If the target
+    /// already shows the document, that tab is selected instead and the dragged one closed.
+    /// An emptied source group goes away. Focuses the target.
+    pub fn move_tab(&mut self, id: EditorId, target: GroupId, index: usize) -> bool {
+        let Some(from) = self.group_of(id) else { return false };
+        if !self.split.contains(target) {
+            return false;
+        }
+        let doc = self.editors.get(&id).map(|e| e.doc);
+        if from == target {
+            let Some(group) = self.groups.get_mut(&target) else { return false };
+            group.tabs.retain(|t| *t != id);
+            let at = index.min(group.tabs.len());
+            group.tabs.insert(at, id);
+            group.active = Some(id);
+            self.focused = target;
+            return true;
+        }
+        let existing = self
+            .groups
+            .get(&target)
+            .and_then(|t| t.tabs.iter().copied().find(|t| self.editors.get(t).map(|e| e.doc) == doc && doc.is_some()));
+        self.detach_tab(from, id);
+        match existing {
+            Some(other) => {
+                self.editors.remove(&id);
+                self.view_revs.remove(&id);
+                if let Some(t) = self.groups.get_mut(&target) {
+                    t.active = Some(other);
+                }
+            }
+            None => {
+                let t = self.groups.entry(target).or_default();
+                let at = index.min(t.tabs.len());
+                t.tabs.insert(at, id);
+                t.active = Some(id);
+            }
+        }
+        self.focused = target;
+        if self.groups.get(&from).is_none_or(|g| g.tabs.is_empty()) {
+            self.remove_group(from);
+            self.focused = target;
+        }
+        true
+    }
+
+    /// Keep views of edited documents consistent: an editor that did not make an edit (any view
+    /// of the document other than [`editor_for_doc`](Self::editor_for_doc), which edit commands
+    /// use) has its carets and scroll position mapped through the document's changes. Call after
+    /// running commands; cheap when nothing changed.
+    pub fn sync_views(&mut self) {
+        let ids: Vec<EditorId> = self.editors.keys().copied().collect();
+        for id in ids {
+            let Some(e) = self.editors.get(&id) else { continue };
+            let Some(od) = self.docs.get(&e.doc) else { continue };
+            let rev = od.doc.revision();
+            let seen = self.view_revs.get(&id).copied();
+            if let Some((r, _)) = seen
+                && r == rev
+            {
+                let top = top_offset(&od.doc, e.scroll_line);
+                self.view_revs.insert(id, (rev, top));
+                continue;
+            }
+            let primary = self.editor_for_doc(e.doc) == Some(id);
+            let mapped = match seen {
+                Some((seen, top)) if !primary => {
+                    od.doc.changes_since(seen).map(|sets| map_view(e, &od.doc, &sets, top))
+                }
+                _ => None,
+            };
+            let len = od.doc.len_chars();
+            let Some(e) = self.editors.get_mut(&id) else { continue };
+            if let Some((sels, scroll)) = mapped {
+                e.selections = sels;
+                e.scroll_line = scroll;
+            }
+            e.selections = e.selections.clamp(len);
+            let top = self.docs.get(&e.doc).map(|d| top_offset(&d.doc, e.scroll_line)).unwrap_or(0);
+            self.view_revs.insert(id, (rev, top));
+        }
     }
 
     // ------------------------------------------------------------ problems
@@ -439,6 +797,42 @@ impl Workspace {
     }
 }
 
+/// Groups under the sibling of the focused group's leaf (what Unsplit merges).
+fn sibling_leaves(tree: &SplitNode, g: GroupId) -> Vec<GroupId> {
+    match tree {
+        SplitNode::Group(_) => Vec::new(),
+        SplitNode::Split { first, second, .. } => {
+            if **first == SplitNode::Group(g) {
+                second.leaves()
+            } else if **second == SplitNode::Group(g) {
+                first.leaves()
+            } else if first.contains(g) {
+                sibling_leaves(first, g)
+            } else {
+                sibling_leaves(second, g)
+            }
+        }
+    }
+}
+
+/// Char offset of the first visible line for a scroll position.
+fn top_offset(doc: &Document, scroll_line: f32) -> usize {
+    let line = if scroll_line.is_finite() && scroll_line > 0.0 { scroll_line as usize } else { 0 };
+    doc.line_start(line)
+}
+
+/// An editor's selections and scroll line mapped through changes made elsewhere.
+fn map_view(e: &Editor, doc: &Document, sets: &[&codecraft_text::ChangeSet], top: usize) -> (SelectionSet, f32) {
+    let mut sels = e.selections.clone();
+    let mut top = top;
+    for cs in sets {
+        sels = sels.map(cs);
+        top = cs.map_pos(top, codecraft_text::Assoc::Before);
+    }
+    let frac = if e.scroll_line.is_finite() { e.scroll_line.fract().max(0.0) } else { 0.0 };
+    (sels.clamp(doc.len_chars()), doc.char_to_line(top) as f32 + frac)
+}
+
 fn push_recent(list: &mut Vec<PathBuf>, path: PathBuf) {
     list.retain(|p| *p != path);
     list.insert(0, path);
@@ -457,14 +851,169 @@ mod tests {
         assert_eq!(ws.add_document(Some("/p/a.rs".into()), "ignored"), a);
         let ea = ws.open_editor(a).unwrap();
         let eb = ws.open_editor(b).unwrap();
-        assert_eq!(ws.tabs, vec![ea, eb]);
+        assert_eq!(ws.tabs(), &[ea, eb]);
         assert_eq!(ws.open_editor(a), Some(ea));
-        assert_eq!(ws.active_editor, Some(ea));
+        assert_eq!(ws.active_editor(), Some(ea));
         let closed = ws.close_editor(ea).unwrap();
         assert_eq!(closed.path.as_deref(), Some(Path::new("/p/a.rs")));
-        assert_eq!(ws.active_editor, Some(eb));
+        assert_eq!(ws.active_editor(), Some(eb));
         assert!(ws.doc(a).is_none());
         assert_eq!(ws.recent_files.first().map(PathBuf::as_path), Some(Path::new("/p/b.rs")));
+    }
+
+    fn two_docs() -> (Workspace, DocId, DocId, EditorId, EditorId) {
+        let mut ws = Workspace::new();
+        let a = ws.add_document(Some("/p/a.rs".into()), "fn a() {}\nlet x = 1;\n");
+        let b = ws.add_document(Some("/p/b.rs".into()), "fn b() {}");
+        let ea = ws.open_editor(a).unwrap();
+        let eb = ws.open_editor(b).unwrap();
+        (ws, a, b, ea, eb)
+    }
+
+    #[test]
+    fn split_right_shows_a_second_view_and_close_removes_the_group() {
+        let (mut ws, _a, b, ea, eb) = two_docs();
+        let g0 = ws.focused_group();
+        ws.set_selections(eb, SelectionSet::caret(3));
+        let g1 = ws.split_editor(SplitAxis::Horizontal, false).unwrap();
+        assert_eq!(ws.group_ids(), vec![g0, g1]);
+        assert_eq!(ws.focused_group(), g1);
+        let view = ws.active_editor().unwrap();
+        assert_ne!(view, eb);
+        assert_eq!(ws.editor(view).unwrap().doc, b);
+        assert_eq!(ws.editor(view).unwrap().selections, SelectionSet::caret(3));
+        assert_eq!(ws.editors_for_doc(b), vec![view, eb]);
+        assert_eq!(ws.all_tabs(), vec![ea, eb, view]);
+        // Closing one view keeps the document; closing the split's last tab unsplits.
+        assert!(ws.close_editor(view).is_none());
+        assert!(!ws.is_split());
+        assert_eq!(ws.focused_group(), g0);
+        assert_eq!(ws.active_editor(), Some(eb));
+        assert!(ws.doc(b).is_some());
+    }
+
+    #[test]
+    fn split_and_move_moves_the_tab_unless_it_is_alone() {
+        let (mut ws, _, _, ea, eb) = two_docs();
+        let g0 = ws.focused_group();
+        let g1 = ws.split_editor(SplitAxis::Vertical, true).unwrap();
+        assert_eq!(ws.group(g0).unwrap().tabs, vec![ea]);
+        assert_eq!(ws.group(g0).unwrap().active, Some(ea));
+        assert_eq!(ws.group(g1).unwrap().tabs, vec![eb]);
+        // Alone in its group: Split and Move copies instead of leaving an empty group.
+        let g2 = ws.split_editor(SplitAxis::Horizontal, true).unwrap();
+        assert_eq!(ws.group(g1).unwrap().tabs, vec![eb]);
+        assert_eq!(ws.group(g2).unwrap().tabs.len(), 1);
+        assert!(matches!(ws.split_layout(), SplitNode::Split { axis: SplitAxis::Vertical, .. }));
+    }
+
+    #[test]
+    fn opening_a_file_shown_in_another_group_focuses_it() {
+        let (mut ws, a, b, ea, eb) = two_docs();
+        let g0 = ws.focused_group();
+        ws.split_editor(SplitAxis::Horizontal, true).unwrap();
+        assert_eq!(ws.open_editor(a), Some(ea));
+        assert_eq!(ws.focused_group(), g0);
+        assert_eq!(ws.editor_for_doc(b), Some(eb));
+        let c = ws.add_document(Some("/p/c.rs".into()), "");
+        let ec = ws.open_editor(c).unwrap();
+        assert_eq!(ws.group_of(ec), Some(g0));
+        assert!(ws.set_active_editor(eb));
+        assert_ne!(ws.focused_group(), g0);
+        assert!(!ws.set_active_editor(EditorId(999)));
+    }
+
+    #[test]
+    fn unsplit_merges_siblings_into_the_focused_group() {
+        let (mut ws, _, b, ea, eb) = two_docs();
+        let g0 = ws.focused_group();
+        let g1 = ws.split_editor(SplitAxis::Horizontal, false).unwrap();
+        let view = ws.active_editor().unwrap();
+        let c = ws.add_document(Some("/p/c.rs".into()), "");
+        let ec = ws.open_editor(c).unwrap();
+        assert_eq!(ws.group_of(ec), Some(g1));
+        let g2 = ws.split_editor(SplitAxis::Vertical, false).unwrap();
+        assert_eq!(ws.group_ids(), vec![g0, g1, g2]);
+        // From g0, the sibling subtree (g1, g2) merges in: the second view of b closes.
+        assert!(ws.focus_group(g0));
+        assert!(ws.unsplit());
+        assert_eq!(ws.group_ids(), vec![g0]);
+        assert_eq!(ws.tabs(), &[ea, eb, ec]);
+        assert!(ws.editor(view).is_none());
+        assert_eq!(ws.editors_for_doc(b), vec![eb]);
+        assert!(!ws.unsplit());
+        assert!(!ws.unsplit_all());
+    }
+
+    #[test]
+    fn unsplit_all_cycle_flip_and_maximize() {
+        let (mut ws, ..) = two_docs();
+        let g0 = ws.focused_group();
+        let g1 = ws.split_editor(SplitAxis::Horizontal, true).unwrap();
+        let g2 = ws.split_editor(SplitAxis::Horizontal, false).unwrap();
+        assert!(ws.cycle_group(1));
+        assert_eq!(ws.focused_group(), g0);
+        assert!(ws.cycle_group(-1));
+        assert_eq!(ws.focused_group(), g2);
+        assert!(ws.flip_split());
+        assert!(ws.toggle_maximize());
+        assert!(!ws.toggle_maximize());
+        assert!(ws.stretch_editor(Stretch::Top, 0.1));
+        assert!(ws.set_split_ratio(0, 0.3));
+        assert!(ws.focus_group(g1));
+        assert!(ws.unsplit_all());
+        assert_eq!(ws.group_ids(), vec![g1]);
+        assert_eq!(ws.all_tabs().len(), 2);
+        assert!(!ws.cycle_group(1));
+    }
+
+    #[test]
+    fn move_tab_between_groups() {
+        let (mut ws, _, _, ea, eb) = two_docs();
+        let g0 = ws.focused_group();
+        let g1 = ws.split_editor(SplitAxis::Horizontal, true).unwrap();
+        assert!(ws.move_tab(ea, g1, 0));
+        // g0 emptied and went away.
+        assert_eq!(ws.group_ids(), vec![g1]);
+        assert_eq!(ws.tabs(), &[ea, eb]);
+        assert!(ws.move_tab(ea, g1, 5));
+        assert_eq!(ws.tabs(), &[eb, ea]);
+        assert!(!ws.move_tab(ea, g0, 0));
+        // Dropping a view on a group that already shows its document selects that tab.
+        let g2 = ws.split_editor(SplitAxis::Horizontal, false).unwrap();
+        let view = ws.active_editor().unwrap();
+        assert!(ws.move_tab(view, g1, 0));
+        assert!(ws.editor(view).is_none());
+        assert_eq!(ws.active_editor(), Some(ea));
+        assert!(!ws.group_ids().contains(&g2));
+    }
+
+    #[test]
+    fn other_views_follow_edits_made_in_one_view() {
+        let (mut ws, a, _, ea, _) = two_docs();
+        assert!(ws.set_active_editor(ea));
+        ws.split_editor(SplitAxis::Horizontal, false).unwrap();
+        let view = ws.active_editor().unwrap();
+        // The original view looks at line 1 with its caret on `x`.
+        ws.set_selections(ea, SelectionSet::caret(14));
+        ws.editor_mut(ea).unwrap().scroll_line = 1.0;
+        ws.sync_views();
+        // Typing two lines at the top of the focused view (the editor edit commands use).
+        assert_eq!(ws.editor_for_doc(a), Some(view));
+        let od = ws.doc_mut(a).unwrap();
+        let edit = codecraft_text::Edit {
+            changes: codecraft_text::ChangeSet::single(0, 0, "// 1\n// 2\n"),
+            selections: SelectionSet::caret(10),
+        };
+        od.doc.apply(&edit, &SelectionSet::caret(0), codecraft_text::EditGroup::Standalone).unwrap();
+        ws.set_selections(view, SelectionSet::caret(10));
+        ws.sync_views();
+        assert_eq!(ws.editor(view).unwrap().selections, SelectionSet::caret(10));
+        assert_eq!(ws.editor(ea).unwrap().selections, SelectionSet::caret(24));
+        assert_eq!(ws.editor(ea).unwrap().scroll_line, 3.0);
+        // Nothing changes on a second sync.
+        ws.sync_views();
+        assert_eq!(ws.editor(ea).unwrap().selections, SelectionSet::caret(24));
     }
 
     #[test]

@@ -46,8 +46,13 @@ worker threads
   └─ jobs: project scan + cargo metadata, find in files, rustfmt
 ```
 
-Document sync to rust-analyzer is full-text, at most once per frame per changed document, and
-always flushed before a position-based request.
+Document sync is incremental (ranged `didChange` built from `Document::changes_since` against a
+snapshot of the server's text) when the server asks for it, else full-text; at most once per frame
+per changed document, and always flushed before a position-based request.
+
+Editors are grouped in a split tree (`Workspace::split_layout`); `Workspace::active()` is the
+focused group's active editor. After every command and pump, `Workspace::sync_views` maps the carets
+of other views of an edited document through its change log.
 
 ## Coordinates
 

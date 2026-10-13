@@ -231,7 +231,7 @@ pub(crate) fn to_highlights(index: &LineIndex, spans: &[Span]) -> Highlights {
     Highlights::from_lines(lines)
 }
 
-fn push_line_span(spans: &mut Vec<LineSpan>, span: LineSpan) {
+pub(crate) fn push_line_span(spans: &mut Vec<LineSpan>, span: LineSpan) {
     let start = spans.last().map_or(span.start, |last| span.start.max(last.end));
     if span.end <= start {
         return;

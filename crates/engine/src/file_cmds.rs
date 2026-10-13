@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use codecraft_text::LineEnding;
 
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_editor, has_project, ok, simple, spec};
-use crate::params::{opt_path, req_str};
+use crate::params::opt_path;
 use crate::popup::NewItemKind;
 use crate::{CommandError, Effect, Popup, Session};
 
@@ -80,10 +80,6 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             always,
             new_project,
         ),
-        simple("app.settings", "Settings…", always, |s, _| {
-            s.popup = Some(Popup::Settings);
-            ok()
-        }),
         simple("app.aboutRustRover", "About CodeCraft", always, |s, _| {
             s.popup = Some(Popup::About);
             ok()
@@ -106,15 +102,6 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Context::Global,
             always,
             synchronize,
-        ),
-        spec(
-            "settings.set",
-            "Change Setting",
-            None,
-            "{key: string, value: any} — set one field of Settings (e.g. editor_font_size, tab_size, use_clippy)",
-            Context::Global,
-            always,
-            set_setting,
         ),
     ]
 }
@@ -145,6 +132,9 @@ fn open(s: &mut Session, p: &Value) -> CmdResult {
 fn save_all(s: &mut Session, _: &Value) -> CmdResult {
     let n = s.save_all()?;
     s.status = if n == 0 { "All files are saved".into() } else { format!("Saved {n} file(s)") };
+    if n > 0 {
+        crate::settings_cmds::check_on_save(s);
+    }
     Ok(json!({ "saved": n }))
 }
 
@@ -307,25 +297,4 @@ fn cargo_new(path: &Path, lib: bool) -> Result<(), CommandError> {
     } else {
         Err(CommandError::Failed(String::from_utf8_lossy(&out.stderr).trim().to_string()))
     }
-}
-
-fn set_setting(s: &mut Session, p: &Value) -> CmdResult {
-    let key = req_str(p, "key")?;
-    let value = p.get("value").cloned().unwrap_or(Value::Null);
-    let mut current = serde_json::to_value(&s.ws.settings).map_err(|e| CommandError::Failed(e.to_string()))?;
-    let Some(obj) = current.as_object_mut() else {
-        return Err(CommandError::Failed("settings are not an object".into()));
-    };
-    if !obj.contains_key(key) {
-        return Err(CommandError::BadParams(format!("unknown setting `{key}`")));
-    }
-    obj.insert(key.to_string(), value);
-    let restart_lsp = matches!(key, "use_clippy" | "rust_analyzer_path" | "rust_analyzer_low_memory");
-    s.ws.settings = serde_json::from_value(current).map_err(|e| CommandError::BadParams(format!("{key}: {e}")))?;
-    s.ws.settings.editor_font_size = s.ws.settings.editor_font_size.clamp(6.0, 72.0);
-    s.ws.settings.tab_size = s.ws.settings.tab_size.clamp(1, 16);
-    if restart_lsp && let Some(root) = s.ws.project.as_ref().map(|p| p.root.clone()) {
-        s.start_lsp(&root);
-    }
-    ok()
 }

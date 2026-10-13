@@ -48,7 +48,16 @@ fn skip(id: &str, params: &Value) -> bool {
     }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
-        || matches!(id, "run.run" | "run.rerun" | "run.contextConfiguration" | "code.reformatCargoProjectWithRustfmt");
+        || matches!(
+            id,
+            "run.run"
+                | "run.rerun"
+                | "run.contextConfiguration"
+                | "code.reformatCargoProjectWithRustfmt"
+                | "run.runWithCoverage"
+                | "test.rerun"
+                | "test.rerunFailed"
+        );
     spawns && !params.is_null()
 }
 

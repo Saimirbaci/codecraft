@@ -40,8 +40,8 @@ fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolW
     let visible = s.ws.layout.is_visible(tw);
     let color = if visible { st.theme.text } else { st.theme.text_muted };
     let mut tip = tw.title().to_string();
-    if let Some(sc) = tw.shortcut() {
-        tip = format!("{tip} ({})", keymap::display(sc));
+    if let Some(sc) = keymap::shortcut_label(&format!("view.toolWindows.{}", tw.key())) {
+        tip = format!("{tip} ({sc})");
     }
     let resp = ui
         .add(egui::Button::new(RichText::new(icon(tw)).size(16.0).color(color)).frame(false).min_size(vec2(30.0, 30.0)))
@@ -240,8 +240,29 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
         for (id, depth) in rows.get(range).unwrap_or(&[]) {
             let Some(node) = project.tree.node(*id) else { continue };
-            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), row_h), Sense::click());
+            // Rows below the root drag onto directories to move (refactor.moveFile).
+            let sense = if *depth > 0 { Sense::click_and_drag() } else { Sense::click() };
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width().max(200.0), row_h), sense);
+            if *depth > 0 {
+                resp.dnd_set_drag_payload(node.path.clone());
+            }
+            let drop_dir = if node.is_dir { Some(node.path.clone()) } else { node.path.parent().map(Path::to_path_buf) };
             let selected = project.selected.as_deref() == Some(node.path.as_path());
+            if let Some(dragged) = resp.dnd_hover_payload::<PathBuf>()
+                && drop_dir.as_deref().is_some_and(|d| dragged.parent() != Some(d) && !d.starts_with(dragged.as_path()))
+            {
+                ui.painter().rect_stroke(
+                    rect,
+                    CornerRadius::same(4),
+                    egui::Stroke::new(1.5, theme.accent),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if let Some(dragged) = resp.dnd_release_payload::<PathBuf>()
+                && let Some(dir) = drop_dir.filter(|d| dragged.parent() != Some(d.as_path()) && !d.starts_with(dragged.as_path()))
+            {
+                cmd = Some(("refactor.moveFile", json!({ "path": *dragged, "to": dir, "ask": true })));
+            }
             if selected {
                 ui.painter().rect_filled(rect, CornerRadius::same(4), theme.list_selection);
             } else if resp.hovered() {
@@ -314,17 +335,32 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     cmd = Some(("file.new.directory", Value::Null));
                     ui.close();
                 }
+                if *depth > 0 {
+                    ui.separator();
+                    for (label, id) in [
+                        ("Rename…", "refactor.renameFile"),
+                        ("Move…", "refactor.moveFile"),
+                        ("Copy…", "refactor.copyFile"),
+                        ("Delete…", "refactor.safeDelete"),
+                    ] {
+                        if ui.button(label).clicked() {
+                            select = Some(node.path.clone());
+                            cmd = Some((id, json!({ "path": node.path })));
+                            ui.close();
+                        }
+                    }
+                    ui.separator();
+                }
                 if ui.button("Copy Absolute Path").clicked() {
-                    ui.ctx().copy_text(node.path.display().to_string());
+                    cmd = Some(("projectView.copyPath", json!({ "path": node.path })));
+                    ui.close();
+                }
+                if ui.button("Copy Path from Project Root").clicked() {
+                    cmd = Some(("projectView.copyPath", json!({ "path": node.path, "relative": true })));
                     ui.close();
                 }
                 if ui.button("Reveal in Finder").clicked() {
-                    let dir = if node.is_dir {
-                        node.path.clone()
-                    } else {
-                        node.path.parent().map(Path::to_path_buf).unwrap_or_default()
-                    };
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(format!("file://{}", dir.display())));
+                    cmd = Some(("projectView.revealInFinder", json!({ "path": node.path })));
                     ui.close();
                 }
                 if !node.is_dir && node.name.ends_with(".rs") && ui.button("Run Tests in File").clicked() {
@@ -429,6 +465,7 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
         return;
     }
     let Some(tab) = active.and_then(|a| s.ws.run(a)).cloned() else { return };
+    let is_test_run = s.testing.run(tab.id).is_some();
     ui.horizontal(|ui| {
         if ui.button("↻ Rerun").on_hover_text("Rerun (⌘R)").clicked() {
             s.ws.active_run = Some(tab.id);
@@ -440,7 +477,7 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
         }
         ui.checkbox(&mut st.console_follow, "Scroll to end");
         let (p, f, i) = tab.test_counts();
-        if p + f + i > 0 {
+        if p + f + i > 0 && !is_test_run {
             let color = if f > 0 { theme.error } else { theme.success };
             ui.label(RichText::new(format!("Tests passed: {p}, failed: {f}, ignored: {i}")).color(color));
         }
@@ -454,7 +491,11 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
         .filter(|t| t.outcome == codecraft_cargo::TestOutcome::Failed)
         .map(|t| t.name.as_str())
         .collect();
-    if !failed.is_empty() {
+    // Test runs: the test tree (and the selected test's output) beside the console.
+    if is_test_run && !crate::testing_panel::show_test_run(ui, s, st, tab.id) {
+        return;
+    }
+    if !failed.is_empty() && !is_test_run {
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Failed:").color(theme.error));
             for name in failed {

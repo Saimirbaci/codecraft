@@ -175,6 +175,7 @@ pub(crate) fn start_chain(
 ) -> Result<RunTabId, CommandError> {
     let (handle, events) = codecraft_cargo::spawn(&inv).map_err(|e| CommandError::Failed(e.to_string()))?;
     let tab = s.ws.add_run(title, inv.command_line(), build);
+    crate::testing::track_cargo(s, tab, &inv, title);
     if matches!(inv.command, CargoCommand::Build | CargoCommand::Check | CargoCommand::Clippy | CargoCommand::Clean) {
         s.ws.clear_cargo_problems();
     }
@@ -195,10 +196,13 @@ pub(crate) fn start_config(s: &mut Session, config: &RunConfig) -> Result<RunTab
 /// Start a plain process in a Run (or Build) tab. Saves all files first.
 pub(crate) fn start_process(s: &mut Session, cmd: &ProcessCommand, title: &str) -> Result<RunTabId, CommandError> {
     let _ = s.save_all();
+    // Test processes may get extra arguments (pytest: `-v` and a JUnit report).
+    let (configured, (cmd, junit)) = (cmd, crate::testing::instrument_process(cmd));
     let program = cmd.resolved_program();
     let (handle, events) = codecraft_cargo::spawn_process(&program, &cmd.args, &cmd.cwd, &cmd.env, false)
         .map_err(|e| CommandError::Failed(e.to_string()))?;
     let tab = s.ws.add_run(title, cmd.command_line(), cmd.build);
+    crate::testing::track_process(s, tab, configured, junit, title);
     s.ws.layout.show(if cmd.build { ToolWindowId::Build } else { ToolWindowId::Run });
     s.runs.procs.push(Proc { tab, handle, events, root: cmd.cwd.clone(), then: None });
     s.status = format!("{title}: running");

@@ -115,6 +115,7 @@ pub fn registry() -> &'static Registry {
     REG.get_or_init(|| {
         let mut specs = Vec::new();
         specs.extend(crate::file_cmds::specs());
+        specs.extend(crate::app_cmds::specs());
         specs.extend(crate::edit_cmds::specs());
         specs.extend(crate::editor_cmds::specs());
         specs.extend(crate::view_cmds::specs());
@@ -125,6 +126,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::lang_cmds::specs());
         specs.extend(crate::terminal_cmds::specs());
         specs.extend(crate::vcs_cmds::specs());
+        specs.extend(crate::vcs_ext_cmds::specs());
         specs.extend(crate::debug_cmds::specs());
         specs.extend(crate::database_cmds::specs());
         specs.extend(crate::agent_cmds::specs());
@@ -134,6 +136,12 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::split_cmds::specs());
         specs.extend(crate::testing_cmds::specs());
         specs.extend(crate::refactor_cmds::specs());
+        specs.extend(crate::bookmark_cmds::specs());
+        specs.extend(crate::todo::specs());
+        specs.extend(crate::local_history_cmds::specs());
+        specs.extend(crate::scratch::specs());
+        specs.extend(crate::settings_cmds::specs());
+        specs.extend(crate::run_config_cmds::specs());
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {
@@ -161,7 +169,7 @@ pub(crate) fn has_project(s: &Session) -> Result<(), String> {
 }
 
 pub(crate) fn has_tabs(s: &Session) -> Result<(), String> {
-    if s.ws.tabs.is_empty() { Err("no editor tabs are open".into()) } else { Ok(()) }
+    if s.ws.tabs().is_empty() { Err("no editor tabs are open".into()) } else { Ok(()) }
 }
 
 pub(crate) fn has_lsp_editor(s: &Session) -> Result<(), String> {

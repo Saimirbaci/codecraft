@@ -106,7 +106,9 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         paths.iter().any(|p| {
             let in_tree = proj.tree.find(p).is_some();
             let exists = p.exists();
-            in_tree != exists && !p.components().any(|c| c.as_os_str() == ".git")
+            // Local history snapshots are written on every save; they never need a rescan.
+            let snapshot = p.starts_with(crate::local_history::HistoryStore::dir_for(&proj.root));
+            in_tree != exists && !snapshot && !p.components().any(|c| c.as_os_str() == ".git")
         })
     });
     if tree_changed {
@@ -114,6 +116,8 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
     }
     crate::vcs::files_changed(s, &paths);
+    crate::todo::files_changed(s, &paths);
+    crate::local_history::files_changed(s, &paths);
     changed
 }
 

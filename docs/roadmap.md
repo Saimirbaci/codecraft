@@ -13,7 +13,7 @@ see `docs/m4-plan.md`. Menu parity: 116/131 core items live; see `docs/parity-ch
 | M6 Test runner | Test tree tool window, rerun failed, history, coverage | M4 wave 1 |
 | M7 Refactorings | Extract/inline/change signature via language-server assists, with preview; file operations; hierarchies | M4 wave 1 |
 | M8 Settings and keymaps | Full Settings dialog, Windows/Linux keymaps, colour schemes | M4 wave 2 |
-| M9 Native macOS menus, packaging | NSMenu global menu bar, signed .app/.dmg, Linux and Windows packages | M4 wave 2 |
+| M9 Native macOS menus, packaging | NSMenu global menu bar, signed .app/.dmg, Linux and Windows packages, project windows | ✅ (2026-10-13) |
 
 ## Current focus
 

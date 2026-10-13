@@ -7,7 +7,7 @@ use crate::common::{self, Bracket, LineIndex, SpanSink};
 use crate::{FoldKind, FoldRange, HighlightKind, Highlights, OutlineItem, SymbolKind};
 
 /// One lexer token with byte and char positions.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Tok {
     pub(crate) kind: TokenKind,
     /// Byte range in the text.
@@ -23,11 +23,12 @@ pub(crate) struct Tok {
     pub(crate) end_line: usize,
 }
 
-struct Cursor {
-    byte: usize,
-    ch: usize,
-    line: usize,
-    line_start: usize,
+pub(crate) struct Cursor {
+    pub(crate) byte: usize,
+    pub(crate) ch: usize,
+    pub(crate) line: usize,
+    /// Char offset of the start of the current line.
+    pub(crate) line_start: usize,
 }
 
 /// Tokenizes the whole text; the tokens cover it exactly. A leading shebang line becomes a
@@ -53,7 +54,7 @@ pub(crate) fn lex(text: &str) -> Vec<Tok> {
     toks
 }
 
-fn push_tok(toks: &mut Vec<Tok>, text: &str, cur: &mut Cursor, len: usize, kind: TokenKind) {
+pub(crate) fn push_tok(toks: &mut Vec<Tok>, text: &str, cur: &mut Cursor, len: usize, kind: TokenKind) {
     let start = cur.byte;
     let mut end = start.saturating_add(len).min(text.len());
     while !text.is_char_boundary(end) {
@@ -92,7 +93,7 @@ fn tok_text<'a>(text: &'a str, tok: &Tok) -> &'a str {
     text.get(tok.start..tok.end).unwrap_or("")
 }
 
-fn is_trivia(kind: TokenKind) -> bool {
+pub(crate) fn is_trivia(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Whitespace
@@ -115,19 +116,19 @@ fn bracket_char(kind: TokenKind) -> Option<char> {
 }
 
 /// The significant (non-whitespace, non-comment) tokens, addressed by position `p`.
-struct Sig<'a> {
+pub(crate) struct Sig<'a> {
     text: &'a str,
     toks: &'a [Tok],
-    idx: Vec<usize>,
+    pub(crate) idx: Vec<usize>,
 }
 
 impl<'a> Sig<'a> {
-    fn new(text: &'a str, toks: &'a [Tok]) -> Self {
+    pub(crate) fn new(text: &'a str, toks: &'a [Tok]) -> Self {
         let idx = toks.iter().enumerate().filter(|(_, t)| !is_trivia(t.kind)).map(|(i, _)| i).collect();
         Self { text, toks, idx }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.idx.len()
     }
 
@@ -135,11 +136,11 @@ impl<'a> Sig<'a> {
         self.idx.get(p).and_then(|&i| self.toks.get(i))
     }
 
-    fn kind(&self, p: usize) -> Option<TokenKind> {
+    pub(crate) fn kind(&self, p: usize) -> Option<TokenKind> {
         self.tok(p).map(|t| t.kind)
     }
 
-    fn is(&self, p: usize, kind: TokenKind) -> bool {
+    pub(crate) fn is(&self, p: usize, kind: TokenKind) -> bool {
         self.kind(p) == Some(kind)
     }
 
@@ -171,7 +172,7 @@ impl<'a> Sig<'a> {
 
     /// For each opening bracket, the position of the closer that balances it (counting all
     /// bracket kinds alike), if any.
-    fn group_ends(&self) -> Vec<Option<usize>> {
+    pub(crate) fn group_ends(&self) -> Vec<Option<usize>> {
         let mut ends = vec![None; self.len()];
         let mut stack = Vec::new();
         for p in 0..self.len() {
@@ -205,14 +206,14 @@ pub(crate) fn highlight(text: &str) -> Highlights {
 }
 
 /// Highlight kind per token.
-fn classify(text: &str, toks: &[Tok]) -> Vec<HighlightKind> {
+pub(crate) fn classify(text: &str, toks: &[Tok]) -> Vec<HighlightKind> {
     let mut kinds: Vec<HighlightKind> = toks.iter().map(|t| base_kind(t.kind)).collect();
     let sig = Sig::new(text, toks);
     let ends = sig.group_ends();
     let mut p = 0;
     while p < sig.len() {
         p = match sig.kind(p) {
-            Some(TokenKind::Pound) => attribute(&sig, &ends, p, &mut kinds),
+            Some(TokenKind::Pound) => attribute(&sig, &|o| ends.get(o).copied().flatten(), p, &mut kinds),
             Some(TokenKind::Ident | TokenKind::RawIdent) => ident(&sig, p, &mut kinds),
             _ => p + 1,
         };
@@ -220,7 +221,7 @@ fn classify(text: &str, toks: &[Tok]) -> Vec<HighlightKind> {
     kinds
 }
 
-fn base_kind(kind: TokenKind) -> HighlightKind {
+pub(crate) fn base_kind(kind: TokenKind) -> HighlightKind {
     use HighlightKind as K;
     match kind {
         TokenKind::LineComment { doc_style } | TokenKind::BlockComment { doc_style, .. } => {
@@ -295,7 +296,13 @@ fn set(kinds: &mut [HighlightKind], sig: &Sig<'_>, p: usize, kind: HighlightKind
 }
 
 /// `#[...]` / `#![...]` at `p`: marks the whole attribute and returns the next position.
-fn attribute(sig: &Sig<'_>, ends: &[Option<usize>], p: usize, kinds: &mut [HighlightKind]) -> usize {
+/// `close_of(open)` is the position of the closer that balances the opener at `open`.
+pub(crate) fn attribute(
+    sig: &Sig<'_>,
+    close_of: &dyn Fn(usize) -> Option<usize>,
+    p: usize,
+    kinds: &mut [HighlightKind],
+) -> usize {
     let open = if sig.is(p + 1, TokenKind::OpenBracket) {
         p + 1
     } else if sig.is(p + 1, TokenKind::Bang) && sig.is(p + 2, TokenKind::OpenBracket) {
@@ -303,7 +310,7 @@ fn attribute(sig: &Sig<'_>, ends: &[Option<usize>], p: usize, kinds: &mut [Highl
     } else {
         return p + 1;
     };
-    let close = ends.get(open).copied().flatten().filter(|&c| sig.is(c, TokenKind::CloseBracket));
+    let close = close_of(open).filter(|&c| sig.is(c, TokenKind::CloseBracket));
     let Some(close) = close else {
         // Unterminated (typically mid-typing): mark just the opener.
         for q in p..=open {
@@ -324,7 +331,7 @@ fn attribute(sig: &Sig<'_>, ends: &[Option<usize>], p: usize, kinds: &mut [Highl
 }
 
 /// Classifies the identifier at `p` (and a macro `!` after it); returns the next position.
-fn ident(sig: &Sig<'_>, p: usize, kinds: &mut [HighlightKind]) -> usize {
+pub(crate) fn ident(sig: &Sig<'_>, p: usize, kinds: &mut [HighlightKind]) -> usize {
     let raw = sig.is(p, TokenKind::RawIdent);
     let full = sig.text(p);
     let name = if raw { full.get(2..).unwrap_or(full) } else { full };
@@ -534,11 +541,15 @@ pub(crate) fn brackets(text: &str) -> Vec<Bracket> {
 }
 
 pub(crate) fn folding_ranges(text: &str) -> Vec<FoldRange> {
-    let toks = lex(text);
+    folding_ranges_from(text, &lex(text))
+}
+
+/// Fold regions from an existing token stream of `text`.
+pub(crate) fn folding_ranges_from(text: &str, toks: &[Tok]) -> Vec<FoldRange> {
     let mut out = Vec::new();
     common::bracket_folds(toks.iter().filter_map(|t| bracket_char(t.kind).map(|c| (c, t.line))), &mut out);
-    comment_folds(&toks, &mut out);
-    import_folds(&Sig::new(text, &toks), &mut out);
+    comment_folds(toks, &mut out);
+    import_folds(&Sig::new(text, toks), &mut out);
     common::finish_folds(out)
 }
 

@@ -11,14 +11,21 @@ use crate::{UiState, keymap, run_command};
 
 /// Commands without an observed menu entry (or whose observed submenu is filled lazily by
 /// RustRover), placed where RustRover shows them.
-const EXTRA: &[(&str, &str)] = &[
+pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("Edit", "edit.findUsages.findUsages"),
     ("View", "view.quickDocumentation"),
     ("View", "view.hideAllToolWindows"),
-    ("View", "view.toggleSoftWrap"),
+    ("View › Active Editor", "view.toggleSoftWrap"),
     ("View", "view.toggleWhitespace"),
     ("View", "view.toggleLineNumbers"),
     ("Code", "code.showContextActions"),
+    // RustRover's Refactor menu fills Extract/Inline/Change Signature for the caret's context.
+    ("Refactor", "refactor.extract.variable"),
+    ("Refactor", "refactor.extract.constant"),
+    ("Refactor", "refactor.extract.function"),
+    ("Refactor", "refactor.inline"),
+    ("Refactor", "refactor.changeSignature"),
+    ("Refactor", "refactor.renameFile"),
     ("Code › Folding", "code.folding.expand"),
     ("Code › Folding", "code.folding.collapse"),
     ("Code › Folding", "code.folding.expandAll"),
@@ -46,10 +53,21 @@ const EXTRA: &[(&str, &str)] = &[
     ("Run", "run.contextConfiguration"),
     ("Run", "cargo.test"),
     ("Run", "run.rerun"),
+    // RustRover fills Run › Test History lazily (recent runs); ours opens the history dialog.
+    ("Run › Test History", "run.testHistory"),
+    ("Run › Test History", "run.importTestsFromFile"),
     ("Help", "help.findAction"),
+    // RustRover fills Edit › Bookmarks lazily too.
+    ("Edit › Bookmarks", "edit.bookmarks.toggle"),
+    ("Edit › Bookmarks", "edit.bookmarks.toggleWithMnemonic"),
+    ("Edit › Bookmarks", "edit.bookmarks.show"),
+    ("Edit › Bookmarks", "edit.bookmarks.next"),
+    ("Edit › Bookmarks", "edit.bookmarks.previous"),
+    ("Edit › Bookmarks", "edit.bookmarks.editDescription"),
+    ("File", "file.scratches"),
 ];
 
-fn visible(item: &CatalogItem) -> bool {
+pub(crate) fn visible(item: &CatalogItem) -> bool {
     !matches!(item.scope, Scope::Out | Scope::Os)
 }
 
@@ -57,7 +75,7 @@ fn children<'a>(path: &'a [&'a str]) -> impl Iterator<Item = &'static CatalogIte
     CATALOG.iter().filter(move |c| c.path == path && visible(c))
 }
 
-fn label_for(item: &CatalogItem) -> String {
+pub(crate) fn label_for(item: &CatalogItem) -> String {
     match item.id {
         "app.aboutRustRover" => "About CodeCraft".into(),
         "app.quitRustRover" => "Quit CodeCraft".into(),
@@ -68,14 +86,23 @@ fn label_for(item: &CatalogItem) -> String {
     }
 }
 
+/// The shortcut shown for a command in the menus (in-window and native), in RustRover notation
+/// (`Shift+Cmd+F`): the command's effective shortcut, else the catalog's. The one place menus read
+/// shortcuts, so keymap changes reach both menu bars through it.
+pub(crate) fn raw_shortcut(id: &str) -> Option<String> {
+    // Live commands follow the active keymap and the user's changes (which may remove it).
+    if registry().contains(id) {
+        return keymap::active_shortcuts(id).into_iter().next();
+    }
+    registry().catalog_item(id).and_then(|c| c.shortcut).map(str::to_string)
+}
+
 fn item_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, id: &str, label: &str) {
     let live = registry().contains(id);
     let enabled = live && s.enabled(id).is_ok();
     let mut button = Button::new(label);
-    if let Some(sc) =
-        keymap::shortcut_label(id).or_else(|| registry().catalog_item(id).and_then(|c| c.shortcut).map(keymap::display))
-    {
-        button = button.shortcut_text(RichText::new(sc).color(st.theme.text_muted));
+    if let Some(sc) = raw_shortcut(id) {
+        button = button.shortcut_text(RichText::new(keymap::display(&sc)).color(st.theme.text_muted));
     }
     let resp = ui.add_enabled(enabled, button);
     let resp = if !live {
@@ -120,7 +147,12 @@ fn menu_items(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, path: &[&str
     }
     {
         let key = path.join(" › ");
-        let extras: Vec<&str> = EXTRA.iter().filter(|(m, _)| *m == key).map(|(_, id)| *id).collect();
+        // An EXTRA command the catalog already shows here is not repeated.
+        let extras: Vec<&str> = EXTRA
+            .iter()
+            .filter(|(m, id)| *m == key && !children(path).any(|c| c.id == *id))
+            .map(|(_, id)| *id)
+            .collect();
         if !extras.is_empty() {
             if any {
                 ui.separator();

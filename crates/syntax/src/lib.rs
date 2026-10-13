@@ -23,6 +23,7 @@
 
 mod c;
 mod common;
+mod incremental;
 mod js;
 mod json;
 mod lex;
@@ -38,6 +39,8 @@ mod zig;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+
+pub use incremental::IncrementalHighlighter;
 
 use crate::common::{Doc, Span};
 

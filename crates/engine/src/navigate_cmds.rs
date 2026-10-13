@@ -62,9 +62,12 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         editor("navigate.nextHighlightedError", "Next Highlighted Error", |s, _| next_error(s, true)),
         editor("navigate.previousHighlightedError", "Previous Highlighted Error", |s, _| next_error(s, false)),
         simple("navigate.lastEditLocation", "Last Edit Location", always, |s, _| {
-            let Some(loc) = s.last_edit.clone() else { return ok() };
-            s.navigate_to(&loc.path, loc.offset)?;
-            ok()
+            if s.editing.history.places.is_empty() {
+                let Some(loc) = s.last_edit.clone() else { return ok() };
+                s.navigate_to(&loc.path, loc.offset)?;
+                return ok();
+            }
+            crate::editing_cmds::last_edit_location(s)
         }),
         editor("navigate.navigateInFile.moveCaretToMatchingBrace", "Move Caret to Matching Brace", matching_brace),
         editor("navigate.navigateInFile.nextMethod", "Next Method", |s, _| step_method(s, true)),
@@ -122,7 +125,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         }),
         simple("view.recentFiles", "Recent Files", always, |s, _| {
             s.popup =
-                Some(Popup::RecentFiles { query: String::new(), selected: if s.ws.tabs.len() > 1 { 1 } else { 0 } });
+                Some(Popup::RecentFiles { query: String::new(), selected: if s.ws.tabs().len() > 1 { 1 } else { 0 } });
             ok()
         }),
         simple("view.recentLocations", "Recent Locations", always, |s, _| {

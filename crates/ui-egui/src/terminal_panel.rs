@@ -60,7 +60,7 @@ pub fn has_focus(ctx: &egui::Context) -> bool {
     ctx.memory(|m| m.has_focus(grid_id()))
 }
 
-fn palette(theme: &Theme) -> term::Palette {
+pub(crate) fn palette(theme: &Theme) -> term::Palette {
     let rgb = |c: Color32| (c.r(), c.g(), c.b());
     let mut ansi = [(0, 0, 0); 16];
     for (dst, src) in ansi.iter_mut().zip(theme.terminal_ansi.iter()) {

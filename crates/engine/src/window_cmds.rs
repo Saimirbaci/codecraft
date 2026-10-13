@@ -9,13 +9,13 @@ use crate::params::req_usize;
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
         simple("window.editorTabs.closeTab", "Close Tab", has_tabs, |s, _| {
-            if let Some(id) = s.ws.active_editor {
+            if let Some(id) = s.ws.active_editor() {
                 close(s, id);
             }
             ok()
         }),
         simple("window.editorTabs.closeOtherTabs", "Close Other Tabs", has_tabs, |s, _| {
-            close_where(s, |s, id| Some(id) != s.ws.active_editor)
+            close_where(s, |s, id| Some(id) != s.ws.active_editor())
         }),
         simple("window.editorTabs.closeAllTabs", "Close All Tabs", has_tabs, |s, _| close_where(s, |_, _| true)),
         simple("window.editorTabs.closeUnmodifiedTabs", "Close Unmodified Tabs", has_tabs, |s, _| {
@@ -28,7 +28,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         simple("window.editorTabs.selectNextTab", "Select Next Tab", has_tabs, |s, _| cycle(s, 1)),
         simple("window.editorTabs.selectPreviousTab", "Select Previous Tab", has_tabs, |s, _| cycle(s, -1)),
         simple("window.editorTabs.pinTab", "Pin Tab", has_tabs, |s, _| {
-            if let Some(id) = s.ws.active_editor
+            if let Some(id) = s.ws.active_editor()
                 && let Some(e) = s.ws.editor_mut(id)
             {
                 e.pinned = !e.pinned;
@@ -37,8 +37,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         }),
         spec("window.editorTabs.activate", "Activate Tab", None, "{editor: int}", Context::Global, has_tabs, |s, p| {
             let id = EditorId(req_usize(p, "editor")? as u64);
-            if s.ws.tabs.contains(&id) {
-                s.ws.active_editor = Some(id);
+            if s.ws.set_active_editor(id) {
                 s.effects.push(crate::Effect::FocusEditor);
             }
             ok()
@@ -73,9 +72,10 @@ pub(crate) fn close(s: &mut Session, id: EditorId) {
     }
 }
 
-fn close_where(s: &mut Session, pred: impl Fn(&Session, EditorId) -> bool) -> CmdResult {
+/// Close the focused group's unpinned tabs matching `pred`.
+pub(crate) fn close_where(s: &mut Session, pred: impl Fn(&Session, EditorId) -> bool) -> CmdResult {
     let ids: Vec<EditorId> =
-        s.ws.tabs
+        s.ws.tabs()
             .iter()
             .copied()
             .filter(|id| !s.ws.editor(*id).is_some_and(|e| e.pinned))
@@ -88,10 +88,10 @@ fn close_where(s: &mut Session, pred: impl Fn(&Session, EditorId) -> bool) -> Cm
 }
 
 fn close_side(s: &mut Session, left: bool) -> CmdResult {
-    let Some(active) = s.ws.active_editor else { return ok() };
-    let Some(idx) = s.ws.tabs.iter().position(|t| *t == active) else { return ok() };
+    let Some(active) = s.ws.active_editor() else { return ok() };
+    let Some(idx) = s.ws.tabs().iter().position(|t| *t == active) else { return ok() };
     let ids: Vec<EditorId> =
-        s.ws.tabs
+        s.ws.tabs()
             .iter()
             .enumerate()
             .filter(|(i, _)| if left { *i < idx } else { *i > idx })
@@ -105,13 +105,15 @@ fn close_side(s: &mut Session, left: bool) -> CmdResult {
 }
 
 fn cycle(s: &mut Session, delta: isize) -> CmdResult {
-    let n = s.ws.tabs.len();
+    let n = s.ws.tabs().len();
     if n == 0 {
         return ok();
     }
-    let idx = s.ws.active_editor.and_then(|a| s.ws.tabs.iter().position(|t| *t == a)).unwrap_or(0);
+    let idx = s.ws.active_editor().and_then(|a| s.ws.tabs().iter().position(|t| *t == a)).unwrap_or(0);
     let next = (idx as isize + delta).rem_euclid(n as isize) as usize;
-    s.ws.active_editor = s.ws.tabs.get(next).copied();
+    if let Some(id) = s.ws.tabs().get(next).copied() {
+        s.ws.set_active_editor(id);
+    }
     s.effects.push(crate::Effect::FocusEditor);
     ok()
 }

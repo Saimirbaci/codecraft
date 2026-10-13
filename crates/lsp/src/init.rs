@@ -62,6 +62,8 @@ pub(crate) fn client_capabilities() -> Value {
             // The server asks us to re-request these once its analysis is ready.
             "inlayHint": { "refreshSupport": true },
             "semanticTokens": { "refreshSupport": true },
+            // Move/rename of `.rs` files asks the server for `mod`/path updates first.
+            "fileOperations": { "dynamicRegistration": false, "didRename": true, "willRename": true },
         },
         "textDocument": {
             "synchronization": {
@@ -154,6 +156,8 @@ pub(crate) fn client_capabilities() -> Value {
                 "augmentsSyntaxTokens": true,
             },
             "inlayHint": { "dynamicRegistration": false },
+            "callHierarchy": { "dynamicRegistration": false },
+            "typeHierarchy": { "dynamicRegistration": false },
         },
         "window": { "workDoneProgress": true },
         "general": { "positionEncodings": ["utf-16"] },
@@ -200,6 +204,8 @@ mod tests {
         assert!(text.inlay_hint.is_some());
         assert!(text.semantic_tokens.unwrap().requests.full.is_some());
         assert!(text.selection_range.is_some());
+        assert!(text.call_hierarchy.is_some());
+        assert!(text.type_hierarchy.is_some());
         assert_eq!(caps.window.unwrap().work_done_progress, Some(true));
         let workspace = caps.workspace.unwrap();
         assert_eq!(workspace.configuration, Some(true));
@@ -207,6 +213,7 @@ mod tests {
         assert_eq!(workspace.apply_edit, Some(true));
         assert_eq!(workspace.did_change_watched_files.unwrap().dynamic_registration, Some(false));
         assert_eq!(caps.general.unwrap().position_encodings.unwrap(), [PositionEncodingKind::UTF16]);
+        assert_eq!(workspace.file_operations.unwrap().will_rename, Some(true));
     }
 
     #[cfg(unix)]

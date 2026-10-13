@@ -20,16 +20,22 @@ mod diff_view;
 mod editor;
 mod feedback;
 mod fonts;
+mod history_ui;
 pub mod keymap;
 mod markdown;
 mod menus;
+mod native_menu;
+mod navbar;
 mod panels;
 mod popups;
+mod project_windows;
 mod refactor_ui;
+mod settings_ui;
 mod state;
 mod terminal_panel;
 mod testing_panel;
 pub mod theme;
+mod vcs_merge_ui;
 mod vcs_panels;
 mod windows;
 
@@ -84,8 +90,16 @@ pub struct UiState {
     pub terminal: terminal_panel::TerminalUi,
     /// Git tool windows, branch popup and dialogs view state.
     pub vcs: vcs_panels::VcsUi,
+    /// Refactoring preview, file dialogs and Hierarchy view state.
+    pub refactor: refactor_ui::RefactorUi,
+    /// Settings dialog, keymap editor, Quick Switch and Edit Configurations view state.
+    pub prefs: settings_ui::PrefsUi,
     /// Last size of each floating window, by key (see `windows`); persisted.
     pub window_sizes: std::collections::BTreeMap<String, [f32; 2]>,
+    /// Project window requests from this window's effects, handled by the app after the frame.
+    pub(crate) window_requests: Vec<project_windows::Request>,
+    /// A picked project waiting for This Window / New Window.
+    pub(crate) open_choice: Option<PathBuf>,
 }
 
 impl UiState {
@@ -117,7 +131,11 @@ impl UiState {
             debug: debug_panel::DebugUi::default(),
             terminal: terminal_panel::TerminalUi::default(),
             vcs: vcs_panels::VcsUi::default(),
+            refactor: refactor_ui::RefactorUi::default(),
+            prefs: settings_ui::PrefsUi::default(),
             window_sizes: Default::default(),
+            window_requests: Vec::new(),
+            open_choice: None,
         }
     }
 }
@@ -141,6 +159,10 @@ pub struct App {
     /// Save settings/layout on exit (off for tests and snapshots).
     persist: bool,
     fonts_installed: bool,
+    /// The macOS global menu bar (inactive in tests and on other platforms).
+    native_menu: native_menu::NativeMenu,
+    /// Projects opened in their own windows (each with its own session).
+    windows: project_windows::ProjectWindows,
 }
 
 impl App {
@@ -160,12 +182,30 @@ impl App {
         app
     }
 
+    /// Project windows open, the main one included.
+    pub fn project_window_count(&self) -> usize {
+        self.windows.count()
+    }
+
+    /// The session of the `index`th project window opened beside the main one.
+    pub fn project_window_session(&self, index: usize) -> Option<&Session> {
+        self.windows.session(index)
+    }
+
     fn build(open: Option<PathBuf>, persisted: PersistedState, persist: bool) -> Self {
         let mut session = Session::new();
         persisted.apply(&mut session);
         let mut ui = UiState::new();
         ui.window_sizes = persisted.window_sizes.clone();
-        let mut app = Self { session, ui, persisted, persist, fonts_installed: false };
+        let mut app = Self {
+            session,
+            ui,
+            persisted,
+            persist,
+            fonts_installed: false,
+            native_menu: native_menu::NativeMenu::default(),
+            windows: project_windows::ProjectWindows::default(),
+        };
         let target = open.or_else(|| app.persisted.last_project.clone().filter(|p| p.is_dir()));
         if let Some(path) = target {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
@@ -173,20 +213,23 @@ impl App {
         app
     }
 
-    fn editor_focused(&self, ctx: &egui::Context) -> Option<EditorId> {
-        let id = self.session.ws.active_editor?;
+    fn editor_focused(ctx: &egui::Context, s: &Session) -> Option<EditorId> {
+        let id = s.ws.active_editor()?;
         ctx.memory(|m| m.has_focus(editor_id(id))).then_some(id)
     }
 
     /// Keyboard routing: popups first, then shortcuts by context, then text input to the editor.
-    fn handle_input(&mut self, ctx: &egui::Context) {
+    fn handle_input(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         let events = ctx.input(|i| i.events.clone());
-        let editor_focused = self.editor_focused(ctx).is_some();
+        let editor_focused = Self::editor_focused(ctx, s).is_some();
         let text_field_focused = !editor_focused && ctx.memory(|m| m.focused().is_some());
-        let s = &mut self.session;
-        let st = &mut self.ui;
         // The feedback overlay takes all input while it is shown.
         if feedback::intercept_input(ctx, s, st) {
+            return;
+        }
+        // Settings, Edit Configurations and Quick Switch are modal (and record shortcuts).
+        if settings_ui::wants_keyboard(s) {
+            settings_ui::handle_keys(ctx, &events, s, st);
             return;
         }
 
@@ -204,7 +247,9 @@ impl App {
                         let now = Instant::now();
                         if st.last_shift_tap.is_some_and(|t| now.duration_since(t) < Duration::from_millis(400)) {
                             st.last_shift_tap = None;
-                            run_command(s, st, "navigate.searchEverywhere", &Value::Null);
+                            if let Some(id) = keymap::double_shift_command() {
+                                run_command(s, st, id, &Value::Null);
+                            }
                         } else {
                             st.last_shift_tap = Some(now);
                         }
@@ -213,6 +258,17 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // The navigation bar, template choosers and the save-template dialog.
+        if navbar::wants_keyboard(s) {
+            navbar::handle_keys(ctx, s, st);
+            return;
+        }
+
+        // Bookmark, scratch and Local History dialogs read their keys themselves.
+        if bookmarks_panel::wants_keyboard(s) || history_ui::wants_keyboard(s) {
+            return;
         }
 
         // Popups with their own keyboard handling.
@@ -285,36 +341,44 @@ impl App {
         }
     }
 
-    fn apply_effects(&mut self, ctx: &egui::Context) {
-        let effects = std::mem::take(&mut self.session.effects);
+    fn apply_effects(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+        let effects = std::mem::take(&mut s.effects);
         for e in effects {
             match e {
                 Effect::CopyToClipboard(t) => ctx.copy_text(t),
                 Effect::PickOpenPath => {
-                    let start = self.session.project_root();
+                    let start = s.project_root();
                     let mut dialog = rfd::FileDialog::new().set_title("Open File or Project");
                     if let Some(dir) = start {
                         dialog = dialog.set_directory(dir);
                     }
                     if let Some(p) = dialog.pick_folder() {
-                        run_command(&mut self.session, &mut self.ui, "file.open", &json!({ "path": p }));
+                        if s.ws.project.is_some() {
+                            // RustRover asks: This Window or New Window (`project_windows::open_choice`).
+                            st.open_choice = Some(p);
+                        } else {
+                            run_command(s, st, "file.open", &json!({ "path": p }));
+                        }
                     }
                 }
                 Effect::PickNewProjectPath => {
                     if let Some(p) = rfd::FileDialog::new().set_title("New Cargo Project Location").save_file() {
-                        run_command(&mut self.session, &mut self.ui, "file.new.project", &json!({ "path": p }));
+                        run_command(s, st, "file.new.project", &json!({ "path": p }));
                     }
                 }
-                Effect::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Effect::FocusEditor => self.ui.focus_editor = true,
+                // Quit closes the main window (and with it every project window).
+                Effect::Quit => ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Close),
+                Effect::FocusEditor => st.focus_editor = true,
                 Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
+                Effect::OpenProjectWindow(p) => st.window_requests.push(project_windows::Request::Open(p)),
+                Effect::SwitchProjectWindow(d) => st.window_requests.push(project_windows::Request::Switch(d)),
             }
         }
     }
 
-    fn window_title(&self) -> String {
-        let project = self.session.ws.project.as_ref().map(|p| p.name.clone());
-        let file = self.session.ws.active().map(|(_, d)| d.title());
+    pub(crate) fn window_title(s: &Session) -> String {
+        let project = s.ws.project.as_ref().map(|p| p.name.clone());
+        let file = s.ws.active().map(|(_, d)| d.title());
         match (project, file) {
             (Some(p), Some(f)) => format!("{p} – {f}"),
             (Some(p), None) => p,
@@ -322,10 +386,96 @@ impl App {
             (None, None) => "CodeCraft".into(),
         }
     }
+
+    /// One project window's per-frame logic: settings, focus, engine pump, input, effects, title.
+    pub(crate) fn window_logic(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+        // Theme, colour scheme, UI font size and keymap follow the settings.
+        settings_ui::sync(ctx, s, st);
+        // Window focus: RustRover saves on deactivation and synchronizes on activation.
+        let focus_changes: Vec<bool> = ctx.input(|i| {
+            i.events.iter().filter_map(|e| if let Event::WindowFocused(f) = e { Some(*f) } else { None }).collect()
+        });
+        for focused in focus_changes {
+            if focused {
+                run_command(s, st, "file.synchronize", &Value::Null);
+            } else {
+                let _ = s.save_all();
+            }
+        }
+        if s.pump() {
+            ctx.request_repaint();
+        }
+        s.page_lines = st.page_lines;
+        Self::handle_input(ctx, s, st);
+        Self::apply_effects(ctx, s, st);
+        if s.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(Self::window_title(s)));
+    }
+
+    /// Paint one project window. `menu_bar`: show the in-window menu bar (no native one).
+    pub(crate) fn paint(
+        ui: &mut egui::Ui,
+        s: &mut Session,
+        st: &mut UiState,
+        persisted: &PersistedState,
+        menu_bar: bool,
+    ) {
+        if menu_bar {
+            chrome::menu_bar(ui, s, st);
+        }
+        chrome::toolbar(ui, s, st);
+        chrome::status_bar(ui, s, st);
+        if s.ws.project.is_none() && s.ws.tabs().is_empty() {
+            chrome::welcome(ui, s, st, persisted);
+        } else {
+            panels::stripes(ui, s, st);
+            panels::side_panels(ui, s, st);
+            chrome::editor_area(ui, s, st);
+        }
+        popups::show(ui, s, st);
+        project_windows::open_choice(ui, s, st);
+        settings_ui::show(ui, s, st);
+        navbar::show_popups(ui, s, st);
+        approvals_ui::show(ui, s, st);
+        testing_panel::windows(ui, s, st);
+        debug_panel::attach_window(ui, s, st);
+        bookmarks_panel::windows(ui, s, st);
+        history_ui::windows(ui, s, st);
+        refactor_ui::overlays(ui, s, st);
+        feedback::overlay(ui, s, st);
+        windows::capture(ui.ctx(), st);
+        if st.focus_editor
+            && let Some(id) = s.ws.active_editor()
+        {
+            ui.memory_mut(|m| m.request_focus(editor_id(id)));
+            st.focus_editor = false;
+        }
+        Self::apply_effects(ui.ctx(), s, st);
+        // Errors surfaced as notifications pop into the status bar.
+        if let Some(n) = s.ws.notifications.last()
+            && n.level == NotificationLevel::Error
+            && s.status.is_empty()
+        {
+            s.status = format!("{}: {}", n.title, n.message);
+        }
+    }
 }
 
 fn is_text_editing_command(id: &str) -> bool {
-    matches!(id, "edit.copy" | "edit.cut" | "edit.paste" | "edit.selectAll" | "edit.undo" | "edit.redo" | "edit.delete")
+    // Safe Delete is Cmd+Backspace, which text fields use to delete to the line start.
+    matches!(
+        id,
+        "edit.copy"
+            | "edit.cut"
+            | "edit.paste"
+            | "edit.selectAll"
+            | "edit.undo"
+            | "edit.redo"
+            | "edit.delete"
+            | "refactor.safeDelete"
+    )
 }
 
 fn is_function_key(k: Key) -> bool {
@@ -353,27 +503,10 @@ impl eframe::App for App {
             self.ui.theme.apply(ctx);
             self.fonts_installed = true;
         }
-        // Window focus: RustRover saves on deactivation and synchronizes on activation.
-        let focus_changes: Vec<bool> = ctx.input(|i| {
-            i.events.iter().filter_map(|e| if let Event::WindowFocused(f) = e { Some(*f) } else { None }).collect()
-        });
-        for focused in focus_changes {
-            if focused {
-                run_command(&mut self.session, &mut self.ui, "file.synchronize", &Value::Null);
-            } else {
-                let _ = self.session.save_all();
-            }
-        }
-        if self.session.pump() {
-            ctx.request_repaint();
-        }
-        self.session.page_lines = self.ui.page_lines;
-        self.handle_input(ctx);
-        self.apply_effects(ctx);
-        if self.session.busy() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+        Self::window_logic(ctx, &mut self.session, &mut self.ui);
+        // The native menu shows the focused window's enabled states.
+        let focused = self.windows.focused(ctx).and_then(|i| self.windows.session(i));
+        self.native_menu.update(ctx, focused.unwrap_or(&self.session));
         // Remember the main window size (eframe's own persistence is not enabled).
         if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
             let size = [r.width(), r.height()];
@@ -384,39 +517,45 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let s = &mut self.session;
-        let st = &mut self.ui;
-        chrome::menu_bar(ui, s, st);
-        chrome::toolbar(ui, s, st);
-        chrome::status_bar(ui, s, st);
-        if s.ws.project.is_none() && s.ws.tabs.is_empty() {
-            chrome::welcome(ui, s, st, &self.persisted);
-        } else {
-            panels::stripes(ui, s, st);
-            panels::side_panels(ui, s, st);
-            chrome::editor_area(ui, s, st);
+        let menu_bar = !self.native_menu.active();
+        Self::paint(ui, &mut self.session, &mut self.ui, &self.persisted, menu_bar);
+        // Project windows, then what any window's effects asked of the app.
+        let ctx = ui.ctx().clone();
+        let mut requests: Vec<_> = self.ui.window_requests.drain(..).map(|r| (None, r)).collect();
+        self.windows.show(&ctx, &self.persisted, &self.native_menu, &mut requests);
+        for (from, request) in requests {
+            match request {
+                project_windows::Request::Open(path) => {
+                    self.windows.open(path, &self.session, &self.persisted);
+                    ctx.request_repaint();
+                }
+                project_windows::Request::Switch(delta) => self.windows.switch(&ctx, from, delta),
+            }
         }
-        popups::show(ui, s, st);
-        approvals_ui::show(ui, s, st);
-        feedback::overlay(ui, s, st);
-        windows::capture(ui.ctx(), st);
-        if st.focus_editor
-            && let Some(id) = s.ws.active_editor
-        {
-            ui.memory_mut(|m| m.request_focus(editor_id(id)));
-            st.focus_editor = false;
+        self.windows.sync_settings(&mut self.session);
+        codecraft_engine::app_cmds::set_project_window_count(self.windows.count());
+    }
+
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // Native menu activations go to the focused window (project windows take theirs in
+        // their own frame).
+        if raw_input.viewport_id != egui::ViewportId::ROOT {
+            return;
         }
-        self.apply_effects(ui.ctx());
-        // Errors surfaced as notifications pop into the status bar.
-        if let Some(n) = self.session.ws.notifications.last()
-            && n.level == NotificationLevel::Error
-            && self.session.status.is_empty()
-        {
-            self.session.status = format!("{}: {}", n.title, n.message);
+        let fired = self.native_menu.take_fired();
+        if fired.is_empty() {
+            return;
         }
+        if self.windows.focused(ctx).is_some() {
+            self.windows.defer_native(fired);
+            return;
+        }
+        let held = native_menu::held_modifiers(ctx, &raw_input.events);
+        self.native_menu.deliver(fired, ctx, &mut self.session, &mut self.ui, &held, &mut raw_input.events);
     }
 
     fn on_exit(&mut self) {
+        self.windows.shutdown();
         let _ = self.session.save_all();
         if self.persist {
             self.persisted.capture(&self.session, &self.ui);
@@ -437,5 +576,13 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
             .with_min_inner_size([640.0, 400.0]),
         ..Default::default()
     };
-    eframe::run_native("CodeCraft", options, Box::new(move |_cc| Ok(Box::new(App::build(open, persisted, true)))))
+    eframe::run_native(
+        "CodeCraft",
+        options,
+        Box::new(move |_cc| {
+            let mut app = App::build(open, persisted, true);
+            app.native_menu.allowed = true;
+            Ok(Box::new(app))
+        }),
+    )
 }

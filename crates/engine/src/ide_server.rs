@@ -429,9 +429,9 @@ fn current_selection(s: &Session) -> Option<Value> {
 }
 
 fn open_editors(s: &Session) -> Value {
-    let active = s.ws.active_editor;
+    let active = s.ws.active_editor();
     let tabs: Vec<Value> =
-        s.ws.tabs
+        s.ws.all_tabs()
             .iter()
             .filter_map(|id| {
                 let e = s.ws.editor(*id)?;
@@ -578,7 +578,7 @@ fn open_file(s: &mut Session, args: &Value) -> ToolResult {
     let Some(raw) = str_arg(args, "filePath") else { return ToolResult::error("filePath is required") };
     let Some(path) = resolve_path(s, raw) else { return ToolResult::error(format!("invalid path: {raw}")) };
     let front = args.get("makeFrontmost").and_then(Value::as_bool).unwrap_or(true);
-    let prev_active = s.ws.active_editor;
+    let prev_active = s.ws.active_editor();
     let effects_before = s.effects.len();
     let editor = match s.open_file(&path) {
         Ok(e) => e,
@@ -629,7 +629,7 @@ fn open_file(s: &mut Session, args: &Value) -> ToolResult {
     }
     // Background open: keep the user's tab and focus.
     if let Some(prev) = prev_active.filter(|p| s.ws.editor(*p).is_some()) {
-        s.ws.active_editor = Some(prev);
+        s.ws.set_active_editor(prev);
     }
     let tail = s.effects.split_off(effects_before.min(s.effects.len()));
     s.effects.extend(tail.into_iter().filter(|e| *e != Effect::FocusEditor));

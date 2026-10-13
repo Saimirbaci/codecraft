@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use ropey::Rope;
 use serde::{Deserialize, Serialize};
 
@@ -95,7 +97,16 @@ pub struct Document {
     next_entry_id: u64,
     saved_state: u64,
     group_open: bool,
+    /// Recent content changes, oldest first: (revision after the change, the change set), for
+    /// incremental consumers (highlighting, LSP sync, other views of the document).
+    log: VecDeque<(u64, ChangeSet)>,
+    /// Inserted bytes held by `log` (bounded by `MAX_LOG_BYTES`).
+    log_bytes: usize,
 }
+
+/// Change-log bounds: older entries are dropped (consumers then fall back to a full refresh).
+const MAX_LOG_ENTRIES: usize = 1024;
+const MAX_LOG_BYTES: usize = 8 << 20;
 
 impl Default for Document {
     fn default() -> Self {
@@ -122,6 +133,8 @@ impl Document {
             next_entry_id: 1,
             saved_state: 0,
             group_open: false,
+            log: VecDeque::new(),
+            log_bytes: 0,
         }
     }
 
@@ -229,6 +242,7 @@ impl Document {
         if self.line_ending != le {
             self.line_ending = le;
             self.revision += 1;
+            self.record(ChangeSet::empty());
         }
     }
 
@@ -422,7 +436,55 @@ impl Document {
             })?;
         }
         self.revision += 1;
+        self.record(changes.clone());
         Ok(inverse)
+    }
+
+    fn record(&mut self, changes: ChangeSet) {
+        self.log_bytes = self.log_bytes.saturating_add(changes.changes().iter().map(|c| c.text.len()).sum());
+        self.log.push_back((self.revision, changes));
+        while self.log.len() > MAX_LOG_ENTRIES || (self.log_bytes > MAX_LOG_BYTES && self.log.len() > 1) {
+            let Some((_, old)) = self.log.pop_front() else { break };
+            self.log_bytes = self.log_bytes.saturating_sub(old.changes().iter().map(|c| c.text.len()).sum());
+        }
+    }
+
+    /// The change sets applied after `revision`, oldest first, each in the coordinates of the
+    /// text just before it (apply them in order to the text of `revision` to get the current
+    /// text). Line-ending changes appear as empty sets. `None` when that part of the history is
+    /// no longer kept or `revision` is newer than the document.
+    pub fn changes_since(&self, revision: u64) -> Option<Vec<&ChangeSet>> {
+        if revision == self.revision {
+            return Some(Vec::new());
+        }
+        let (first, _) = self.log.front()?;
+        if revision > self.revision || revision.saturating_add(1) < *first {
+            return None;
+        }
+        Some(self.log.iter().filter(|(r, _)| *r > revision).map(|(_, c)| c).collect())
+    }
+
+    /// The current text as a new document without undo history (cheap: the rope is shared).
+    pub fn snapshot(&self) -> Document {
+        Self {
+            rope: self.rope.clone(),
+            line_ending: self.line_ending,
+            saved_line_ending: self.line_ending,
+            revision: 0,
+            history: Vec::new(),
+            applied: 0,
+            next_entry_id: 1,
+            saved_state: 0,
+            group_open: false,
+            log: VecDeque::new(),
+            log_bytes: 0,
+        }
+    }
+
+    /// Apply changes without recording undo history (for shadow copies such as the text a
+    /// language server has). Validates first; an error leaves the document untouched.
+    pub fn apply_untracked(&mut self, changes: &ChangeSet) -> Result<()> {
+        self.apply_changes(&changes.with_normalized_newlines()).map(|_| ())
     }
 }
 
@@ -598,6 +660,63 @@ mod tests {
         assert_eq!(d.undo(), Some(SelectionSet::caret(99)));
         assert_eq!(d.text(), "one\ntwo");
         assert!(!d.can_undo());
+    }
+
+    #[test]
+    fn change_log_replays_edits_undo_and_redo() {
+        let mut d = Document::from_text("one\ntwo\nthree");
+        let base = d.snapshot();
+        let rev0 = d.revision();
+        let sel = SelectionSet::caret(0);
+        let cs = ChangeSet::new(vec![Change::new(0, 3, "1"), Change::insert(8, "x\r\ny")]).unwrap();
+        d.apply(&Edit { changes: cs, selections: sel.clone() }, &sel, EditGroup::Standalone).unwrap();
+        d.set_line_ending(LineEnding::CrLf);
+        d.undo();
+        d.redo();
+        d.replace_all("fresh", &sel).unwrap();
+        let sets = d.changes_since(rev0).unwrap();
+        assert_eq!(sets.len() as u64, d.revision() - rev0);
+        let mut shadow = base;
+        for cs in sets {
+            shadow.apply_untracked(cs).unwrap();
+        }
+        assert_eq!(shadow.text(), d.text());
+        assert!(!shadow.can_undo());
+        assert_eq!(d.changes_since(d.revision()).map(|v| v.len()), Some(0));
+        assert!(d.changes_since(d.revision() + 1).is_none());
+    }
+
+    #[test]
+    fn change_log_is_bounded() {
+        let mut d = Document::new();
+        let rev0 = d.revision();
+        for i in 0..(MAX_LOG_ENTRIES + 10) {
+            let e = Edit { changes: ChangeSet::single(i, i, "a"), selections: SelectionSet::caret(i + 1) };
+            d.apply(&e, &SelectionSet::caret(i), EditGroup::Standalone).unwrap();
+        }
+        assert!(d.changes_since(rev0).is_none());
+        let recent = d.revision() - 5;
+        assert_eq!(d.changes_since(recent).map(|v| v.len()), Some(5));
+        // A single huge change is kept; the next one evicts it.
+        let big = "x".repeat(MAX_LOG_BYTES + 1);
+        let r = d.revision();
+        d.replace_all(&big, &SelectionSet::caret(0)).unwrap();
+        assert_eq!(d.changes_since(r).map(|v| v.len()), Some(1));
+        d.replace_all("small", &SelectionSet::caret(0)).unwrap();
+        assert!(d.changes_since(r).is_none());
+    }
+
+    #[test]
+    fn snapshot_shares_text_without_history() {
+        let mut d = Document::from_text("a\r\nb");
+        d.replace_all("c", &SelectionSet::caret(0)).unwrap();
+        let s = d.snapshot();
+        assert_eq!(s.text(), "c");
+        assert_eq!(s.line_ending(), LineEnding::CrLf);
+        assert!(!s.can_undo() && !s.is_modified());
+        let mut s2 = s.clone();
+        assert!(s2.apply_untracked(&ChangeSet::single(5, 6, "")).is_err());
+        assert_eq!(s2.text(), "c");
     }
 
     #[test]

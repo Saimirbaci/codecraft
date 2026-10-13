@@ -259,6 +259,9 @@ fn set_find_query(s: &mut Session, p: &Value) -> CmdResult {
     }
     bar.invalidate();
     s.refresh_find_matches();
+    if opt_str(p, "pattern").is_some() {
+        crate::editing_cmds::scroll_to_find_result(s);
+    }
     let n = s.find_bar.as_ref().map(|b| b.matches.len()).unwrap_or(0);
     Ok(json!({ "matches": n }))
 }

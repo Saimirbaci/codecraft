@@ -74,7 +74,7 @@ impl Session {
         let _ = self.save_all();
         crate::runs::stop_all(self);
         self.stop_lsp();
-        let tabs = self.ws.tabs.clone();
+        let tabs = self.ws.all_tabs();
         for t in tabs {
             self.ws.close_editor(t);
         }
@@ -85,6 +85,7 @@ impl Session {
         self.ws.clear_cargo_problems();
         self.run_configs.clear();
         self.selected_run_config = 0;
+        crate::run_config_store::project_closed(self);
         self.popup = None;
         self.find_bar = None;
         self.jobs.project = None;
@@ -236,6 +237,8 @@ fn on_project_loaded(s: &mut Session, load: ProjectLoad) {
     s.start_watching(&load.root);
     // Run configurations of the other ecosystems in the project (CMake, Make, Zig, npm, Python).
     s.run_configs.extend(crate::run_configs::derive_polyglot(&load.root));
+    // User configurations (Run › Edit Configurations…) come first.
+    crate::run_config_store::project_loaded(s, &load.root);
     s.status = format!("Opened {}", load.root.display());
     if start_lsp {
         s.start_lsp(&load.root);
@@ -252,12 +255,17 @@ fn apply_rustfmt(s: &mut Session, doc: DocId, revision: u64, result: Result<Stri
                 s.status = "Reformat skipped: the file changed while rustfmt ran".into();
                 return;
             }
-            match od.doc.replace_all(&formatted, &sels) {
+            // Only the changed lines are replaced, and carets keep their place (gap 15).
+            let edit = crate::reformat::diff_edit(&od.doc, &formatted, &sels);
+            if edit.is_noop() {
+                s.status = "Reformatted with rustfmt (no changes)".into();
+                return;
+            }
+            match od.doc.apply(&edit, &sels, codecraft_text::EditGroup::Standalone) {
                 Ok(()) => {
                     s.status = "Reformatted with rustfmt".into();
                     if let Some(e) = editor {
-                        let len = s.ws.doc(doc).map(|d| d.doc.len_chars()).unwrap_or(0);
-                        s.ws.set_selections(e, sels.clamp(len));
+                        s.ws.set_selections(e, edit.selections);
                     }
                 }
                 Err(e) => s.status = e.to_string(),

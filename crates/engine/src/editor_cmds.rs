@@ -196,6 +196,9 @@ fn mv(s: &mut Session, motion: Motion, extend: bool) -> CmdResult {
         };
         return ok();
     }
+    if let Some(r) = crate::editing_cmds::motion_hook(s, motion, extend) {
+        return r;
+    }
     s.select_active(|d, sel| movement::move_selections(d, sel, motion, extend));
     s.refresh_completion_filter();
     ok()

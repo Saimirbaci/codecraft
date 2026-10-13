@@ -155,6 +155,10 @@ fn stop(s: &mut Session, _: &Value) -> CmdResult {
 
 fn rerun(s: &mut Session, _: &Value) -> CmdResult {
     let Some(tab) = s.ws.active_run.and_then(|t| s.ws.run(t)).cloned() else { return ok() };
+    // Test runs remember their exact invocation (filters included).
+    if let Some(started) = crate::testing::rerun_tab(s, tab.id) {
+        return started.map(|t| json!({ "tab": t.0 }));
+    }
     // Find the configuration by title, else rerun as a plain command line is not possible; fall back to Run.
     if let Some(idx) = s.run_configs.iter().position(|c| c.name == tab.title) {
         return run_selected(s, &json!({ "config": idx }));

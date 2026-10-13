@@ -14,12 +14,16 @@ const MAX: f32 = 8000.0;
 /// Every floating window that remembers its size: `(key in the state file, egui id)`.
 pub(crate) const REMEMBERED: &[(&str, &str)] = &[
     ("settings", "settings-window"),
+    ("run-configs", "run-configs-window"),
     ("about", "about-window"),
     ("vcs-dialog", "vcs-dialog"),
     ("vcs-compare", "vcs-compare"),
     ("db-datasource", "db-datasource-dialog"),
     ("feedback", "codecraft-feedback-panel"),
     ("feedback-history", "codecraft-feedback-history"),
+    ("refactor-preview", "refactor-preview"),
+    ("refactor-dialog", "refactor-dialog"),
+    ("local-history", "local-history-window"),
 ];
 
 fn valid(v: f32) -> bool {

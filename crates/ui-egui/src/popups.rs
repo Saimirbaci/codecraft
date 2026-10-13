@@ -680,12 +680,16 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         }
         Some(Popup::Message { title, text }) => {
             let (title, text) = (title.clone(), text.clone());
+            let mono = s.ws.settings.editor_font_size - 1.0;
             top_center().show(&ctx, |ui| {
                 frame(st).show(ui, |ui| {
                     ui.set_max_width(width);
                     ui.label(RichText::new(title).strong());
                     ui.separator();
-                    ui.label(text);
+                    // Messages may be long Markdown (Help › Help): scroll and render it.
+                    ScrollArea::vertical()
+                        .max_height(ctx.content_rect().height() * 0.6)
+                        .show(ui, |ui| markdown::render(ui, &text, &st.theme, mono));
                     if ui.button("Close").clicked() {
                         s.popup = None;
                     }
@@ -694,7 +698,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         }
         Some(Popup::GotoLine { .. } | Popup::Rename { .. } | Popup::NewItem { .. }) => input_popup(&ctx, s, st, width),
         Some(Popup::FindInFiles { .. }) => find_in_files(&ctx, s, st, width),
-        Some(Popup::Settings) => settings(&ctx, s, st),
+        // Drawn by `settings_ui` (with its draft, keymap and colour scheme editors).
+        Some(Popup::Settings) => {}
         Some(Popup::About) => about(&ctx, s, st),
         _ => {}
     }
@@ -708,6 +713,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 
 fn input_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: f32) {
     let Some(mut popup) = s.popup.clone() else { return };
+    let is_rename = matches!(popup, Popup::Rename { .. });
     let (title, text) = match &mut popup {
         Popup::GotoLine { input } => ("Go to Line:Column", input),
         Popup::Rename { name, .. } => ("Rename", name),
@@ -717,6 +723,7 @@ fn input_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: f3
         _ => return,
     };
     let mut accept_now = false;
+    let mut preview_now = false;
     egui::Area::new(egui::Id::new("codecraft-input"))
         .order(egui::Order::Foreground)
         .anchor(Align2::CENTER_TOP, vec2(0.0, 120.0))
@@ -737,6 +744,10 @@ fn input_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: f3
                     if ui.button("OK").clicked() {
                         accept_now = true;
                     }
+                    // Rename › Preview: review every edit before applying (refactoring preview).
+                    if is_rename && ui.button("Preview").clicked() {
+                        preview_now = true;
+                    }
                     if ui.button("Cancel").clicked() {
                         s.popup = None;
                     }
@@ -745,6 +756,11 @@ fn input_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: f3
         });
     if s.popup.is_some() {
         s.popup = Some(popup);
+    }
+    if preview_now && let Some(Popup::Rename { name, .. }) = &s.popup {
+        let name = name.clone();
+        run_command(s, st, "refactor.rename", &json!({ "newName": name, "preview": true }));
+        return;
     }
     if accept_now {
         accept(s, st, None);
@@ -810,133 +826,6 @@ fn find_in_files(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: 
     }
     if go {
         accept(s, st, None);
-    }
-}
-
-fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
-    let mut open = true;
-    let mut set: Vec<(&'static str, Value)> = Vec::new();
-    let mut cfg = s.ws.settings.clone();
-    crate::windows::resizable(egui::Window::new("Settings").default_width(520.0), st, "settings")
-        .id(egui::Id::new("settings-window"))
-        .open(&mut open)
-        .collapsible(false)
-        .show(ctx, |ui| {
-            ui.heading("Editor");
-            egui::Grid::new("settings-grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("Font size");
-                if ui.add(egui::Slider::new(&mut cfg.editor_font_size, 8.0..=32.0).step_by(1.0)).changed() {
-                    set.push(("editor_font_size", json!(cfg.editor_font_size)));
-                }
-                ui.end_row();
-                ui.label("Line spacing");
-                if ui.add(egui::Slider::new(&mut cfg.line_spacing, 1.0..=2.0).step_by(0.05)).changed() {
-                    set.push(("line_spacing", json!(cfg.line_spacing)));
-                }
-                ui.end_row();
-                ui.label("Tab size");
-                if ui.add(egui::Slider::new(&mut cfg.tab_size, 1..=8)).changed() {
-                    set.push(("tab_size", json!(cfg.tab_size)));
-                }
-                ui.end_row();
-                ui.label("Show line numbers");
-                if ui.checkbox(&mut cfg.show_line_numbers, "").changed() {
-                    set.push(("show_line_numbers", json!(cfg.show_line_numbers)));
-                }
-                ui.end_row();
-            });
-            ui.add_space(8.0);
-            ui.heading("Rust");
-            egui::Grid::new("settings-rust").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                ui.label("External linter");
-                let mut clippy = cfg.use_clippy;
-                egui::ComboBox::from_id_salt("linter")
-                    .selected_text(if clippy { "Clippy" } else { "Cargo Check" })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut clippy, false, "Cargo Check");
-                        ui.selectable_value(&mut clippy, true, "Clippy");
-                    });
-                if clippy != cfg.use_clippy {
-                    set.push(("use_clippy", json!(clippy)));
-                }
-                ui.end_row();
-                ui.label("rust-analyzer path");
-                let mut path = cfg.rust_analyzer_path.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                let resp = ui.add(TextEdit::singleline(&mut path).hint_text("auto-detect"));
-                if resp.lost_focus() {
-                    let v = if path.trim().is_empty() { Value::Null } else { json!(path.trim()) };
-                    set.push(("rust_analyzer_path", v));
-                }
-                ui.end_row();
-                ui.label("rust-analyzer low-memory mode");
-                if ui.checkbox(&mut cfg.rust_analyzer_low_memory, "smaller caches, no eager indexing").changed() {
-                    set.push(("rust_analyzer_low_memory", json!(cfg.rust_analyzer_low_memory)));
-                }
-                ui.end_row();
-                ui.label("Restart a language server above");
-                let mut limit = cfg.lsp_memory_limit_mb;
-                let resp = ui.add(
-                    egui::Slider::new(&mut limit, 0..=16_384)
-                        .step_by(256.0)
-                        .suffix(" MiB")
-                        .custom_formatter(|v, _| if v <= 0.0 { "never".into() } else { format!("{v:.0}") }),
-                );
-                if resp.changed() {
-                    set.push(("lsp_memory_limit_mb", json!(limit)));
-                }
-                ui.end_row();
-            });
-            ui.add_space(8.0);
-            ui.heading("Commit message generation");
-            egui::Grid::new("settings-commit-ai").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
-                use codecraft_engine::commit_ai::Provider;
-                let provider = Provider::from_id(&cfg.commit_ai_provider).unwrap_or(Provider::OpenRouter);
-                ui.label("Provider");
-                let mut chosen = provider;
-                egui::ComboBox::from_id_salt("commit-ai-provider").selected_text(provider.label()).show_ui(ui, |ui| {
-                    for p in Provider::ALL {
-                        ui.selectable_value(&mut chosen, p, p.label());
-                    }
-                });
-                if chosen != provider {
-                    set.push(("commit_ai_provider", json!(chosen.id())));
-                }
-                ui.end_row();
-                ui.label("Model");
-                if ui.add(TextEdit::singleline(&mut cfg.commit_ai_model).hint_text(provider.default_model())).changed()
-                {
-                    set.push(("commit_ai_model", json!(cfg.commit_ai_model)));
-                }
-                ui.end_row();
-                if provider == Provider::Ollama {
-                    ui.label("Ollama URL");
-                    if ui.add(TextEdit::singleline(&mut cfg.ollama_url).hint_text("http://localhost:11434")).changed() {
-                        set.push(("ollama_url", json!(cfg.ollama_url)));
-                    }
-                    ui.end_row();
-                } else if let Some(var) = provider.key_env() {
-                    ui.label("API key");
-                    let mut key = cfg.commit_ai_keys.get(provider.id()).cloned().unwrap_or_default();
-                    if ui
-                        .add(TextEdit::singleline(&mut key).password(true).hint_text(format!("or set {var}")))
-                        .changed()
-                    {
-                        cfg.commit_ai_keys.insert(provider.id().to_string(), key);
-                        set.push(("commit_ai_keys", json!(cfg.commit_ai_keys)));
-                    }
-                    ui.end_row();
-                }
-            });
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("Editor font: {}", st.mono_font_name)).color(st.theme.text_muted).size(11.0),
-            );
-        });
-    for (k, v) in set {
-        run_command(s, st, "settings.set", &json!({ "key": k, "value": v }));
-    }
-    if !open {
-        s.popup = None;
     }
 }
 

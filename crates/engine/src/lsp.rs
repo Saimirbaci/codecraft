@@ -34,7 +34,6 @@ pub(crate) enum Pending {
     Completion { editor: EditorId, anchor: usize },
     SignatureHelp { editor: EditorId, offset: usize },
     Formatting { doc: DocId, revision: u64 },
-    Rename,
     DocumentSymbol,
     WorkspaceSymbol { query: String },
     References { title: String },
@@ -43,6 +42,10 @@ pub(crate) enum Pending {
     ExecuteCommand,
     SemanticTokens { doc: DocId, revision: u64, kind: ServerKind },
     InlayHints { doc: DocId, revision: u64 },
+    /// Optimize Imports (`source.organizeImports` code actions, track E).
+    OrganizeImports { doc: DocId, revision: u64 },
+    /// Refactorings and hierarchies (track R); errors are routed too.
+    Refactor(crate::refactor::RefactorPending),
 }
 
 /// One running language server.
@@ -159,6 +162,16 @@ impl Session {
     /// (semantic tokens, inlay hints) support of a ready server.
     pub(crate) fn server_decoration_support(&self, kind: ServerKind) -> (bool, bool) {
         self.servers.get(&kind).filter(|l| l.ready).map(|l| (l.legend.is_some(), l.inlay)).unwrap_or((false, false))
+    }
+
+    /// The capabilities a ready server announced.
+    pub(crate) fn server_capabilities(&self, kind: ServerKind) -> Option<lt::ServerCapabilities> {
+        self.servers.get(&kind).filter(|l| l.ready).and_then(|l| l.client.capabilities())
+    }
+
+    /// A ready server's client (for notifications).
+    pub(crate) fn ready_client(&self, kind: ServerKind) -> Option<&LspClient> {
+        self.servers.get(&kind).filter(|l| l.ready).map(|l| &l.client)
     }
 
     pub(crate) fn server_legend(&self, kind: ServerKind) -> Option<lt::SemanticTokensLegend> {
@@ -335,7 +348,10 @@ impl Session {
         }
         od.lsp_version = 1;
         match l.client.did_open(&path, od.language.lsp_id(), od.lsp_version, &od.doc.text()) {
-            Ok(()) => od.lsp_synced = Some(od.doc.revision()),
+            Ok(()) => {
+                od.lsp_synced = Some(od.doc.revision());
+                od.lsp_text = Some(od.doc.snapshot());
+            }
             Err(e) => log::warn!("didOpen {}: {e}", path.display()),
         }
     }
@@ -359,7 +375,8 @@ impl Session {
         }
     }
 
-    /// Send the document's current text if its server has an older revision.
+    /// Bring the server up to date with the document if it has an older revision: ranged
+    /// changes when the server takes them and the edits since are known, else the full text.
     pub(crate) fn lsp_sync(&mut self, doc: DocId) {
         let Some(kind) = self.ws.doc(doc).and_then(|d| server_kind(d.language)) else { return };
         let Some(l) = self.servers.get(&kind).filter(|l| l.ready) else { return };
@@ -368,10 +385,30 @@ impl Session {
             return;
         }
         let Some(path) = od.path.clone() else { return };
+        let ranged = if l.client.incremental_sync() { incremental_changes(od) } else { None };
+        let rev = od.doc.revision();
+        if let Some(changes) = &ranged
+            && changes.is_empty()
+        {
+            // Only the line ending changed: the server's text is the same.
+            od.lsp_synced = Some(rev);
+            return;
+        }
         od.lsp_version = od.lsp_version.saturating_add(1);
-        match l.client.did_change_full(&path, od.lsp_version, &od.doc.text()) {
-            Ok(()) => od.lsp_synced = Some(od.doc.revision()),
-            Err(e) => log::warn!("didChange {}: {e}", path.display()),
+        let sent = match ranged {
+            Some(changes) => l.client.did_change(&path, od.lsp_version, changes),
+            None => l.client.did_change_full(&path, od.lsp_version, &od.doc.text()),
+        };
+        match sent {
+            Ok(()) => {
+                od.lsp_synced = Some(rev);
+                od.lsp_text = Some(od.doc.snapshot());
+            }
+            Err(e) => {
+                // The server's text is unknown now: resend in full next time.
+                od.lsp_text = None;
+                log::warn!("didChange {}: {e}", path.display());
+            }
         }
     }
 
@@ -468,16 +505,6 @@ impl Session {
         self.lsp_send(|c| c.formatting(&path, tab, true), Pending::Formatting { doc: did, revision })
     }
 
-    pub(crate) fn lsp_rename(&mut self, editor: EditorId, offset: usize, new_name: &str) -> Result<(), CommandError> {
-        self.lsp_ready().map_err(CommandError::Disabled)?;
-        let doc = self.ws.editor(editor).map(|e| e.doc).ok_or_else(|| CommandError::Failed("editor closed".into()))?;
-        self.lsp_sync(doc);
-        let od = self.ws.doc(doc).ok_or_else(|| CommandError::Failed("document closed".into()))?;
-        let path = od.path.clone().ok_or_else(|| CommandError::Failed("the file is not saved on disk".into()))?;
-        let pos = convert::lsp_pos(&od.doc, offset);
-        self.lsp_send(|c| c.rename(&path, pos.line, pos.character, new_name), Pending::Rename)
-    }
-
     pub(crate) fn lsp_document_symbols(&mut self) -> Result<(), CommandError> {
         let (_, path, _, _) = self.caret_for_lsp()?;
         self.lsp_send(|c| c.document_symbol(&path), Pending::DocumentSymbol)
@@ -533,6 +560,10 @@ impl Session {
 
     /// Apply a chosen code action (resolving it first if the server wants that).
     pub(crate) fn apply_code_action(&mut self, payload: &Value) -> Result<(), CommandError> {
+        // Refactor This lists engine commands (Rename…, Move File…) next to the server's actions.
+        if let Some(id) = payload.get("codecraftCommand").and_then(Value::as_str) {
+            return self.execute(id, &Value::Null).map(|_| ());
+        }
         if payload.get("edit").is_none() && payload.get("data").is_some() {
             let p = payload.clone();
             return self.lsp_send(|c| c.request_raw("codeAction/resolve", p), Pending::CodeActionResolve);
@@ -544,7 +575,9 @@ impl Session {
         if let Some(edit) = payload.get("edit") {
             let edit: lt::WorkspaceEdit =
                 serde_json::from_value(edit.clone()).map_err(|e| CommandError::Failed(format!("bad edit: {e}")))?;
-            self.apply_workspace_edit(&edit)?;
+            let title = payload.get("title").and_then(Value::as_str).unwrap_or("Code action");
+            // Multi-file edits open the refactoring preview.
+            crate::refactor::apply_or_preview(self, title, &edit, false)?;
         }
         // A bare Command, or a CodeAction carrying one.
         let command = if payload.get("title").is_some() && payload.get("command").is_some_and(Value::is_string) {
@@ -768,6 +801,7 @@ impl Session {
                 return self.on_semantic_tokens(doc, revision, kind, result.ok());
             }
             Pending::InlayHints { doc, revision } => return self.on_inlay_hints(doc, revision, result.ok()),
+            Pending::Refactor(p) => return crate::refactor::on_response(self, p, result),
             _ => {}
         }
         let value = match result {
@@ -818,14 +852,6 @@ impl Session {
                     self.status = e.to_string();
                 }
             }
-            Pending::Rename => {
-                let edit: Option<lt::WorkspaceEdit> = serde_json::from_value(value).ok().flatten();
-                match edit.map(|e| self.apply_workspace_edit(&e)) {
-                    Some(Ok(n)) => self.status = format!("Renamed in {n} file(s)"),
-                    Some(Err(e)) => self.status = e.to_string(),
-                    None => self.status = "Nothing to rename".into(),
-                }
-            }
             Pending::DocumentSymbol => self.on_document_symbols(value),
             Pending::WorkspaceSymbol { query } => self.on_workspace_symbols(&query, value),
             Pending::References { title } => self.on_references(title, value),
@@ -836,8 +862,11 @@ impl Session {
                 }
             }
             Pending::ExecuteCommand => {}
+            Pending::OrganizeImports { doc, revision } => {
+                crate::editing_cmds::on_organize_imports(self, doc, revision, value)
+            }
             // Handled before the error check above.
-            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } => {}
+            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } | Pending::Refactor(_) => {}
         }
     }
 
@@ -1235,5 +1264,161 @@ fn symbol_kind(k: lt::SymbolKind) -> &'static str {
         lt::SymbolKind::VARIABLE => "static",
         lt::SymbolKind::OBJECT => "impl",
         _ => "symbol",
+    }
+}
+
+/// Most ranged changes sent in one `didChange` before full text is simpler for the server.
+const MAX_RANGED_CHANGES: usize = 256;
+
+/// LSP content changes that turn the server's text (`lsp_text`, at revision `lsp_synced`) into
+/// the document's, oldest first; `None` when that history is gone (send the full text). Within
+/// one change set the changes go back to front, so each range is still valid in the text the
+/// previous ones left.
+fn incremental_changes(od: &codecraft_workspace::OpenDocument) -> Option<Vec<lt::TextDocumentContentChangeEvent>> {
+    let mut shadow = od.lsp_text.as_ref()?.snapshot();
+    let sets = od.doc.changes_since(od.lsp_synced?)?;
+    let mut out = Vec::new();
+    for cs in sets {
+        for c in cs.changes().iter().rev() {
+            if c.end > shadow.len_chars() || c.start > c.end {
+                return None;
+            }
+            out.push(lt::TextDocumentContentChangeEvent {
+                range: Some(lt::Range::new(convert::lsp_pos(&shadow, c.start), convert::lsp_pos(&shadow, c.end))),
+                range_length: None,
+                text: c.text.clone(),
+            });
+        }
+        shadow.apply_untracked(cs).ok()?;
+        if out.len() > MAX_RANGED_CHANGES {
+            return None;
+        }
+    }
+    // The replay must land on the document's text (cheap check; a mismatch means a gap).
+    (shadow.len_chars() == od.doc.len_chars()).then_some(out)
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+    use codecraft_text::{Change, ChangeSet, Document, Edit, EditGroup, SelectionSet};
+    use codecraft_workspace::OpenDocument;
+
+    /// What a server does with a ranged change: (line, UTF-16 column) → byte offset, splice.
+    fn apply_lsp(text: &mut String, ev: &lt::TextDocumentContentChangeEvent) {
+        let Some(range) = ev.range else {
+            *text = ev.text.clone();
+            return;
+        };
+        let offset = |text: &str, pos: lt::Position| -> usize {
+            let mut line_start = 0;
+            for _ in 0..pos.line {
+                line_start += text[line_start..].find('\n').map(|i| i + 1).unwrap();
+            }
+            let mut units = 0;
+            for (i, ch) in text[line_start..].char_indices() {
+                if units >= pos.character as usize || ch == '\n' {
+                    return line_start + i;
+                }
+                units += ch.len_utf16();
+            }
+            text.len()
+        };
+        let (a, b) = (offset(text, range.start), offset(text, range.end));
+        text.replace_range(a..b, &ev.text);
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % n.max(1) as u64) as usize
+        }
+    }
+
+    fn random_set(rng: &mut Rng, len: usize) -> ChangeSet {
+        const SNIPPETS: &[&str] = &["", "x", "😀", "é\n", "\n", "ab\ncd", "\r\n", "🦀🦀", "fn "];
+        let mut changes = Vec::new();
+        let mut at = 0;
+        for _ in 0..1 + rng.next(3) {
+            if at > len {
+                break;
+            }
+            let start = at + rng.next(len - at + 1);
+            let end = (start + rng.next(4)).min(len);
+            changes.push(Change::new(start, end, SNIPPETS[rng.next(SNIPPETS.len())]));
+            at = end + 1;
+        }
+        ChangeSet::new(changes).unwrap()
+    }
+
+    #[test]
+    fn ranged_changes_replay_to_the_document_text() {
+        for seed in 1..40u64 {
+            let mut rng = Rng(seed * 7919);
+            let mut od =
+                OpenDocument::new(DocId(1), Some("/x.rs".into()), Document::from_text("a😀b\nfn é() {}\n\nend"));
+            od.lsp_synced = Some(od.doc.revision());
+            od.lsp_text = Some(od.doc.snapshot());
+            let mut server = od.doc.text();
+            for _ in 0..30 {
+                // A few revisions (edits, undo, redo, line endings) between syncs.
+                for _ in 0..1 + rng.next(3) {
+                    match rng.next(10) {
+                        0 => {
+                            od.doc.undo();
+                        }
+                        1 => {
+                            od.doc.redo();
+                        }
+                        2 => od.doc.set_line_ending(codecraft_text::LineEnding::CrLf),
+                        _ => {
+                            let cs = random_set(&mut rng, od.doc.len_chars());
+                            let sel = SelectionSet::caret(0);
+                            od.doc
+                                .apply(&Edit { changes: cs, selections: sel.clone() }, &sel, EditGroup::Standalone)
+                                .unwrap();
+                        }
+                    }
+                }
+                let events = incremental_changes(&od).expect("history is available");
+                for ev in &events {
+                    apply_lsp(&mut server, ev);
+                }
+                assert_eq!(server, od.doc.text(), "seed {seed}");
+                od.lsp_synced = Some(od.doc.revision());
+                od.lsp_text = Some(od.doc.snapshot());
+            }
+        }
+    }
+
+    #[test]
+    fn missing_history_falls_back_to_full_text() {
+        let mut od = OpenDocument::new(DocId(1), Some("/x.rs".into()), Document::from_text("abc"));
+        assert!(incremental_changes(&od).is_none());
+        od.lsp_synced = Some(0);
+        od.lsp_text = Some(od.doc.snapshot());
+        assert_eq!(incremental_changes(&od).map(|v| v.len()), Some(0));
+        // A revision the document never had.
+        od.lsp_synced = Some(99);
+        assert!(incremental_changes(&od).is_none());
+        // A shadow that does not match the history.
+        od.lsp_synced = Some(0);
+        od.lsp_text = Some(Document::from_text(""));
+        let sel = SelectionSet::caret(0);
+        let edit = Edit { changes: ChangeSet::single(2, 3, "Z"), selections: sel.clone() };
+        od.doc.apply(&edit, &sel, EditGroup::Standalone).unwrap();
+        assert!(incremental_changes(&od).is_none());
+        // Too many revisions for one notification.
+        let mut od = OpenDocument::new(DocId(1), Some("/x.rs".into()), Document::from_text(""));
+        od.lsp_synced = Some(0);
+        od.lsp_text = Some(od.doc.snapshot());
+        for i in 0..=MAX_RANGED_CHANGES {
+            let e = Edit { changes: ChangeSet::single(i, i, "a"), selections: SelectionSet::caret(i + 1) };
+            od.doc.apply(&e, &SelectionSet::caret(i), EditGroup::Standalone).unwrap();
+        }
+        assert!(incremental_changes(&od).is_none());
     }
 }

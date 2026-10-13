@@ -76,7 +76,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "refactor.rename",
             "Rename…",
             None,
-            "{newName?: string} — renames the symbol at the caret; without newName the UI asks",
+            "{newName?: string, preview?: bool} — renames the symbol at the caret (multi-file results open the refactoring preview; `preview` always does); without newName the server is asked whether it can be renamed and the UI asks for the name",
             Context::Editor,
             has_lsp_editor,
             rename,
@@ -147,22 +147,11 @@ fn apply_context_action(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn rename(s: &mut Session, p: &Value) -> CmdResult {
-    let (e, d) = s.ws.active().ok_or_else(|| CommandError::Disabled("no editor".into()))?;
-    let editor = e.id;
-    let offset = e.selections.primary().head;
-    let Some(new_name) = opt_str(p, "newName") else {
-        let word = d.doc.slice(codecraft_text::movement::word_range_at(&d.doc, offset));
-        if word.is_empty() {
-            return Err(CommandError::Failed("nothing to rename at the caret".into()));
-        }
-        s.popup = Some(Popup::Rename { editor, offset, name: word });
-        return ok();
+    let new_name = match p.get("newName") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(opt_str(p, "newName").ok_or_else(|| CommandError::BadParams("`newName` must be a string".into()))?),
     };
-    if new_name.trim().is_empty() {
-        return Err(CommandError::BadParams("the new name is empty".into()));
-    }
-    s.popup = None;
-    s.lsp_rename(editor, offset, new_name.trim())?;
+    crate::refactor::rename(s, new_name, crate::params::bool_or(p, "preview", false))?;
     ok()
 }
 

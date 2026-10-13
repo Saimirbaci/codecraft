@@ -2,6 +2,7 @@
 //! through engine commands; this module only paints and turns pointer input into commands.
 
 use std::collections::BTreeSet;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use egui::text::{CCursor, LayoutJob, TextFormat};
@@ -11,6 +12,7 @@ use serde_json::json;
 use codecraft_engine::Session;
 use codecraft_syntax::{FoldRange, HighlightKind, Highlights};
 use codecraft_text::Document;
+use codecraft_text::wrap::WrapConfig;
 use codecraft_workspace::{EditorId, Problem, Severity};
 
 use crate::UiState;
@@ -24,21 +26,34 @@ pub fn editor_id(e: EditorId) -> Id {
     Id::new(("codecraft-editor", e.0))
 }
 
-/// Rows of the editor after folding: row → document line.
+/// Visual rows of the editor after folding and soft wrap: row → (document line, first char
+/// column of the row).
+#[derive(Clone)]
 struct DisplayMap {
-    rows: Option<Vec<usize>>,
+    /// `None` = one row per line (nothing folded or wrapped).
+    rows: Option<Vec<(usize, usize)>>,
     lines: usize,
 }
 
+/// Soft wrap is off for documents with more lines than this (the map is rebuilt per edit).
+const MAX_WRAP_LINES: usize = 200_000;
+
 impl DisplayMap {
-    fn build(lines: usize, folds: &[FoldRange], folded: &BTreeSet<usize>) -> Self {
-        if folded.is_empty() {
+    fn build(doc: &Document, folds: &[FoldRange], folded: &BTreeSet<usize>, wrap: Option<WrapConfig>) -> Self {
+        let lines = doc.len_lines();
+        if folded.is_empty() && wrap.is_none() {
             return Self { rows: None, lines };
         }
         let mut rows = Vec::with_capacity(lines);
         let mut line = 0;
         while line < lines {
-            rows.push(line);
+            match wrap {
+                Some(cfg) => {
+                    let text = doc.line_text(line).unwrap_or_default();
+                    rows.extend(codecraft_text::wrap::wrap_line(&text, cfg).into_iter().map(|c| (line, c)));
+                }
+                None => rows.push((line, 0)),
+            }
             let fold_end = folded
                 .contains(&line)
                 .then(|| folds.iter().filter(|f| f.start_line == line).map(|f| f.end_line).max())
@@ -55,21 +70,53 @@ impl DisplayMap {
         self.rows.as_ref().map_or(self.lines, Vec::len).max(1)
     }
 
-    fn line(&self, row: usize) -> Option<usize> {
+    /// `(line, first column)` of a row.
+    fn row(&self, row: usize) -> Option<(usize, usize)> {
         match &self.rows {
             Some(r) => r.get(row).copied(),
-            None => (row < self.lines).then_some(row),
+            None => (row < self.lines).then_some((row, 0)),
         }
     }
 
+    fn line(&self, row: usize) -> Option<usize> {
+        self.row(row).map(|(l, _)| l)
+    }
+
+    /// The first row showing `line` (or the row of the fold hiding it).
     fn row_of(&self, line: usize) -> usize {
         match &self.rows {
-            Some(r) => match r.binary_search(&line) {
-                Ok(i) => i,
-                Err(i) => i.saturating_sub(1),
-            },
+            Some(r) => {
+                let i = r.partition_point(|(l, _)| *l < line);
+                if r.get(i).is_some_and(|(l, _)| *l == line) { i } else { i.saturating_sub(1) }
+            }
             None => line,
         }
+    }
+
+    /// The row showing char column `col` of `line`.
+    fn row_of_col(&self, line: usize, col: usize) -> usize {
+        let mut row = self.row_of(line);
+        if let Some(r) = &self.rows {
+            while r.get(row + 1).is_some_and(|(l, c)| *l == line && *c <= col) {
+                row += 1;
+            }
+        }
+        row
+    }
+
+    /// End column of a row: the next row's start on the same line, else the line length.
+    fn row_end(&self, row: usize, line_len: usize) -> usize {
+        let Some((line, _)) = self.row(row) else { return line_len };
+        match self.row(row + 1) {
+            Some((l, c)) if l == line => c.min(line_len),
+            _ => line_len,
+        }
+    }
+
+    /// Whether a row is the last one of its line.
+    fn is_last_of_line(&self, row: usize) -> bool {
+        let line = self.line(row);
+        self.line(row + 1) != line || line.is_none()
     }
 }
 
@@ -122,14 +169,14 @@ fn layout_line(
     hl: &Highlights,
     decor: Decor<'_>,
     line: usize,
+    cols: std::ops::Range<usize>,
     font: &FontId,
     theme: &Theme,
     tab: usize,
 ) -> LineLayout {
     let text = doc.line_text(line).unwrap_or_default();
-    let chars: Vec<char> = text.chars().take(MAX_LAYOUT_CHARS).collect();
-    let n = chars.len();
-    let has_tabs = chars.contains(&'\t');
+    let full: Vec<char> = text.chars().take(MAX_LAYOUT_CHARS).collect();
+    let n = full.len();
     // Per-char style: lexical class, overridden by semantic tokens.
     let mut kinds: Vec<Option<HighlightKind>> = vec![None; n];
     for span in hl.line(line) {
@@ -154,22 +201,35 @@ fn layout_line(
             }
         }
     }
-    // Inlay hints on this line, as (column, hint).
+    // The row's part of the line (soft wrap shows a line as several rows).
+    let seg = cols.start.min(n)..cols.end.min(n).max(cols.start.min(n));
+    let last_row = seg.end == n;
+    // Tab stops continue from the row's display column.
+    let mut x = full.get(..seg.start).unwrap_or(&[]).iter().fold(0usize, |x, c| {
+        if *c == '\t' { x + tab - (x % tab.max(1)) } else { x + 1 }
+    });
+    let chars: Vec<char> = full.get(seg.clone()).unwrap_or(&[]).to_vec();
+    let kinds: Vec<Option<HighlightKind>> = kinds.get(seg.clone()).unwrap_or(&[]).to_vec();
+    let mutable: Vec<bool> = mutable.get(seg.clone()).unwrap_or(&[]).to_vec();
+    let unresolved: Vec<bool> = unresolved.get(seg.clone()).unwrap_or(&[]).to_vec();
+    let n = chars.len();
+    let has_tabs = chars.contains(&'\t');
+    // Inlay hints on this row, as (column within the row, hint).
     let line_start = doc.line_start(line);
-    let first = decor.inlays.partition_point(|h| h.offset < line_start);
+    let first = decor.inlays.partition_point(|h| h.offset < line_start + seg.start);
     let inlays: Vec<(usize, &codecraft_workspace::InlayHint)> = decor
         .inlays
         .get(first..)
         .unwrap_or(&[])
         .iter()
-        .take_while(|h| h.offset <= line_start + n)
-        .map(|h| (h.offset - line_start, h))
+        .take_while(|h| h.offset < line_start + seg.end || (last_row && h.offset == line_start + seg.end))
+        .map(|h| (h.offset.saturating_sub(line_start + seg.start), h))
         .collect();
     let mapped = has_tabs || !inlays.is_empty();
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     let mut xcols: Vec<usize> = if mapped { Vec::with_capacity(n + 1) } else { Vec::new() };
-    let (mut x, mut gi) = (0usize, 0usize);
+    let mut gi = 0usize;
     let hint_font = FontId::new((font.size * 0.86).max(8.0), font.family.clone());
     let mut next_inlay = 0usize;
     let mut emit_inlays = |job: &mut LayoutJob, col: usize, gi: &mut usize| {
@@ -290,10 +350,11 @@ fn severity_color(theme: &Theme, s: Severity) -> Color32 {
     }
 }
 
-/// Lines with a gutter run icon: `fn main` and `#[test]` functions, plus `mod tests`.
-fn run_lines(doc: &Document, lang: codecraft_syntax::Language) -> Vec<usize> {
+/// Lines with a gutter run icon: `fn main` and `#[test]` functions, plus `mod tests` (other
+/// languages: `run_configs::gutter_run_lines`).
+fn run_lines(doc: &Document, lang: codecraft_syntax::Language, path: Option<&std::path::Path>) -> Vec<usize> {
     if lang != codecraft_syntax::Language::Rust {
-        return Vec::new();
+        return path.map(|p| codecraft_engine::run_configs::gutter_run_lines(p, &doc.text())).unwrap_or_default();
     }
     let text = doc.text();
     let outline = codecraft_syntax::outline(lang, &text);
@@ -370,6 +431,38 @@ fn breakpoint_tooltip(bp: &codecraft_engine::debug::Breakpoint) -> String {
     text
 }
 
+/// One painted visual row: a line, or (with soft wrap) a part of one.
+struct RowLayout {
+    line: usize,
+    /// Char columns of the line shown on this row.
+    start: usize,
+    end: usize,
+    /// The row ends its line.
+    last: bool,
+    y: f32,
+    ll: LineLayout,
+}
+
+impl RowLayout {
+    /// The part of the line columns `a..b` on this row, if any.
+    fn clip(&self, a: usize, b: usize) -> Option<(usize, usize)> {
+        let (a, b) = (a.max(self.start), b.min(self.end));
+        (a < b).then_some((a, b))
+    }
+
+    /// Whether a caret at line column `col` is drawn on this row.
+    fn shows(&self, col: usize) -> bool {
+        self.start <= col && (col < self.end || (col == self.end && self.last))
+    }
+
+    /// x of a line column within this row (relative to the text origin).
+    fn x(&self, col: usize) -> f32 {
+        self.ll.x_of(col.saturating_sub(self.start).min(self.end - self.start))
+    }
+}
+
+type MapCache = Arc<(u64, Arc<DisplayMap>)>;
+
 /// Paint the editor and handle pointer input. Returns the caret's screen position.
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId) {
     let theme = st.theme.clone();
@@ -380,7 +473,24 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
     let marks = path.as_deref().map(|p| DebugMarks::collect(s, p)).unwrap_or_default();
+    let tests = path.as_deref().map(|p| crate::testing_panel::GutterTests::collect(s, p)).unwrap_or_default();
     let vcs = crate::vcs_panels::GutterVcs::collect(s, editor.doc);
+    let bookmark_lines = path.as_deref().map(|p| s.bookmarks.lines_in(p)).unwrap_or_default();
+    // Live template variables (current one highlighted), column mode, breadcrumbs.
+    let doc_rev = s.ws.doc(editor.doc).map(|d| d.doc.revision()).unwrap_or(0);
+    let template_ranges: Vec<(std::ops::Range<usize>, bool)> = s
+        .editing
+        .session_for(eid, doc_rev)
+        .map(|t| {
+            t.vars
+                .iter()
+                .enumerate()
+                .flat_map(|(i, occ)| occ.iter().map(move |r| (r.clone(), i == t.current)))
+                .collect()
+        })
+        .unwrap_or_default();
+    let column_mode = s.editing.column_mode.contains(&eid);
+    let crumbs_shown = s.ws.doc(editor.doc).is_some_and(|d| crate::navbar::has_breadcrumbs(d.language));
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
     let od = &*od;
@@ -403,12 +513,15 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let inline_font = FontId::proportional((settings.editor_font_size - 1.0).max(8.0));
     let (char_w, row_h) = ui.fonts_mut(|f| (f.glyph_width(&font, 'M'), f.row_height(&font)));
     let line_h = (settings.editor_font_size * settings.line_spacing).max(row_h).round();
-    let rect = ui.available_rect_before_wrap();
+    let full_rect = ui.available_rect_before_wrap();
+    let crumb_h = if crumbs_shown { crate::navbar::BREADCRUMBS_H } else { 0.0 };
+    let rect =
+        Rect::from_min_max(full_rect.min, pos2(full_rect.right(), (full_rect.bottom() - crumb_h).max(full_rect.top())));
+    let crumb_rect = Rect::from_min_max(pos2(full_rect.left(), rect.bottom()), full_rect.max);
     let id = editor_id(eid);
     let response = ui.interact(rect, id, Sense::click_and_drag());
-    ui.advance_cursor_after_rect(rect);
+    ui.advance_cursor_after_rect(full_rect);
 
-    let map = DisplayMap::build(doc.len_lines(), folds, &editor.folded);
     let digits = doc.len_lines().max(1).ilog10() as f32 + 1.0;
     // Breakpoints sit over the line numbers (RustRover's New UI), so keep room for them.
     let numbers_w = if settings.show_line_numbers { (digits.max(2.0) + 1.0) * char_w } else { 16.0 };
@@ -420,6 +533,29 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let visible_rows = ((rect.height() / line_h).floor() as usize).max(1);
     s_set_page(st, visible_rows);
 
+    // ------------------------------------------------------------ soft wrap
+    let wrap_cols = ((text_rect.width() - 8.0) / char_w.max(1.0)).floor().max(10.0) as usize;
+    let wrap = (settings.soft_wrap && doc.len_lines() <= MAX_WRAP_LINES).then(|| WrapConfig::new(wrap_cols, tab));
+    let map: Arc<DisplayMap> = match wrap {
+        None => Arc::new(DisplayMap::build(doc, folds, &editor.folded, None)),
+        Some(cfg) => {
+            let key = {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                (editor.doc, revision, cfg.width, cfg.tab, &editor.folded).hash(&mut h);
+                h.finish()
+            };
+            let cache_id = id.with("wrap-map");
+            match ui.data(|d| d.get_temp::<MapCache>(cache_id)).filter(|c| c.0 == key) {
+                Some(c) => c.1.clone(),
+                None => {
+                    let m = Arc::new(DisplayMap::build(doc, folds, &editor.folded, Some(cfg)));
+                    ui.data_mut(|d| d.insert_temp(cache_id, Arc::new((key, m.clone()))));
+                    m
+                }
+            }
+        }
+    };
+
     // ------------------------------------------------------------ scrolling
     let mut scroll = editor.scroll_line;
     let mut scroll_x = editor.scroll_x;
@@ -430,7 +566,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     }
     let primary = editor.selections.primary();
     let caret_line = doc.char_to_line(primary.head);
-    let caret_row = map.row_of(caret_line);
+    let caret_row = map.row_of_col(caret_line, primary.head.saturating_sub(doc.line_start(caret_line)));
     let mut reveal = editor.reveal_caret;
     if reveal {
         let margin = 3.0f32.min(visible_rows as f32 / 3.0);
@@ -442,7 +578,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     }
     let max_scroll = (map.len() as f32 - 1.0).max(0.0);
     scroll = scroll.clamp(0.0, max_scroll);
-    scroll_x = scroll_x.max(0.0);
+    scroll_x = if wrap.is_some() { 0.0 } else { scroll_x.max(0.0) };
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, CornerRadius::ZERO, theme.editor_bg);
@@ -451,13 +587,15 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
     // Caret line layout for horizontal reveal.
     if reveal {
-        let ll = layout_line(ui, doc, hl, decor, caret_line, &font, &theme, tab);
-        let cx = ll.x_of(primary.head.saturating_sub(doc.line_start(caret_line)));
-        let view_w = text_rect.width() - 8.0;
-        if cx - scroll_x > view_w - 4.0 * char_w {
-            scroll_x = cx - view_w + 8.0 * char_w;
-        } else if cx < scroll_x + 2.0 * char_w {
-            scroll_x = (cx - 8.0 * char_w).max(0.0);
+        if wrap.is_none() {
+            let ll = layout_line(ui, doc, hl, decor, caret_line, 0..usize::MAX, &font, &theme, tab);
+            let cx = ll.x_of(primary.head.saturating_sub(doc.line_start(caret_line)));
+            let view_w = text_rect.width() - 8.0;
+            if cx - scroll_x > view_w - 4.0 * char_w {
+                scroll_x = cx - view_w + 8.0 * char_w;
+            } else if cx < scroll_x + 2.0 * char_w {
+                scroll_x = (cx - 8.0 * char_w).max(0.0);
+            }
         }
         reveal = false;
     }
@@ -509,7 +647,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let run_lines = {
         let key = (editor.doc, doc.revision());
         if st.run_lines_cache.as_ref().map(|(k, _)| *k) != Some(key) {
-            st.run_lines_cache = Some((key, run_lines(doc, od.language)));
+            st.run_lines_cache = Some((key, run_lines(doc, od.language, od.path.as_deref())));
         }
         st.run_lines_cache.as_ref().map(|(_, v)| v.clone()).unwrap_or_default()
     };
@@ -519,21 +657,25 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let focused = ui.memory(|m| m.has_focus(id));
     let blink_on = !focused || (ui.input(|i| i.time) * 2.0 % 2.0) < 1.3;
     let mut indent_prev: Option<usize> = None;
-    let mut layouts: Vec<(usize, f32, LineLayout)> = Vec::with_capacity(rows_to_draw);
+    let mut rows: Vec<RowLayout> = Vec::with_capacity(rows_to_draw);
 
     for row in first_row..first_row + rows_to_draw {
-        let Some(line) = map.line(row) else { break };
+        let Some((line, start)) = map.row(row) else { break };
         let y = row_y(row);
         if y > rect.bottom() {
             break;
         }
-        let ll = layout_line(ui, doc, hl, decor, line, &font, &theme, tab);
-        let line_start = doc.line_start(line);
         let line_len = doc.line_len(line);
+        let end = map.row_end(row, line_len).max(start);
+        let last = map.is_last_of_line(row);
+        let ll = layout_line(ui, doc, hl, decor, line, start..end, &font, &theme, tab);
+        let r = RowLayout { line, start, end, last, y, ll };
+        let line_start = doc.line_start(line);
         let text_y = y + (line_h - row_h) * 0.5;
         let line_rect = Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), y + line_h));
+        let x_at = |c: usize| text_x0 - scroll_x + r.x(c);
 
-        if line == caret_line && primary.is_empty() {
+        if row == caret_row && primary.is_empty() {
             painter.rect_filled(line_rect, CornerRadius::ZERO, theme.caret_row);
         }
         if let Some(bg) = vcs.line_bg(line, &theme) {
@@ -542,35 +684,39 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         if marks.execution == Some(line) {
             painter.rect_filled(line_rect, CornerRadius::ZERO, theme.execution_line);
         }
-        // Indent guides.
-        let indent_cols = {
-            let text = doc.line_text(line).unwrap_or_default();
-            if text.trim().is_empty() {
-                indent_prev.unwrap_or(0)
-            } else {
-                let w: usize =
-                    text.chars().take_while(|c| *c == ' ' || *c == '\t').map(|c| if c == '\t' { tab } else { 1 }).sum();
-                indent_prev = Some(w);
-                w
+        // Indent guides (on a line's first row).
+        if start == 0 {
+            let indent_cols = {
+                let text = doc.line_text(line).unwrap_or_default();
+                if text.trim().is_empty() {
+                    indent_prev.unwrap_or(0)
+                } else {
+                    let w: usize = text
+                        .chars()
+                        .take_while(|c| *c == ' ' || *c == '\t')
+                        .map(|c| if c == '\t' { tab } else { 1 })
+                        .sum();
+                    indent_prev = Some(w);
+                    w
+                }
+            };
+            let mut level = tab;
+            while level < indent_cols + 1 && level <= indent_cols {
+                let gx = text_x0 - scroll_x + level as f32 * char_w - tab as f32 * char_w;
+                if gx > text_rect.left() {
+                    text_painter.vline(gx, y..=y + line_h, Stroke::new(1.0, theme.indent_guide));
+                }
+                level += tab;
             }
-        };
-        let mut level = tab;
-        while level < indent_cols + 1 && level <= indent_cols {
-            let gx = text_x0 - scroll_x + level as f32 * char_w - tab as f32 * char_w;
-            if gx > text_rect.left() {
-                text_painter.vline(gx, y..=y + line_h, Stroke::new(1.0, theme.indent_guide));
-            }
-            level += tab;
         }
         // Occurrences of the identifier under the caret.
         if let Some(w) = &occurrence_word {
             let text = doc.line_text(line).unwrap_or_default();
             for (a, b) in word_occurrences(&text, w) {
-                let r = Rect::from_min_max(
-                    pos2(text_x0 - scroll_x + ll.x_of(a), y + 1.0),
-                    pos2(text_x0 - scroll_x + ll.x_of(b), y + line_h - 1.0),
-                );
-                text_painter.rect_filled(r, CornerRadius::same(2), theme.occurrence);
+                if let Some((a, b)) = r.clip(a, b) {
+                    let rr = Rect::from_min_max(pos2(x_at(a), y + 1.0), pos2(x_at(b), y + line_h - 1.0));
+                    text_painter.rect_filled(rr, CornerRadius::same(2), theme.occurrence);
+                }
             }
         }
         // Find matches.
@@ -581,12 +727,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             }
             let a = m.start.max(line_start) - line_start;
             let b = m.end.min(line_end_full) - line_start;
+            let span = if a == b { r.shows(a).then_some((a, a)) } else { r.clip(a, b) };
+            let Some((a, b)) = span else { continue };
             let color = if Some(i) == find_current { theme.find_match_current } else { theme.find_match };
-            let r = Rect::from_min_max(
-                pos2(text_x0 - scroll_x + ll.x_of(a), y + 1.0),
-                pos2(text_x0 - scroll_x + ll.x_of(b).max(ll.x_of(a) + 2.0), y + line_h - 1.0),
-            );
-            text_painter.rect_filled(r, CornerRadius::same(2), color);
+            let rr = Rect::from_min_max(pos2(x_at(a), y + 1.0), pos2(x_at(b).max(x_at(a) + 2.0), y + line_h - 1.0));
+            text_painter.rect_filled(rr, CornerRadius::same(2), color);
         }
         // Selections.
         for sel in editor.selections.ranges() {
@@ -596,73 +741,93 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             if sel.end() == line_start && line_len > 0 {
                 continue;
             }
-            let a = sel.start().max(line_start) - line_start;
-            let b = sel.end().min(line_end_full) - line_start;
-            let mut x2 = text_x0 - scroll_x + ll.x_of(b);
-            if sel.end() > line_end_full {
+            let a = (sel.start().max(line_start) - line_start).max(start);
+            let b = (sel.end().min(line_end_full) - line_start).min(end);
+            let tail = last && sel.end() > line_end_full;
+            if a > b || (a == b && !tail) {
+                continue;
+            }
+            let mut x2 = x_at(b);
+            if tail {
                 x2 += char_w * 0.6;
             }
-            let r = Rect::from_min_max(pos2(text_x0 - scroll_x + ll.x_of(a), y), pos2(x2, y + line_h));
-            text_painter.rect_filled(r, CornerRadius::ZERO, theme.selection);
+            let rr = Rect::from_min_max(pos2(x_at(a), y), pos2(x2, y + line_h));
+            text_painter.rect_filled(rr, CornerRadius::ZERO, theme.selection);
+        }
+        // Live template variables: the current one framed in the link colour.
+        for (tr, current) in &template_ranges {
+            if tr.end < line_start || tr.start > line_end_full {
+                continue;
+            }
+            let a = tr.start.max(line_start) - line_start;
+            let b = tr.end.min(line_end_full) - line_start;
+            let span = if a == b { r.shows(a).then_some((a, a)) } else { r.clip(a, b) };
+            let Some((a, b)) = span else { continue };
+            let rr = Rect::from_min_max(pos2(x_at(a) - 1.0, y + 1.0), pos2(x_at(b).max(x_at(a) + 2.0) + 1.0, y + line_h - 1.0));
+            let color = if *current { theme.link } else { theme.text_disabled };
+            text_painter.rect_stroke(rr, CornerRadius::same(2), Stroke::new(1.0, color), egui::StrokeKind::Inside);
         }
         // Matching brackets.
         if let Some((a, b)) = brackets {
             for o in [a, b] {
-                if o >= line_start && o < line_end_full {
+                if o >= line_start && o < line_end_full && r.clip(o - line_start, o - line_start + 1).is_some() {
                     let c = o - line_start;
-                    let r = Rect::from_min_max(
-                        pos2(text_x0 - scroll_x + ll.x_of(c), y + 1.0),
-                        pos2(text_x0 - scroll_x + ll.x_of(c + 1), y + line_h - 1.0),
-                    );
-                    text_painter.rect_filled(r, CornerRadius::same(2), theme.bracket_match);
+                    let rr = Rect::from_min_max(pos2(x_at(c), y + 1.0), pos2(x_at(c + 1), y + line_h - 1.0));
+                    text_painter.rect_filled(rr, CornerRadius::same(2), theme.bracket_match);
                 }
             }
         }
         // Text.
-        text_painter.galley(pos2(text_x0 - scroll_x, text_y), ll.galley.clone(), theme.text_editor);
-        // Inline debugger values after the line end (while suspended).
-        for (_, text) in marks.inline.iter().filter(|(l, _)| *l == line) {
-            let x = text_x0 - scroll_x + ll.x_of(ll.len) + 2.0 * char_w;
-            text_painter.text(
-                pos2(x, y + line_h * 0.5),
-                Align2::LEFT_CENTER,
-                text,
-                inline_font.clone(),
-                theme.inline_value,
-            );
+        text_painter.galley(pos2(text_x0 - scroll_x, text_y), r.ll.galley.clone(), theme.text_editor);
+        if last {
+            // Inline debugger values after the line end (while suspended).
+            for (_, text) in marks.inline.iter().filter(|(l, _)| *l == line) {
+                let x = text_x0 - scroll_x + r.ll.x_of(r.ll.len) + 2.0 * char_w;
+                text_painter.text(
+                    pos2(x, y + line_h * 0.5),
+                    Align2::LEFT_CENTER,
+                    text,
+                    inline_font.clone(),
+                    theme.inline_value,
+                );
+            }
+            // Folded placeholder.
+            if editor.folded.contains(&line) && fold_starts.contains(&line) {
+                let x = text_x0 - scroll_x + r.ll.x_of(r.ll.len) + char_w;
+                let rr = Rect::from_min_size(pos2(x, y + 2.0), vec2(char_w * 3.5, line_h - 4.0));
+                text_painter.rect_filled(rr, CornerRadius::same(3), theme.bracket_match);
+                text_painter.text(rr.center(), Align2::CENTER_CENTER, "…", font.clone(), theme.text_muted);
+            }
         }
-        // Folded placeholder.
-        if editor.folded.contains(&line) && fold_starts.contains(&line) {
-            let x = text_x0 - scroll_x + ll.x_of(ll.len) + char_w;
-            let r = Rect::from_min_size(pos2(x, y + 2.0), vec2(char_w * 3.5, line_h - 4.0));
-            text_painter.rect_filled(r, CornerRadius::same(3), theme.bracket_match);
-            text_painter.text(r.center(), Align2::CENTER_CENTER, "…", font.clone(), theme.text_muted);
-        }
-        // Right margin.
-        let mx = text_x0 - scroll_x + RIGHT_MARGIN_COL as f32 * char_w;
-        if mx > text_rect.left() {
-            text_painter.vline(mx, y..=y + line_h, Stroke::new(1.0, theme.right_margin));
+        // Right margin (not while soft-wrapping).
+        if wrap.is_none() {
+            let mx = text_x0 - scroll_x + RIGHT_MARGIN_COL as f32 * char_w;
+            if mx > text_rect.left() {
+                text_painter.vline(mx, y..=y + line_h, Stroke::new(1.0, theme.right_margin));
+            }
         }
         // Diagnostics.
         for p in problems.iter().filter(|p| p.start.line <= line && line <= p.end.line) {
+            if p.severity == Severity::Hint {
+                continue;
+            }
             let a = if p.start.line == line { p.start.column } else { 0 };
             let mut b = if p.end.line == line { p.end.column } else { line_len };
             if b <= a {
                 b = (a + 1).min(line_len.max(a + 1));
             }
-            let x1 = text_x0 - scroll_x + ll.x_of(a);
-            let x2 = (text_x0 - scroll_x + ll.x_of(b)).max(x1 + char_w);
-            let color = severity_color(&theme, p.severity);
-            if p.severity == Severity::Hint {
+            let Some((a, b)) = r.clip(a, b).or_else(|| (last && a >= end && start <= a).then_some((a, b))) else {
                 continue;
-            }
-            wavy(&text_painter, x1, x2, y + line_h - 2.0, color);
+            };
+            let x1 = x_at(a);
+            let x2 = x_at(b).max(x1 + char_w);
+            wavy(&text_painter, x1, x2, y + line_h - 2.0, severity_color(&theme, p.severity));
         }
         // Carets.
         for sel in editor.selections.ranges() {
             let h = sel.head;
-            if h >= line_start && h <= line_end_full && doc.char_to_line(h) == line {
-                let x = text_x0 - scroll_x + ll.x_of(h - line_start);
+            if h >= line_start && h <= line_end_full && doc.char_to_line(h) == line && r.shows(h - line_start) {
+                let x = x_at(h - line_start);
                 if sel == &primary {
                     caret_screen = Some(pos2(x, y + line_h));
                 }
@@ -675,7 +840,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                 }
             }
         }
-        layouts.push((line, y, ll));
+        rows.push(r);
     }
 
     // ------------------------------------------------------------ gutter
@@ -694,7 +859,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         .input(|i| i.pointer.hover_pos())
         .filter(|p| gutter.contains(*p) && bp_area.contains(&p.x) && path.is_some())
         .and_then(|p| map.line((((p.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize));
-    for (line, y, _) in &layouts {
+    // Gutter marks go on a line's first row only.
+    for r in rows.iter().filter(|r| r.start == 0) {
+        let (line, y) = (&r.line, &r.y);
         let cy = y + line_h * 0.5;
         let breakpoint = marks.breakpoints.iter().find(|b| b.line == *line);
         if let Some(bp) = breakpoint {
@@ -705,8 +872,14 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         if marks.execution == Some(*line) {
             crate::debug_panel::paint_exec_arrow(&painter, pos2(bp_x, cy), &theme);
         }
+        let bookmark = bookmark_lines.iter().find(|(l, _)| l == line).map(|(_, m)| *m);
+        if let Some(m) = bookmark {
+            let x = if breakpoint.is_some() || marks.execution == Some(*line) { bp_area.start + 5.0 } else { bp_x };
+            crate::bookmarks_panel::paint_badge(&painter, &theme, pos2(x, cy), line_h, m);
+        }
         if settings.show_line_numbers
             && breakpoint.is_none()
+            && bookmark.is_none()
             && marks.execution != Some(*line)
             && hover_line != Some(*line)
         {
@@ -720,10 +893,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             );
         }
         vcs.paint_line(&painter, &theme, *line, *y, line_h, gutter, ann_rect, &num_font);
+        tests.paint_coverage(&painter, &theme, *line, *y, line_h, gutter.left() + 15.0);
         if run_lines.contains(line) {
             let x = gutter.left() + 9.0;
             let tri = vec![pos2(x - 4.0, cy - 5.0), pos2(x + 5.0, cy), pos2(x - 4.0, cy + 5.0)];
-            painter.add(Shape::convex_polygon(tri, theme.success, Stroke::NONE));
+            painter.add(Shape::convex_polygon(tri, tests.run_icon_color(*line, &theme), Stroke::NONE));
         }
         if fold_starts.contains(line) {
             let x = gutter.right() - 10.0;
@@ -785,17 +959,39 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
     // ------------------------------------------------------------ pointer input
     let hit_scroll = scroll;
-    let hit = |pos: Pos2, layouts: &[(usize, f32, LineLayout)], ui: &egui::Ui| -> usize {
+    // The char offset under a point, and how many display columns it lies past its line's end.
+    let hit_ex = |pos: Pos2, rows: &[RowLayout], ui: &egui::Ui| -> (usize, usize) {
         let row = (((pos.y - rect.top()) / line_h) + hit_scroll).floor().max(0.0) as usize;
         let row = row.min(map.len().saturating_sub(1));
-        let line = map.line(row).unwrap_or(0);
+        let (line, start) = map.row(row).unwrap_or((0, 0));
+        let line_len = doc.line_len(line);
+        let end = map.row_end(row, line_len).max(start);
+        let last = map.is_last_of_line(row);
         let x = pos.x - text_x0 + scroll_x;
-        let col = match layouts.iter().find(|(l, _, _)| *l == line) {
-            Some((_, _, ll)) => ll.col_at_x(x),
-            None => layout_line(ui, doc, hl, decor, line, &font, &theme, tab).col_at_x(x),
+        let (rel, x_end) = match rows.iter().find(|r| r.line == line && r.start == start) {
+            Some(r) => (r.ll.col_at_x(x), r.ll.x_of(r.ll.len)),
+            None => {
+                let ll = layout_line(ui, doc, hl, decor, line, start..end, &font, &theme, tab);
+                (ll.col_at_x(x), ll.x_of(ll.len))
+            }
         };
-        doc.line_start(line) + col.min(doc.line_len(line))
+        let max = if last { end } else { end.saturating_sub(1).max(start) };
+        let col = (start + rel).min(max);
+        let beyond = if last && col == line_len && x > x_end {
+            ((x - x_end) / char_w.max(1.0)).round().max(0.0) as usize
+        } else {
+            0
+        };
+        (doc.line_start(line) + col.min(line_len), beyond)
     };
+    let hit = |pos: Pos2, rows: &[RowLayout], ui: &egui::Ui| hit_ex(pos, rows, ui).0;
+    // A box-selection corner: line and display column (may lie past the line end).
+    let box_point = |pos: Pos2, rows: &[RowLayout], ui: &egui::Ui| -> (usize, usize) {
+        let (offset, beyond) = hit_ex(pos, rows, ui);
+        let p = codecraft_text::column::box_point_of(doc, offset, tab);
+        (p.line, p.column + beyond)
+    };
+    let box_key = id.with("box-anchor");
 
     let mut commands: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let pointer = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.interact_pos(), i.modifiers));
@@ -833,14 +1029,22 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                 }
             }
         } else {
-            let offset = hit(pos, &layouts, ui);
+            let offset = hit(pos, &rows, ui);
             let m = pointer.2;
-            commands.push((
-                "editor.click",
-                json!({ "offset": offset, "extend": m.shift && !m.alt, "addCaret": m.alt && m.shift }),
-            ));
-            if m.mac_cmd || m.command {
-                commands.push(("navigate.declarationOrUsages", json!({})));
+            // Alt+drag (or any drag in column selection mode) selects a box.
+            if (m.alt && !m.shift || column_mode) && !(m.mac_cmd || m.command) {
+                let p = box_point(pos, &rows, ui);
+                ui.data_mut(|d| d.insert_temp(box_key, p));
+                commands.push(("editor.click", json!({ "offset": offset })));
+            } else {
+                ui.data_mut(|d| d.remove::<(usize, usize)>(box_key));
+                commands.push((
+                    "editor.click",
+                    json!({ "offset": offset, "extend": m.shift && !m.alt, "addCaret": m.alt && m.shift }),
+                ));
+                if m.mac_cmd || m.command {
+                    commands.push(("navigate.declarationOrUsages", json!({})));
+                }
             }
             st.drag_anchor_active = true;
         }
@@ -849,13 +1053,13 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         && let Some(pos) = response.interact_pointer_pos()
         && text_rect.contains(pos)
     {
-        commands.push(("editor.click", json!({ "offset": hit(pos, &layouts, ui), "clicks": 2 })));
+        commands.push(("editor.click", json!({ "offset": hit(pos, &rows, ui), "clicks": 2 })));
     }
     if response.triple_clicked()
         && let Some(pos) = response.interact_pointer_pos()
         && text_rect.contains(pos)
     {
-        commands.push(("editor.click", json!({ "offset": hit(pos, &layouts, ui), "clicks": 3 })));
+        commands.push(("editor.click", json!({ "offset": hit(pos, &rows, ui), "clicks": 3 })));
     }
     if response.dragged()
         && st.drag_anchor_active
@@ -867,7 +1071,16 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         } else if pos.y > rect.bottom() {
             scroll = (scroll + 1.0).min(max_scroll);
         }
-        commands.push(("editor.drag", json!({ "offset": hit(pos, &layouts, ui) })));
+        match ui.data(|d| d.get_temp::<(usize, usize)>(box_key)) {
+            Some((line, column)) => {
+                let (hl_, hc) = box_point(pos, &rows, ui);
+                commands.push((
+                    "editor.boxSelect",
+                    json!({ "anchor": { "line": line, "column": column }, "head": { "line": hl_, "column": hc } }),
+                ));
+            }
+            None => commands.push(("editor.drag", json!({ "offset": hit(pos, &rows, ui) }))),
+        }
     }
     if response.drag_stopped() || !ui.input(|i| i.pointer.primary_down()) {
         st.drag_anchor_active = false;
@@ -879,7 +1092,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         && text_rect.contains(pos)
         && !ui.input(|i| i.pointer.any_down())
     {
-        let off = hit(pos, &layouts, ui);
+        let off = hit(pos, &rows, ui);
         let p = doc.offset_to_position(off);
         let msgs: Vec<String> = problems
             .iter()
@@ -925,6 +1138,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         e.scroll_x = scroll_x;
         e.reveal_caret = reveal;
     }
+    s.editing.set_wrap_width(eid, wrap.map(|w| w.width).unwrap_or(0));
     st.caret_screen = caret_screen;
     st.editor_rect = Some(rect);
     st.editor_line_h = line_h;
@@ -953,6 +1167,10 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     if let Some(id) = gutter_menu_breakpoint {
         crate::debug_panel::select_breakpoint(s, st, id);
     }
+    if crumbs_shown {
+        crate::navbar::breadcrumbs(ui, s, st, eid, crumb_rect);
+    }
+    crate::navbar::overlay(ui, s, st, eid, rect);
 }
 
 fn s_set_page(st: &mut UiState, rows: usize) {

@@ -27,6 +27,7 @@
 mod client;
 mod discover;
 mod init;
+mod refactor;
 mod servers;
 mod transport;
 mod uri;
@@ -237,6 +238,26 @@ impl LspClient {
         })
     }
 
+    /// Whether the server takes ranged (incremental) `didChange` notifications.
+    pub fn incremental_sync(&self) -> bool {
+        self.capabilities().is_some_and(|c| sync_kind(&c) == lsp_types::TextDocumentSyncKind::INCREMENTAL)
+    }
+
+    /// Incremental sync: the server applies `changes` in order, each in the coordinates (line,
+    /// UTF-16 column) of the text the previous one left. Only for servers that asked for it
+    /// ([`incremental_sync`](Self::incremental_sync)).
+    pub fn did_change(
+        &self,
+        path: &Path,
+        version: i32,
+        changes: Vec<lsp_types::TextDocumentContentChangeEvent>,
+    ) -> Result<()> {
+        self.notify::<notif::DidChangeTextDocument>(lsp_types::DidChangeTextDocumentParams {
+            text_document: lsp_types::VersionedTextDocumentIdentifier::new(path_to_uri(path)?, version),
+            content_changes: changes,
+        })
+    }
+
     pub fn did_save(&self, path: &Path) -> Result<()> {
         self.notify::<notif::DidSaveTextDocument>(lsp_types::DidSaveTextDocumentParams {
             text_document: document(path)?,
@@ -418,6 +439,18 @@ fn goto(path: &Path, line: u32, character: u32) -> Result<lsp_types::GotoDefinit
 /// Locate rust-analyzer: `$RUST_ANALYZER`, then `PATH`, then `~/.cargo/bin`, then
 /// `rustup which rust-analyzer`. Only returns a binary that answers `--version` successfully
 /// (the rustup proxy without the component installed fails that check).
+/// How a server wants document changes (`textDocumentSync.change`); `NONE` when it does not
+/// say (CodeCraft then sends the full text, which every server accepts).
+pub fn sync_kind(capabilities: &lsp_types::ServerCapabilities) -> lsp_types::TextDocumentSyncKind {
+    match &capabilities.text_document_sync {
+        Some(lsp_types::TextDocumentSyncCapability::Kind(kind)) => *kind,
+        Some(lsp_types::TextDocumentSyncCapability::Options(o)) => {
+            o.change.unwrap_or(lsp_types::TextDocumentSyncKind::NONE)
+        }
+        None => lsp_types::TextDocumentSyncKind::NONE,
+    }
+}
+
 pub fn find_rust_analyzer() -> Option<PathBuf> {
     discover::find_rust_analyzer()
 }

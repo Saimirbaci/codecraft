@@ -13,7 +13,10 @@
 )]
 
 mod agent_cmds;
+mod bookmark_cmds;
+pub mod bookmarks;
 pub mod agents;
+pub mod app_cmds;
 pub mod approvals;
 pub mod catalog;
 mod code_cmds;
@@ -26,6 +29,7 @@ pub mod debug;
 mod debug_cmds;
 mod decorations;
 mod edit_cmds;
+pub mod editing;
 mod editing_cmds;
 mod editor_cmds;
 pub mod feedback;
@@ -34,23 +38,37 @@ mod file_cmds;
 mod ide_cmds;
 pub mod ide_server;
 mod jobs;
+pub mod keymaps;
 mod lang_cmds;
+pub mod local_history;
+mod local_history_cmds;
 mod lsp;
 mod navigate_cmds;
 mod params;
 pub mod refactor;
 mod refactor_cmds;
+mod reformat;
 pub mod popup;
 mod run_cmds;
+mod run_config_cmds;
+pub mod run_config_store;
 pub mod run_configs;
 mod runs;
+pub mod scratch;
+pub mod settings;
+mod settings_cmds;
 mod split_cmds;
+pub mod structure;
+pub mod templates;
+pub mod todo;
 pub mod terminal;
 mod terminal_cmds;
 pub mod testing;
 mod testing_cmds;
 pub mod vcs;
 mod vcs_cmds;
+mod vcs_ext_cmds;
+pub mod vcs_merge;
 mod view_cmds;
 mod watch;
 mod window_cmds;
@@ -97,6 +115,10 @@ pub enum Effect {
     FocusEditor,
     /// Open a URL in the browser.
     OpenUrl(String),
+    /// Open a path in a new project window (its own session).
+    OpenProjectWindow(PathBuf),
+    /// Focus the next (+1) or previous (-1) project window.
+    SwitchProjectWindow(i32),
 }
 
 /// State of the language server connection, for the status bar.
@@ -146,6 +168,20 @@ pub struct Session {
     pub testing: testing::TestingState,
     /// Refactoring previews and hierarchies (M7).
     pub refactor: refactor::RefactorState,
+    /// Live templates, choosers, navigation bar, column mode, soft-wrap geometry (M3b).
+    pub editing: editing::EditingState,
+    /// Line bookmarks (track X).
+    pub bookmarks: bookmarks::BookmarksState,
+    /// The TODO tool window's scan (track X).
+    pub todo: todo::TodoState,
+    /// Local History snapshots and window (track X).
+    pub local_history: local_history::LocalHistoryState,
+    /// Scratch files (track X).
+    pub scratch: scratch::ScratchState,
+    /// Settings dialog draft and Quick Switch Scheme (M8).
+    pub prefs: settings::PrefsState,
+    /// User run configurations and the Edit Configurations dialog (M8).
+    pub run_store: run_config_store::RunConfigStore,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -192,6 +228,13 @@ impl Session {
             feedback: feedback::FeedbackState::default(),
             testing: testing::TestingState::default(),
             refactor: refactor::RefactorState::default(),
+            editing: editing::EditingState::default(),
+            bookmarks: bookmarks::BookmarksState::default(),
+            todo: todo::TodoState::default(),
+            local_history: local_history::LocalHistoryState::default(),
+            scratch: scratch::ScratchState::default(),
+            prefs: settings::PrefsState::default(),
+            run_store: run_config_store::RunConfigStore::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -213,6 +256,8 @@ impl Session {
         (spec.enabled)(self).map_err(CommandError::Disabled)?;
         let run = spec.run;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self, params)));
+        // Other views of an edited document follow the edit (split editors).
+        self.ws.sync_views();
         match result {
             Ok(r) => r,
             Err(payload) => {
@@ -251,6 +296,10 @@ impl Session {
         changed |= watch::pump(self);
         changed |= testing::pump(self);
         changed |= refactor::pump(self);
+        changed |= bookmarks::pump(self);
+        changed |= todo::pump(self);
+        changed |= local_history::pump(self);
+        self.ws.sync_views();
         changed
     }
 
@@ -264,6 +313,7 @@ impl Session {
             || self.db.busy()
             || self.debug.busy()
             || self.vcs.busy()
+            || self.testing.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -330,6 +380,7 @@ impl Session {
             if let Some(path) = path {
                 self.last_edit = Some(Location { path, offset: head });
             }
+            editing::after_edit(self, eid, &edit.changes);
             self.after_text_change(eid);
         }
         Ok(true)
@@ -434,6 +485,7 @@ impl Session {
         let mut saved = 0usize;
         let mut errors = Vec::new();
         let mut saved_paths = Vec::new();
+        local_history::before_save(self);
         for od in self.ws.docs_mut() {
             let Some(path) = od.path.clone() else { continue };
             if !od.doc.is_modified() {
@@ -452,6 +504,7 @@ impl Session {
         for p in &saved_paths {
             self.lsp_did_save(p);
         }
+        local_history::after_save(self, &saved_paths);
         if !errors.is_empty() {
             let msg = errors.join("\n");
             self.notify(NotificationLevel::Error, "Cannot save files", msg.clone());

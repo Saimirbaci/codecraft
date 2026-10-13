@@ -1,10 +1,13 @@
 //! Window chrome: menu bar, main toolbar, status bar, welcome screen, editor tabs and find bar.
 
-use egui::{Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, RichText, Sense, Stroke, TextEdit, vec2};
+use egui::{
+    Align, Color32, CornerRadius, FontId, Frame, Key, Layout, Margin, Rect, RichText, Sense, Stroke, TextEdit, pos2,
+    vec2,
+};
 use serde_json::{Value, json};
 
 use codecraft_engine::{LspStatus, Session};
-use codecraft_workspace::Severity;
+use codecraft_workspace::{EditorId, GroupId, Severity, SplitAxis, SplitNode};
 
 use crate::{PersistedState, UiState, editor, menus, run_command};
 
@@ -103,12 +106,18 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     if cargo { "cargo run".into() } else { "Current File".into() }
                 });
                 let mut selected = s.selected_run_config;
+                let mut edit = false;
                 egui::ComboBox::from_id_salt("run-config").selected_text(current).width(180.0).show_ui(ui, |ui| {
                     for (i, c) in s.run_configs.iter().enumerate() {
                         ui.selectable_value(&mut selected, i, &c.name);
                     }
+                    ui.separator();
+                    edit = ui.add_enabled(has_project, egui::Button::new("Edit Configurations…")).clicked();
                 });
                 s.selected_run_config = selected;
+                if edit {
+                    run_command(s, st, "run.editConfigurations", &Value::Null);
+                }
             });
         });
     });
@@ -276,32 +285,45 @@ pub fn welcome(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, persisted: 
     });
 }
 
-/// Editor tabs, find bar and the active editor.
+/// The editor groups (split editors), each with its tab bar; the focused group also gets the
+/// find bar and the database console toolbar.
 pub fn editor_area(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     egui::CentralPanel::default().frame(Frame::new().fill(st.theme.editor_bg)).show(ui, |ui| {
-        tabs(ui, s, st);
-        if s.find_bar.is_some() {
-            find_bar(ui, s, st);
-        } else {
-            st.find_bar_was_open = false;
+        let area = ui.available_rect_before_wrap();
+        ui.advance_cursor_after_rect(area);
+        let mut groups = Vec::new();
+        let mut splitters = Vec::new();
+        layout_groups(s.ws.split_layout(), area, &mut 0, &mut groups, &mut splitters);
+        for sp in &splitters {
+            splitter(ui, s, st, sp);
         }
-        crate::database_panel::console_toolbar(ui, s, st);
-        match s.ws.active_editor {
-            Some(eid) => editor::show(ui, s, st, eid),
-            None => {
-                ui.centered_and_justified(|ui| {
-                    let hints = [
-                        ("Search Everywhere", "Double ⇧"),
-                        ("Go to File", "⇧⌘O"),
-                        ("Recent Files", "⌘E"),
-                        ("Navigation Bar", "⌘↑"),
-                        ("Drop files here to open them", ""),
-                    ];
-                    let text = hints.iter().map(|(a, b)| format!("{a}   {b}")).collect::<Vec<_>>().join("\n\n");
-                    ui.label(RichText::new(text).color(st.theme.text_muted).size(14.0));
-                });
-            }
+        // A press inside another group focuses it before its editor turns the press into commands
+        // (not a press on a popup or window floating over it).
+        let press = ui.input(|i| {
+            if i.pointer.primary_pressed() || i.pointer.secondary_pressed() { i.pointer.interact_pos() } else { None }
+        });
+        if let Some(pos) = press
+            && ui.ctx().layer_id_at(pos) == Some(ui.layer_id())
+            && let Some((g, _)) = groups.iter().find(|(_, r)| r.contains(pos))
+            && *g != s.ws.focused_group()
+        {
+            run_command(s, st, "window.editorTabs.focusGroup", &json!({ "group": g.0 }));
         }
+        let focused = s.ws.focused_group();
+        let split = groups.len() > 1;
+        let mut tab_bars = Vec::new();
+        // The focused group last, so the caret position popups use is its editor's.
+        groups.sort_by_key(|(g, _)| *g == focused);
+        for (g, rect) in &groups {
+            let bar = ui
+                .scope_builder(egui::UiBuilder::new().max_rect(*rect).id_salt(("editor-group", g.0)), |ui| {
+                    ui.set_clip_rect(rect.intersect(ui.clip_rect()));
+                    group(ui, s, st, *g, *g == focused, split)
+                })
+                .inner;
+            tab_bars.push((*g, *rect, bar));
+        }
+        tab_drop(ui, s, st, &tab_bars);
     });
     // Files dropped on the window open in editors.
     let dropped: Vec<std::path::PathBuf> =
@@ -311,18 +333,176 @@ pub fn editor_area(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
 }
 
-fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+/// A splitter between two groups: `index` in pre-order (as the workspace numbers them).
+struct Splitter {
+    index: usize,
+    axis: SplitAxis,
+    outer: Rect,
+    divider: Rect,
+}
+
+const SPLITTER_W: f32 = 5.0;
+
+fn layout_groups(
+    node: &SplitNode,
+    rect: Rect,
+    next: &mut usize,
+    groups: &mut Vec<(GroupId, Rect)>,
+    splitters: &mut Vec<Splitter>,
+) {
+    match node {
+        SplitNode::Group(g) => groups.push((*g, rect)),
+        SplitNode::Split { axis, ratio, first, second } => {
+            let index = *next;
+            *next += 1;
+            let half = SPLITTER_W / 2.0;
+            let (a, b, divider) = match axis {
+                SplitAxis::Horizontal => {
+                    let x = rect.left() + rect.width() * ratio;
+                    (
+                        Rect::from_min_max(rect.min, pos2(x - half, rect.bottom())),
+                        Rect::from_min_max(pos2(x + half, rect.top()), rect.max),
+                        Rect::from_min_max(pos2(x - half, rect.top()), pos2(x + half, rect.bottom())),
+                    )
+                }
+                SplitAxis::Vertical => {
+                    let y = rect.top() + rect.height() * ratio;
+                    (
+                        Rect::from_min_max(rect.min, pos2(rect.right(), y - half)),
+                        Rect::from_min_max(pos2(rect.left(), y + half), rect.max),
+                        Rect::from_min_max(pos2(rect.left(), y - half), pos2(rect.right(), y + half)),
+                    )
+                }
+            };
+            splitters.push(Splitter { index, axis: *axis, outer: rect, divider });
+            layout_groups(first, a, next, groups, splitters);
+            layout_groups(second, b, next, groups, splitters);
+        }
+    }
+}
+
+/// Draw a splitter and let the user drag it (pure view state: the ratio is set directly).
+fn splitter(ui: &mut egui::Ui, s: &mut Session, st: &UiState, sp: &Splitter) {
+    let resp = ui.interact(sp.divider, egui::Id::new(("editor-splitter", sp.index)), Sense::drag());
+    let horizontal = sp.axis == SplitAxis::Horizontal;
+    if resp.hovered() || resp.dragged() {
+        ui.ctx().set_cursor_icon(if horizontal {
+            egui::CursorIcon::ResizeHorizontal
+        } else {
+            egui::CursorIcon::ResizeVertical
+        });
+    }
+    if resp.dragged()
+        && let Some(pos) = resp.interact_pointer_pos()
+    {
+        let ratio = if horizontal {
+            (pos.x - sp.outer.left()) / sp.outer.width().max(1.0)
+        } else {
+            (pos.y - sp.outer.top()) / sp.outer.height().max(1.0)
+        };
+        s.ws.set_split_ratio(sp.index, ratio);
+    }
+    let color = if resp.dragged() { st.theme.accent } else { st.theme.border };
+    ui.painter().rect_filled(sp.divider, CornerRadius::ZERO, st.theme.panel_bg);
+    let c = sp.divider.center();
+    if horizontal {
+        ui.painter().vline(c.x, sp.divider.y_range(), Stroke::new(1.0, color));
+    } else {
+        ui.painter().hline(sp.divider.x_range(), c.y, Stroke::new(1.0, color));
+    }
+}
+
+/// One group: tab bar, (focused only) find bar and console toolbar, then the editor.
+/// Returns the tab bar's rect and its tabs' rects (for dropping dragged tabs).
+fn group(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focused: bool, split: bool) -> TabBar {
+    let bar = tabs(ui, s, st, g, focused, split);
+    if focused {
+        if s.find_bar.is_some() {
+            find_bar(ui, s, st);
+        } else {
+            st.find_bar_was_open = false;
+        }
+        crate::database_panel::console_toolbar(ui, s, st);
+    }
+    match s.ws.group(g).and_then(|gr| gr.active) {
+        Some(eid) => editor::show(ui, s, st, eid),
+        None => {
+            ui.centered_and_justified(|ui| {
+                let hints = [
+                    ("Search Everywhere", "Double ⇧"),
+                    ("Go to File", "⇧⌘O"),
+                    ("Recent Files", "⌘E"),
+                    ("Navigation Bar", "⌘↑"),
+                    ("Drop files here to open them", ""),
+                ];
+                let text = hints.iter().map(|(a, b)| format!("{a}   {b}")).collect::<Vec<_>>().join("\n\n");
+                ui.label(RichText::new(text).color(st.theme.text_muted).size(14.0));
+            });
+        }
+    }
+    bar
+}
+
+struct TabBar {
+    rect: Rect,
+    tabs: Vec<(EditorId, Rect)>,
+}
+
+/// Finish a tab drag: dropping on another group (its tab bar or editor) moves the tab there;
+/// dropping on a tab bar inserts it at that position.
+fn tab_drop(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, bars: &[(GroupId, Rect, TabBar)]) {
+    let ctx = ui.ctx().clone();
+    let Some(dragged) = egui::DragAndDrop::payload::<EditorId>(&ctx) else { return };
+    let Some(pos) = ctx.pointer_latest_pos() else { return };
+    let Some((g, rect, bar)) = bars.iter().find(|(_, r, _)| r.contains(pos)) else { return };
+    let same_group = s.ws.group_of(*dragged) == Some(*g);
+    let index = if bar.rect.contains(pos) {
+        bar.tabs.iter().position(|(_, r)| pos.x < r.center().x).unwrap_or(bar.tabs.len())
+    } else if same_group {
+        return;
+    } else {
+        usize::MAX
+    };
+    // Where it would land.
+    let marker = if bar.rect.contains(pos) {
+        let x = bar.tabs.get(index).map(|(_, r)| r.left()).or_else(|| bar.tabs.last().map(|(_, r)| r.right()));
+        x.map(|x| Rect::from_min_max(pos2(x - 1.0, bar.rect.top()), pos2(x + 1.0, bar.rect.bottom())))
+    } else {
+        Some(*rect)
+    };
+    if let Some(m) = marker {
+        let fill = st.theme.accent.gamma_multiply(if m.width() > 4.0 { 0.12 } else { 1.0 });
+        ui.painter().rect_filled(m, CornerRadius::ZERO, fill);
+    }
+    if ui.input(|i| i.pointer.any_released())
+        && let Some(id) = egui::DragAndDrop::take_payload::<EditorId>(&ctx)
+    {
+        // Within one bar, dropping right of itself means one slot further left once it is removed.
+        let index = match s.ws.group(*g).and_then(|gr| gr.tabs.iter().position(|t| *t == *id)) {
+            Some(from) if same_group && index > from => index - 1,
+            _ => index,
+        };
+        let index = if index == usize::MAX { Value::Null } else { json!(index) };
+        run_command(s, st, "window.editorTabs.moveTab", &json!({ "editor": id.0, "group": g.0, "index": index }));
+    }
+}
+
+fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focused: bool, split: bool) -> TabBar {
     let theme = st.theme.clone();
-    Frame::new().fill(theme.panel_bg).inner_margin(Margin::symmetric(4, 0)).show(ui, |ui| {
+    let tab_ids: Vec<EditorId> = s.ws.group(g).map(|gr| gr.tabs.clone()).unwrap_or_default();
+    let active_tab = s.ws.group(g).and_then(|gr| gr.active);
+    let mut rects = Vec::new();
+    let frame = Frame::new().fill(theme.panel_bg).inner_margin(Margin::symmetric(4, 0)).show(ui, |ui| {
         ui.set_height(32.0);
-        egui::ScrollArea::horizontal().id_salt("editor-tabs").show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::ScrollArea::horizontal().id_salt(("editor-tabs", g.0)).show(ui, |ui| {
             ui.horizontal_centered(|ui| {
                 let mut activate = None;
                 let mut close = None;
-                for id in s.ws.tabs.clone() {
+                for id in tab_ids {
                     let Some(e) = s.ws.editor(id) else { continue };
                     let Some(d) = s.ws.doc(e.doc) else { continue };
-                    let active = s.ws.active_editor == Some(id);
+                    let active = active_tab == Some(id);
                     let has_errors = d
                         .path
                         .as_deref()
@@ -344,11 +524,18 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     let text = RichText::new(title).size(13.0).color(color);
                     let text = if has_errors { text.underline() } else { text };
                     let resp = ui
-                        .add(egui::Button::new(text).frame(false).min_size(vec2(60.0, 28.0)))
+                        .add(
+                            egui::Button::new(text)
+                                .frame(false)
+                                .min_size(vec2(60.0, 28.0))
+                                .sense(Sense::click_and_drag()),
+                        )
                         .on_hover_text(d.path.as_deref().map(|p| p.display().to_string()).unwrap_or_default());
+                    resp.dnd_set_drag_payload(id);
                     if active {
                         let r = resp.rect;
-                        ui.painter().hline(r.x_range(), r.bottom() + 1.0, Stroke::new(2.0, theme.accent));
+                        let accent = if focused { theme.accent } else { theme.text_muted };
+                        ui.painter().hline(r.x_range(), r.bottom() + 1.0, Stroke::new(2.0, accent));
                     }
                     if resp.clicked() {
                         activate = Some(id);
@@ -361,15 +548,27 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                             close = Some(id);
                             ui.close();
                         }
-                        for (cmd, label) in [
+                        let mut items = vec![
                             ("window.editorTabs.closeOtherTabs", "Close Other Tabs"),
                             ("window.editorTabs.closeAllTabs", "Close All Tabs"),
                             ("window.editorTabs.closeTabsToTheLeft", "Close Tabs to the Left"),
                             ("window.editorTabs.closeTabsToTheRight", "Close Tabs to the Right"),
                             ("window.editorTabs.pinTab", "Pin Tab"),
-                        ] {
-                            if ui.button(label).clicked() {
-                                s.ws.active_editor = Some(id);
+                            ("---", ""),
+                            ("window.editorTabs.splitRight", "Split Right"),
+                            ("window.editorTabs.splitDown", "Split Down"),
+                            ("window.editorTabs.splitAndMoveRight", "Split and Move Right"),
+                            ("window.editorTabs.splitAndMoveDown", "Split and Move Down"),
+                        ];
+                        if split {
+                            items.push(("window.editorTabs.unsplit", "Unsplit"));
+                            items.push(("window.editorTabs.unsplitAll", "Unsplit All"));
+                        }
+                        for (cmd, label) in items {
+                            if cmd == "---" {
+                                ui.separator();
+                            } else if ui.button(label).clicked() {
+                                s.ws.set_active_editor(id);
                                 run_command(s, st, cmd, &Value::Null);
                                 ui.close();
                             }
@@ -381,6 +580,7 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     if x.clicked() {
                         close = Some(id);
                     }
+                    rects.push((id, resp.rect.union(x.rect)));
                     ui.add_space(6.0);
                 }
                 if let Some(id) = activate {
@@ -392,6 +592,7 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             });
         });
     });
+    TabBar { rect: frame.response.rect, tabs: rects }
 }
 
 fn find_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
