@@ -13,6 +13,7 @@
 )]
 
 mod agent_cmds;
+pub mod appearance;
 mod bookmark_cmds;
 pub mod bookmarks;
 pub mod agents;
@@ -66,6 +67,7 @@ pub mod session_store;
 pub mod settings;
 mod settings_cmds;
 pub mod snippet;
+pub mod paste;
 mod split_cmds;
 pub mod structure;
 pub mod templates;
@@ -78,6 +80,9 @@ pub mod vcs;
 mod vcs_cmds;
 mod vcs_ext_cmds;
 pub mod vcs_merge;
+pub mod usages;
+mod folding;
+mod tool_window_cmds;
 mod view_cmds;
 mod watch;
 mod window_cmds;
@@ -128,6 +133,8 @@ pub enum Effect {
     OpenProjectWindow(PathBuf),
     /// Focus the next (+1) or previous (-1) project window.
     SwitchProjectWindow(i32),
+    /// Enter (true) or leave (false) full screen (View › Appearance).
+    SetFullScreen(bool),
 }
 
 /// State of the language server connection, for the status bar.
@@ -199,6 +206,12 @@ pub struct Session {
     pub misc: misc::MiscState,
     /// Session save/restore switches (M10 track A; off unless the app turns it on).
     pub session_store: session_store::SessionStore,
+    /// View › Appearance modes, Zoom IDE popup, Memory Indicator (M10 track G).
+    pub appearance: appearance::AppearanceState,
+    /// Edit › Paste › Paste from History… ring (M10 track G).
+    pub clip_history: paste::ClipHistory,
+    /// Highlighted usages, recent Find Usages and the Find Usages Settings dialog (M10 track G).
+    pub usages: usages::UsagesState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -256,6 +269,9 @@ impl Session {
             run_store: run_config_store::RunConfigStore::default(),
             misc: misc::MiscState::default(),
             session_store: session_store::SessionStore::default(),
+            appearance: appearance::AppearanceState::default(),
+            clip_history: paste::ClipHistory::default(),
+            usages: usages::UsagesState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -324,6 +340,7 @@ impl Session {
         changed |= inspections::pump(self);
         changed |= inspections::fixes::pump(self);
         changed |= misc::pump(self);
+        changed |= appearance::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed

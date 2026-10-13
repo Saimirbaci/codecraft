@@ -10,6 +10,7 @@
 )]
 
 mod agent_panel;
+mod appearance_ui;
 mod approvals_ui;
 mod bookmarks_panel;
 mod chrome;
@@ -102,6 +103,9 @@ pub struct UiState {
     pub(crate) window_requests: Vec<project_windows::Request>,
     /// A picked project waiting for This Window / New Window.
     pub(crate) open_choice: Option<PathBuf>,
+    /// The window's full-screen state last reported by the platform (changes made outside
+    /// CodeCraft, like the green button, are copied into the session).
+    pub(crate) viewport_full_screen: Option<bool>,
 }
 
 impl UiState {
@@ -138,8 +142,22 @@ impl UiState {
             window_sizes: Default::default(),
             window_requests: Vec::new(),
             open_choice: None,
+            viewport_full_screen: None,
         }
     }
+}
+
+/// Params a command run from a key or a menu click needs from the platform: Paste as Plain Text
+/// pastes the system clipboard.
+pub(crate) fn platform_params(id: &str) -> Value {
+    #[cfg(target_os = "macos")]
+    if codecraft_engine::registry().canonical(id) == "edit.paste.pasteAsPlainText"
+        && let Some(text) = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok())
+    {
+        return json!({ "text": text.replace("\r\n", "\n") });
+    }
+    let _ = id;
+    Value::Null
 }
 
 /// Run a command, reporting failures in the status bar (never panics).
@@ -339,7 +357,11 @@ impl App {
         }
 
         // Bookmark, scratch and Local History dialogs read their keys themselves.
-        if bookmarks_panel::wants_keyboard(s) || history_ui::wants_keyboard(s) || misc_ui::wants_keyboard(s) {
+        if bookmarks_panel::wants_keyboard(s)
+            || history_ui::wants_keyboard(s)
+            || misc_ui::wants_keyboard(s)
+            || appearance_ui::wants_keyboard(s)
+        {
             return;
         }
 
@@ -391,7 +413,7 @@ impl App {
                 if sc.has_command_modifier() {
                     consumed_text = true;
                 }
-                run_command(s, st, id, &Value::Null);
+                run_command(s, st, id, &platform_params(id));
             }
         }
         if !editor_focused {
@@ -407,7 +429,7 @@ impl App {
                 }
                 Event::Copy => run_command(s, st, "edit.copy", &Value::Null),
                 Event::Cut => run_command(s, st, "edit.cut", &Value::Null),
-                Event::Paste(t) => run_command(s, st, "edit.paste", &json!({ "text": t })),
+                Event::Paste(t) => run_command(s, st, "edit.paste.paste", &json!({ "text": t })),
                 _ => {}
             }
         }
@@ -444,6 +466,7 @@ impl App {
                 Effect::OpenUrl(url) => ctx.open_url(egui::OpenUrl::new_tab(url)),
                 Effect::OpenProjectWindow(p) => st.window_requests.push(project_windows::Request::Open(p)),
                 Effect::SwitchProjectWindow(d) => st.window_requests.push(project_windows::Request::Switch(d)),
+                Effect::SetFullScreen(on) => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on)),
             }
         }
     }
@@ -463,6 +486,7 @@ impl App {
     pub(crate) fn window_logic(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         // Theme, colour scheme, UI font size and keymap follow the settings.
         settings_ui::sync(ctx, s, st);
+        appearance_ui::sync(ctx, s, st);
         // Window focus: RustRover saves on deactivation and synchronizes on activation.
         let focus_changes: Vec<bool> = ctx.input(|i| {
             i.events.iter().filter_map(|e| if let Event::WindowFocused(f) = e { Some(*f) } else { None }).collect()
@@ -494,16 +518,27 @@ impl App {
         persisted: &PersistedState,
         menu_bar: bool,
     ) {
+        // View › Appearance decides which bars show.
+        let bars = codecraft_engine::appearance::chrome(s);
         if menu_bar {
             chrome::menu_bar(ui, s, st);
         }
-        chrome::toolbar(ui, s, st);
-        chrome::status_bar(ui, s, st);
+        if bars.toolbar {
+            chrome::toolbar(ui, s, st);
+        }
+        if bars.status_bar {
+            chrome::status_bar(ui, s, st);
+        }
         if s.ws.project.is_none() && s.ws.tabs().is_empty() {
             chrome::welcome(ui, s, st, persisted);
         } else {
-            panels::stripes(ui, s, st);
+            if bars.stripes {
+                panels::stripes(ui, s, st);
+            }
             panels::side_panels(ui, s, st);
+            if bars.navigation_top {
+                chrome::navigation_bar_top(ui, s, st);
+            }
             chrome::editor_area(ui, s, st);
         }
         popups::show(ui, s, st);
@@ -517,6 +552,7 @@ impl App {
         history_ui::windows(ui, s, st);
         inspections_ui::windows(ui, s, st);
         misc_ui::windows(ui, s, st);
+        appearance_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         windows::capture(ui.ctx(), st);
@@ -543,7 +579,7 @@ fn is_text_editing_command(id: &str) -> bool {
         id,
         "edit.copy"
             | "edit.cut"
-            | "edit.paste"
+            | "edit.paste.paste"
             | "edit.selectAll"
             | "edit.undo"
             | "edit.redo"

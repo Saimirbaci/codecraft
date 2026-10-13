@@ -57,7 +57,7 @@ fn skip(id: &str, params: &Value) -> bool {
             "run.run"
                 | "run.rerun"
                 | "run.contextConfiguration"
-                | "code.reformatCargoProjectWithRustfmt"
+                | "tools.rust.reformatCargoProjectWithRustfmt"
                 | "run.runWithCoverage"
                 | "test.rerun"
                 | "test.rerunFailed"

@@ -247,7 +247,9 @@ pub fn show_popups(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             .fixed_pos(anchor + vec2(0.0, 4.0))
             .show(&ctx, |ui| {
                 popup_frame(st).show(ui, |ui| {
-                    ui.set_width(340.0);
+                    // Clipboard previews and search titles need room; their detail goes right.
+                    let wide = matches!(c.kind, ChooserKind::PasteFromHistory | ChooserKind::RecentFindUsages);
+                    ui.set_width(if wide { 520.0 } else { 340.0 });
                     ui.label(RichText::new(&c.title).strong());
                     if c.kind != ChooserKind::UnwrapRemove {
                         let resp = ui.add(
@@ -280,9 +282,14 @@ pub fn show_popups(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                                 st.theme.text,
                             );
                             if !item.detail.is_empty() {
+                                let (x, align) = if wide {
+                                    (rect.right() - 6.0, Align2::RIGHT_CENTER)
+                                } else {
+                                    (rect.left() + 120.0, Align2::LEFT_CENTER)
+                                };
                                 ui.painter().text(
-                                    pos2(rect.left() + 120.0, rect.center().y),
-                                    Align2::LEFT_CENTER,
+                                    pos2(x, rect.center().y),
+                                    align,
                                     &item.detail,
                                     FontId::proportional(12.0),
                                     st.theme.text_muted,

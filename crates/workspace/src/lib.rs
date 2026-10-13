@@ -156,6 +156,64 @@ pub struct Settings {
     pub preview_tab: bool,
     /// Window › Processes › Auto Show: open the Processes window when a background task starts.
     pub processes_auto_show: bool,
+    /// View › Appearance › Compact Mode: tighter spacing, lower toolbar and status bar.
+    pub compact_mode: bool,
+    /// View › Appearance › Zoom IDE: scale of the whole UI (1.0 = 100%).
+    pub ide_zoom: f32,
+    /// Editor font size in View › Appearance › Enter Presentation Mode.
+    pub presentation_font_size: f32,
+    /// View › Appearance › Toolbar.
+    pub show_toolbar: bool,
+    /// View › Appearance › Navigation Bar placement.
+    pub navigation_bar: NavigationBar,
+    /// View › Appearance › Navigation Bar › Show Members: the symbol at the caret ends the path.
+    pub navigation_bar_members: bool,
+    /// View › Appearance › Tool Window Bars (the stripes with the tool window buttons).
+    pub show_tool_window_bars: bool,
+    /// View › Appearance › Status Bar.
+    pub show_status_bar: bool,
+    /// View › Appearance › Status Bar Widgets: visibility by widget key (`lineColumnNumber`, …);
+    /// a missing key uses the widget's default.
+    pub status_bar_widgets: BTreeMap<String, bool>,
+    /// Edit › Find Usages › Find Usages Settings….
+    pub find_usages: FindUsagesOptions,
+}
+
+/// Where View › Appearance › Navigation Bar shows the path of the active file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationBar {
+    /// A bar above the editor.
+    Top,
+    /// The left part of the status bar (RustRover's New UI default).
+    #[default]
+    InStatusBar,
+    Hidden,
+}
+
+/// Which usages Find Usages lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageScope {
+    #[default]
+    Project,
+    /// Only the file the search started in.
+    CurrentFile,
+}
+
+/// Edit › Find Usages › Find Usages Settings….
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FindUsagesOptions {
+    pub scope: UsageScope,
+    /// Keep usages in test code (`tests/` directories, `*_test.*`/`test_*.*` files).
+    pub include_tests: bool,
+}
+
+impl Default for FindUsagesOptions {
+    fn default() -> Self {
+        Self { scope: UsageScope::Project, include_tests: true }
+    }
 }
 
 /// Which whitespace the editor paints while Show Whitespaces is on.
@@ -221,6 +279,16 @@ impl Default for Settings {
             editor_tab_limit: 0,
             preview_tab: true,
             processes_auto_show: false,
+            compact_mode: false,
+            ide_zoom: 1.0,
+            presentation_font_size: 24.0,
+            show_toolbar: true,
+            navigation_bar: NavigationBar::InStatusBar,
+            navigation_bar_members: true,
+            show_tool_window_bars: true,
+            show_status_bar: true,
+            status_bar_widgets: BTreeMap::new(),
+            find_usages: FindUsagesOptions::default(),
         }
     }
 }

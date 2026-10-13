@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use codecraft_lsp::lsp_types as lt;
 use codecraft_lsp::{LspClient, RequestId, ResponseError, ServerConfig, ServerEvent, ServerKind};
 use codecraft_syntax::Language;
-use codecraft_workspace::{BackgroundTask, DocId, EditorId, FindResults, NotificationLevel, ToolWindowId};
+use codecraft_workspace::{BackgroundTask, DocId, EditorId, NotificationLevel};
 
 use crate::convert::{self, utf16_col_to_char};
 use crate::popup::{ActionItem, LocationItem, StructureItem, SymbolItem};
@@ -50,6 +50,8 @@ pub(crate) enum Pending {
     Refactor(crate::refactor::RefactorPending),
     /// Completion resolve, Type-Matching's expected type, in-place rename (M10 B); errors are routed too.
     Lookup(crate::completion::LookupPending),
+    /// Show Usages and Find/Highlight Usages in File (M10 G); errors are routed too.
+    Usages(crate::usages::UsagesPending),
 }
 
 /// One running language server.
@@ -806,6 +808,7 @@ impl Session {
             Pending::InlayHints { doc, revision } => return self.on_inlay_hints(doc, revision, result.ok()),
             Pending::Refactor(p) => return crate::refactor::on_response(self, p, result),
             Pending::Lookup(p) => return crate::completion::on_response(self, p, result),
+            Pending::Usages(p) => return crate::usages::on_response(self, p, result),
             _ => {}
         }
         let value = match result {
@@ -872,7 +875,11 @@ impl Session {
                 crate::editing_cmds::on_organize_imports(self, doc, revision, value)
             }
             // Handled before the error check above.
-            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } | Pending::Refactor(_) | Pending::Lookup(_) => {}
+            Pending::SemanticTokens { .. }
+            | Pending::InlayHints { .. }
+            | Pending::Refactor(_)
+            | Pending::Lookup(_)
+            | Pending::Usages(_) => {}
         }
     }
 
@@ -902,7 +909,7 @@ impl Session {
     }
 
     /// Line text of a file (from the open document, else disk).
-    fn line_of(&self, path: &Path, line: usize) -> String {
+    pub(crate) fn line_of(&self, path: &Path, line: usize) -> String {
         if let Some(id) = self.ws.doc_by_path(path)
             && let Some(d) = self.ws.doc(id)
         {
@@ -914,7 +921,7 @@ impl Session {
             .unwrap_or_default()
     }
 
-    fn location_item(&self, path: &Path, range: &lt::Range) -> LocationItem {
+    pub(crate) fn location_item(&self, path: &Path, range: &lt::Range) -> LocationItem {
         let text = self.line_of(path, range.start.line as usize);
         LocationItem {
             path: path.to_path_buf(),
@@ -995,9 +1002,7 @@ impl Session {
             });
         }
         matches.sort_by(|a, b| (&a.path, a.line, a.column).cmp(&(&b.path, b.line, b.column)));
-        self.status = format!("{} usage(s) found", matches.len());
-        self.ws.find = Some(FindResults { title, matches, ..FindResults::default() });
-        self.ws.layout.show(ToolWindowId::Find);
+        crate::usages::show_find_results(self, title, matches);
     }
 
     /// Re-filter the completion list against the identifier typed since the anchor; closes it

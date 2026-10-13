@@ -64,6 +64,10 @@ pub enum ChooserKind {
     UnwrapRemove,
     /// The values of an LSP snippet choice placeholder (`${1|a,b|}`).
     SnippetChoice,
+    /// Edit › Paste › Paste from History… (the key is the history index).
+    PasteFromHistory,
+    /// Edit › Find Usages › Recent Find Usages (the key is the search's index).
+    RecentFindUsages,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

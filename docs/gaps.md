@@ -136,8 +136,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 14. ~~No file watching~~ (M3: FSEvents/inotify watcher reloads unmodified files and refreshes the tree and Git).
 15. ~~Reformat with rustfmt replaces the whole document~~ (M4, 2026-10-13: only changed lines are
     replaced and carets keep their token through whitespace changes).
-16. Lazily filled RustRover submenus (Tools › Rust, Edit › Find Usages, Code › Folding…) were not
-    captured by the menu observation. Open each menu in RustRover and re-run the dump.
+16. ~~Lazily filled RustRover submenus (Tools › Rust, Edit › Find Usages, Code › Folding…) were not
+    captured by the menu observation~~ (2026-10-13: captured, and every core item is live; see 27).
+    Still empty: View › Active Editor, Git › Current File and Run › Test History (they need an
+    open editor or test runs in RustRover), so their items stay in the shell's EXTRA table.
 
 ## Low
 
@@ -272,3 +274,42 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Code does not reorder items inside `impl`/`mod` bodies and refuses files with item-level
     macro invocations; Analyze Stack Trace has no thread-dump view (Java-style dumps are plain
     text) and opens in its own window instead of a Run tool window tab.
+
+## M10 newly observed menus (2026-10-13)
+
+27. The items of RustRover's lazily filled submenus are live (track G); core menu parity is
+    192/192. Commands that existed under our own ids now use the catalog id and keep the old one
+    as an alias (`commands::ALIASES`; `Registry::get`, `execute`, `enabled`, shortcuts and saved
+    keymap overrides resolve it): `edit.paste` → `edit.paste.paste`, `edit.bookmarks.next/
+    previous/show/gotoMnemonic` → `…nextLineBookmark/previousLineBookmark/showLineBookmarks/
+    goToMnemonic`, `run.debuggingActions.resume/pause` → `resumeProgram/pauseAllPrograms`,
+    `code.folding.toggle` → `toggleFolding`, `code.reformat{File,CargoProject}WithRustfmt` →
+    `tools.rust.…` (the Code menu's items resolve to them), `view.hideAllToolWindows` →
+    `window.activeToolWindow.hideAllWindows`; the menus' EXTRA entries they duplicated are gone.
+    New: Edit › Paste › Paste from History… (a 100-entry ring of copies, cuts and outside pastes
+    in a chooser at the caret) and Paste as Plain Text (never whole-line); Edit › Find Usages ›
+    Show Usages (popup), Find Usages in File and Highlight Usages in File (`documentHighlight`,
+    else the identifier's whole-word occurrences; highlights stay until Escape or an edit),
+    Next/Previous Highlighted Usage, Recent Find Usages (the last 10 searches) and Find Usages
+    Settings… (project or current file, include test code; applied to Find Usages);
+    View › Appearance: Presentation Mode (editor font `presentation_font_size`, bars and tool
+    windows hidden, full screen), Distraction Free Mode, Full Screen, Zen Mode, Compact Mode,
+    Zoom IDE… (whole-UI zoom 50–300% with a −/+/Reset popup), Toolbar, Navigation Bar (Top, In
+    Status Bar, Don't Show, Show Members), Tool Window Bars, Status Bar and the 17 Status Bar
+    Widgets (persistent toggles; painted: status text, Rust external linter, line:column, language
+    services, line separator, encoding, Power Save, column selection mode, indentation, Git branch,
+    read-only, memory indicator); menus show checkmarks and "Exit …"/"Current: N%" labels in both
+    menu bars; Code › Folding: Expand/Collapse Recursively, Expand (All) to Level 1–5, Expand/
+    Collapse Doc Comments, Fold Selection / Remove Region, Fold Code Block; Run › Debugging
+    Actions: Resume/Pause/Stop All Programs, Force Step Over, Smart Step Into, Force Run to
+    Cursor, Show Execution Point; Window › Active Tool Window › Hide Active Tool Window, Hide Side
+    Tool Windows, Jump to Last Tool Window; Window › Notifications › Close First/Close All.
+    Window › Merge All Project Windows is out of scope (macOS window tabs; project windows are
+    egui viewports). Remaining: no inline (single-line) folds for Fold Selection, and folds stay on
+    their start lines when lines are inserted above; Force Step Over / Smart Step Into / Force Run
+    to Cursor do the plain step (DAP cannot ignore breakpoints, lldb-dap has no step-in targets);
+    File System Sync, Aggregator, Grid Position, JSON Schema and Rust Resolve Context widgets are
+    toggles without a widget; Find Usages' test filter goes by path (not `#[cfg(test)]` modules);
+    the "All Programs" actions act on the one debug session CodeCraft runs; Active Tool Window's
+    tab, maximize and resize actions, Layouts, Tasks & Contexts, Reset Frame and Compile and
+    Reload Modified Files are not implemented.

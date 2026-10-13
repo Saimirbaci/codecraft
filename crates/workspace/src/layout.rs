@@ -163,6 +163,9 @@ pub struct Layout {
     pub tool_sizes: BTreeMap<String, f32>,
     /// Distraction-free: hide all tool windows (Cmd+Shift+F12, "Hide All Tool Windows").
     pub all_hidden: bool,
+    /// The tool window shown last (Window › Active Tool Window acts on it).
+    #[serde(default)]
+    pub last_active: Option<ToolWindowId>,
 }
 
 impl Default for Layout {
@@ -176,6 +179,7 @@ impl Default for Layout {
             right_width: 300.0,
             tool_sizes: BTreeMap::new(),
             all_hidden: false,
+            last_active: None,
         }
     }
 }
@@ -218,11 +222,28 @@ impl Layout {
         self.all_hidden = false;
         let slot = self.slot_mut(tw.side());
         *slot = if *slot == Some(tw) { None } else { Some(tw) };
+        if *slot == Some(tw) {
+            self.last_active = Some(tw);
+        }
     }
 
     pub fn show(&mut self, tw: ToolWindowId) {
         self.all_hidden = false;
         *self.slot_mut(tw.side()) = Some(tw);
+        self.last_active = Some(tw);
+    }
+
+    /// The tool window Window › Active Tool Window acts on: the last one shown while it is still
+    /// visible, else a visible one (bottom, right, left).
+    pub fn active(&self) -> Option<ToolWindowId> {
+        if self.all_hidden {
+            return None;
+        }
+        self.last_active
+            .filter(|tw| self.is_visible(*tw))
+            .or(self.bottom)
+            .or(self.right)
+            .or(self.left)
     }
 
     pub fn hide(&mut self, tw: ToolWindowId) {

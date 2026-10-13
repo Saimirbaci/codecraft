@@ -162,18 +162,61 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             run_to_cursor,
         ),
         spec(
-            "run.debuggingActions.resume",
+            "run.debuggingActions.resumeProgram",
             "Resume Program",
-            Some("Alt+Cmd+R"),
+            None,
             "",
             Context::Global,
             stopped,
             |s, _| step(s, Step::Continue),
         ),
-        spec("run.debuggingActions.pause", "Pause Program", None, "", Context::Global, running, |s, _| {
+        // CodeCraft debugs one program at a time, so the "All Programs" actions act on it.
+        spec("run.debuggingActions.pauseAllPrograms", "Pause All Programs", None, "", Context::Global, running, |s, _| {
             debug::pause(s)?;
             ok()
         }),
+        spec("run.debuggingActions.resumeAllPrograms", "Resume All Programs", None, "", Context::Global, stopped, |s, _| {
+            step(s, Step::Continue)
+        }),
+        spec(
+            "run.debuggingActions.stopAllPrograms",
+            "Stop All Programs",
+            None,
+            "Stops the debug session and every running process",
+            Context::Global,
+            anything_running,
+            |s, _| {
+                debug::stop(s);
+                crate::runs::stop_all(s);
+                ok()
+            },
+        ),
+        // A DAP step is never "forced" past breakpoints and lldb-dap has no step-in targets, so the
+        // force/smart variants do the plain step.
+        spec("run.debuggingActions.forceStepOver", "Force Step Over", None, "", Context::Global, stopped, |s, _| {
+            step(s, Step::Over)
+        }),
+        spec("run.debuggingActions.smartStepInto", "Smart Step Into", None, "", Context::Global, stopped, |s, _| {
+            step(s, Step::Into)
+        }),
+        spec(
+            "run.debuggingActions.forceRunToCursor",
+            "Force Run to Cursor",
+            None,
+            "{path?: string, line?: int} — continue to the caret line (or the given 0-based line)",
+            Context::Global,
+            stopped,
+            run_to_cursor,
+        ),
+        spec(
+            "run.debuggingActions.showExecutionPoint",
+            "Show Execution Point",
+            None,
+            "Opens the file of the selected frame at its line",
+            Context::Global,
+            stopped,
+            show_execution_point,
+        ),
         spec(
             "run.debuggingActions.evaluateExpression",
             "Evaluate Expression…",
@@ -359,6 +402,14 @@ fn stopped(s: &Session) -> Result<(), String> {
 
 fn running(s: &Session) -> Result<(), String> {
     if s.debug.is_running() { Ok(()) } else { Err("the program is not running in the debugger".into()) }
+}
+
+fn anything_running(s: &Session) -> Result<(), String> {
+    if s.debug.is_active() || s.ws.runs.iter().any(|r| r.is_running()) {
+        Ok(())
+    } else {
+        Err("nothing is running".into())
+    }
 }
 
 fn has_session(s: &Session) -> Result<(), String> {
@@ -773,6 +824,15 @@ fn run_to_cursor(s: &mut Session, p: &Value) -> CmdResult {
     ok()
 }
 
+fn show_execution_point(s: &mut Session, _: &Value) -> CmdResult {
+    let Some((path, line)) = s.debug.session.as_ref().and_then(|x| x.execution.clone()) else {
+        s.status = "No execution point".into();
+        return ok();
+    };
+    s.navigate_to_position(&path, line, 0)?;
+    Ok(json!({ "path": path, "line": line }))
+}
+
 fn evaluate_expression(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(expression) = opt_str(p, "expression") {
         debug::evaluate(s, expression, false)?;
@@ -809,7 +869,7 @@ mod tests {
             ("run.debuggingActions.forceStepInto", "Alt+Shift+F7"),
             ("run.debuggingActions.stepOut", "Shift+F8"),
             ("run.debuggingActions.runToCursor", "Alt+F9"),
-            ("run.debuggingActions.resume", "Alt+Cmd+R"),
+            ("run.debuggingActions.resumeProgram", "Alt+Cmd+R"),
             ("run.debuggingActions.evaluateExpression", "Alt+F8"),
             ("run.debug", "Ctrl+D"),
             ("run.chooseAndDebug", "Ctrl+Alt+D"),

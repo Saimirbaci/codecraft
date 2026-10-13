@@ -27,7 +27,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             copy_path,
         ),
         spec(
-            "edit.paste",
+            "edit.paste.paste",
             "Paste",
             Some("Cmd+V"),
             "{text?: string, wholeLine?: bool} — pastes the given text, else the internal clipboard",
@@ -167,6 +167,7 @@ fn copy(s: &mut Session, _: &Value) -> CmdResult {
     let (text, whole_line) = ops::copy_text(&d.doc, &e.selections);
     s.effects.push(Effect::CopyToClipboard(text.clone()));
     s.clipboard = Some((text.clone(), whole_line));
+    crate::paste::record(s, &text, whole_line);
     Ok(json!({ "text": text }))
 }
 
@@ -179,6 +180,7 @@ fn cut(s: &mut Session, _: &Value) -> CmdResult {
     })?;
     if let Some((text, whole)) = clip {
         s.effects.push(Effect::CopyToClipboard(text.clone()));
+        crate::paste::record(s, &text, whole);
         s.clipboard = Some((text, whole));
     }
     ok()
@@ -192,6 +194,7 @@ fn paste(s: &mut Session, p: &Value) -> CmdResult {
                 Some((c, w)) if c == t => *w,
                 _ => bool_or(p, "wholeLine", false),
             };
+            crate::paste::record(s, t, whole);
             (t.to_string(), whole)
         }
         None => s.clipboard.clone().unwrap_or_default(),

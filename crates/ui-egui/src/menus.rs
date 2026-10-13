@@ -1,9 +1,9 @@
 //! The menu bar, generated from the observed RustRover menu catalog. Items whose command is
 //! registered are live; planned ones render disabled; out-of-scope ones are hidden.
 
-use egui::{Button, RichText};
-use serde_json::Value;
+use egui::{Button, Color32, RichText};
 
+use codecraft_engine::appearance;
 use codecraft_engine::catalog::CATALOG;
 use codecraft_engine::{CatalogItem, Scope, Session, registry};
 
@@ -12,9 +12,7 @@ use crate::{UiState, keymap, run_command};
 /// Commands without an observed menu entry (or whose observed submenu is filled lazily by
 /// RustRover), placed where RustRover shows them.
 pub(crate) const EXTRA: &[(&str, &str)] = &[
-    ("Edit", "edit.findUsages.findUsages"),
     ("View", "view.quickDocumentation"),
-    ("View", "view.hideAllToolWindows"),
     ("View › Active Editor", "view.toggleSoftWrap"),
     ("View › Active Editor", "view.toggleWhitespace"),
     ("View", "view.toggleLineNumbers"),
@@ -26,21 +24,7 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("Refactor", "refactor.inline"),
     ("Refactor", "refactor.changeSignature"),
     ("Refactor", "refactor.renameFile"),
-    ("Code › Folding", "code.folding.expand"),
-    ("Code › Folding", "code.folding.collapse"),
-    ("Code › Folding", "code.folding.expandAll"),
-    ("Code › Folding", "code.folding.collapseAll"),
-    // RustRover fills Run › Debugging Actions lazily, so the observation captured it empty.
-    ("Run › Debugging Actions", "run.debuggingActions.resume"),
-    ("Run › Debugging Actions", "run.debuggingActions.pause"),
-    ("Run › Debugging Actions", "run.debuggingActions.stepOver"),
-    ("Run › Debugging Actions", "run.debuggingActions.stepInto"),
-    ("Run › Debugging Actions", "run.debuggingActions.forceStepInto"),
-    ("Run › Debugging Actions", "run.debuggingActions.stepOut"),
-    ("Run › Debugging Actions", "run.debuggingActions.runToCursor"),
-    ("Run › Debugging Actions", "run.debuggingActions.evaluateExpression"),
-    ("Run › Debugging Actions", "debug.stop"),
-    // RustRover fills Git › Current File lazily too.
+    // RustRover fills Git › Current File lazily, so the observation captured it empty.
     ("Git › Current File", "git.currentFile.annotate"),
     ("Git › Current File", "git.currentFile.showHistory"),
     ("Git › Current File", "git.currentFile.compareWithRevision"),
@@ -56,13 +40,9 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     // RustRover fills Run › Test History lazily (recent runs); ours opens the history dialog.
     ("Run › Test History", "run.testHistory"),
     ("Run › Test History", "run.importTestsFromFile"),
-    ("Help", "help.findAction"),
-    // RustRover fills Edit › Bookmarks lazily too.
+    // Edit › Bookmarks as observed lacks the toggles (RustRover adds them for the caret's line).
     ("Edit › Bookmarks", "edit.bookmarks.toggle"),
     ("Edit › Bookmarks", "edit.bookmarks.toggleWithMnemonic"),
-    ("Edit › Bookmarks", "edit.bookmarks.show"),
-    ("Edit › Bookmarks", "edit.bookmarks.next"),
-    ("Edit › Bookmarks", "edit.bookmarks.previous"),
     ("Edit › Bookmarks", "edit.bookmarks.editDescription"),
     ("File", "file.scratches"),
 ];
@@ -82,8 +62,16 @@ pub(crate) fn label_for(item: &CatalogItem) -> String {
         "run.run" | "run.debug" | "run.runWithCoverage" | "run.profile" | "run.runWithValgrindMemcheck" => {
             item.label.replace("'Run'", "")
         }
+        // The observed label carries the zoom at capture time; the live one is `dynamic_label`.
+        "view.appearance.zoomIde" => "Zoom IDE…".into(),
         _ => item.label.to_string(),
     }
+}
+
+/// An EXTRA command that the catalog already shows under `path` (by its id or an old id of it).
+fn in_catalog_here(path: &[&str], id: &str) -> bool {
+    let id = registry().canonical(id);
+    children(path).any(|c| registry().canonical(c.id) == id)
 }
 
 /// The shortcut shown for a command in the menus (in-window and native), in RustRover notation
@@ -100,7 +88,15 @@ pub(crate) fn raw_shortcut(id: &str) -> Option<String> {
 fn item_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, id: &str, label: &str) {
     let live = registry().contains(id);
     let enabled = live && s.enabled(id).is_ok();
-    let mut button = Button::new(label);
+    let label = appearance::dynamic_label(s, id).unwrap_or_else(|| label.to_string());
+    // Toggles get a checkmark column (blank while off, so the labels stay aligned).
+    let mut button = match appearance::checked(s, id) {
+        Some(on) => {
+            let mark = RichText::new("✓").color(if on { st.theme.text } else { Color32::TRANSPARENT });
+            Button::new((mark, label))
+        }
+        None => Button::new(label),
+    };
     if let Some(sc) = raw_shortcut(id) {
         button = button.shortcut_text(RichText::new(keymap::display(&sc)).color(st.theme.text_muted));
     }
@@ -114,7 +110,7 @@ fn item_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, id: &str, l
     };
     if resp.clicked() {
         ui.close();
-        run_command(s, st, id, &Value::Null);
+        run_command(s, st, id, &crate::platform_params(id));
     }
 }
 
@@ -148,11 +144,8 @@ fn menu_items(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, path: &[&str
     {
         let key = path.join(" › ");
         // An EXTRA command the catalog already shows here is not repeated.
-        let extras: Vec<&str> = EXTRA
-            .iter()
-            .filter(|(m, id)| *m == key && !children(path).any(|c| c.id == *id))
-            .map(|(_, id)| *id)
-            .collect();
+        let extras: Vec<&str> =
+            EXTRA.iter().filter(|(m, id)| *m == key && !in_catalog_here(path, id)).map(|(_, id)| *id).collect();
         if !extras.is_empty() {
             if any {
                 ui.separator();
@@ -180,5 +173,19 @@ pub fn menu_bar_contents(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             ui.set_min_width(260.0);
             menu_items(ui, s, st, &[top]);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_entries_are_registered_ids_the_catalog_does_not_show_there() {
+        for (path, id) in EXTRA {
+            assert!(registry().all().iter().any(|s| s.id == *id), "EXTRA {id} is not a registered id (an alias?)");
+            let path: Vec<&str> = path.split(" › ").collect();
+            assert!(!in_catalog_here(&path, id), "EXTRA {id} is already in the catalog under {path:?}");
+        }
     }
 }

@@ -661,12 +661,21 @@ fn ime_preedit(ui: &egui::Ui, id: Id) -> Option<(String, usize)> {
 /// Paint the editor and handle pointer input. Returns the caret's screen position.
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId) {
     let theme = st.theme.clone();
-    let settings = s.ws.settings.clone();
+    let mut settings = s.ws.settings.clone();
+    // Presentation Mode enlarges the editor font without touching the setting.
+    settings.editor_font_size = codecraft_engine::appearance::chrome(s).editor_font_size;
     let Some(editor) = s.ws.editor(eid).cloned() else { return };
     let path = s.ws.doc(editor.doc).and_then(|d| d.path.clone());
     let problems: Vec<Problem> =
         path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
+    // Highlight Usages in File (until Escape), while the document is unchanged.
+    let usage_ranges: Vec<std::ops::Range<usize>> = s
+        .ws
+        .doc(editor.doc)
+        .and_then(|d| s.usages.highlights_for(eid, d.doc.revision()))
+        .map(<[_]>::to_vec)
+        .unwrap_or_default();
     let marks = path.as_deref().map(|p| DebugMarks::collect(s, p)).unwrap_or_default();
     let tests = path.as_deref().map(|p| crate::testing_panel::GutterTests::collect(s, p)).unwrap_or_default();
     let vcs = crate::vcs_panels::GutterVcs::collect(s, editor.doc);
@@ -933,6 +942,18 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             let color = if Some(i) == find_current { theme.find_match_current } else { theme.find_match };
             let rr = Rect::from_min_max(pos2(x_at(a), y + 1.0), pos2(x_at(b).max(x_at(a) + 2.0), y + line_h - 1.0));
             text_painter.rect_filled(rr, CornerRadius::same(2), color);
+        }
+        // Highlighted usages (sorted, so skip those ending before this line).
+        let first_usage = usage_ranges.partition_point(|u| u.end < line_start);
+        for u in usage_ranges.get(first_usage..).unwrap_or_default() {
+            if u.start > line_end_full {
+                break;
+            }
+            let a = u.start.max(line_start) - line_start;
+            let b = u.end.min(line_end_full) - line_start;
+            let Some((a, b)) = r.clip(a, b) else { continue };
+            let rr = Rect::from_min_max(pos2(x_at(a), y + 1.0), pos2(x_at(b).max(x_at(a) + 2.0), y + line_h - 1.0));
+            text_painter.rect_filled(rr, CornerRadius::same(2), theme.find_match);
         }
         // Selections.
         for sel in editor.selections.ranges() {
@@ -1277,7 +1298,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                     st.vcs.hunk_anchor = Some(pos);
                     commands.push(("vcs.showHunk", json!({ "line": line })));
                 } else if pos.x > gutter.right() - 18.0 && fold_starts.contains(&line) {
-                    commands.push(("code.folding.toggle", json!({ "line": line })));
+                    commands.push(("code.folding.toggleFolding", json!({ "line": line })));
                 } else if pos.x < gutter.left() + 18.0 && run_lines.contains(&line) {
                     if let Some(p) = &path {
                         commands.push(("run.contextConfiguration", json!({ "path": p, "line": line })));

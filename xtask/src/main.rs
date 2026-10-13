@@ -215,6 +215,9 @@ const OUT_OF_SCOPE: &[&str] = &[
     "Services › Docker",
     "Import Word Document",
     "Configure Pandoc",
+    // macOS native window tabs (NSWindow merge): CodeCraft's project windows are egui viewports,
+    // which cannot become tabs of one window.
+    "Merge All Project Windows",
 ];
 
 /// Submenus whose items are bound to two-stroke chords, which the menu dump cannot express.

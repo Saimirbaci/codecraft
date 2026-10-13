@@ -24,7 +24,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         spec("code.reformatCode", "Reformat Code", None, "", Context::Editor, has_editor, reformat),
         spec("code.reformatFile", "Reformat File…", None, "", Context::Editor, has_editor, reformat),
         spec(
-            "code.reformatFileWithRustfmt",
+            "tools.rust.reformatFileWithRustfmt",
             "Reformat File with Rustfmt",
             None,
             "",
@@ -37,7 +37,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
-            "code.reformatCargoProjectWithRustfmt",
+            "tools.rust.reformatCargoProjectWithRustfmt",
             "Reformat Cargo Project with Rustfmt",
             None,
             "",
@@ -99,7 +99,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             has_editor,
             |s, _| fold(s, Some(true), true),
         ),
-        spec("code.folding.toggle", "Toggle Fold", None, "{line: int}", Context::Editor, has_editor, |s, p| {
+        spec("code.folding.toggleFolding", "Toggle Folding", None, "{line?: int} (default: the region at the caret)", Context::Editor, has_editor, |s, p| {
             let line = opt_usize(p, "line")?;
             toggle_fold_at(s, line)
         }),

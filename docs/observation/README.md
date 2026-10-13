@@ -35,7 +35,10 @@ Analyze Code, Folding, Profile, Debugging Actions, Tasks & Contexts, Services, M
 Tools › Rust, GitHub Copilot, Layouts, Active Tool Window, Notifications, Diagnostic Tools.
 Still empty: File › Recent Projects (personal paths, skipped on purpose), View › Active Editor
 and Git › Current File (they need an open editor in RustRover), Run › Test History and
-Window › Editor Tabs › Split with Chooser Navigation (empty when observed).
+Window › Editor Tabs › Split with Chooser Navigation (empty when observed). The shell's
+`menus::EXTRA` table places CodeCraft's commands for those (and the bookmark toggles RustRover
+adds for the caret's line); commands that predate the capture keep their old ids as aliases of
+the catalog ids (`crates/engine/src/commands.rs`, `ALIASES`).
 
 The captured menus include items contributed by third-party plugins installed in this copy
 (GitHub Copilot, Python, Zig, Junie, AI Assistant, Educational). The catalog marks those

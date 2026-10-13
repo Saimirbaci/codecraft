@@ -51,6 +51,7 @@ pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         w.ui_font_size,
         &w.keymap,
         &w.keymap_overrides,
+        w.compact_mode,
     ))
     .unwrap_or_default();
     if sig == st.prefs.sig {
@@ -60,6 +61,9 @@ pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     st.theme = Theme::from_settings(w);
     st.theme.apply(ctx);
     apply_ui_font_size(ctx, w.ui_font_size);
+    if w.compact_mode {
+        crate::appearance_ui::compact_spacing(ctx);
+    }
     keymap::set_active(w);
     st.bindings = keymap::bindings_for(w);
     s.terminal.set_palette(crate::terminal_panel::palette(&st.theme));

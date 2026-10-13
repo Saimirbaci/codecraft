@@ -379,6 +379,16 @@ fn bookmarks_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let order = bookmarks::sorted(&s.bookmarks.items);
     let (sel, enter, esc) = list_keys(ctx, key, order.len());
     let mut cmds: Vec<(&'static str, Value)> = Vec::new();
+    // Typing a bookmark's mnemonic jumps to it (Edit › Bookmarks › Go to Mnemonic…).
+    let typed = ctx.input(|i| {
+        i.events.iter().find_map(|e| match e {
+            egui::Event::Text(t) => t.chars().next().and_then(bookmarks::normalize_mnemonic),
+            _ => None,
+        })
+    });
+    if let Some(m) = typed.filter(|m| s.bookmarks.by_mnemonic(*m).is_some()) {
+        cmds.push(("edit.bookmarks.goToMnemonic", json!({ "mnemonic": m.to_string() })));
+    }
     let mut open = true;
     egui::Window::new("Bookmarks")
         .id(Id::new("bookmarks-popup"))

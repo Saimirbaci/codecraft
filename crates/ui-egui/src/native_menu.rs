@@ -78,19 +78,14 @@ fn role_for(id: &str) -> Option<Role> {
     })
 }
 
-/// Toggles shown with a checkmark, and their current state.
+/// Toggles shown with a checkmark, and their current state (the engine's, shared with the
+/// in-window bar).
 fn checked(s: &Session, id: &str) -> Option<bool> {
-    let set = &s.ws.settings;
-    Some(match id {
-        "view.toggleSoftWrap" => set.soft_wrap,
-        "view.toggleWhitespace" => set.show_whitespace,
-        "view.toggleLineNumbers" => set.show_line_numbers,
-        _ => return None,
-    })
+    codecraft_engine::appearance::checked(s, id)
 }
 
 fn checkable(id: &str) -> bool {
-    matches!(id, "view.toggleSoftWrap" | "view.toggleWhitespace" | "view.toggleLineNumbers")
+    codecraft_engine::appearance::is_toggle(id)
 }
 
 fn shown(item: &CatalogItem) -> bool {
@@ -127,7 +122,9 @@ fn entries(path: &[&str]) -> Vec<Node> {
         }
     }
     let key = path.join(" › ");
-    let shown_here = |id: &str| out.iter().any(|n| matches!(n, Node::Item(i) if i.id == id));
+    let canonical = |id: &str| registry().canonical(id).to_string();
+    let shown_here =
+        |id: &str| out.iter().any(|n| matches!(n, Node::Item(i) if canonical(i.id) == canonical(id)));
     let extras: Vec<&'static str> =
         menus::EXTRA.iter().filter(|(m, id)| *m == key && !shown_here(id)).map(|(_, id)| *id).collect();
     let mut extras = extras.into_iter().peekable();
@@ -364,7 +361,7 @@ fn text_field_events(id: &str, clipboard: &dyn Fn() -> Option<String>) -> Option
     Some(match id {
         "edit.copy" => vec![Event::Copy],
         "edit.cut" => vec![Event::Cut],
-        "edit.paste" => paste_event(clipboard),
+        "edit.paste.paste" => paste_event(clipboard),
         "edit.selectAll" => key_pair(Key::A, cmd),
         "edit.undo" => key_pair(Key::Z, cmd),
         "edit.redo" => key_pair(Key::Z, cmd | Modifiers::SHIFT),
@@ -395,7 +392,7 @@ pub(crate) fn dispatch(
     if widget_focus && let Some(events) = text_field_events(id, clipboard) {
         return Dispatch::Inject(events);
     }
-    if id == "edit.paste"
+    if matches!(id, "edit.paste.paste" | "edit.paste.pasteAsPlainText")
         && let Some(text) = clipboard()
     {
         return Dispatch::Run(id.to_string(), json!({ "text": text }));
@@ -560,6 +557,7 @@ mod mac {
     use codecraft_engine::{Session, registry};
 
     use super::{Node, Role, checked};
+    use codecraft_engine::appearance::dynamic_label;
 
     /// Activations not yet seen by a frame, and the context to wake.
     static FIRED: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -583,6 +581,8 @@ mod mac {
         handle: Handle,
         enabled: bool,
         checked: bool,
+        /// The label shown (labels that follow the state are updated by `refresh`).
+        label: String,
     }
 
     pub(super) struct Bar {
@@ -629,7 +629,7 @@ mod mac {
                         parent.append(&item)?;
                         Handle::Plain(item)
                     };
-                    entries.push(Entry { id: it.id, handle, enabled: false, checked: false });
+                    entries.push(Entry { id: it.id, handle, enabled: false, checked: false, label: it.label.clone() });
                 }
             }
         }
@@ -687,6 +687,15 @@ mod mac {
                         Handle::Plain(i) => i.set_enabled(enabled),
                         Handle::Check(i) => i.set_enabled(enabled),
                     }
+                }
+                if let Some(label) = dynamic_label(s, e.id)
+                    && label != e.label
+                {
+                    match &e.handle {
+                        Handle::Plain(i) => i.set_text(escape(&label)),
+                        Handle::Check(i) => i.set_text(escape(&label)),
+                    }
+                    e.label = label;
                 }
                 if let Handle::Check(i) = &e.handle {
                     let on = checked(s, e.id).unwrap_or(false);
@@ -823,20 +832,51 @@ mod tests {
         // Checkable toggles.
         let view = submenu(&m, "View");
         assert!(find_item(view, "view.toggleSoftWrap").unwrap().checkable);
+        for id in [
+            "view.appearance.toolbar",
+            "view.appearance.statusBar",
+            "view.appearance.compactMode",
+            "view.appearance.enterPresentationMode",
+            "view.appearance.navigationBar.top",
+            "view.appearance.statusBarWidgets.memoryIndicator",
+        ] {
+            assert!(find_item(view, id).is_some_and(|i| i.checkable), "{id}");
+        }
+        assert!(!find_item(view, "view.appearance.zoomIde").unwrap().checkable);
+        // The catalog's items replaced the EXTRA ones they duplicated.
+        let run = submenu(&m, "Run");
+        assert!(find_item(run, "run.debuggingActions.resumeProgram").is_some());
+        assert!(find_item(run, "debug.stop").is_none());
+        let edit = submenu(&m, "Edit");
+        assert!(find_item(edit, "edit.bookmarks.showLineBookmarks").is_some());
+        assert!(find_item(edit, "edit.bookmarks.toggle").is_some());
     }
 
     #[test]
     fn no_item_appears_twice_in_one_menu() {
         fn check(nodes: &[Node], path: &str) {
+            // By command (an old id and its catalog id are one command) and by label (an item
+            // and a submenu of the same name count too).
             let ids: Vec<&str> = nodes
                 .iter()
                 .filter_map(|n| match n {
-                    Node::Item(i) => Some(i.id),
+                    Node::Item(i) => Some(registry().canonical(i.id)),
                     _ => None,
                 })
                 .collect();
             for (k, id) in ids.iter().enumerate() {
                 assert!(!ids[..k].contains(id), "{id} twice in {path}");
+            }
+            let labels: Vec<&str> = nodes
+                .iter()
+                .filter_map(|n| match n {
+                    Node::Item(i) => Some(i.label.as_str()),
+                    Node::Submenu { title, .. } => Some(title.as_str()),
+                    _ => None,
+                })
+                .collect();
+            for (k, l) in labels.iter().enumerate() {
+                assert!(!labels[..k].contains(l), "label `{l}` twice in {path}");
             }
             for n in nodes {
                 if let Node::Submenu { title, children } = n {
@@ -917,11 +957,11 @@ mod tests {
         let v = sc("Cmd+V");
         let clip = || Some("a\r\nb".to_string());
         assert_eq!(
-            dispatch("edit.paste", Some(&v), &[v.modifiers()], true, &clip),
+            dispatch("edit.paste.paste", Some(&v), &[v.modifiers()], true, &clip),
             Dispatch::Inject(vec![Event::Paste("a\nb".into())])
         );
         // An empty clipboard pastes nothing (like egui-winit).
-        assert_eq!(dispatch("edit.paste", Some(&v), &[v.modifiers()], true, &no_clip), Dispatch::Inject(vec![]));
+        assert_eq!(dispatch("edit.paste.paste", Some(&v), &[v.modifiers()], true, &no_clip), Dispatch::Inject(vec![]));
         // Copy Path (Shift+Alt+Cmd+C) is a key, not Copy.
         let p = sc("Shift+Alt+Cmd+C");
         let Dispatch::Inject(e) = dispatch("edit.copyPathReference", Some(&p), &[p.modifiers()], false, &no_clip)
@@ -945,8 +985,8 @@ mod tests {
         // Paste into the editor carries the system clipboard.
         let clip = || Some("x".to_string());
         assert_eq!(
-            dispatch("edit.paste", Some(&sc("Cmd+V")), &[Modifiers::NONE], false, &clip),
-            Dispatch::Run("edit.paste".into(), json!({ "text": "x" }))
+            dispatch("edit.paste.paste", Some(&sc("Cmd+V")), &[Modifiers::NONE], false, &clip),
+            Dispatch::Run("edit.paste.paste".into(), json!({ "text": "x" }))
         );
     }
 

@@ -277,6 +277,10 @@ fn escape(s: &mut Session, _: &Value) -> CmdResult {
         s.find_bar = None;
         return ok();
     }
+    // Highlight Usages in File: Escape removes the highlighting.
+    if s.usages.highlights.take().is_some() {
+        return ok();
+    }
     s.select_active(|_, sel| {
         if sel.len() > 1 {
             sel.collapse_to_primary()

@@ -65,9 +65,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         tool_window!("view.toolWindows.databaseChanges", "Database Changes", ToolWindowId::DatabaseChanges),
         tool_window!("view.toolWindows.inspectionResults", "Inspection Results", ToolWindowId::InspectionResults),
         spec(
-            "view.hideAllToolWindows",
-            "Hide All Tool Windows",
-            Some("Shift+Cmd+F12"),
+            "window.activeToolWindow.hideAllWindows",
+            "Hide All Windows",
+            None,
             "",
             Context::Global,
             always,

@@ -31,7 +31,7 @@ pub fn set_active(settings: &Settings) {
 /// The shortcuts of a command in the active keymap (RustRover notation).
 pub fn active_shortcuts(id: &str) -> Vec<String> {
     ACTIVE.with(|a| match &a.borrow().table {
-        Some(t) => t.get(id).cloned().unwrap_or_default(),
+        Some(t) => t.get(registry().canonical(id)).cloned().unwrap_or_default(),
         None => registry().shortcuts(id).iter().map(|s| (*s).to_string()).collect(),
     })
 }

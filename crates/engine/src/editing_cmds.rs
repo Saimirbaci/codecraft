@@ -642,7 +642,13 @@ fn chooser_accept(s: &mut Session, p: &Value) -> CmdResult {
             unwrap_remove(s, &json!({ "index": index }))
         }
         ChooserKind::SnippetChoice => crate::completion::apply_choice(s, &item.key),
+        ChooserKind::PasteFromHistory => crate::paste::paste_entry(s, parse_key(&item.key)?),
+        ChooserKind::RecentFindUsages => crate::usages::show_recent(s, parse_key(&item.key)?),
     }
+}
+
+fn parse_key(key: &str) -> Result<usize, CommandError> {
+    key.parse::<usize>().map_err(|_| CommandError::Failed(format!("bad chooser item `{key}`")))
 }
 
 // ------------------------------------------------------------------------------- column / wrap

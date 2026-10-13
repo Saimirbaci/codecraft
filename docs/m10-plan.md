@@ -1,6 +1,6 @@
 # M10: daily-use depth
 
-Status: in progress (started 2026-10-13). After M4 the menus are at 98% of RustRover's core;
+Status: done (2026-10-13; tracks A–D, F and G (newly observed menus) landed, 1,267 tests passing, core menu parity 192/192). After M4 the menus are at 98% of RustRover's core;
 this milestone closes the gaps you feel while editing every day. Tracks run in parallel; read
 `AGENTS.md` and `docs/m4-plan.md` (same rules and contracts). (M4/M5 numbers were folded into
 M2/M3 earlier, hence the jump.)

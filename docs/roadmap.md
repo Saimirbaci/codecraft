@@ -1,8 +1,8 @@
 # Roadmap
 
-Status as of 2026-10-13: **M0–M9 have landed** (M4 delivered M3b and M6–M9 in parallel
-tracks, see `docs/m4-plan.md`). Menu parity: 129/131 core and 216/275 in-scope items live; see
-`docs/parity-checklist.md`. What remains is depth, listed in `docs/gaps.md`.
+Status as of 2026-10-13: **M0–M10 have landed** (M4 delivered M3b and M6–M9 in parallel
+tracks, see `docs/m4-plan.md`). Menu parity (after capturing the lazily filled submenus): 192/192 core and 338/407 in-scope items
+live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gaps.md`.
 
 | Milestone | Scope | Status |
 |---|---|---|
@@ -15,7 +15,7 @@ tracks, see `docs/m4-plan.md`). Menu parity: 129/131 core and 216/275 in-scope i
 | M7 Refactorings | Extract/inline/change signature via language-server assists, with preview; file operations; hierarchies | ✅ (2026-10-13) |
 | M8 Settings and keymaps | Full Settings dialog, Windows/Linux keymaps, colour schemes | ✅ (2026-10-13) |
 | M9 Native macOS menus, packaging | NSMenu global menu bar, signed .app/.dmg, Linux and Windows packages, project windows | ✅ (2026-10-13) |
-| M10 Daily-use depth | Session restore, snippet placeholders and completion resolve, in-place rename, whitespace/wrap rendering, inspections (Clippy) with quick-fixes, remaining cheap menu items. Plan: `docs/m10-plan.md` | in progress |
+| M10 Daily-use depth | Session restore, snippet placeholders and completion resolve, in-place rename, whitespace/wrap rendering, inspections (Clippy) with quick-fixes, remaining cheap menu items, RustRover's lazily filled submenus. Plan: `docs/m10-plan.md` | ✅ (2026-10-13) |
 
 ## Current focus
 

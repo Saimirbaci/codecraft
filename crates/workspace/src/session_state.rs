@@ -400,6 +400,7 @@ fn sanitize_layout(l: &Layout) -> Layout {
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
         all_hidden: l.all_hidden,
+        last_active: l.last_active,
     }
 }
 

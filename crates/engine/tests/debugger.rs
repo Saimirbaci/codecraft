@@ -135,8 +135,8 @@ fn stepping_commands_are_disabled_without_a_session() {
         "run.debuggingActions.stepOver",
         "run.debuggingActions.stepInto",
         "run.debuggingActions.stepOut",
-        "run.debuggingActions.resume",
-        "run.debuggingActions.pause",
+        "run.debuggingActions.resumeProgram",
+        "run.debuggingActions.pauseAllPrograms",
         "run.debuggingActions.runToCursor",
         "run.debuggingActions.evaluateExpression",
         "debug.stop",
@@ -245,7 +245,7 @@ fn rust_session_with_lldb_dap() {
     assert_eq!(local(&s, "doubled").as_deref(), Some("12"));
 
     // Resume to the end.
-    s.execute("run.debuggingActions.resume", &Value::Null).unwrap();
+    s.execute("run.debuggingActions.resumeProgram", &Value::Null).unwrap();
     pump_until(&mut s, "the program to exit", |s| matches!(status(s), Some(DebugStatus::Exited { .. })));
     pump_until(&mut s, "the adapter to go away", |s| !s.debug.busy());
     let out: Vec<&str> =
@@ -292,7 +292,7 @@ fn python_session_with_debugpy() {
     pump_until(&mut s, "run to cursor", |s| stopped_line(s) == Some(7));
     assert_eq!(local(&s, "result").as_deref(), Some("6"));
 
-    s.execute("run.debuggingActions.resume", &Value::Null).unwrap();
+    s.execute("run.debuggingActions.resumeProgram", &Value::Null).unwrap();
     pump_until(&mut s, "the exit", |s| matches!(status(s), Some(DebugStatus::Exited { code: Some(0) })));
     pump_until(&mut s, "the adapter to go away", |s| !s.debug.busy());
     assert!(s.debug.console.iter().any(|l| console_text(l).contains("result 6")));
@@ -318,7 +318,7 @@ fn stopping_a_session_leaves_no_processes() {
     assert!(alive(pid));
 
     // Pause shows where it is, then stop.
-    s.execute("run.debuggingActions.pause", &Value::Null).unwrap();
+    s.execute("run.debuggingActions.pauseAllPrograms", &Value::Null).unwrap();
     pump_until(&mut s, "the pause", |s| stopped_line(s).is_some());
     s.execute("debug.stop", &Value::Null).unwrap();
     assert!(matches!(status(&s), Some(DebugStatus::Exited { .. })));

@@ -144,7 +144,7 @@ fn attach_to_a_running_process_and_detach() {
         std::thread::sleep(Duration::from_millis(10));
     }
     if s.debug.is_running() {
-        s.execute("run.debuggingActions.pause", &Value::Null).unwrap();
+        s.execute("run.debuggingActions.pauseAllPrograms", &Value::Null).unwrap();
     }
     pump_until(&mut s, "a stop with frames", |s| {
         s.debug.is_stopped() && !s.debug.settling() && s.debug.session.as_ref().is_some_and(|x| !x.frames.is_empty())

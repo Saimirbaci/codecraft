@@ -6,6 +6,7 @@ use egui::{
 };
 use serde_json::{Value, json};
 
+use codecraft_engine::appearance::{self, NavPathItem, widget_visible};
 use codecraft_engine::{LspStatus, Session};
 use codecraft_workspace::{EditorId, GroupId, Severity, SplitAxis, SplitNode};
 
@@ -37,8 +38,14 @@ fn tool_button(ui: &mut egui::Ui, st: &UiState, text: &str, tip: &str, enabled: 
         .clicked()
 }
 
+/// Heights of the main toolbar and the status bar (View › Appearance › Compact Mode lowers them).
+pub(crate) fn bar_heights(compact: bool) -> (f32, f32) {
+    if compact { (30.0, 22.0) } else { (38.0, 26.0) }
+}
+
 pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
-    egui::Panel::top("main-toolbar").exact_size(38.0).frame(bar_frame(st)).show(ui, |ui| {
+    let (height, _) = bar_heights(s.ws.settings.compact_mode);
+    egui::Panel::top("main-toolbar").exact_size(height).frame(bar_frame(st)).show(ui, |ui| {
         ui.horizontal_centered(|ui| {
             // Project widget.
             let name = s.ws.project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| "No project".into());
@@ -123,25 +130,66 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     });
 }
 
+/// The navigation path as small clickable labels: a member moves the caret to it, the other
+/// elements open the navigation bar popup (Navigate › Jump to Navigation Bar).
+fn navigation_path(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, items: &[NavPathItem], size: f32) {
+    let mut clicked = None;
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            ui.label(RichText::new("›").size(size).color(st.theme.text_disabled));
+        }
+        let text = RichText::new(&item.label).size(size).color(st.theme.text_muted);
+        let resp = ui.add(egui::Label::new(text).sense(Sense::click()));
+        if resp.on_hover_text(item.path.display().to_string()).clicked() {
+            clicked = Some(item.offset);
+        }
+    }
+    match clicked {
+        Some(Some(offset)) => {
+            run_command(s, st, "editor.setSelection", &json!({ "anchor": offset }));
+            st.focus_editor = true;
+        }
+        Some(None) => run_command(s, st, "navigate.jumpToNavigationBar", &Value::Null),
+        None => {}
+    }
+}
+
+/// View › Appearance › Navigation Bar › Top: the path of the active file above the editor.
+pub fn navigation_bar_top(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let items = appearance::navigation_path(s);
+    if items.is_empty() {
+        return;
+    }
+    egui::Panel::top("navigation-bar-top").exact_size(26.0).frame(bar_frame(st)).show(ui, |ui| {
+        ui.horizontal_centered(|ui| navigation_path(ui, s, st, &items, 12.0));
+    });
+}
+
+/// The status bar: the status text or navigation path on the left, the widgets of View ›
+/// Appearance › Status Bar Widgets on the right.
 pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
-    egui::Panel::bottom("status-bar").exact_size(26.0).frame(bar_frame(st)).show(ui, |ui| {
+    let (_, height) = bar_heights(s.ws.settings.compact_mode);
+    let widgets = s.ws.settings.clone();
+    let shown = |key: &str| widget_visible(&widgets, key);
+    let chrome = appearance::chrome(s);
+    egui::Panel::bottom("status-bar").exact_size(height).frame(bar_frame(st)).show(ui, |ui| {
         ui.horizontal_centered(|ui| {
             let muted = st.theme.text_muted;
-            // Left: navigation path or status message.
-            let left = if !s.status.is_empty() {
-                s.status.clone()
-            } else if let (Some(p), Some((_, d))) = (&s.ws.project, s.ws.active()) {
-                d.path
-                    .as_deref()
-                    .map(|path| format!("{} › {}", p.name, p.relative(path).replace('/', " › ")))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            let left: String = left.lines().next().unwrap_or_default().chars().take(160).collect();
-            ui.label(RichText::new(left).color(muted).size(12.0));
+            // Left: the status message (Status Text widget), else the navigation path.
+            if shown("statusText") && !s.status.is_empty() {
+                let left: String = s.status.lines().next().unwrap_or_default().chars().take(160).collect();
+                ui.label(RichText::new(left).color(muted).size(12.0));
+            } else if chrome.navigation_in_status_bar {
+                let items = appearance::navigation_path(s);
+                navigation_path(ui, s, st, &items, 12.0);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let small = |t: String| RichText::new(t).size(12.0).color(muted);
+                if shown("memoryIndicator")
+                    && let Some(mb) = s.appearance.memory_mb
+                {
+                    ui.label(small(format!("{mb} MB"))).on_hover_text("Memory used by CodeCraft");
+                }
                 let info = s.ws.active().map(|(e, d)| {
                     let unit = d.doc.detect_indent_unit();
                     let indent =
@@ -156,36 +204,52 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                         format!("{}:{}", pos.line + 1, pos.column + 1)
                     };
                     let enc = format!("{}{}", d.encoding.label(), if d.bom { " BOM" } else { "" });
-                    (d.read_only, indent, d.doc.line_ending(), caret, d.language.name(), enc)
+                    let column_mode = s.editing.column_mode.contains(&e.id);
+                    (d.read_only, indent, d.doc.line_ending(), caret, d.language.name(), enc, column_mode)
                 });
-                if let Some((read_only, indent, le, caret, language, enc)) = info {
-                    if read_only {
-                        ui.label(small("🔒".into()));
+                if let Some((read_only, indent, le, caret, language, enc, column_mode)) = info {
+                    if read_only && shown("readOnlyAttribute") {
+                        ui.label(small("🔒".into())).on_hover_text("The file is read-only");
                     }
-                    ui.label(small(indent));
-                    if ui
-                        .add(egui::Label::new(small(enc)).sense(Sense::click()))
-                        .on_hover_text("File Encoding")
-                        .clicked()
+                    if shown("indentation") {
+                        ui.label(small(indent));
+                    }
+                    if shown("fileEncoding")
+                        && ui
+                            .add(egui::Label::new(small(enc)).sense(Sense::click()))
+                            .on_hover_text("File Encoding")
+                            .clicked()
                     {
                         run_command(s, st, "file.fileProperties.fileEncoding", &Value::Null);
                     }
-                    ui.menu_button(small(le.label().into()), |ui| {
-                        if ui.button("LF - Unix and macOS (\\n)").clicked() {
-                            ui.close();
-                            run_command(s, st, "file.fileProperties.lineSeparators.lfUnixAndMacOS", &Value::Null);
-                        }
-                        if ui.button("CRLF - Windows (\\r\\n)").clicked() {
-                            ui.close();
-                            run_command(s, st, "file.fileProperties.lineSeparators.crlfWindows", &Value::Null);
-                        }
-                    });
-                    if ui
-                        .add(egui::Label::new(small(caret)).sense(Sense::click()))
-                        .on_hover_text("Go to Line:Column (⌘L)")
-                        .clicked()
+                    if shown("lineSeparator") {
+                        ui.menu_button(small(le.label().into()), |ui| {
+                            if ui.button("LF - Unix and macOS (\\n)").clicked() {
+                                ui.close();
+                                run_command(s, st, "file.fileProperties.lineSeparators.lfUnixAndMacOS", &Value::Null);
+                            }
+                            if ui.button("CRLF - Windows (\\r\\n)").clicked() {
+                                ui.close();
+                                run_command(s, st, "file.fileProperties.lineSeparators.crlfWindows", &Value::Null);
+                            }
+                        });
+                    }
+                    if shown("lineColumnNumber")
+                        && ui
+                            .add(egui::Label::new(small(caret)).sense(Sense::click()))
+                            .on_hover_text("Go to Line:Column (⌘L)")
+                            .clicked()
                     {
                         run_command(s, st, "navigate.lineColumn", &Value::Null);
+                    }
+                    if column_mode
+                        && shown("editorSelectionMode")
+                        && ui
+                            .add(egui::Label::new(small("Column".into())).sense(Sense::click()))
+                            .on_hover_text("Column selection mode: click to turn it off")
+                            .clicked()
+                    {
+                        run_command(s, st, "edit.columnSelectionMode", &json!({ "on": false }));
                     }
                     ui.label(small(language.into()));
                 }
@@ -196,7 +260,7 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     .as_ref()
                     .and_then(|p| p.cargo.as_ref())
                     .map(|_| codecraft_engine::ServerKind::RustAnalyzer));
-                if let Some(kind) = kind {
+                if let Some(kind) = kind.filter(|_| shown("languageServices")) {
                     let status = s.server_status(kind);
                     let name = s.server_name(kind).unwrap_or(kind.label()).to_string();
                     let mem = s.server_memory_mb(kind).map(|mb| format!(" {mb} MB")).unwrap_or_default();
@@ -220,7 +284,23 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                         }
                     }
                 }
-                if s.power_save() {
+                // Rust External Linter: cargo check / Clippy on save.
+                if shown("rustExternalLinter") && s.ws.project.as_ref().is_some_and(|p| p.cargo.is_some()) {
+                    let on = s.ws.settings.check_on_save;
+                    let text = match (on, s.ws.settings.use_clippy) {
+                        (false, _) => "Linter off",
+                        (true, false) => "cargo check",
+                        (true, true) => "Clippy",
+                    };
+                    let resp = ui.add(egui::Label::new(small(text.into())).sense(Sense::click()));
+                    if resp.on_hover_text("Rust external linter on save: click to turn it on or off").clicked() {
+                        run_command(s, st, "settings.set", &json!({ "key": "check_on_save", "value": !on }));
+                    }
+                }
+                if shown("gitBranch") && s.vcs.repo.is_some() {
+                    ui.label(small(format!("⎇ {}", s.vcs.head_label()))).on_hover_text("Git Branch");
+                }
+                if s.power_save() && shown("powerSaveMode") {
                     let resp = ui.add(
                         egui::Label::new(RichText::new("Power Save").size(12.0).color(st.theme.warning))
                             .sense(Sense::click()),

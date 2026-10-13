@@ -150,9 +150,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
-            "edit.bookmarks.show",
-            "Show Bookmarks",
-            Some("Cmd+F3"),
+            "edit.bookmarks.showLineBookmarks",
+            "Show Line Bookmarks…",
+            None,
             "Opens the bookmarks popup; returns the list",
             Context::Global,
             always,
@@ -177,15 +177,20 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             open(s, i)
         }),
         spec(
-            "edit.bookmarks.gotoMnemonic",
-            "Go to Bookmark with Mnemonic",
+            "edit.bookmarks.goToMnemonic",
+            "Go to Mnemonic…",
             None,
-            "{mnemonic}",
+            "{mnemonic?: \"0\"-\"9\" | \"A\"-\"Z\"}: without a mnemonic, opens the bookmarks popup (typing a mnemonic there jumps to it)",
             Context::Global,
             always,
-            |s, p| {
-                let m = mnemonic_param(p)?.ok_or_else(|| CommandError::BadParams("missing mnemonic".into()))?;
-                goto_mnemonic(s, m)
+            |s, p| match mnemonic_param(p)? {
+                Some(m) => goto_mnemonic(s, m),
+                None => {
+                    bookmarks::ensure_loaded(s);
+                    bookmarks::sync(s);
+                    s.bookmarks.popup = true;
+                    Ok(list_json(s))
+                }
             },
         ),
         goto_digit!("edit.bookmarks.goto0", "Go to Bookmark 0", "Ctrl+0", '0'),
@@ -198,8 +203,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         goto_digit!("edit.bookmarks.goto7", "Go to Bookmark 7", "Ctrl+7", '7'),
         goto_digit!("edit.bookmarks.goto8", "Go to Bookmark 8", "Ctrl+8", '8'),
         goto_digit!("edit.bookmarks.goto9", "Go to Bookmark 9", "Ctrl+9", '9'),
-        spec("edit.bookmarks.next", "Next Line Bookmark", None, "", Context::Global, has_editor, |s, _| step(s, true)),
-        spec("edit.bookmarks.previous", "Previous Line Bookmark", None, "", Context::Global, has_editor, |s, _| {
+        spec("edit.bookmarks.nextLineBookmark", "Next Line Bookmark", None, "", Context::Global, has_editor, |s, _| {
+            step(s, true)
+        }),
+        spec("edit.bookmarks.previousLineBookmark", "Previous Line Bookmark", None, "", Context::Global, has_editor, |s, _| {
             step(s, false)
         }),
         spec(
@@ -324,9 +331,9 @@ mod tests {
             d.doc.char_to_line(e.selections.primary().head)
         };
         assert_eq!(caret_line(&s), 5);
-        s.execute("edit.bookmarks.next", &json!({})).unwrap();
+        s.execute("edit.bookmarks.nextLineBookmark", &json!({})).unwrap();
         assert_eq!(caret_line(&s), 3);
-        s.execute("edit.bookmarks.previous", &json!({})).unwrap();
+        s.execute("edit.bookmarks.previousLineBookmark", &json!({})).unwrap();
         assert_eq!(caret_line(&s), 5);
 
         // Same mnemonic on the same line removes it; toggling removes the plain one.

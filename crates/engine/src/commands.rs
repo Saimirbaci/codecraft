@@ -73,15 +73,48 @@ pub struct CatalogItem {
     pub scope: Scope,
 }
 
+/// Command ids that were renamed to the observed catalog's id once RustRover's lazily filled
+/// submenus were captured: `(old id, catalog id)`. The old ids keep working for agents, scripts
+/// and saved keymaps ([`Registry::get`] resolves them), but only the catalog id is registered, so
+/// menus, the keymap and command lists show each action once.
+pub const ALIASES: &[(&str, &str)] = &[
+    ("edit.paste", "edit.paste.paste"),
+    ("edit.bookmarks.next", "edit.bookmarks.nextLineBookmark"),
+    ("edit.bookmarks.previous", "edit.bookmarks.previousLineBookmark"),
+    ("edit.bookmarks.show", "edit.bookmarks.showLineBookmarks"),
+    ("edit.bookmarks.gotoMnemonic", "edit.bookmarks.goToMnemonic"),
+    ("run.debuggingActions.resume", "run.debuggingActions.resumeProgram"),
+    ("run.debuggingActions.pause", "run.debuggingActions.pauseAllPrograms"),
+    ("code.folding.toggle", "code.folding.toggleFolding"),
+    ("code.reformatFileWithRustfmt", "tools.rust.reformatFileWithRustfmt"),
+    ("code.reformatCargoProjectWithRustfmt", "tools.rust.reformatCargoProjectWithRustfmt"),
+    ("view.hideAllToolWindows", "window.activeToolWindow.hideAllWindows"),
+];
+
 pub struct Registry {
     specs: Vec<CommandSpec>,
     by_id: HashMap<&'static str, usize>,
     catalog_by_id: HashMap<&'static str, usize>,
+    aliases: HashMap<&'static str, &'static str>,
 }
 
 impl Registry {
+    /// The command registered for `id` (an [`ALIASES`] old id resolves to its catalog id).
     pub fn get(&self, id: &str) -> Option<&CommandSpec> {
-        self.by_id.get(id).and_then(|i| self.specs.get(*i))
+        self.by_id.get(self.canonical(id)).and_then(|i| self.specs.get(*i))
+    }
+
+    /// The registered id for `id`: the catalog id of an old (aliased) id, else `id` itself.
+    pub fn canonical<'a>(&self, id: &'a str) -> &'a str {
+        match self.aliases.get(id) {
+            Some(primary) => primary,
+            None => id,
+        }
+    }
+
+    /// The old ids that resolve to `id`.
+    pub fn aliases_of(&self, id: &str) -> Vec<&'static str> {
+        ALIASES.iter().filter(|(_, p)| *p == id).map(|(a, _)| *a).collect()
     }
 
     pub fn all(&self) -> &[CommandSpec] {
@@ -89,11 +122,11 @@ impl Registry {
     }
 
     pub fn contains(&self, id: &str) -> bool {
-        self.by_id.contains_key(id)
+        self.by_id.contains_key(self.canonical(id))
     }
 
     pub fn catalog_item(&self, id: &str) -> Option<&'static CatalogItem> {
-        self.catalog_by_id.get(id).and_then(|i| crate::catalog::CATALOG.get(*i))
+        self.catalog_by_id.get(self.canonical(id)).and_then(|i| crate::catalog::CATALOG.get(*i))
     }
 
     /// The effective shortcuts of a command: its own, else the catalog's, plus alternates.
@@ -147,6 +180,11 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::inspection_cmds::specs());
         specs.extend(crate::render_cmds::specs());
         specs.extend(crate::session_store::specs());
+        specs.extend(crate::appearance::specs());
+        specs.extend(crate::paste::specs());
+        specs.extend(crate::usages::specs());
+        specs.extend(crate::folding::specs());
+        specs.extend(crate::tool_window_cmds::specs());
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {
@@ -155,7 +193,9 @@ pub fn registry() -> &'static Registry {
         }
         let catalog_by_id =
             crate::catalog::CATALOG.iter().enumerate().filter(|(_, c)| c.id != "---").map(|(i, c)| (c.id, i)).collect();
-        Registry { specs, by_id, catalog_by_id }
+        // An alias never shadows a registered id.
+        let aliases = ALIASES.iter().copied().filter(|(old, _)| !by_id.contains_key(old)).collect();
+        Registry { specs, by_id, catalog_by_id, aliases }
     })
 }
 
@@ -225,5 +265,32 @@ mod tests {
         // Every live catalog item has a spec; menu ids must match exactly.
         let live = crate::catalog::CATALOG.iter().filter(|c| reg.contains(c.id)).count();
         assert!(live > 50, "only {live} catalog items are live");
+    }
+
+    #[test]
+    fn aliases_resolve_to_registered_catalog_ids() {
+        let reg = registry();
+        for (old, primary) in ALIASES {
+            assert!(!reg.all().iter().any(|s| s.id == *old), "{old} is still registered");
+            let spec = reg.get(old).unwrap_or_else(|| panic!("{old} does not resolve"));
+            assert_eq!(spec.id, *primary);
+            assert!(reg.catalog_item(primary).is_some(), "{primary} is not a catalog id");
+            assert_eq!(reg.canonical(old), *primary);
+            assert!(reg.contains(old));
+            assert_eq!(reg.shortcuts(old), reg.shortcuts(primary));
+            assert!(reg.aliases_of(primary).contains(old));
+        }
+        assert_eq!(reg.canonical("edit.copy"), "edit.copy");
+    }
+
+    #[test]
+    fn old_ids_execute_through_their_alias() {
+        let mut s = crate::Session::new();
+        let d = s.ws.add_document(None, "abc");
+        s.ws.open_editor(d);
+        s.execute("edit.paste", &serde_json::json!({ "text": "x" })).unwrap();
+        assert_eq!(s.ws.active().unwrap().1.doc.text(), "xabc");
+        assert!(s.enabled("edit.paste").is_ok());
+        assert!(matches!(s.execute("no.such.command", &Value::Null), Err(CommandError::Unknown(_))));
     }
 }

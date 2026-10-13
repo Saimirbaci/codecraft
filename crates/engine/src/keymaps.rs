@@ -235,7 +235,11 @@ pub const WINDOWS: &[(&str, &[&str])] = &[
     ("run.debug", &["Shift+F9"]),
     ("run.chooseAndDebug", &["Alt+Shift+F9"]),
     ("debug.atCaret", &["Ctrl+Shift+F9"]),
-    ("run.debuggingActions.resume", &["F9"]),
+    ("run.debuggingActions.resumeProgram", &["F9"]),
+    // macOS Ctrl shortcuts have no mechanical translation (see `translate`).
+    ("edit.findUsages.nextHighlightedUsage", &["Ctrl+Alt+Down"]),
+    ("edit.findUsages.previousHighlightedUsage", &["Ctrl+Alt+Up"]),
+    ("view.appearance.enterFullScreen", &[]),
     // Window
     ("window.editorTabs.closeTab", &["Ctrl+F4"]),
     ("window.editorTabs.selectNextTab", &["Alt+Right"]),
@@ -251,7 +255,7 @@ pub const WINDOWS: &[(&str, &[&str])] = &[
     // shortcuts are never translated mechanically, so they are listed.
     ("edit.bookmarks.toggle", &["F11"]),
     ("edit.bookmarks.toggleWithMnemonic", &["Ctrl+F11"]),
-    ("edit.bookmarks.show", &["Shift+F11"]),
+    ("edit.bookmarks.showLineBookmarks", &["Shift+F11"]),
     ("edit.bookmarks.goto0", &["Ctrl+0"]),
     ("edit.bookmarks.goto1", &["Ctrl+1"]),
     ("edit.bookmarks.goto2", &["Ctrl+2"]),
@@ -280,6 +284,7 @@ fn windows_explicit() -> &'static HashSet<String> {
 
 /// The built-in shortcuts of a command in `keymap` (no user overrides).
 pub fn defaults(keymap: &str, id: &str) -> Vec<String> {
+    let id = registry().canonical(id);
     let mac = registry().shortcuts(id);
     if canonical_name(keymap) == Some(MACOS) {
         return dedup(mac.iter().filter_map(|s| normalize(s).ok()));
@@ -306,10 +311,17 @@ pub fn overrides<'a>(settings: &'a Settings, keymap: &str) -> Option<&'a BTreeMa
     settings.keymap_overrides.get(keymap)
 }
 
+/// A command's entry in an overrides map: under its id, else under an old (aliased) id from a
+/// settings file written before the rename.
+fn override_for<'a>(o: &'a BTreeMap<String, Vec<String>>, id: &str) -> Option<&'a Vec<String>> {
+    let id = registry().canonical(id);
+    o.get(id).or_else(|| registry().aliases_of(id).into_iter().find_map(|a| o.get(a)))
+}
+
 /// The effective shortcuts of a command in the active keymap (overrides applied).
 pub fn shortcuts(settings: &Settings, id: &str) -> Vec<String> {
     let keymap = active(settings);
-    match overrides(settings, keymap).and_then(|o| o.get(id)) {
+    match overrides(settings, keymap).and_then(|o| override_for(o, id)) {
         Some(list) => dedup(list.iter().filter_map(|s| normalize(s).ok())),
         None => defaults(keymap, id),
     }
@@ -317,7 +329,7 @@ pub fn shortcuts(settings: &Settings, id: &str) -> Vec<String> {
 
 /// Whether the user changed this command's shortcuts in the active keymap.
 pub fn is_overridden(settings: &Settings, id: &str) -> bool {
-    overrides(settings, active(settings)).is_some_and(|o| o.contains_key(id))
+    overrides(settings, active(settings)).is_some_and(|o| override_for(o, id).is_some())
 }
 
 /// One bound shortcut.
@@ -336,7 +348,7 @@ pub fn bindings(settings: &Settings) -> Vec<KeyBinding> {
     let user = overrides(settings, keymap);
     let windows = keymap == WINDOWS_LINUX;
     let rank = |spec: &crate::CommandSpec| {
-        if user.is_some_and(|o| o.contains_key(spec.id)) {
+        if user.is_some_and(|o| override_for(o, spec.id).is_some()) {
             0
         } else if spec.shortcut.is_some()
             || !spec.alt_shortcuts.is_empty()
@@ -364,6 +376,7 @@ pub fn bindings(settings: &Settings) -> Vec<KeyBinding> {
 /// Commands other than `except` that have `shortcut` in the active keymap.
 pub fn conflicts(settings: &Settings, shortcut: &str, except: &str) -> Vec<&'static str> {
     let Ok(sc) = normalize(shortcut) else { return Vec::new() };
+    let except = registry().canonical(except);
     registry()
         .all()
         .iter()
@@ -392,10 +405,14 @@ pub fn set_shortcuts(settings: &mut Settings, id: &str, list: &[String]) -> Resu
     if !registry().contains(id) {
         return Err(format!("unknown command `{id}`"));
     }
+    let id = registry().canonical(id);
     let list = list.iter().map(|s| normalize(s)).collect::<Result<Vec<_>, _>>()?;
     let list = dedup(list.into_iter());
     let keymap = active(settings);
     let entry = settings.keymap_overrides.entry(keymap.to_string()).or_default();
+    for old in registry().aliases_of(id) {
+        entry.remove(old);
+    }
     if list == defaults(keymap, id) {
         entry.remove(id);
     } else {
@@ -449,7 +466,11 @@ pub fn reset(settings: &mut Settings, id: Option<&str>) {
     match id {
         Some(id) => {
             if let Some(o) = settings.keymap_overrides.get_mut(keymap) {
+                let id = registry().canonical(id);
                 o.remove(id);
+                for old in registry().aliases_of(id) {
+                    o.remove(old);
+                }
                 if o.is_empty() {
                     settings.keymap_overrides.remove(keymap);
                 }
@@ -475,7 +496,7 @@ pub fn validate_overrides(
                 return Err(format!("unknown command `{id}`"));
             }
             let list = list.iter().map(|s| normalize(s)).collect::<Result<Vec<_>, _>>()?;
-            checked.insert(id.clone(), dedup(list.into_iter()));
+            checked.insert(registry().canonical(id).to_string(), dedup(list.into_iter()));
         }
         out.insert(name.to_string(), checked);
     }
@@ -556,10 +577,10 @@ mod tests {
         assert!(one("app.quitRustRover").is_empty());
         // macOS Ctrl shortcuts never leak into the Ctrl-based keymap (Ctrl+V is Paste there).
         assert_eq!(one("git.vcsOperationsPopup"), vec!["Alt+`"]);
-        assert!(one("edit.paste").contains(&"Ctrl+V".to_string()));
+        assert!(one("edit.paste.paste").contains(&"Ctrl+V".to_string()));
         assert!(shortcuts(&s, "navigate.declarationOrUsages").contains(&"Ctrl+B".to_string()));
         assert_eq!(one("edit.bookmarks.toggle"), vec!["F11"]);
-        assert_eq!(one("edit.bookmarks.show"), vec!["Shift+F11"]);
+        assert_eq!(one("edit.bookmarks.showLineBookmarks"), vec!["Shift+F11"]);
         assert_eq!(one("edit.bookmarks.goto3"), vec!["Ctrl+3"]);
         assert_eq!(one("edit.find.findNextOccurrence"), vec!["F3"]);
     }
@@ -578,6 +599,29 @@ mod tests {
             assert!(hits.len() <= 1, "{sc} is bound to {hits:?}");
             assert!(b.iter().any(|k| k.shortcut == sc), "{sc} unbound");
         }
+    }
+
+    #[test]
+    fn overrides_saved_under_an_old_id_still_apply() {
+        let mut s = with(MACOS);
+        let mut o = BTreeMap::new();
+        o.insert("edit.bookmarks.show".to_string(), vec!["F4".to_string()]);
+        s.keymap_overrides.insert(MACOS.into(), o);
+        assert_eq!(shortcuts(&s, "edit.bookmarks.showLineBookmarks"), vec!["F4"]);
+        assert_eq!(shortcuts(&s, "edit.bookmarks.show"), vec!["F4"]);
+        assert!(is_overridden(&s, "edit.bookmarks.showLineBookmarks"));
+        assert!(bindings(&s).iter().any(|b| b.shortcut == "F4" && b.id == "edit.bookmarks.showLineBookmarks"));
+        // Editing moves the override to the catalog id.
+        set_shortcuts(&mut s, "edit.bookmarks.show", &["F5".into()]).unwrap();
+        let o = &s.keymap_overrides[MACOS];
+        assert_eq!(o.get("edit.bookmarks.showLineBookmarks"), Some(&vec!["F5".to_string()]));
+        assert!(!o.contains_key("edit.bookmarks.show"));
+        reset(&mut s, Some("edit.bookmarks.show"));
+        assert_eq!(shortcuts(&s, "edit.bookmarks.showLineBookmarks"), vec!["Cmd+F3"]);
+        let mut map = BTreeMap::new();
+        map.insert(MACOS.to_string(), BTreeMap::from([("edit.paste".to_string(), vec!["Cmd+V".to_string()])]));
+        let v = validate_overrides(&map).unwrap();
+        assert!(v[MACOS].contains_key("edit.paste.paste"));
     }
 
     #[test]

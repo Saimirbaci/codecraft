@@ -129,6 +129,8 @@ pub struct OpenDocument {
     /// Highlights at a revision, updated incrementally from the document's change log.
     highlight_cache: Option<(u64, IncrementalHighlighter)>,
     fold_cache: Option<(u64, Vec<FoldRange>)>,
+    /// Code › Folding › Fold Selection regions (line-based, like the editors' folds).
+    manual_folds: Vec<FoldRange>,
     /// Semantic tokens per line, for the revision they were computed at.
     pub semantic: Option<(u64, Vec<Vec<SemanticSpan>>)>,
     /// Inlay hints (sorted by offset), for the revision they were computed at.
@@ -152,6 +154,7 @@ impl OpenDocument {
             lsp_text: None,
             highlight_cache: None,
             fold_cache: None,
+            manual_folds: Vec::new(),
             semantic: None,
             inlay_hints: None,
         }
@@ -204,13 +207,31 @@ impl OpenDocument {
             if self.highlight_stale(rev) {
                 self.update_highlights(rev, &text);
             }
-            let f = match &self.highlight_cache {
+            let mut f = match &self.highlight_cache {
                 Some((_, h)) => h.folding_ranges(&text),
                 None => codecraft_syntax::folding_ranges(self.language, &text),
             };
+            if !self.manual_folds.is_empty() {
+                let lines = self.doc.len_lines();
+                f.extend(self.manual_folds.iter().filter(|m| m.start_line < m.end_line && m.end_line < lines).copied());
+                // Sorted by start line, outermost first, no duplicates (as the syntax crate's).
+                f.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+                f.dedup_by_key(|r| (r.start_line, r.end_line));
+            }
             self.fold_cache = Some((rev, f));
         }
         self.fold_cache.as_ref().map(|(_, f)| f.as_slice()).unwrap_or(&[])
+    }
+
+    /// The Fold Selection regions.
+    pub fn manual_folds(&self) -> &[FoldRange] {
+        &self.manual_folds
+    }
+
+    /// Replace the Fold Selection regions (they join [`folding_ranges`](Self::folding_ranges)).
+    pub fn set_manual_folds(&mut self, folds: Vec<FoldRange>) {
+        self.manual_folds = folds;
+        self.fold_cache = None;
     }
 
     /// Bring the highlight and fold caches up to date (then read them with the `cached_*` accessors).

@@ -57,7 +57,7 @@ fn bookmarks_todo_history_and_scratches() {
     assert_eq!(std::fs::read_to_string(root.join("a.rs")).unwrap().lines().count(), 3, "the key did not reach the editor");
 
     // Cmd+F3 popup, Escape closes it.
-    h.state_mut().session.execute("edit.bookmarks.show", &json!({})).unwrap();
+    h.state_mut().session.execute("edit.bookmarks.showLineBookmarks", &json!({})).unwrap();
     h.run_steps(3);
     assert!(h.query_by_label_contains("[5] a.rs:3").is_some());
     h.key_press(Key::Escape);

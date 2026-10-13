@@ -132,8 +132,8 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
     let enabled = |id: &str| s.enabled(id).is_ok();
     let buttons: [(Icon, &str, &'static str, bool); 10] = [
         (Icon::Rerun, "Rerun", "debug.rerun", enabled("debug.rerun")),
-        (Icon::Resume, "Resume Program", "run.debuggingActions.resume", enabled("run.debuggingActions.resume")),
-        (Icon::Pause, "Pause Program", "run.debuggingActions.pause", enabled("run.debuggingActions.pause")),
+        (Icon::Resume, "Resume Program", "run.debuggingActions.resumeProgram", enabled("run.debuggingActions.resumeProgram")),
+        (Icon::Pause, "Pause Program", "run.debuggingActions.pauseAllPrograms", enabled("run.debuggingActions.pauseAllPrograms")),
         (Icon::Stop, "Stop", "debug.stop", enabled("debug.stop")),
         (Icon::StepOver, "Step Over", "run.debuggingActions.stepOver", enabled("run.debuggingActions.stepOver")),
         (Icon::StepInto, "Step Into", "run.debuggingActions.stepInto", enabled("run.debuggingActions.stepInto")),

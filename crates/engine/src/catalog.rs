@@ -5054,7 +5054,7 @@ pub static CATALOG: &[CatalogItem] = &[
         shortcut: None,
         id: "window.mergeAllProjectWindows",
         submenu: false,
-        scope: Scope::Core,
+        scope: Scope::Out,
     },
     CatalogItem { path: &["Window"], label: "---", shortcut: None, id: "---", submenu: false, scope: Scope::Core },
     CatalogItem {

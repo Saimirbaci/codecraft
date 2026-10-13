@@ -62,7 +62,8 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         .fill(st.theme.panel_bg)
         .inner_margin(Margin::symmetric(3, 6))
         .stroke(Stroke::new(1.0, st.theme.border));
-    egui::Panel::left("stripe-left").exact_size(38.0).resizable(false).frame(frame).show(ui, |ui| {
+    let width = if s.ws.settings.compact_mode { 32.0 } else { 38.0 };
+    egui::Panel::left("stripe-left").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
         ui.vertical_centered(|ui| {
             for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Left) {
                 stripe_button(ui, s, st, tw);
@@ -74,7 +75,7 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             });
         });
     });
-    egui::Panel::right("stripe-right").exact_size(38.0).resizable(false).frame(frame).show(ui, |ui| {
+    egui::Panel::right("stripe-right").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
         ui.vertical_centered(|ui| {
             for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right) {
                 stripe_button(ui, s, st, tw);
