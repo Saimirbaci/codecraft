@@ -97,6 +97,14 @@ pub struct Settings {
     pub lsp_memory_limit_mb: u64,
     /// Smaller rust-analyzer caches and no eager dependency indexing.
     pub rust_analyzer_low_memory: bool,
+    /// Commit message generation: `openrouter`, `ollama`, `claude` or `openai`.
+    pub commit_ai_provider: String,
+    /// Model name; empty = the provider's default.
+    pub commit_ai_model: String,
+    /// Base URL of the Ollama server.
+    pub ollama_url: String,
+    /// API keys by provider id. An empty entry falls back to the provider's environment variable.
+    pub commit_ai_keys: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -116,6 +124,10 @@ impl Default for Settings {
             theme: "Dark".into(),
             lsp_memory_limit_mb: 0,
             rust_analyzer_low_memory: false,
+            commit_ai_provider: "openrouter".into(),
+            commit_ai_model: String::new(),
+            ollama_url: "http://localhost:11434".into(),
+            commit_ai_keys: BTreeMap::new(),
         }
     }
 }

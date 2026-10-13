@@ -884,6 +884,47 @@ fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 }
                 ui.end_row();
             });
+            ui.add_space(8.0);
+            ui.heading("Commit message generation");
+            egui::Grid::new("settings-commit-ai").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                use codecraft_engine::commit_ai::Provider;
+                let provider = Provider::from_id(&cfg.commit_ai_provider).unwrap_or(Provider::OpenRouter);
+                ui.label("Provider");
+                let mut chosen = provider;
+                egui::ComboBox::from_id_salt("commit-ai-provider").selected_text(provider.label()).show_ui(ui, |ui| {
+                    for p in Provider::ALL {
+                        ui.selectable_value(&mut chosen, p, p.label());
+                    }
+                });
+                if chosen != provider {
+                    set.push(("commit_ai_provider", json!(chosen.id())));
+                }
+                ui.end_row();
+                ui.label("Model");
+                if ui.add(TextEdit::singleline(&mut cfg.commit_ai_model).hint_text(provider.default_model())).changed()
+                {
+                    set.push(("commit_ai_model", json!(cfg.commit_ai_model)));
+                }
+                ui.end_row();
+                if provider == Provider::Ollama {
+                    ui.label("Ollama URL");
+                    if ui.add(TextEdit::singleline(&mut cfg.ollama_url).hint_text("http://localhost:11434")).changed() {
+                        set.push(("ollama_url", json!(cfg.ollama_url)));
+                    }
+                    ui.end_row();
+                } else if let Some(var) = provider.key_env() {
+                    ui.label("API key");
+                    let mut key = cfg.commit_ai_keys.get(provider.id()).cloned().unwrap_or_default();
+                    if ui
+                        .add(TextEdit::singleline(&mut key).password(true).hint_text(format!("or set {var}")))
+                        .changed()
+                    {
+                        cfg.commit_ai_keys.insert(provider.id().to_string(), key);
+                        set.push(("commit_ai_keys", json!(cfg.commit_ai_keys)));
+                    }
+                    ui.end_row();
+                }
+            });
             ui.add_space(6.0);
             ui.label(
                 RichText::new(format!("Editor font: {}", st.mono_font_name)).color(st.theme.text_muted).size(11.0),

@@ -555,6 +555,20 @@ fn commit_box(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd
         if ui.add_enabled(can, egui::Button::new("Commit and Push…")).clicked() {
             *cmd = Some(("vcs.commit", json!({ "push": true })));
         }
+        let generating = s.vcs.generating;
+        let provider = codecraft_engine::commit_ai::Provider::from_id(&s.ws.settings.commit_ai_provider)
+            .map_or("the language model", |p| p.label());
+        if ui
+            .add_enabled(!generating && !s.vcs.included_paths().is_empty(), egui::Button::new("Generate"))
+            .on_hover_text(format!("Write the commit message with {provider} (choose it in Settings)"))
+            .clicked()
+        {
+            *cmd = Some(("vcs.generateMessage", Value::Null));
+        }
+        if generating {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(RichText::new("Generating…").color(theme.text_muted).small());
+        }
         if let Some(op) = &busy {
             ui.add(egui::Spinner::new().size(12.0));
             ui.label(RichText::new(&op.label).color(theme.text_muted).small());

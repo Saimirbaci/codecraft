@@ -397,3 +397,79 @@ fn no_git_command_panics_in_a_repository() {
     }
     s.shutdown();
 }
+
+/// A one-shot HTTP server answering like Ollama's `/api/chat`; returns its URL and the request.
+fn stub_ollama(reply: &'static str) -> (String, std::thread::JoinHandle<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let h = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = conn.read(&mut chunk).unwrap();
+            buf.extend_from_slice(&chunk[..n]);
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                let len = head
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap_or(0))
+                    })
+                    .unwrap_or(0usize);
+                if body.len() >= len {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let body = reply.to_string();
+        let _ = write!(
+            conn,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    (url, h)
+}
+
+#[test]
+fn generate_commit_message_with_ollama() {
+    let curl = Command::new("curl").arg("--version").output().is_ok_and(|o| o.status.success());
+    if !git_available() || !curl {
+        return;
+    }
+    let e = Env::new();
+    let mut s = e.session(&[("a.txt", "one\n")]);
+    let (url, server) = stub_ollama(r#"{"message":{"role":"assistant","content":"Change a.txt\n"}}"#);
+    s.execute("settings.set", &json!({ "key": "commit_ai_provider", "value": "ollama" })).unwrap();
+    s.execute("settings.set", &json!({ "key": "ollama_url", "value": url })).unwrap();
+
+    // Nothing included yet.
+    e.write("a.txt", "two\n");
+    settle(&mut s, "change", |s| s.vcs.status.file("a.txt").is_some());
+    s.execute("vcs.generateMessage", &Value::Null).unwrap();
+    assert!(s.vcs.generating);
+    settle(&mut s, "message", |s| !s.vcs.generating);
+    assert_eq!(s.vcs.commit.message, "Change a.txt");
+    let request = server.join().unwrap();
+    assert!(request.contains("POST /api/chat") && request.contains("+two"), "{request}");
+}
+
+#[test]
+fn generate_commit_message_reports_a_missing_key() {
+    if !git_available() {
+        return;
+    }
+    let e = Env::new();
+    let mut s = e.session(&[("a.txt", "one\n")]);
+    e.write("a.txt", "two\n");
+    settle(&mut s, "change", |s| s.vcs.status.file("a.txt").is_some());
+    s.execute("settings.set", &json!({ "key": "commit_ai_provider", "value": "nope" })).unwrap();
+    assert!(matches!(s.execute("vcs.generateMessage", &Value::Null), Err(CommandError::Failed(_))));
+    assert!(!s.vcs.generating);
+}

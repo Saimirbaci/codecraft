@@ -477,6 +477,26 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
+            "vcs.generateMessage",
+            "Generate Commit Message",
+            None,
+            "Write the commit message for the included changes with the language model chosen in \
+             Settings (commit_ai_provider: openrouter, ollama, claude or openai; commit_ai_model; \
+             ollama_url; commit_ai_keys)",
+            g,
+            |s| {
+                has_repo(s)?;
+                if s.vcs.generating {
+                    return Err("a commit message is being generated".into());
+                }
+                Ok(())
+            },
+            |s, _| {
+                vcs::generate_message(s)?;
+                ok()
+            },
+        ),
+        spec(
             "vcs.setAmend",
             "Amend Commit",
             None,

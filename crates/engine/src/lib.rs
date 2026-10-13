@@ -18,6 +18,7 @@ pub mod approvals;
 pub mod catalog;
 mod code_cmds;
 pub mod commands;
+pub mod commit_ai;
 mod convert;
 pub mod database;
 mod database_cmds;
