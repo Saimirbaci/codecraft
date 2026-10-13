@@ -478,6 +478,9 @@ fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
         s.selected_run_config = i;
     }
     s.popup = None;
+    if let Some(name) = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()) {
+        crate::run_config_store::prepare_run(s, &name).map_err(CommandError::Failed)?;
+    }
     let target = match s.run_configs.get(s.selected_run_config) {
         Some(c) => match (c.cargo_invocation(), &c.command) {
             (Some(invocation), _) => DebugTarget::Cargo { name: c.name.clone(), invocation: invocation.clone() },

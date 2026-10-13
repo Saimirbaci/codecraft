@@ -24,7 +24,7 @@ pub fn python_for(root: &Path) -> String {
 }
 
 /// The JavaScript package manager from the lockfile.
-fn package_manager(root: &Path) -> &'static str {
+pub(crate) fn package_manager(root: &Path) -> &'static str {
     if root.join("bun.lockb").is_file() || root.join("bun.lock").is_file() {
         "bun"
     } else if root.join("pnpm-lock.yaml").is_file() {

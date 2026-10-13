@@ -4,7 +4,9 @@
 //!
 //! A user configuration is either a Cargo command (`run --package app --bin app -- --verbose`,
 //! like RustRover's Cargo configuration's Command field) or any other command line (`make test`,
-//! `sh -c 'a && b'`), with environment variables and a working directory (empty = the project).
+//! `sh -c 'a && b'`), a Python script, an npm script, a Zig build or a C/C++ program (compiled
+//! and run), with environment variables (optionally loaded from a `.env` file) and a working
+//! directory (empty = the project).
 //! `Session::run_configs` lists the user configurations first, then the derived ones.
 
 use std::path::{Path, PathBuf};
@@ -29,6 +31,15 @@ pub enum RunKind {
     Cargo,
     /// `command` is a program and its arguments (shell-style quoting).
     Command,
+    /// `command` is a script (or `-m module`) and its arguments, run by the project's Python.
+    Python,
+    /// `command` is source files (and compiler flags), then optionally `--` and program
+    /// arguments: compiled with `cc`/`c++` into `.codecraft/build/` and run.
+    Cpp,
+    /// `command` is the arguments of `zig` (`build run`, `run src/main.zig -- --arg`).
+    Zig,
+    /// `command` is the arguments of the project's package manager (`run dev`, `test`).
+    Npm,
 }
 
 impl RunKind {
@@ -36,7 +47,11 @@ impl RunKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "cargo" => Ok(Self::Cargo),
             "command" | "shell" | "process" => Ok(Self::Command),
-            other => Err(format!("unknown configuration type `{other}` (cargo or command)")),
+            "python" | "python3" | "py" => Ok(Self::Python),
+            "cpp" | "c" | "c++" | "c/c++" | "cc" => Ok(Self::Cpp),
+            "zig" => Ok(Self::Zig),
+            "npm" | "node" | "js" => Ok(Self::Npm),
+            other => Err(format!("unknown configuration type `{other}` (cargo, command, python, cpp, zig or npm)")),
         }
     }
 
@@ -44,6 +59,37 @@ impl RunKind {
         match self {
             Self::Cargo => "Cargo",
             Self::Command => "Command",
+            Self::Python => "Python",
+            Self::Cpp => "C/C++",
+            Self::Zig => "Zig",
+            Self::Npm => "Npm",
+        }
+    }
+
+    /// Every kind, in the order the UI offers them.
+    pub const ALL: [RunKind; 6] = [Self::Cargo, Self::Command, Self::Python, Self::Cpp, Self::Zig, Self::Npm];
+
+    /// What the Command field of a new configuration of this kind starts with.
+    pub fn default_command(self) -> &'static str {
+        match self {
+            Self::Cargo => "run",
+            Self::Command => "make",
+            Self::Python => "main.py",
+            Self::Cpp => "main.c",
+            Self::Zig => "build run",
+            Self::Npm => "run dev",
+        }
+    }
+
+    /// The Command field's placeholder.
+    pub fn hint(self) -> &'static str {
+        match self {
+            Self::Cargo => "run --package app --bin app -- --arg",
+            Self::Command => "make test   or   sh -c 'a && b'",
+            Self::Python => "main.py --arg   or   -m pytest",
+            Self::Cpp => "main.c util.c -O2 -- --arg",
+            Self::Zig => "build run   or   run src/main.zig",
+            Self::Npm => "run dev   or   test",
         }
     }
 }
@@ -56,6 +102,9 @@ pub struct UserRunConfig {
     pub kind: RunKind,
     pub command: String,
     pub env: Vec<(String, String)>,
+    /// A `.env` file (relative = from the project) whose variables are added to the environment
+    /// when the configuration runs; `env` wins over it. Empty = none.
+    pub env_file: String,
     /// Empty = the project root (the Cargo workspace root for Cargo); relative = from the project.
     pub working_dir: String,
 }
@@ -246,6 +295,73 @@ pub fn env_text(env: &[(String, String)]) -> String {
     env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(";")
 }
 
+/// Largest `.env` file read, and most variables taken from one.
+const MAX_ENV_FILE_BYTES: u64 = 1024 * 1024;
+const MAX_ENV_FILE_VARS: usize = 2000;
+
+/// The variables of a `.env` file: `NAME=value` lines, an optional `export ` prefix, `#` comments
+/// (whole-line, or after unquoted values), `'…'` literal and `"…"` with `\n \r \t \" \\`
+/// escapes. Lines that are not assignments are skipped; a later assignment wins.
+pub fn parse_env_file(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in text.trim_start_matches('\u{feff}').lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").map(str::trim_start).unwrap_or(line);
+        let Some((key, rest)) = line.split_once('=') else { continue };
+        let key = key.trim();
+        if key.is_empty()
+            || key.starts_with('#')
+            || !key.chars().all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let value = match rest.chars().next() {
+            Some('\'') => rest.get(1..).and_then(|r| r.split_once('\'')).map(|(v, _)| v.to_string()),
+            Some('"') => {
+                let mut v = String::new();
+                let mut chars = rest.get(1..).unwrap_or("").chars();
+                let mut closed = false;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => match chars.next() {
+                            Some('n') => v.push('\n'),
+                            Some('r') => v.push('\r'),
+                            Some('t') => v.push('\t'),
+                            Some(c @ ('"' | '\\' | '$')) => v.push(c),
+                            Some(c) => {
+                                v.push('\\');
+                                v.push(c);
+                            }
+                            None => break,
+                        },
+                        c => v.push(c),
+                    }
+                }
+                closed.then_some(v)
+            }
+            _ => {
+                let end = rest.find(" #").unwrap_or(rest.len());
+                Some(rest.get(..end).unwrap_or(rest).trim_end().to_string())
+            }
+        };
+        let Some(value) = value else { continue };
+        if value.contains('\0') {
+            continue;
+        }
+        out.retain(|(k, _)| k != key);
+        out.push((key.to_string(), value));
+        if out.len() >= MAX_ENV_FILE_VARS {
+            break;
+        }
+    }
+    out
+}
+
 impl UserRunConfig {
     /// The working directory: `working_dir` resolved against `project`, else `default`.
     pub fn cwd(&self, project: &Path, default: &Path) -> PathBuf {
@@ -255,6 +371,40 @@ impl UserRunConfig {
         }
         let p = PathBuf::from(w);
         if p.is_absolute() { p } else { project.join(p) }
+    }
+
+    /// The `.env` file, resolved against `project` (`None` when the configuration has none).
+    pub fn env_file_path(&self, project: &Path) -> Option<PathBuf> {
+        let f = self.env_file.trim();
+        if f.is_empty() {
+            return None;
+        }
+        let p = PathBuf::from(f);
+        Some(if p.is_absolute() { p } else { project.join(p) })
+    }
+
+    /// Read the `.env` file: `Ok(vec![])` when there is none configured.
+    pub fn read_env_file(&self, project: &Path) -> Result<Vec<(String, String)>, String> {
+        use std::io::Read;
+        let Some(path) = self.env_file_path(project) else { return Ok(Vec::new()) };
+        let name = self.name.trim();
+        let file = std::fs::File::open(&path).map_err(|e| format!("`{name}`: cannot read {}: {e}", path.display()))?;
+        let mut text = String::new();
+        file.take(MAX_ENV_FILE_BYTES)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("`{name}`: cannot read {}: {e}", path.display()))?;
+        Ok(parse_env_file(&text))
+    }
+
+    /// The environment to run with: the `.env` file's variables, overridden by `env`. A `.env`
+    /// file that cannot be read adds nothing here (`validate` and `check_env_file` report it).
+    pub fn effective_env(&self, project: &Path) -> Vec<(String, String)> {
+        let mut env = self.read_env_file(project).unwrap_or_default();
+        for (k, v) in &self.env {
+            env.retain(|(o, _)| o != k);
+            env.push((k.clone(), v.clone()));
+        }
+        env
     }
 
     /// Check the configuration (name, command, working directory).
@@ -270,25 +420,87 @@ impl UserRunConfig {
         if !self.working_dir.trim().is_empty() && !cwd.is_dir() {
             return Err(format!("`{name}`: working directory {} does not exist", cwd.display()));
         }
+        if let Some(path) = self.env_file_path(project)
+            && !path.is_file()
+        {
+            return Err(format!("`{name}`: environment file {} does not exist", path.display()));
+        }
         self.to_run_config(project, project).map(|_| ())
     }
 
     /// The runnable configuration; Cargo runs default to `cargo_root`.
     pub fn to_run_config(&self, project: &Path, cargo_root: &Path) -> Result<RunConfig, String> {
         let name = self.name.trim().to_string();
+        let env = self.effective_env(project);
+        let words = || split_words(&self.command).map_err(|e| format!("`{name}`: {e}"));
+        let process = |program: String, args: Vec<String>| {
+            let mut cmd = ProcessCommand::new(program, &[], self.cwd(project, project));
+            cmd.args = args;
+            cmd.env = env.clone();
+            Ok(RunConfig::process(name.clone(), cmd))
+        };
         match self.kind {
             RunKind::Cargo => {
                 let mut inv =
                     parse_cargo(&self.command, &self.cwd(project, cargo_root)).map_err(|e| format!("`{name}`: {e}"))?;
-                inv.env = self.env.clone();
-                Ok(RunConfig::cargo(name, inv))
+                inv.env = env.clone();
+                Ok(RunConfig::cargo(name.clone(), inv))
             }
             RunKind::Command => {
-                let words = split_words(&self.command).map_err(|e| format!("`{name}`: {e}"))?;
+                let words = words()?;
                 let (program, args) = words.split_first().ok_or_else(|| format!("`{name}`: the command is empty"))?;
-                let mut cmd = ProcessCommand::new(program.clone(), &[], self.cwd(project, project));
-                cmd.args = args.to_vec();
-                cmd.env = self.env.clone();
+                process(program.clone(), args.to_vec())
+            }
+            RunKind::Python => {
+                let args = words()?;
+                if args.is_empty() {
+                    return Err(format!("`{name}`: the command is empty"));
+                }
+                process(crate::run_configs::python_for(project), args)
+            }
+            RunKind::Zig => {
+                let args = words()?;
+                if args.is_empty() {
+                    return Err(format!("`{name}`: the command is empty"));
+                }
+                process("zig".into(), args)
+            }
+            RunKind::Npm => {
+                let args = words()?;
+                if args.is_empty() {
+                    return Err(format!("`{name}`: the command is empty"));
+                }
+                process(crate::run_configs::package_manager(project).into(), args)
+            }
+            RunKind::Cpp => {
+                let words = words()?;
+                let (build, args) = match words.iter().position(|w| w == "--") {
+                    Some(i) => (words.get(..i).unwrap_or_default(), words.get(i + 1..).unwrap_or_default()),
+                    None => (words.as_slice(), &[][..]),
+                };
+                let sources: Vec<&String> = build.iter().filter(|w| !w.starts_with('-')).collect();
+                if sources.is_empty() {
+                    return Err(format!("`{name}`: no C/C++ source file in the command"));
+                }
+                let cxx = sources.iter().any(|s| {
+                    let ext = Path::new(s.as_str()).extension().and_then(|e| e.to_str()).unwrap_or("");
+                    matches!(ext, "cpp" | "cc" | "cxx" | "C" | "c++" | "cp")
+                });
+                let dir = project.join(".codecraft").join("build");
+                let exe = dir.join(build_file_name(&name));
+                let mut compile: Vec<String> = vec![(if cxx { "c++" } else { "cc" }).into()];
+                compile.extend(build.iter().cloned());
+                compile.extend(["-o".into(), exe.display().to_string()]);
+                let mut run = vec![exe.display().to_string()];
+                run.extend(args.iter().cloned());
+                let script = format!(
+                    "mkdir -p {} && {} && {}",
+                    codecraft_cargo::shell_quote(&dir.display().to_string()),
+                    join_words(&compile),
+                    join_words(&run)
+                );
+                let mut cmd = ProcessCommand::shell(script, self.cwd(project, project));
+                cmd.env = env;
                 Ok(RunConfig::process(name, cmd))
             }
         }
@@ -305,6 +517,7 @@ impl UserRunConfig {
                 kind: RunKind::Command,
                 command: join_words(&words),
                 env: cmd.env.clone(),
+                env_file: String::new(),
                 working_dir: rel(&cmd.cwd),
             };
         }
@@ -315,9 +528,20 @@ impl UserRunConfig {
             kind: RunKind::Cargo,
             command: join_words(&quiet.args()),
             env: c.invocation.env.clone(),
+            env_file: String::new(),
             working_dir: rel(&c.invocation.cwd),
         }
     }
+}
+
+/// A configuration name as a file name (letters, digits, `-_.`; the rest becomes `_`).
+fn build_file_name(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .take(60)
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
+        .collect();
+    if s.is_empty() { "program".into() } else { s }
 }
 
 /// `base`, or `base (2)`, `base (3)`… not used by `taken`.
@@ -338,6 +562,15 @@ pub fn check_unique(list: &[UserRunConfig]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Before a run: the user configuration called `name` (if any) must have a readable `.env` file,
+/// and the run configurations are rebuilt so the file's current contents are used.
+pub(crate) fn prepare_run(s: &mut Session, name: &str) -> Result<(), String> {
+    let Some(project) = s.run_store.root.clone() else { return Ok(()) };
+    let checked = s.run_store.user.iter().find(|c| c.name.trim() == name).map(|c| c.read_env_file(&project));
+    rebuild(s);
+    checked.transpose().map(|_| ())
 }
 
 // ---------------------------------------------------------------- store and dialog
@@ -527,6 +760,57 @@ mod tests {
         assert_eq!(env_text(&want), "A=1;B=x=y");
         for bad in [json!("A"), json!("=1"), json!({ "A": 1 }), json!([1]), json!(5)] {
             assert!(parse_env(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn env_files_parse_like_dotenv() {
+        let text = "\u{feff}# c\nA=1\nexport B = two words # note\nC=\"x # y\\n\\\"q\\\"\"\nD='$raw # kept'\nnot an assignment\n=bad\nE=\nA=override\nBAD KEY=1\nUNCLOSED=\"abc\n";
+        let got: std::collections::HashMap<_, _> = parse_env_file(text).into_iter().collect();
+        assert_eq!(got.get("A").map(String::as_str), Some("override"));
+        assert_eq!(got.get("B").map(String::as_str), Some("two words"));
+        assert_eq!(got.get("C").map(String::as_str), Some("x # y\n\"q\""));
+        assert_eq!(got.get("D").map(String::as_str), Some("$raw # kept"));
+        assert_eq!(got.get("E").map(String::as_str), Some(""));
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert!(parse_env_file("").is_empty());
+        assert!(parse_env_file("A=\"\u{0}\"\nB=\u{0}").is_empty());
+    }
+
+    #[test]
+    fn env_file_merges_under_explicit_env() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "A=file\nB=file\n").unwrap();
+        let mut c = UserRunConfig {
+            name: "X".into(),
+            kind: RunKind::Command,
+            command: "true".into(),
+            env: vec![("B".into(), "explicit".into())],
+            env_file: ".env".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            c.effective_env(dir.path()),
+            vec![("A".to_string(), "file".to_string()), ("B".to_string(), "explicit".to_string())]
+        );
+        c.validate(dir.path()).unwrap();
+        c.env_file = "missing.env".into();
+        assert!(c.validate(dir.path()).unwrap_err().contains("does not exist"));
+        assert!(c.read_env_file(dir.path()).is_err());
+        // Running with the file gone still builds the configuration, with the explicit env only.
+        assert_eq!(c.to_run_config(dir.path(), dir.path()).unwrap().command.unwrap().env.len(), 1);
+    }
+
+    #[test]
+    fn kinds_parse_with_aliases() {
+        for (s, k) in
+            [("c++", RunKind::Cpp), ("Python3", RunKind::Python), ("zig", RunKind::Zig), ("node", RunKind::Npm)]
+        {
+            assert_eq!(RunKind::parse(s).unwrap(), k);
+        }
+        for k in RunKind::ALL {
+            assert_eq!(RunKind::parse(k.label()).ok().map(|p| p.label()).or(Some(k.label())), Some(k.label()));
+            assert!(!k.default_command().is_empty() && !k.hint().is_empty());
         }
     }
 

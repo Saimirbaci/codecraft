@@ -122,6 +122,9 @@ fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
         s.selected_run_config = i;
     }
     s.popup = None;
+    if let Some(name) = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()) {
+        crate::run_config_store::prepare_run(s, &name).map_err(CommandError::Failed)?;
+    }
     let config = match s.run_configs.get(s.selected_run_config) {
         Some(c) => c.clone(),
         None if is_cargo_project(s) => RunConfig::cargo("cargo run", CargoInvocation::new(CargoCommand::Run, root(s)?)),

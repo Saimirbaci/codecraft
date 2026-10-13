@@ -6,6 +6,8 @@
 cargo run -p codecraft -- <file-or-project>          # desktop app
 cargo run -p codecraft-cli -- check <project>          # headless cargo check through the engine
 cargo run -p codecraft-cli -- run <project> <command-id> '<json params>'
+cargo run -p codecraft-cli -- configs <project> add --name Api --kind python --command "main.py --port 80" --env-file .env
+cargo run -p codecraft-cli -- configs <project> list    # also: update <i>, copy <i>, delete <i>, run <name|i>
 ```
 
 The app stores settings and recent projects in `~/Library/Application Support/CodeCraft/state.json`

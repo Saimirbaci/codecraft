@@ -6,7 +6,7 @@
 use egui::{Align, Align2, Color32, Event, FontId, Key, Layout, Modifiers, RichText, ScrollArea, TextEdit, vec2};
 use serde_json::{Value, json};
 
-use codecraft_engine::run_config_store::{RunKind, Selection, env_text};
+use codecraft_engine::run_config_store::{RunKind, Selection, UserRunConfig, env_text};
 use codecraft_engine::settings::{self, Kind, QuickLevel, SettingDef};
 use codecraft_engine::{Popup, Session, keymaps, registry};
 use codecraft_workspace::Settings;
@@ -36,6 +36,7 @@ struct RunForm {
     kind: RunKind,
     command: String,
     env: String,
+    env_file: String,
     working_dir: String,
 }
 
@@ -730,6 +731,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 kind: c.kind,
                 command: c.command.clone(),
                 env: env_text(&c.env),
+                env_file: c.env_file.clone(),
                 working_dir: c.working_dir.clone(),
             });
             st.prefs.run_error = None;
@@ -771,12 +773,17 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         });
         egui::Panel::left("run-configs-list").resizable(true).default_size(260.0).show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("+ Cargo").on_hover_text("New Cargo configuration").clicked() {
-                    cmds.push(("runConfig.create", json!({ "name": "Cargo", "kind": "cargo", "command": "run" })));
-                }
-                if ui.button("+ Command").on_hover_text("New command-line configuration").clicked() {
-                    cmds.push(("runConfig.create", json!({ "name": "Command", "kind": "command", "command": "make" })));
-                }
+                ui.menu_button("+ Add", |ui| {
+                    for kind in RunKind::ALL {
+                        if ui.button(kind.label()).on_hover_text(format!("New {} configuration", kind.label())).clicked() {
+                            cmds.push((
+                                "runConfig.create",
+                                json!({ "name": kind.label(), "kind": run_kind_id(kind), "command": kind.default_command() }),
+                            ));
+                            ui.close();
+                        }
+                    }
+                });
                 let can_copy = dialog.selected.is_some();
                 if ui.add_enabled(can_copy, egui::Button::new("Copy")).on_hover_text("Copy Configuration").clicked()
                     && let Some(sel) = dialog.selected
@@ -841,7 +848,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             }
             _ => {
                 ui.label(
-                    RichText::new("Add a configuration with + Cargo or + Command, or copy one from the project.")
+                    RichText::new("Add a configuration with + Add (Cargo, Command, Python, C/C++, Zig, Npm), or copy one from the project.")
                         .color(theme.text_muted),
                 );
             }
@@ -855,9 +862,10 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         let params = json!({
             "index": new.index,
             "name": new.name,
-            "kind": match new.kind { RunKind::Cargo => "cargo", RunKind::Command => "command" },
+            "kind": run_kind_id(new.kind),
             "command": new.command,
             "env": new.env,
+            "envFile": new.env_file,
             "workingDir": new.working_dir,
         });
         st.prefs.run_error = s.execute("runConfig.update", &params).err().map(|e| e.to_string());
@@ -871,6 +879,18 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     }
 }
 
+/// The id `runConfig.create/update` take for a kind.
+fn run_kind_id(kind: RunKind) -> &'static str {
+    match kind {
+        RunKind::Cargo => "cargo",
+        RunKind::Command => "command",
+        RunKind::Python => "python",
+        RunKind::Cpp => "cpp",
+        RunKind::Zig => "zig",
+        RunKind::Npm => "npm",
+    }
+}
+
 fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path::Path, error: Option<&str>) {
     egui::Grid::new("run-config-form").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
         ui.label("Name:");
@@ -878,15 +898,13 @@ fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path:
         ui.end_row();
         ui.label("Type:");
         egui::ComboBox::from_id_salt("run-config-kind").selected_text(f.kind.label()).show_ui(ui, |ui| {
-            ui.selectable_value(&mut f.kind, RunKind::Cargo, RunKind::Cargo.label());
-            ui.selectable_value(&mut f.kind, RunKind::Command, RunKind::Command.label());
+            for kind in RunKind::ALL {
+                ui.selectable_value(&mut f.kind, kind, kind.label());
+            }
         });
         ui.end_row();
         ui.label("Command:");
-        let hint = match f.kind {
-            RunKind::Cargo => "run --package app --bin app -- --arg",
-            RunKind::Command => "make test   or   sh -c 'a && b'",
-        };
+        let hint = f.kind.hint();
         ui.add(
             TextEdit::singleline(&mut f.command)
                 .hint_text(hint)
@@ -897,6 +915,13 @@ fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path:
         ui.label("Environment variables:");
         ui.add(TextEdit::singleline(&mut f.env).hint_text("RUST_LOG=debug;PORT=8080").desired_width(f32::INFINITY));
         ui.end_row();
+        ui.label("Environment file:");
+        ui.add(
+            TextEdit::singleline(&mut f.env_file)
+                .hint_text(".env   (variables loaded when running; the fields above win)")
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
         ui.label("Working directory:");
         ui.add(
             TextEdit::singleline(&mut f.working_dir).hint_text(root.display().to_string()).desired_width(f32::INFINITY),
@@ -904,9 +929,11 @@ fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path:
         ui.end_row();
     });
     ui.add_space(6.0);
-    let preview = match f.kind {
-        RunKind::Cargo => format!("cargo {}", f.command.trim()),
-        RunKind::Command => f.command.trim().to_string(),
+    let probe =
+        UserRunConfig { name: "preview".into(), kind: f.kind, command: f.command.clone(), ..Default::default() };
+    let preview = match probe.to_run_config(root, root) {
+        Ok(c) if f.kind != RunKind::Cpp => c.command_line(),
+        _ => f.command.trim().to_string(),
     };
     ui.label(RichText::new(preview).monospace().color(theme.text_muted));
     if let Some(e) = error {

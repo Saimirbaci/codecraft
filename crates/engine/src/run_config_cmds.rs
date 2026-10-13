@@ -20,8 +20,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.create",
             "New Run Configuration",
             None,
-            "{name?: string, kind?: cargo|command, command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, workingDir?: string} → {index}. \
-             Cargo commands omit `cargo` (`run --bin app -- --port 80`).",
+            "{name?: string, kind?: cargo|command|python|cpp|zig|npm, command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, \
+             envFile?: string (a .env file, relative to the project), workingDir?: string} → {index}. \
+             Cargo commands omit `cargo` (`run --bin app -- --port 80`); python: `main.py --arg` or `-m pytest`; \
+             cpp: sources and flags, then `-- args` (compiled and run); zig: `build run`; npm: `run dev`.",
             Context::Global,
             has_project,
             create,
@@ -39,7 +41,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.update",
             "Edit Run Configuration",
             None,
-            "{index: int, name?, kind?, command?, env?, workingDir?} — change a user configuration",
+            "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?} — change a user configuration",
             Context::Global,
             has_project,
             update,
@@ -114,6 +116,7 @@ fn describe(c: &UserRunConfig, root: &std::path::Path) -> Value {
         "kind": c.kind,
         "command": c.command,
         "env": env_text(&c.env),
+        "envFile": c.env_file,
         "workingDir": c.working_dir,
         "commandLine": line,
         "error": error,
@@ -179,6 +182,12 @@ fn fill(c: &mut UserRunConfig, p: &Value) -> Result<(), String> {
     if let Some(v) = p.get("env") {
         c.env = parse_env(v)?;
     }
+    if let Some(v) = p.get("envFile") {
+        c.env_file = match v {
+            Value::Null => String::new(),
+            v => v.as_str().ok_or("`envFile` must be text")?.trim().to_string(),
+        };
+    }
     if let Some(v) = p.get("workingDir") {
         c.working_dir = match v {
             Value::Null => String::new(),
@@ -199,8 +208,11 @@ fn create(s: &mut Session, p: &Value) -> CmdResult {
         if list.len() >= 500 {
             return Err("too many run configurations".into());
         }
-        let mut c = UserRunConfig { command: "run".into(), ..Default::default() };
+        let mut c = UserRunConfig::default();
         fill(&mut c, p)?;
+        if c.command.is_empty() {
+            c.command = c.kind.default_command().into();
+        }
         c.name = unique_name(&c.name, list);
         list.push(c);
         Ok(list.len() - 1)

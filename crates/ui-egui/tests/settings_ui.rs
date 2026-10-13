@@ -177,15 +177,21 @@ fn edit_configurations_creates_and_saves() {
     h.state_mut().session.execute("run.editConfigurations", &Value::Null).unwrap();
     h.run_steps(2);
     assert!(h.query_by_label_contains("Run/Debug Configurations").is_some());
-    h.get_by_label("+ Command").click();
+    h.get_by_label("+ Add").click();
+    h.run_steps(3);
+    for kind in ["Cargo", "Command", "Python", "C/C++", "Zig", "Npm"] {
+        assert!(h.query_by_label(kind).is_some(), "+ Add offers {kind}");
+    }
+    h.get_by_label("Python").click();
     h.run_steps(3);
     assert_eq!(h.state().session.run_store.dialog.as_ref().unwrap().draft.len(), 1);
     assert!(h.query_by_label_contains("Environment variables").is_some());
+    assert!(h.query_by_label_contains("Environment file").is_some());
     snapshot(&mut h, "edit-configurations");
     h.get_by_label("OK").click();
     h.run_steps(2);
     assert!(h.state().session.run_store.dialog.is_none());
     let saved = std::fs::read_to_string(root.join(".codecraft/run-configurations.json")).unwrap();
-    assert!(saved.contains("\"Command\"") && saved.contains("make"), "{saved}");
-    assert_eq!(h.state().session.run_configs.first().map(|c| c.name.as_str()), Some("Command"));
+    assert!(saved.contains("\"python\"") && saved.contains("main.py"), "{saved}");
+    assert_eq!(h.state().session.run_configs.first().map(|c| c.name.as_str()), Some("Python"));
 }

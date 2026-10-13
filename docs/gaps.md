@@ -110,6 +110,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     project's derived configurations and user ones (Cargo command or any command line, env vars,
     working directory), creates/copies/deletes/edits them with Apply/OK/Cancel and saves them in
     `.codecraft/run-configurations.json`; `runConfig.*` commands do the same headlessly).
+    2026-10-13: + Add offers Cargo, Command, Python, C/C++ (compiled with cc/c++ then run), Zig
+    and Npm configurations; every configuration can load a `.env` file (re-read on each run;
+    explicit variables win); `codecraft-cli configs <project> list|add|update|copy|delete|run`
+    lets agents manage them without JSON.
     Remaining: no before-launch tasks, no templates, no "store as project file" choice, no
     per-configuration debugger options.
 12. ~~Test results show as a summary + console~~ (M6, 2026-10-13: test tree beside the Run

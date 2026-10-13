@@ -201,3 +201,113 @@ fn check_on_save_runs_the_external_linter() {
     wait_idle(&mut s);
     s.shutdown();
 }
+
+fn run_to_end(s: &mut Session, name: &str) -> Vec<String> {
+    let config = config_index(s, name);
+    s.execute("run.run", &json!({ "config": config })).unwrap();
+    let start = Instant::now();
+    while s.jobs_running() && start.elapsed() < Duration::from_secs(60) {
+        s.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    s.ws.runs.last().map(|r| r.lines.iter().map(|l| l.text.clone()).collect()).unwrap_or_default()
+}
+
+fn config_index(s: &Session, name: &str) -> usize {
+    s.run_configs.iter().position(|c| c.name == name).unwrap()
+}
+
+#[test]
+fn env_file_feeds_the_process_and_explicit_env_wins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = project(tmp.path());
+    std::fs::write(root.join(".env"), "# comment\nFROM_FILE=file\nSHARED=file\nexport QUOTED=\"a b\"\n").unwrap();
+    let mut s = open(&root);
+    s.execute(
+        "runConfig.create",
+        &json!({
+            "name": "Echo", "kind": "command", "command": "sh -c 'echo $FROM_FILE/$SHARED/$QUOTED'",
+            "env": "SHARED=explicit", "envFile": ".env",
+        }),
+    )
+    .unwrap();
+    let listed = s.execute("runConfig.list", &Value::Null).unwrap();
+    assert_eq!(listed["user"][0]["envFile"], ".env");
+    let lines = run_to_end(&mut s, "Echo");
+    assert!(lines.iter().any(|l| l == "file/explicit/a b"), "{lines:?}");
+
+    // The file is re-read on every run.
+    std::fs::write(root.join(".env"), "FROM_FILE=changed\n").unwrap();
+    let lines = run_to_end(&mut s, "Echo");
+    assert!(lines.iter().any(|l| l == "changed/explicit/"), "{lines:?}");
+
+    // A missing file is refused when set, and reported (not ignored) when it vanishes later.
+    assert!(s.execute("runConfig.update", &json!({ "index": 0, "envFile": "nope.env" })).is_err());
+    std::fs::remove_file(root.join(".env")).unwrap();
+    assert!(matches!(
+        s.execute("run.run", &json!({ "config": config_index(&s, "Echo") })),
+        Err(CommandError::Failed(_))
+    ));
+    s.execute("runConfig.update", &json!({ "index": 0, "envFile": null })).unwrap();
+    assert_eq!(s.run_store.user[0].env_file, "");
+    s.shutdown();
+}
+
+#[test]
+fn python_cpp_zig_and_npm_configurations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = project(tmp.path());
+    let mut s = open(&root);
+    for (kind, command) in
+        [("python", "main.py --port 80"), ("zig", "build run"), ("npm", "run dev"), ("cpp", "main.c -O2 -- one two")]
+    {
+        let r = s.execute("runConfig.create", &json!({ "name": kind, "kind": kind })).unwrap();
+        let i = r["index"].as_u64().unwrap() as usize;
+        // The default command of a new configuration is a valid one.
+        assert!(!s.run_store.user[i].command.is_empty(), "{kind}");
+        s.execute("runConfig.update", &json!({ "index": i, "command": command })).unwrap();
+    }
+    let cmd = |s: &Session, name: &str| s.run_configs[config_index(s, name)].command.clone().unwrap();
+    let py = cmd(&s, "python");
+    assert!(py.program.ends_with("python") || py.program.ends_with("python3"), "{}", py.program);
+    assert_eq!(py.args, ["main.py", "--port", "80"]);
+    let zig = cmd(&s, "zig");
+    assert_eq!((zig.program.as_str(), zig.args.clone()), ("zig", vec!["build".to_string(), "run".to_string()]));
+    let npm = cmd(&s, "npm");
+    assert_eq!((npm.program.as_str(), npm.args.clone()), ("npm", vec!["run".to_string(), "dev".to_string()]));
+    let cpp = cmd(&s, "cpp");
+    let script = &cpp.args[1];
+    assert!(script.contains("cc main.c -O2 -o ") && script.ends_with("one two"), "{script}");
+    assert!(!script.contains("c++"));
+    // A C++ source selects c++; a command without a source file is refused.
+    s.execute("runConfig.update", &json!({ "index": 3, "command": "main.cpp" })).unwrap();
+    assert!(cmd(&s, "cpp").args[1].contains("c++ main.cpp"));
+    assert!(s.execute("runConfig.update", &json!({ "index": 3, "command": "-O2 -- x" })).is_err());
+    s.shutdown();
+}
+
+#[test]
+fn cpp_configuration_compiles_and_runs_with_the_env_file() {
+    let cc_ok = std::process::Command::new("cc").arg("--version").output().is_ok_and(|o| o.status.success());
+    if !cc_ok {
+        eprintln!("skipping: no C compiler");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let root = project(tmp.path());
+    std::fs::write(
+        root.join("hello.c"),
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(int c, char **v) { printf(\"%s %s\\n\", getenv(\"GREETING\"), v[1]); return 0; }\n",
+    )
+    .unwrap();
+    std::fs::write(root.join(".env"), "GREETING=hello\n").unwrap();
+    let mut s = open(&root);
+    s.execute(
+        "runConfig.create",
+        &json!({ "name": "Hello", "kind": "cpp", "command": "hello.c -- world", "envFile": ".env" }),
+    )
+    .unwrap();
+    let lines = run_to_end(&mut s, "Hello");
+    assert!(lines.iter().any(|l| l == "hello world"), "{lines:?}");
+    s.shutdown();
+}
