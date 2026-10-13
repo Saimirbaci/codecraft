@@ -86,6 +86,10 @@ impl ProjectWindows {
         persisted.apply(&mut session);
         session.ws.settings = main.ws.settings.clone();
         session.lsp_enabled = main.lsp_enabled;
+        // Save and restore the window's project session like the main window does.
+        session.session_store.autosave = main.session_store.autosave;
+        session.session_store.restore_on_open = main.session_store.restore_on_open;
+        session.session_store.fallback_dir = main.session_store.fallback_dir.clone();
         let mut ui = UiState::new();
         ui.window_sizes = persisted.window_sizes.clone();
         run_command(&mut session, &mut ui, "file.open", &json!({ "path": path }));
@@ -101,6 +105,24 @@ impl ProjectWindows {
 
     pub(crate) fn session(&self, index: usize) -> Option<&Session> {
         self.windows.get(index).map(|w| &w.session)
+    }
+
+    /// The project of each open window (reopened on the next start).
+    pub(crate) fn project_roots(&self) -> Vec<PathBuf> {
+        self.windows
+            .iter()
+            .filter(|w| !w.closed)
+            .filter_map(|w| Some(w.session.ws.project.as_ref()?.root.clone()))
+            .collect()
+    }
+
+    /// Save every window's project session now.
+    pub(crate) fn save_sessions(&mut self) {
+        for w in &mut self.windows {
+            if let Err(e) = codecraft_engine::session_store::save_now(&mut w.session) {
+                log::warn!("cannot save the session: {e}");
+            }
+        }
     }
 
     /// Keep native menu activations for the focused window's next frame.

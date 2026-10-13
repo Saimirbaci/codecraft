@@ -1,4 +1,6 @@
-//! Persisted IDE state: settings, layout, recent projects, last project.
+//! Persisted IDE state: settings, layout, recent projects, last project and the other project
+//! windows (each project's editors are saved with the project, see
+//! `codecraft_engine::session_store`).
 
 use std::path::PathBuf;
 
@@ -14,8 +16,11 @@ pub struct PersistedState {
     pub layout: Option<Layout>,
     pub recent_projects: Vec<PathBuf>,
     pub last_project: Option<PathBuf>,
-    /// Files open in the last project (reopened with it).
+    /// Files open in the last project (superseded by the per-project session snapshot; kept so
+    /// older state files load).
     pub open_files: Vec<PathBuf>,
+    /// Projects open in their own windows besides the main one at exit (reopened on start).
+    pub open_windows: Vec<PathBuf>,
     /// Inner size of the main window in points, restored on the next launch.
     pub window_size: Option<[f32; 2]>,
     /// Last size of each floating window (dialogs, settings, …), by key.
@@ -23,17 +28,11 @@ pub struct PersistedState {
 }
 
 fn config_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CODECRAFT_CONFIG_DIR") {
-        return Some(PathBuf::from(dir).join("state.json"));
-    }
-    let home = PathBuf::from(std::env::var_os("HOME")?);
-    let dir = if cfg!(target_os = "macos") {
-        home.join("Library/Application Support/CodeCraft")
-    } else {
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config")).join("codecraft")
-    };
-    Some(dir.join("state.json"))
+    codecraft_engine::session_store::config_dir().map(|d| d.join("state.json"))
 }
+
+/// At most this many project windows are reopened besides the main one.
+const MAX_REOPEN_WINDOWS: usize = 16;
 
 impl PersistedState {
     /// Load; a missing or corrupt file yields defaults (never fatal).
@@ -55,13 +54,27 @@ impl PersistedState {
             return;
         }
         match serde_json::to_string_pretty(self) {
+            // Atomic, so a crash mid-write never leaves a truncated state file.
             Ok(text) => {
-                if let Err(e) = std::fs::write(&path, text) {
+                if let Err(e) = codecraft_fs::write_text_file_atomic(&path, &text) {
                     log::warn!("cannot save {}: {e}", path.display());
                 }
             }
             Err(e) => log::warn!("cannot serialize state: {e}"),
         }
+    }
+
+    /// The project windows to reopen beside a main window showing `main`: existing directories,
+    /// each once, not the main project.
+    pub fn windows_to_reopen(&self, main: Option<&std::path::Path>) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        for p in &self.open_windows {
+            if p.is_dir() && Some(p.as_path()) != main && !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+        out.truncate(MAX_REOPEN_WINDOWS);
+        out
     }
 
     /// The remembered main window size, if it is sane.
@@ -110,5 +123,26 @@ mod tests {
         for bad in [[0.0, 0.0], [f32::NAN, 800.0], [1e9, 800.0], [10.0, 10.0]] {
             assert_eq!(PersistedState { window_size: Some(bad), ..Default::default() }.saved_window_size(), None);
         }
+    }
+
+    #[test]
+    fn windows_to_reopen_skip_missing_duplicate_and_main_projects() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let p = PersistedState {
+            open_windows: vec![
+                a.path().into(),
+                a.path().join("gone"),
+                b.path().into(),
+                a.path().into(),
+                std::path::PathBuf::new(),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(p.windows_to_reopen(None), vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        assert_eq!(p.windows_to_reopen(Some(a.path())), vec![b.path().to_path_buf()]);
+        // Older state files without the field load with no windows.
+        let old: PersistedState = serde_json::from_str("{\"last_project\": \"/x\"}").unwrap();
+        assert!(old.open_windows.is_empty());
     }
 }
