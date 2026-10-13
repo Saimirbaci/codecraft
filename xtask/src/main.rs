@@ -212,7 +212,13 @@ const OUT_OF_SCOPE: &[&str] = &[
     "Getting Started",
     "What's New",
     "Move to Built-in Display",
+    "Services › Docker",
+    "Import Word Document",
+    "Configure Pandoc",
 ];
+
+/// Submenus whose items are bound to two-stroke chords, which the menu dump cannot express.
+const CHORD_SUBMENUS: &[&str] = &["Expand to Level", "Expand All to Level"];
 
 /// Provided by the macOS application menu / window server rather than the app.
 const OS_ITEMS: &[&str] = &[
@@ -227,6 +233,8 @@ const OS_ITEMS: &[&str] = &[
 
 /// In scope for RustRover parity but planned after the editor/build/LSP core (see docs/roadmap.md).
 const LATER: &[&str] = &[
+    "Rust REPL",
+    "Presentation Assistant",
     "Python",
     "Zig",
     "TypeScript",
@@ -412,7 +420,10 @@ fn catalog(root: &Path) -> Result<(), String> {
             id = format!("{}{n}", command_id(&e.path, &e.title));
             n += 1;
         }
-        let shortcut = if e.shortcut.is_empty() { "None".to_string() } else { format!("Some({:?})", e.shortcut) };
+        // Two-stroke chords (Cmd+* then a digit) show only their first stroke in the menu.
+        let chord = e.path.iter().any(|p| CHORD_SUBMENUS.contains(&p.as_str()));
+        let shortcut =
+            if e.shortcut.is_empty() || chord { "None".to_string() } else { format!("Some({:?})", e.shortcut) };
         let scope = scope_of(&e.path, &e.title);
         let _ = writeln!(
             out,
