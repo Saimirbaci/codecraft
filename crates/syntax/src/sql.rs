@@ -739,6 +739,16 @@ pub(crate) fn outline(doc: &Doc) -> Vec<OutlineItem> {
     items
 }
 
+// ---------------------------------------------------------------------------------------------
+// Tokens for the formatter and the name analysis (`sql_format`, `sql_scope`)
+
+/// The classified tokens of `doc` (comments included) and its dollar-quoted code bodies as
+/// (offset of the opening tag, offset of the closing tag).
+pub(crate) fn tokens(doc: &Doc) -> (Vec<lex::Tok>, Vec<(usize, usize)>) {
+    let Analysis { lexed, bodies } = analyze(doc);
+    (lexed.toks, bodies)
+}
+
 #[cfg(test)]
 mod tests {
     use crate::test_util::{assert_kind, checked, kind_at, offset_of, spans};

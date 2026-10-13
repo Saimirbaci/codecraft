@@ -481,6 +481,7 @@ fn diagnostic_json(s: &Session, p: &Problem) -> Value {
     let source = match p.source {
         codecraft_workspace::ProblemSource::RustAnalyzer => "rust-analyzer",
         codecraft_workspace::ProblemSource::Cargo => "cargo",
+        codecraft_workspace::ProblemSource::Inspection => "codecraft",
     };
     let mut d = json!({
         "message": p.message,

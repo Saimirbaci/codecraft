@@ -31,6 +31,8 @@ pub enum ProblemSource {
     RustAnalyzer,
     /// `cargo check`/`build`/`clippy` compiler messages from a Build or Run.
     Cargo,
+    /// CodeCraft's own inspections (unresolved tables and columns in SQL, …).
+    Inspection,
 }
 
 /// A diagnostic in a file, in char-based positions (line, char column; zero-based).

@@ -200,6 +200,8 @@ impl LineLayout {
 #[derive(Clone, Copy, Default)]
 struct Decor<'a> {
     semantic: Option<&'a [Vec<codecraft_workspace::SemanticSpan>]>,
+    /// SQL highlighting inside Rust string literals (over the string and semantic colours).
+    injected: Option<&'a Highlights>,
     /// Inlay hints sorted by offset.
     inlays: &'a [codecraft_workspace::InlayHint],
     /// Uncommitted IME composition: char offset and text.
@@ -264,6 +266,13 @@ fn layout_line(
                 if let Some(u) = unresolved.get_mut(i) {
                     *u = sp.unresolved;
                 }
+            }
+        }
+    }
+    if let Some(inj) = decor.injected {
+        for span in inj.line(line) {
+            for k in kinds.iter_mut().take(span.end.min(n)).skip(span.start) {
+                *k = Some(span.kind);
             }
         }
     }
@@ -698,6 +707,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let vbox = s.column_box(eid);
     let preedit = ime_preedit(ui, editor_id(eid));
     let crumbs_shown = s.ws.doc(editor.doc).is_some_and(|d| crate::navbar::has_breadcrumbs(d.language));
+    codecraft_engine::sql_lang::refresh(s, editor.doc);
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
     let od = &*od;
@@ -707,6 +717,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let revision = od.doc.revision();
     let decor = Decor {
         semantic: od.semantic.as_ref().filter(|(r, _)| *r == revision).map(|(_, v)| v.as_slice()),
+        injected: s.sql_lang.highlights_for(editor.doc, revision),
         inlays: if settings.show_inlay_hints {
             od.inlay_hints.as_ref().filter(|(r, _)| *r == revision).map(|(_, v)| v.as_slice()).unwrap_or(&[])
         } else {
