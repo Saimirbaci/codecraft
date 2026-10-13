@@ -964,8 +964,13 @@ fn compare_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut st.vcs.side_by_side, "Side by side");
             });
-            let h = ui.available_height();
-            file_diff_view(ui, st, &theme, "vcs-compare", &d, h);
+            // Lay the diff out in a child ui that does not report its size back to the window: egui never
+            // lets a window be smaller than its content, so a diff sized from `available_height` would
+            // ratchet and the window could only grow.
+            let rect = ui.available_rect_before_wrap();
+            let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+            let h = rect.height();
+            file_diff_view(&mut body, st, &theme, "vcs-compare", &d, h);
         });
     if !open {
         s.vcs.compare = None;
