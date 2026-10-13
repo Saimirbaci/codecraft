@@ -21,7 +21,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "code.inspectCode",
             "Inspect Code…",
             None,
-            "{scope?: \"file\"|\"directory\"|\"project\"|\"uncommitted\", path?: string, tools?: [\"clippy\"|\"check\"|\"ruff\"|\"eslint\"|\"clang-tidy\"|\"zig\"]} — run the linters on a scope into the Inspection Results tool window (Clippy, or cargo check when Clippy is off or missing; others when installed). Without `scope` opens the scope dialog.",
+            "{scope?: \"file\"|\"directory\"|\"project\"|\"uncommitted\", path?: string, tools?: [\"clippy\"|\"check\"|\"ruff\"|\"mypy\"|\"pyright\"|\"eslint\"|\"clang-tidy\"|\"zig\"]} — run the linters on a scope into the Inspection Results tool window (Clippy, or cargo check when Clippy is off or missing; others when installed). Without `scope` opens the scope dialog.",
             Context::Global,
             has_project,
             |s, p| run_or_dialog(s, p, JobKind::Inspect),

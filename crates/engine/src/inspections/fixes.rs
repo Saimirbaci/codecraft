@@ -547,6 +547,14 @@ pub fn suppress_change(f: &Finding, text: &str) -> Result<TextChange, String> {
             Ok(at(f.start.line, l.chars().count(), format!("  // NOLINT({code})")))
         }
         Tool::ZigFmt => Err("zig fmt problems cannot be suppressed".into()),
+        Tool::Mypy | Tool::Pyright => {
+            let l = line_text(f.start.line)?;
+            if l.contains("# type: ignore") || l.contains("# pyright: ignore") {
+                return Err("this line already has an ignore comment".into());
+            }
+            let comment = crate::python_lint::suppress_comment(f.tool, code).ok_or("cannot be suppressed")?;
+            Ok(at(f.start.line, l.chars().count(), comment))
+        }
     }
 }
 

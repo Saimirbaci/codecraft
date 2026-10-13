@@ -34,6 +34,9 @@ pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) 
         Tool::ClangTidy => Vec::new(),
         Tool::ZigFmt => vec!["fmt".into(), "--check".into()],
         Tool::Clippy | Tool::CargoCheck => Vec::new(),
+        Tool::Mypy | Tool::Pyright => {
+            return crate::python_lint::args(tool, paths, crate::python_env::project_python(&spec.root).as_deref());
+        }
     };
     if tool == Tool::ClangTidy {
         // clang-tidy needs files, not directories.
@@ -115,6 +118,9 @@ pub(crate) fn parse(
             (f, None)
         }
         Tool::Clippy | Tool::CargoCheck => (Vec::new(), None),
+        Tool::Mypy | Tool::Pyright => {
+            crate::python_lint::parse(tool, &spec.root, &stdout, out.code, out.success, &|| out.stderr_summary())
+        }
     }
 }
 

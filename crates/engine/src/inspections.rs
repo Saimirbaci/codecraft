@@ -55,6 +55,10 @@ pub enum Tool {
     Eslint,
     ClangTidy,
     ZigFmt,
+    /// mypy (Python type checker, M11 track Y).
+    Mypy,
+    /// pyright or basedpyright (M11 track Y).
+    Pyright,
 }
 
 impl Tool {
@@ -66,6 +70,8 @@ impl Tool {
             Self::Eslint => "ESLint",
             Self::ClangTidy => "clang-tidy",
             Self::ZigFmt => "zig fmt",
+            Self::Mypy => "mypy",
+            Self::Pyright => "Pyright",
         }
     }
 
@@ -77,6 +83,8 @@ impl Tool {
             "eslint" | "javascript" | "typescript" => Some(Self::Eslint),
             "clang_tidy" | "c" | "cpp" => Some(Self::ClangTidy),
             "zig_fmt" | "zig" => Some(Self::ZigFmt),
+            "mypy" => Some(Self::Mypy),
+            "pyright" | "basedpyright" => Some(Self::Pyright),
             _ => None,
         }
     }
@@ -722,6 +730,7 @@ pub(crate) fn find_program(spec: &JobSpec, tool: Tool) -> Option<PathBuf> {
                 .find(|p| p.is_file())
         }),
         Tool::ZigFmt => codecraft_lsp::which("zig"),
+        Tool::Mypy | Tool::Pyright => crate::python_lint::find(&spec.root, tool),
     }
 }
 
@@ -780,8 +789,14 @@ fn run_job(spec: &JobSpec, cancel: &AtomicBool, tx: &Sender<Msg>) -> JobOutput {
             }),
         }
     }
-    let linters: [(Tool, &[&str]); 4] =
-        [(Tool::Ruff, PY_EXTS), (Tool::Eslint, JS_EXTS), (Tool::ClangTidy, C_EXTS), (Tool::ZigFmt, ZIG_EXTS)];
+    let linters: [(Tool, &[&str]); 6] = [
+        (Tool::Ruff, PY_EXTS),
+        (Tool::Mypy, PY_EXTS),
+        (Tool::Pyright, PY_EXTS),
+        (Tool::Eslint, JS_EXTS),
+        (Tool::ClangTidy, C_EXTS),
+        (Tool::ZigFmt, ZIG_EXTS),
+    ];
     for (tool, exts) in linters {
         if cancelled || cancel.load(Ordering::Relaxed) {
             cancelled = true;
@@ -930,6 +945,8 @@ pub fn docs_url(tool: Tool, code: &str, severity: Severity) -> Option<String> {
             }
         }
         Tool::ZigFmt => None,
+        Tool::Mypy => Some(format!("https://mypy.readthedocs.io/en/stable/error_code_list.html#code-{code}")),
+        Tool::Pyright => Some(format!("https://microsoft.github.io/pyright/#/configuration?id={code}")),
     }
 }
 
@@ -942,6 +959,8 @@ pub fn suppress_label(f: &Finding) -> String {
         Tool::Eslint => format!("Suppress '{code}' for line"),
         Tool::ClangTidy => format!("Suppress with NOLINT({code})"),
         Tool::ZigFmt => "Suppress".to_string(),
+        Tool::Mypy => format!("Suppress with # type: ignore[{code}]"),
+        Tool::Pyright => format!("Suppress with # pyright: ignore[{code}]"),
     }
 }
 
