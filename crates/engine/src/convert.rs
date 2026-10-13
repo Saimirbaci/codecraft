@@ -108,80 +108,6 @@ pub(crate) fn documentation_text(d: &lt::Documentation) -> String {
     }
 }
 
-/// Strip snippet syntax and return the char offset of the final cursor (`$0`, else the first
-/// tab stop), if the snippet has one.
-pub(crate) fn snippet_with_cursor(s: &str) -> (String, Option<usize>) {
-    for marker in ["$0", "${0}", "$1", "${1"] {
-        if let Some(byte) = s.find(marker) {
-            let before = strip_snippet(s.get(..byte).unwrap_or(""));
-            let cursor = before.chars().count();
-            return (strip_snippet(s), Some(cursor));
-        }
-    }
-    (strip_snippet(s), None)
-}
-
-/// Strip LSP snippet syntax: `$0`, `$1`, `${1:text}` → `text`, `${1|a,b|}` → `a`, `\$` → `$`.
-pub(crate) fn strip_snippet(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let chars: Vec<char> = s.chars().collect();
-    let mut i = 0usize;
-    while let Some(&c) = chars.get(i) {
-        if c == '\\'
-            && let Some(&n) = chars.get(i + 1)
-        {
-            out.push(n);
-            i += 2;
-            continue;
-        }
-        if c == '$' {
-            if chars.get(i + 1).is_some_and(|n| n.is_ascii_digit()) {
-                i += 1;
-                while chars.get(i).is_some_and(char::is_ascii_digit) {
-                    i += 1;
-                }
-                continue;
-            }
-            if chars.get(i + 1) == Some(&'{') {
-                // ${N:default} or ${N|a,b|} or ${N}
-                let mut j = i + 2;
-                while chars.get(j).is_some_and(char::is_ascii_digit) {
-                    j += 1;
-                }
-                let mut depth = 1usize;
-                let mut inner = String::new();
-                let mut k = match chars.get(j) {
-                    Some(':') | Some('|') => j + 1,
-                    _ => j,
-                };
-                while let Some(&ch) = chars.get(k) {
-                    if ch == '{' {
-                        depth += 1;
-                    } else if ch == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    inner.push(ch);
-                    k += 1;
-                }
-                let inner = if chars.get(j) == Some(&'|') {
-                    inner.trim_end_matches('|').split(',').next().unwrap_or_default().to_string()
-                } else {
-                    strip_snippet(&inner)
-                };
-                out.push_str(&inner);
-                i = k + 1;
-                continue;
-            }
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
-
 impl Session {
     /// Apply an LSP workspace edit across files (opening unopened files as documents).
     pub(crate) fn apply_workspace_edit(&mut self, edit: &lt::WorkspaceEdit) -> Result<usize, CommandError> {
@@ -301,17 +227,6 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn snippets_are_stripped() {
-        assert_eq!(strip_snippet("foo($1)$0"), "foo()");
-        assert_eq!(strip_snippet("foo(${1:a}, ${2:b})"), "foo(a, b)");
-        assert_eq!(strip_snippet("${1|x,y|}"), "x");
-        assert_eq!(strip_snippet("a\\$b"), "a$b");
-        assert_eq!(strip_snippet("${1:Vec<${2:T}>}"), "Vec<T>");
-        assert_eq!(strip_snippet("$"), "$");
-        assert_eq!(strip_snippet("${"), "");
-    }
 
     #[test]
     fn utf16_columns() {
