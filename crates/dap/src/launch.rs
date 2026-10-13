@@ -162,6 +162,92 @@ pub fn native_attach(kind: AdapterKind, name: &str, pid: u32, init_commands: &[S
     }
 }
 
+fn quoted(path: &std::path::Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Open a core dump (post-mortem debugging): lldb-dap attaches with `coreFile`; CodeLLDB creates
+/// the target with `target create -c`. `program` is the executable that crashed (lldb finds it
+/// from the core when `None`).
+pub fn native_core(
+    kind: AdapterKind,
+    name: &str,
+    program: Option<&std::path::Path>,
+    core: &std::path::Path,
+    init_commands: &[String],
+) -> Value {
+    match kind {
+        AdapterKind::CodeLldb => {
+            let create = match program {
+                Some(p) => format!("target create -c {} {}", quoted(core), quoted(p)),
+                None => format!("target create -c {}", quoted(core)),
+            };
+            json!({
+                "name": name,
+                "type": "lldb",
+                "request": "launch",
+                "initCommands": init_commands,
+                "targetCreateCommands": [create],
+                "processCreateCommands": [],
+            })
+        }
+        _ => compact(json!({
+            "name": name,
+            "type": "lldb-dap",
+            "request": "attach",
+            "program": program.map(|p| p.display().to_string()),
+            "coreFile": core.display().to_string(),
+            "initCommands": init_commands,
+        })),
+    }
+}
+
+/// Connect to a remote stub (`gdbserver host:port`, `lldb-server gdbserver`, `debugserver`)
+/// with `gdb-remote`. `program` is a local copy of the remote executable (for symbols).
+pub fn native_remote(
+    kind: AdapterKind,
+    name: &str,
+    program: Option<&std::path::Path>,
+    address: &str,
+    init_commands: &[String],
+) -> Value {
+    let connect = format!("gdb-remote {}", address.trim());
+    match kind {
+        AdapterKind::CodeLldb => {
+            let create = match program {
+                Some(p) => vec![format!("target create {}", quoted(p))],
+                None => Vec::new(),
+            };
+            json!({
+                "name": name,
+                "type": "lldb",
+                "request": "launch",
+                "initCommands": init_commands,
+                "targetCreateCommands": create,
+                "processCreateCommands": [connect],
+            })
+        }
+        _ => compact(json!({
+            "name": name,
+            "type": "lldb-dap",
+            "request": "attach",
+            "program": program.map(|p| p.display().to_string()),
+            "attachCommands": [connect],
+            "initCommands": init_commands,
+        })),
+    }
+}
+
+/// A `host:port` (or `[v6]:port`) a remote stub listens on.
+pub fn valid_remote_address(address: &str) -> bool {
+    let address = address.trim();
+    let Some((host, port)) = address.rsplit_once(':') else { return false };
+    !host.is_empty()
+        && !host.contains(char::is_whitespace)
+        && !host.contains(['"', '\\', ';'])
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+}
+
 /// `attach` arguments for a running Python process (debugpy injects itself by process id).
 pub fn python_attach(name: &str, pid: u32, just_my_code: bool) -> Value {
     json!({
@@ -190,6 +276,34 @@ mod tests {
         let p = python_attach("py", 7, true);
         assert_eq!(p["processId"], json!(7));
         assert_eq!(p["request"], json!("attach"));
+    }
+
+    #[test]
+    fn core_and_remote_arguments() {
+        let core = native_core(
+            AdapterKind::LldbDap,
+            "crash",
+            Some(std::path::Path::new("/p/app")),
+            std::path::Path::new("/c/core"),
+            &[],
+        );
+        assert_eq!(core["request"], json!("attach"));
+        assert_eq!(core["coreFile"], json!("/c/core"));
+        assert_eq!(core["program"], json!("/p/app"));
+        let no_program = native_core(AdapterKind::LldbDap, "crash", None, std::path::Path::new("/c/core"), &[]);
+        assert!(no_program.get("program").is_none());
+        let code = native_core(AdapterKind::CodeLldb, "crash", None, std::path::Path::new("/c/my \"core\""), &[]);
+        assert_eq!(code["targetCreateCommands"][0], json!("target create -c \"/c/my \\\"core\\\"\""));
+        let remote = native_remote(AdapterKind::LldbDap, "r", None, " 127.0.0.1:1234 ", &[]);
+        assert_eq!(remote["attachCommands"], json!(["gdb-remote 127.0.0.1:1234"]));
+        assert_eq!(remote["request"], json!("attach"));
+        let code = native_remote(AdapterKind::CodeLldb, "r", Some(std::path::Path::new("/p/app")), "h:1", &[]);
+        assert_eq!(code["processCreateCommands"], json!(["gdb-remote h:1"]));
+        assert!(valid_remote_address("localhost:1234"));
+        assert!(valid_remote_address("[::1]:9"));
+        for bad in ["", "host", "host:", ":12", "host:0", "host:99999", "a b:1", "h;x:1"] {
+            assert!(!valid_remote_address(bad), "{bad}");
+        }
     }
 
     #[test]

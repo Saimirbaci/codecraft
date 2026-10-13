@@ -161,23 +161,31 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             stopped,
             run_to_cursor,
         ),
+        spec("run.debuggingActions.resumeProgram", "Resume Program", None, "", Context::Global, stopped, |s, _| {
+            step(s, Step::Continue)
+        }),
+        // CodeCraft debugs one program at a time, so the "All Programs" actions act on it.
         spec(
-            "run.debuggingActions.resumeProgram",
-            "Resume Program",
+            "run.debuggingActions.pauseAllPrograms",
+            "Pause All Programs",
+            None,
+            "",
+            Context::Global,
+            running,
+            |s, _| {
+                debug::pause(s)?;
+                ok()
+            },
+        ),
+        spec(
+            "run.debuggingActions.resumeAllPrograms",
+            "Resume All Programs",
             None,
             "",
             Context::Global,
             stopped,
             |s, _| step(s, Step::Continue),
         ),
-        // CodeCraft debugs one program at a time, so the "All Programs" actions act on it.
-        spec("run.debuggingActions.pauseAllPrograms", "Pause All Programs", None, "", Context::Global, running, |s, _| {
-            debug::pause(s)?;
-            ok()
-        }),
-        spec("run.debuggingActions.resumeAllPrograms", "Resume All Programs", None, "", Context::Global, stopped, |s, _| {
-            step(s, Step::Continue)
-        }),
         spec(
             "run.debuggingActions.stopAllPrograms",
             "Stop All Programs",
@@ -284,7 +292,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "debug.showTab",
             "Show Debug Tab",
             None,
-            "{tab: variables|console|breakpoints}",
+            "{tab: variables|console|breakpoints|memory|disassembly|registers}",
             Context::Global,
             always,
             |s, p| {
@@ -292,9 +300,12 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                     "variables" => DebugTab::Variables,
                     "console" => DebugTab::Console,
                     "breakpoints" => DebugTab::Breakpoints,
+                    "memory" => DebugTab::Memory,
+                    "disassembly" => DebugTab::Disassembly,
+                    "registers" => DebugTab::Registers,
                     other => return Err(CommandError::BadParams(format!("unknown tab `{other}`"))),
                 };
-                show_tab(s, tab);
+                crate::debug_views::show_view(s, tab);
                 ok()
             },
         ),
@@ -382,12 +393,77 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "debug.state",
             "Debugger State",
             None,
-            "→ {active, session, breakpoints, watches, evaluation, console}",
+            "→ {active, session, breakpoints, watches, evaluation, console, views}",
             Context::Global,
             always,
             |s, _| Ok(debug::snapshot(s)),
         ),
+        // ----- post-mortem and remote debugging
+        spec(
+            "debug.coreDump",
+            "Debug Core Dump…",
+            None,
+            "{core?: path, program?: path, name?: string} — open a core dump in the debugger (lldb-dap or \
+             CodeLLDB); without `core`, show the form in the Debug tool window",
+            Context::Global,
+            always,
+            debug_core_dump,
+        ),
+        spec(
+            "debug.remote",
+            "Remote Debug…",
+            None,
+            "{address?: \"host:port\", program?: path, name?: string} — connect to gdbserver, lldb-server \
+             gdbserver or debugserver (`gdb-remote`); `program` is a local copy of the executable for \
+             symbols. Without `address`, show the form in the Debug tool window",
+            Context::Global,
+            always,
+            debug_remote,
+        ),
     ]
+    .into_iter()
+    .chain(crate::debug_views::specs())
+    .chain(crate::asm::specs())
+    .collect()
+}
+
+/// Which form the Debug tool window's chooser shows (`debug.coreDump`/`debug.remote` without
+/// params).
+fn show_form(s: &mut Session, form: debug::DebugForm) -> CmdResult {
+    s.debug.form = Some(form);
+    s.debug.choosing = true;
+    show_tab(s, s.debug.tab);
+    ok()
+}
+
+fn path_in_project(s: &Session, path: PathBuf) -> PathBuf {
+    match (path.is_absolute(), s.project_root()) {
+        (false, Some(root)) => crate::normalize_path(&root.join(path)),
+        _ => crate::normalize_path(&path),
+    }
+}
+
+fn debug_core_dump(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(core) = opt_path(p, "core") else { return show_form(s, debug::DebugForm::CoreDump) };
+    let core = path_in_project(s, core);
+    let program = opt_path(p, "program").map(|x| path_in_project(s, x));
+    let name = opt_str(p, "name").map(str::to_owned).unwrap_or_else(|| {
+        format!("Core {}", core.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+    });
+    s.debug.form = None;
+    debug::start(s, DebugTarget::CoreDump { name: name.clone(), core, program })?;
+    started(s, &name)
+}
+
+fn debug_remote(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(address) = opt_str(p, "address").map(str::to_owned) else {
+        return show_form(s, debug::DebugForm::Remote);
+    };
+    let program = opt_path(p, "program").map(|x| path_in_project(s, x));
+    let name = opt_str(p, "name").map_or_else(|| format!("Remote {}", address.trim()), str::to_owned);
+    s.debug.form = None;
+    debug::start(s, DebugTarget::Remote { name: name.clone(), address, program })?;
+    started(s, &name)
 }
 
 // ---------------------------------------------------------------- enabled predicates
@@ -507,6 +583,7 @@ fn choose_and_debug(s: &mut Session, p: &Value) -> CmdResult {
         return debug_config(s, p);
     }
     s.debug.choosing = true;
+    s.debug.form = None;
     show_tab(s, s.debug.tab);
     ok()
 }
@@ -726,12 +803,9 @@ fn process_target(name: &str, cmd: &crate::runs::ProcessCommand) -> Option<Debug
     }
 }
 
-/// A project virtualenv's interpreter (`.venv`, `venv`).
+/// The project's interpreter: the selected one (Python status bar widget), else its virtualenv.
 fn project_python(root: &Path) -> Option<PathBuf> {
-    [".venv/bin/python", "venv/bin/python", ".venv/Scripts/python.exe", "venv/Scripts/python.exe"]
-        .iter()
-        .map(|rel| root.join(rel))
-        .find(|p| p.is_file())
+    crate::python_env::project_python(root)
 }
 
 fn debug_at_caret(s: &mut Session, p: &Value) -> CmdResult {

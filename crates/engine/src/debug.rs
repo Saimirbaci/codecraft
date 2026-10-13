@@ -171,6 +171,9 @@ pub struct FrameInfo {
     pub column: usize,
     /// Library or generated code (shown dimmed).
     pub subtle: bool,
+    /// The frame's program counter as the adapter gives it (`0x…`), for the disassembly.
+    #[serde(default)]
+    pub instruction_pointer: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -178,6 +181,9 @@ pub struct ScopeInfo {
     pub name: String,
     pub reference: i64,
     pub expensive: bool,
+    /// `arguments`, `locals`, `registers`, … (DAP's hint).
+    #[serde(default)]
+    pub presentation_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +195,9 @@ pub struct VariableInfo {
     /// Non-zero when the variable has children.
     pub reference: i64,
     pub evaluate_name: Option<String>,
+    /// Where the value lives (`0x…`), when the adapter says.
+    #[serde(default)]
+    pub memory_reference: Option<String>,
 }
 
 /// A value painted after the end of a source line while suspended.
@@ -209,6 +218,16 @@ pub struct Evaluation {
     pub pending: bool,
 }
 
+/// A form in the Debug tool window's chooser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DebugForm {
+    /// Debug Core Dump…: a core file and the program that crashed.
+    CoreDump,
+    /// Remote Debug…: a gdbserver/lldb-server address and a local copy of the program.
+    Remote,
+}
+
 /// The tabs of the Debug tool window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DebugTab {
@@ -216,6 +235,11 @@ pub enum DebugTab {
     Variables,
     Console,
     Breakpoints,
+    /// Hex and ASCII view of the debuggee's memory.
+    Memory,
+    /// Instructions around the program counter; stepping steps by instruction while shown.
+    Disassembly,
+    Registers,
 }
 
 /// One debug session as the UI sees it.
@@ -347,6 +371,25 @@ pub enum DebugTarget {
         #[serde(default)]
         process: ProcessKind,
     },
+    /// Post-mortem debugging of a core dump (lldb-dap or CodeLLDB).
+    #[serde(rename_all = "camelCase")]
+    CoreDump {
+        name: String,
+        core: PathBuf,
+        /// The executable that crashed (for symbols); lldb finds it from the core when unset.
+        #[serde(default)]
+        program: Option<PathBuf>,
+    },
+    /// A program under `gdbserver`, `lldb-server gdbserver` or `debugserver` on another machine
+    /// (or locally), connected with `gdb-remote host:port`. Stopping detaches.
+    #[serde(rename_all = "camelCase")]
+    Remote {
+        name: String,
+        address: String,
+        /// A local copy of the remote executable, for symbols.
+        #[serde(default)]
+        program: Option<PathBuf>,
+    },
 }
 
 fn yes() -> bool {
@@ -362,7 +405,9 @@ impl DebugTarget {
             | Self::Zig { name, .. }
             | Self::ZigFile { name, .. }
             | Self::Node { name, .. }
-            | Self::Attach { name, .. } => name,
+            | Self::Attach { name, .. }
+            | Self::CoreDump { name, .. }
+            | Self::Remote { name, .. } => name,
         }
     }
 }
@@ -473,12 +518,18 @@ pub struct DebugState {
     pub focus_evaluate: Option<String>,
     /// The Debug tool window shows a configuration chooser (Run › Debug…).
     pub choosing: bool,
+    /// The chooser shows the Core Dump or Remote Debug form.
+    pub form: Option<DebugForm>,
     /// Stop when a Rust program panics (a `rust_panic` function breakpoint), like RustRover.
     pub break_on_panic: bool,
     /// The last target debugged (Rerun).
     pub last_target: Option<DebugTarget>,
     /// Run › Attach to Process…'s process list while it is open.
     pub attach: Option<AttachPicker>,
+    /// Memory, Disassembly, Registers, watchpoints and the console history.
+    pub views: crate::debug_views::DebugViews,
+    /// Code › Show Assembly.
+    pub asm: crate::asm::AsmState,
     attach_rx: Option<Receiver<Result<Vec<ProcessInfo>, String>>>,
     next_id: u64,
     /// The project whose breakpoints are loaded (`Some(None)`: none open, loaded nothing).
@@ -502,9 +553,12 @@ impl Default for DebugState {
             evaluation: None,
             focus_evaluate: None,
             choosing: false,
+            form: None,
             break_on_panic: true,
             last_target: None,
             attach: None,
+            views: crate::debug_views::DebugViews::default(),
+            asm: crate::asm::AsmState::default(),
             attach_rx: None,
             next_id: 1,
             loaded_for: None,
@@ -531,7 +585,7 @@ impl DebugState {
 
     /// Background work is in flight (the UI keeps polling).
     pub fn busy(&self) -> bool {
-        self.rt.is_some() || self.attach_rx.is_some()
+        self.rt.is_some() || self.attach_rx.is_some() || self.asm.running()
     }
 
     /// Something will change without user input: building, starting, running, or answers still
@@ -588,6 +642,11 @@ impl DebugState {
             let excess = self.console.len() - MAX_CONSOLE_LINES;
             self.console.drain(..excess);
         }
+    }
+
+    /// Add console output (the views report failures here).
+    pub(crate) fn push_console_line(&mut self, kind: DebugConsoleKind, text: impl Into<String>) {
+        self.push_console(kind, text);
     }
 
     fn info(&mut self, text: impl Into<String>) {
@@ -659,6 +718,8 @@ enum RunSpec {
     Python { program: Option<PathBuf>, module: Option<String>, python: Option<PathBuf>, just_my_code: bool },
     Node { program: PathBuf },
     Attach { pid: u32, process: ProcessKind },
+    Core { core: PathBuf, program: Option<PathBuf> },
+    Remote { address: String, program: Option<PathBuf> },
 }
 
 struct Prepared {
@@ -703,6 +764,14 @@ enum Pending {
     },
     /// continue / next / stepIn / stepOut: a failure means we are still stopped.
     Resume,
+    /// A console command that resumes (`thread step-inst`): an error in its output means we are
+    /// still stopped.
+    ResumeCommand,
+    /// Memory, Disassembly, Registers and watchpoint requests (see `debug_views`).
+    View {
+        epoch: u64,
+        request: crate::debug_views::ViewRequest,
+    },
     Other,
 }
 
@@ -716,6 +785,8 @@ impl Pending {
                 | Self::Variables { .. }
                 | Self::Evaluate { .. }
                 | Self::Resume
+                | Self::ResumeCommand
+                | Self::View { .. }
                 | Self::SetBreakpoints { .. }
         )
     }
@@ -785,15 +856,13 @@ impl Runtime {
 
     /// A Rust program under an LLDB adapter (values get Rust's formatting clean-up).
     fn is_rust(&self) -> bool {
-        matches!(
-            self.plan.run,
-            RunSpec::Native { rust: true, .. } | RunSpec::Attach { process: ProcessKind::Rust, .. }
-        )
+        matches!(self.plan.run, RunSpec::Native { rust: true, .. } | RunSpec::Attach { process: ProcessKind::Rust, .. })
     }
 
-    /// Attached to a process we did not start: stopping detaches and never kills it.
+    /// Attached to a process we did not start (or a core dump, or a remote program whose pid
+    /// means nothing here): stopping detaches and never kills it.
     fn attached(&self) -> bool {
-        matches!(self.plan.run, RunSpec::Attach { .. })
+        matches!(self.plan.run, RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. })
     }
 
     /// End the session with `disconnect`: detach from an attached process, else terminate.
@@ -957,6 +1026,38 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                 name: name.clone(),
                 build: None,
                 run: RunSpec::Attach { pid: *pid, process: *process },
+                args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+            })
+        }
+        DebugTarget::CoreDump { name, core, program } => {
+            if !core.is_file() {
+                return Err(format!("{} does not exist", core.display()));
+            }
+            if let Some(program) = program.as_ref().filter(|p| !p.is_file()) {
+                return Err(format!("{} does not exist", program.display()));
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::Core { core: core.clone(), program: program.clone() },
+                args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+            })
+        }
+        DebugTarget::Remote { name, address, program } => {
+            if !dap::launch::valid_remote_address(address) {
+                return Err(format!("`{address}` is not a host:port address"));
+            }
+            if let Some(program) = program.as_ref().filter(|p| !p.is_file()) {
+                return Err(format!("{} does not exist", program.display()));
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::Remote { address: address.trim().to_owned(), program: program.clone() },
                 args: Vec::new(),
                 cwd: None,
                 env: Vec::new(),
@@ -1126,6 +1227,18 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
             let args = dap::launch::native_attach(adapter.kind, &plan.name, *pid, &init_commands);
             (adapter, args)
         }
+        RunSpec::Core { core, program } => {
+            let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
+            let init = rust_init_commands(adapter.kind);
+            let args = dap::launch::native_core(adapter.kind, &plan.name, program.as_deref(), core, &init);
+            (adapter, args)
+        }
+        RunSpec::Remote { address, program } => {
+            let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
+            let init = rust_init_commands(adapter.kind);
+            let args = dap::launch::native_remote(adapter.kind, &plan.name, program.as_deref(), address, &init);
+            (adapter, args)
+        }
         RunSpec::Node { program } => {
             let adapter = dap::discover::find_js_debug().map_err(|e| e.to_string())?;
             let launch = dap::launch::node(&dap::launch::NodeLaunch {
@@ -1141,6 +1254,14 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
     };
     let (client, events) = DapClient::spawn(&adapter).map_err(|e| e.to_string())?;
     Ok(Prepared { client, events, adapter: adapter.name, kind: adapter.kind, launch })
+}
+
+/// Rust pretty printers for lldb-dap (programs that may or may not be Rust: core dumps, remote).
+fn rust_init_commands(kind: AdapterKind) -> Vec<String> {
+    if kind != AdapterKind::LldbDap {
+        return Vec::new();
+    }
+    dap::discover::rust_sysroot(None).map(|s| dap::discover::rust_lldb_init_commands(&s)).unwrap_or_default()
 }
 
 fn adapter_id(kind: AdapterKind) -> &'static str {
@@ -1188,6 +1309,7 @@ pub(crate) fn start(s: &mut Session, target: DebugTarget) -> Result<(), CommandE
     }
     s.debug.evaluation = None;
     s.debug.choosing = false;
+    s.debug.views.reset();
     s.debug.last_target = Some(target.clone());
     s.debug.console.clear();
     s.debug.session = Some(DebugSession { name: plan.name.clone(), ..DebugSession::default() });
@@ -1285,6 +1407,7 @@ fn end_session(s: &mut Session, status: DebugStatus, message: &str) {
         session.status = Some(status);
     }
     reset_verification(s);
+    s.debug.views.on_session_end();
     s.status = message.to_owned();
 }
 
@@ -1310,6 +1433,7 @@ pub(crate) fn shutdown(s: &mut Session) {
 pub(crate) fn pump(s: &mut Session) -> bool {
     let mut changed = ensure_loaded(s);
     changed |= pump_attach(s);
+    changed |= crate::asm::pump(s);
     changed |= follow_edits(s);
     let Some(rt) = s.debug.rt.as_mut() else { return changed };
     match &mut rt.phase {
@@ -1544,11 +1668,17 @@ fn on_response(s: &mut Session, response: dap::Response) {
             let scopes: Vec<ScopeInfo> = body
                 .scopes
                 .into_iter()
-                .map(|x| ScopeInfo { name: x.name, reference: x.variables_reference, expensive: x.expensive })
+                .map(|x| ScopeInfo {
+                    name: x.name,
+                    reference: x.variables_reference,
+                    expensive: x.expensive,
+                    presentation_hint: x.presentation_hint,
+                })
                 .collect();
             if let Some(session) = s.debug.session.as_mut() {
                 session.scopes = scopes.clone();
             }
+            crate::debug_views::on_scopes(s);
             for (i, scope) in scopes.iter().enumerate() {
                 let path = scope_path(&scope.name);
                 if (i == 0 && !scope.expensive) || s.debug.expanded.contains(&path) {
@@ -1575,6 +1705,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                         type_name: v.type_.filter(|t| !t.is_empty()),
                         reference: v.variables_reference,
                         evaluate_name: v.evaluate_name,
+                        memory_reference: v.memory_reference,
                     })
                     .collect(),
                 Err(e) => vec![VariableInfo {
@@ -1583,6 +1714,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                     type_name: None,
                     reference: 0,
                     evaluate_name: None,
+                    memory_reference: None,
                 }],
             };
             session.variables.insert(reference, vars.clone());
@@ -1599,8 +1731,22 @@ fn on_response(s: &mut Session, response: dap::Response) {
             }
         }
         Pending::Evaluate { epoch, purpose } => on_evaluate(s, epoch == epoch_now, purpose, response.result),
-        Pending::Resume => {
-            if let Err(e) = response.result {
+        Pending::View { epoch, request } => {
+            crate::debug_views::on_response(s, epoch == epoch_now, request, response.result);
+        }
+        Pending::Resume | Pending::ResumeCommand => {
+            // A console command answers even when it fails; its output says so.
+            let result = match (response.command == "evaluate", response.result) {
+                (true, Ok(body)) => match dap::types::parse::<dap::EvaluateBody>(&body)
+                    .ok()
+                    .and_then(|b| dap::lldb::error_of(&b.result))
+                {
+                    Some(e) => Err(e),
+                    None => Ok(body),
+                },
+                (_, result) => result,
+            };
+            if let Err(e) = result {
                 s.debug.error(e);
                 // Still where we were: show it again.
                 let Some(rt) = s.debug.rt.as_mut() else { return };
@@ -1818,6 +1964,7 @@ fn on_stopped(s: &mut Session, ev: dap::StoppedEvent) {
     for w in &mut s.debug.watches {
         w.clear();
     }
+    s.debug.views.on_stop();
     rt.ref_paths.clear();
     rt.request(Pending::Threads, DapClient::threads);
     if let Some(thread) = thread {
@@ -1849,6 +1996,7 @@ fn on_stopped(s: &mut Session, ev: dap::StoppedEvent) {
         Some(d) if !d.is_empty() => format!("Paused: {d}"),
         _ => format!("Paused ({})", ev.reason),
     };
+    crate::debug_views::after_stop(s);
 }
 
 fn on_stack_trace(s: &mut Session, body: &Value, reveal: bool) {
@@ -1870,6 +2018,7 @@ fn on_stack_trace(s: &mut Session, body: &Value, reveal: bool) {
                 line: line_from_dap(f.line),
                 column: line_from_dap(f.column),
                 subtle,
+                instruction_pointer: f.instruction_pointer_reference,
             }
         })
         .collect();
@@ -1931,7 +2080,9 @@ fn select_frame(s: &mut Session, index: usize, reveal: bool) {
         let purpose = EvalPurpose::Watch(expression.clone());
         rt.request(Pending::Evaluate { epoch, purpose }, |c| c.evaluate(&expression, Some(frame.id), "watch"));
     }
-    if reveal && let Some((path, line)) = session.execution.clone() {
+    let execution = session.execution.clone();
+    crate::debug_views::on_frame_selected(s);
+    if reveal && let Some((path, line)) = execution {
         reveal_line(s, &path, line);
     }
 }
@@ -2025,8 +2176,12 @@ fn on_evaluate(s: &mut Session, current: bool, purpose: EvalPurpose, result: Res
         }
         EvalPurpose::Console => match parsed {
             Ok(body) => {
-                if !body.result.is_empty() {
-                    s.debug.push_console(DebugConsoleKind::Result, body.result);
+                // Older lldb-dap echoes `(lldb) command` before a command's output.
+                let text = dap::lldb::strip_echo(&body.result).trim_end_matches('\n');
+                if !text.is_empty() {
+                    let kind =
+                        if text.starts_with("error:") { DebugConsoleKind::Error } else { DebugConsoleKind::Result };
+                    s.debug.push_console(kind, text.to_owned());
                 }
             }
             Err(e) => s.debug.push_console(DebugConsoleKind::Error, e),
@@ -2038,6 +2193,7 @@ fn on_evaluate(s: &mut Session, current: bool, purpose: EvalPurpose, result: Res
                 type_name: body.type_.filter(|t| !t.is_empty()),
                 reference: body.variables_reference,
                 evaluate_name: Some(expression.clone()),
+                memory_reference: body.memory_reference,
             });
             let reference = result.as_ref().map(|v| v.reference).unwrap_or(0);
             s.debug.evaluation = Some(Evaluation { expression, result, pending: false });
@@ -2070,19 +2226,45 @@ fn current_thread(s: &Session) -> Option<i64> {
         .or_else(|| session.threads.first().map(|t| t.id))
 }
 
+/// Step or continue. While the Disassembly tab is shown, Step Over and Step Into go by one
+/// instruction (like CLion's disassembly view).
 pub(crate) fn step(s: &mut Session, step: Step) -> Result<(), CommandError> {
+    let by_instruction = s.debug.tab == DebugTab::Disassembly && matches!(step, Step::Over | Step::Into);
+    step_with(s, step, by_instruction)
+}
+
+/// Step by one machine instruction (`over` steps over calls).
+pub(crate) fn step_instruction(s: &mut Session, over: bool) -> Result<(), CommandError> {
+    step_with(s, if over { Step::Over } else { Step::Into }, true)
+}
+
+fn step_with(s: &mut Session, step: Step, by_instruction: bool) -> Result<(), CommandError> {
     if !s.debug.is_stopped() {
         return Err(CommandError::Disabled("the program is not paused".into()));
     }
     let thread = current_thread(s).ok_or_else(|| CommandError::Failed("no thread to step".into()))?;
+    let frame = s.debug.session.as_ref().and_then(|x| x.selected_frame()).map(|f| f.id);
     let Some(rt) = s.debug.rt.as_mut() else { return Err(CommandError::Disabled("not debugging".into())) };
     let previous = s.debug.session.as_ref().and_then(|x| x.status.clone());
-    let sent = rt.request(Pending::Resume, |c| match step {
-        Step::Over => c.next(thread),
-        Step::Into => c.step_in(thread),
-        Step::Out => c.step_out(thread),
-        Step::Continue => c.continue_(thread),
-    });
+    let by_instruction = by_instruction && matches!(step, Step::Over | Step::Into);
+    let lldb = matches!(rt.kind, AdapterKind::LldbDap | AdapterKind::CodeLldb);
+    let sent = if by_instruction && rt.capabilities.supports_stepping_granularity {
+        let command = if step == Step::Over { "next" } else { "stepIn" };
+        rt.request(Pending::Resume, |c| c.step_by(command, thread, "instruction"))
+    } else if by_instruction && lldb {
+        // Older lldb-dap has no stepping granularity; its console steps by instruction.
+        let command = dap::lldb::step_instruction_command(step == Step::Over);
+        rt.request(Pending::ResumeCommand, |c| c.evaluate(command, frame, "repl"))
+    } else if by_instruction {
+        return Err(CommandError::Failed(format!("{} cannot step by instruction", adapter_id(rt.kind))));
+    } else {
+        rt.request(Pending::Resume, |c| match step {
+            Step::Over => c.next(thread),
+            Step::Into => c.step_in(thread),
+            Step::Out => c.step_out(thread),
+            Step::Continue => c.continue_(thread),
+        })
+    };
     if !sent {
         return Err(CommandError::Failed("the debugger is not responding".into()));
     }
@@ -2092,6 +2274,7 @@ pub(crate) fn step(s: &mut Session, step: Step) -> Result<(), CommandError> {
         session.status = Some(DebugStatus::Running);
         session.clear_stop();
     }
+    s.debug.views.on_resume();
     s.status = "Running".into();
     Ok(())
 }
@@ -2138,6 +2321,7 @@ pub(crate) fn evaluate(s: &mut Session, expression: &str, console: bool) -> Resu
     }
     if console {
         s.debug.push_console(DebugConsoleKind::Input, format!("> {expression}"));
+        s.debug.views.remember_command(expression);
     } else {
         s.debug.evaluation =
             Some(Evaluation { expression: expression.to_owned(), result: Err(String::new()), pending: true });
@@ -2211,6 +2395,82 @@ pub(crate) fn remove_watch(s: &mut Session, index: usize) -> Result<(), CommandE
     s.debug.watches.remove(index);
     save(s);
     Ok(())
+}
+
+// ---------------------------------------------------------------- for debug_views
+
+/// The live adapter as the Memory, Disassembly and Registers views need it.
+pub(crate) struct LiveAdapter {
+    pub kind: AdapterKind,
+    pub capabilities: dap::Capabilities,
+}
+
+impl LiveAdapter {
+    /// lldb-dap or CodeLLDB: LLDB console commands are a fallback for missing requests.
+    pub fn is_lldb(&self) -> bool {
+        matches!(self.kind, AdapterKind::LldbDap | AdapterKind::CodeLldb)
+    }
+
+    pub fn name(&self) -> &'static str {
+        adapter_id(self.kind)
+    }
+}
+
+/// The adapter of a running session (`None` while building or starting, or when it is over).
+pub(crate) fn live_adapter(s: &Session) -> Option<LiveAdapter> {
+    let rt = s.debug.rt.as_ref()?;
+    rt.client()?;
+    Some(LiveAdapter { kind: rt.kind, capabilities: rt.capabilities.clone() })
+}
+
+/// Tests: a running session talking to `client` (a scripted adapter), already configured.
+#[cfg(test)]
+pub(crate) fn install_fake(
+    s: &mut Session,
+    client: DapClient,
+    events: Receiver<DapEvent>,
+    kind: AdapterKind,
+    capabilities: dap::Capabilities,
+) {
+    let plan = LaunchPlan {
+        name: "fake".into(),
+        build: None,
+        run: RunSpec::Native { program: Some("/fake/program".into()), rust: false },
+        args: Vec::new(),
+        cwd: None,
+        env: Vec::new(),
+    };
+    let mut rt = Runtime::new(plan, Phase::Live { client, events }, None);
+    rt.kind = kind;
+    rt.capabilities = capabilities;
+    rt.configured = true;
+    s.debug.views.reset();
+    s.debug.session = Some(DebugSession {
+        name: "fake".into(),
+        adapter: "fake".into(),
+        status: Some(DebugStatus::Running),
+        ..DebugSession::default()
+    });
+    s.debug.rt = Some(rt);
+}
+
+/// Send a view request (answered in `debug_views::on_response`). False if the adapter is gone.
+pub(crate) fn view_request(
+    s: &mut Session,
+    request: crate::debug_views::ViewRequest,
+    send: impl FnOnce(&DapClient) -> dap::Result<RequestId>,
+) -> bool {
+    let Some(rt) = s.debug.rt.as_mut() else { return false };
+    let epoch = rt.epoch;
+    rt.request(Pending::View { epoch, request }, send)
+}
+
+/// Read the selected frame's variables again (after memory was written).
+pub(crate) fn reload_frame(s: &mut Session) {
+    let index = s.debug.session.as_ref().map_or(0, |x| x.frame);
+    if s.debug.is_stopped() {
+        select_frame(s, index, false);
+    }
 }
 
 // ---------------------------------------------------------------- breakpoints
@@ -2604,6 +2864,7 @@ pub(crate) fn snapshot(s: &Session) -> Value {
         "watches": s.debug.watches,
         "evaluation": s.debug.evaluation,
         "breakOnPanic": s.debug.break_on_panic,
+        "views": s.debug.views,
         "console": s.debug.console.iter().rev().take(200).rev().map(|l| json!({
             "kind": l.kind, "text": console_text(l),
         })).collect::<Vec<_>>(),
@@ -2639,7 +2900,11 @@ mod tests {
             kind: dap::processes::guess_kind(cmd),
         };
         let mut picker = AttachPicker {
-            processes: vec![p(10, "me", "/a/target/debug/app"), p(11, "root", "/sbin/launchd"), p(120, "me", "/usr/bin/python3")],
+            processes: vec![
+                p(10, "me", "/a/target/debug/app"),
+                p(11, "root", "/sbin/launchd"),
+                p(120, "me", "/usr/bin/python3"),
+            ],
             user: Some("me".into()),
             ..AttachPicker::default()
         };
@@ -2675,7 +2940,14 @@ mod tests {
     }
 
     fn var(name: &str, value: &str) -> VariableInfo {
-        VariableInfo { name: name.into(), value: value.into(), type_name: None, reference: 0, evaluate_name: None }
+        VariableInfo {
+            name: name.into(),
+            value: value.into(),
+            type_name: None,
+            reference: 0,
+            evaluate_name: None,
+            memory_reference: None,
+        }
     }
 
     #[test]

@@ -17,13 +17,13 @@ use codecraft_engine::debug::{
     self as dbg, Breakpoint, DebugConsoleKind, DebugSession, DebugState, DebugStatus, DebugTab, VariableInfo,
 };
 
+use crate::debug_views_ui::{self, ViewsUi};
 use crate::theme::Theme;
 use crate::{UiState, keymap, run_command};
 
 const ROW_H: f32 = 20.0;
 const INDENT: f32 = 14.0;
 const MAX_DEPTH: usize = 40;
-const MAX_HISTORY: usize = 200;
 
 /// View state of the Debug tool window (kept in [`UiState`]).
 #[derive(Default)]
@@ -31,9 +31,8 @@ pub struct DebugUi {
     /// The Evaluate expression field above the variables.
     pub evaluate: String,
     focus_evaluate: bool,
-    /// The console's input line and its history (newest last).
+    /// The console's input line and the position in the engine's history while browsing it.
     pub console_input: String,
-    history: Vec<String>,
     history_pos: Option<usize>,
     /// A watch being typed (the "+" row).
     pub new_watch: Option<String>,
@@ -47,6 +46,8 @@ pub struct DebugUi {
     console_follow_set: bool,
     /// Scroll the Attach to Process list to the selection (after ↑/↓).
     attach_scroll: bool,
+    /// The Memory, Disassembly and Registers tabs and the debug forms.
+    pub views: ViewsUi,
 }
 
 /// What the user did this frame; applied after painting (the tree is drawn from `&Session`).
@@ -67,15 +68,24 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     let mut actions = Vec::new();
     header(ui, s, &theme, &mut actions);
     ui.add_space(2.0);
+    let mut cmds: Vec<debug_views_ui::Cmd> = Vec::new();
     if s.debug.choosing {
         chooser(ui, s, &theme, &mut actions);
+        debug_views_ui::chooser_forms(ui, s, &theme, &mut st.debug.views, &mut cmds);
     } else {
         match s.debug.tab {
             DebugTab::Variables => threads_and_variables(ui, &s.debug, &theme, &mut st.debug, &mut actions),
             DebugTab::Console => console(ui, &s.debug, &theme, &mut st.debug, &mut actions),
-            DebugTab::Breakpoints => breakpoints(ui, s, &theme, &mut st.debug, &mut actions),
+            DebugTab::Breakpoints => {
+                debug_views_ui::watchpoints(ui, s, &theme, &mut cmds);
+                breakpoints(ui, s, &theme, &mut st.debug, &mut actions);
+            }
+            DebugTab::Memory => debug_views_ui::memory(ui, s, &theme, &mut st.debug.views, &mut cmds),
+            DebugTab::Disassembly => debug_views_ui::disassembly(ui, s, &theme, &mut st.debug.views, &mut cmds),
+            DebugTab::Registers => debug_views_ui::registers(ui, s, &theme, &mut cmds),
         }
     }
+    actions.extend(cmds.into_iter().map(|(id, params)| Action::Command(id, params)));
     for action in actions {
         match action {
             Action::Command(id, params) => run_command(s, st, id, &params),
@@ -108,6 +118,9 @@ fn header(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
                 if bp_count > 0 { format!("Breakpoints {bp_count}") } else { "Breakpoints".to_owned() },
                 "breakpoints",
             ),
+            (DebugTab::Memory, "Memory".to_owned(), "memory"),
+            (DebugTab::Disassembly, "Disassembly".to_owned(), "disassembly"),
+            (DebugTab::Registers, "Registers".to_owned(), "registers"),
         ] {
             let selected = debug.tab == tab && !debug.choosing;
             let text = RichText::new(label).color(if selected { theme.text } else { theme.text_muted });
@@ -132,8 +145,18 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
     let enabled = |id: &str| s.enabled(id).is_ok();
     let buttons: [(Icon, &str, &'static str, bool); 10] = [
         (Icon::Rerun, "Rerun", "debug.rerun", enabled("debug.rerun")),
-        (Icon::Resume, "Resume Program", "run.debuggingActions.resumeProgram", enabled("run.debuggingActions.resumeProgram")),
-        (Icon::Pause, "Pause Program", "run.debuggingActions.pauseAllPrograms", enabled("run.debuggingActions.pauseAllPrograms")),
+        (
+            Icon::Resume,
+            "Resume Program",
+            "run.debuggingActions.resumeProgram",
+            enabled("run.debuggingActions.resumeProgram"),
+        ),
+        (
+            Icon::Pause,
+            "Pause Program",
+            "run.debuggingActions.pauseAllPrograms",
+            enabled("run.debuggingActions.pauseAllPrograms"),
+        ),
         (Icon::Stop, "Stop", "debug.stop", enabled("debug.stop")),
         (Icon::StepOver, "Step Over", "run.debuggingActions.stepOver", enabled("run.debuggingActions.stepOver")),
         (Icon::StepInto, "Step Into", "run.debuggingActions.stepInto", enabled("run.debuggingActions.stepInto")),
@@ -533,7 +556,7 @@ fn variables(
                         paint_job(ui, rect, rect.left() + 18.0, job);
                     }
                     (Ok(v), false) => {
-                        tree.node(ui, 0, dbg::EVALUATION_PATH, v, Glyph::Result, actions);
+                        tree.node(ui, 0, dbg::EVALUATION_PATH, v, 0, Glyph::Result, actions);
                     }
                     (Err(e), false) => {
                         let (rect, _) = row(ui, theme, false);
@@ -573,8 +596,9 @@ fn variables(
                     type_name: None,
                     reference: scope.reference,
                     evaluate_name: None,
+                    memory_reference: None,
                 };
-                tree.node(ui, 0, &dbg::scope_path(&scope.name), &info, Glyph::Scope, actions);
+                tree.node(ui, 0, &dbg::scope_path(&scope.name), &info, 0, Glyph::Scope, actions);
             }
         });
     });
@@ -597,9 +621,10 @@ fn watches(
             type_name: w.type_name.clone(),
             reference: w.reference,
             evaluate_name: Some(w.expression.clone()),
+            memory_reference: None,
         };
         let resp = match (tree, &w.error, &w.value) {
-            (Some(tree), None, Some(_)) => tree.node(ui, 0, &path, &info, Glyph::Watch, actions),
+            (Some(tree), None, Some(_)) => tree.node(ui, 0, &path, &info, 0, Glyph::Watch, actions),
             (_, error, _) => {
                 let (rect, resp) = row(ui, theme, false);
                 paint_glyph(ui.painter(), pos2(rect.left() + 9.0, rect.center().y), Glyph::Watch, theme);
@@ -708,7 +733,7 @@ impl Tree<'_> {
             Some(vars) if vars.is_empty() => self.note(ui, depth, "No variables"),
             Some(vars) => {
                 for v in vars {
-                    self.node(ui, depth, &dbg::child_path(path, &v.name), v, Glyph::Variable, actions);
+                    self.node(ui, depth, &dbg::child_path(path, &v.name), v, reference, Glyph::Variable, actions);
                 }
             }
             None if self.session.loading.contains(&reference) => self.note(ui, depth, "Collecting data…"),
@@ -722,12 +747,15 @@ impl Tree<'_> {
         paint_job(ui, rect, rect.left() + 18.0 + depth as f32 * INDENT, job);
     }
 
+    /// One node; `parent` is the variables reference it was listed under (0 for roots).
+    #[allow(clippy::too_many_arguments)]
     fn node(
         &self,
         ui: &mut Ui,
         depth: usize,
         path: &str,
         v: &VariableInfo,
+        parent: i64,
         glyph: Glyph,
         actions: &mut Vec<Action>,
     ) -> Response {
@@ -789,6 +817,26 @@ impl Tree<'_> {
                     let expr = v.evaluate_name.clone().unwrap_or_else(|| v.name.clone());
                     actions.push(Action::Command("debug.addWatch", json!({ "expression": expr })));
                     ui.close();
+                }
+                if glyph == Glyph::Variable && self.debug.is_stopped() {
+                    ui.separator();
+                    let expr = v.evaluate_name.clone().unwrap_or_else(|| v.name.clone());
+                    for (label, access) in
+                        [("Add Watchpoint (Break on Change)", "write"), ("Break on Value Access", "readWrite")]
+                    {
+                        if ui.button(label).clicked() {
+                            actions.push(Action::Command(
+                                "debug.watchpoint.add",
+                                json!({ "name": v.name, "reference": parent, "evaluateName": expr, "access": access }),
+                            ));
+                            ui.close();
+                        }
+                    }
+                    if ui.button("Show in Memory View").clicked() {
+                        let address = v.memory_reference.clone().unwrap_or_else(|| format!("&({expr})"));
+                        actions.push(Action::Command("debug.memory.show", json!({ "address": address })));
+                        ui.close();
+                    }
                 }
             });
         }
@@ -863,6 +911,7 @@ fn console(ui: &mut Ui, debug: &DebugState, theme: &Theme, view: &mut DebugUi, a
     ui.horizontal(|ui| {
         ui.label(RichText::new("›").color(theme.link).font(FontId::monospace(14.0)));
         let enabled = debug.is_active();
+        let lldb = debug.session.as_ref().is_some_and(|x| x.adapter.starts_with("lldb") || x.adapter == "codelldb");
         let resp = ui.add_enabled(
             enabled,
             TextEdit::singleline(&mut view.console_input)
@@ -870,7 +919,9 @@ fn console(ui: &mut Ui, debug: &DebugState, theme: &Theme, view: &mut DebugUi, a
                 .desired_width(f32::INFINITY)
                 .font(FontId::monospace(13.0))
                 .hint_text(
-                    RichText::new(if enabled {
+                    RichText::new(if enabled && lldb {
+                        "LLDB command or expression (↩), e.g. bt, frame variable, register read"
+                    } else if enabled {
                         "Expression or debugger command (↩)"
                     } else {
                         "Start debugging to evaluate"
@@ -878,33 +929,29 @@ fn console(ui: &mut Ui, debug: &DebugState, theme: &Theme, view: &mut DebugUi, a
                     .color(theme.text_muted),
                 ),
         );
+        let history = &debug.views.console_history;
         if resp.has_focus() {
             let (up, down) = ui.input(|i| (i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown)));
-            if up && !view.history.is_empty() {
-                let pos = view.history_pos.map_or(view.history.len().saturating_sub(1), |p| p.saturating_sub(1));
+            if up && !history.is_empty() {
+                let pos = view.history_pos.map_or(history.len().saturating_sub(1), |p| p.saturating_sub(1));
                 view.history_pos = Some(pos);
-                view.console_input = view.history.get(pos).cloned().unwrap_or_default();
+                view.console_input = history.get(pos).cloned().unwrap_or_default();
             } else if down && let Some(p) = view.history_pos {
-                let next = p + 1;
-                if next >= view.history.len() {
+                let next = p.saturating_add(1);
+                if next >= history.len() {
                     view.history_pos = None;
                     view.console_input.clear();
                 } else {
                     view.history_pos = Some(next);
-                    view.console_input = view.history.get(next).cloned().unwrap_or_default();
+                    view.console_input = history.get(next).cloned().unwrap_or_default();
                 }
             }
         }
         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
             let expr = view.console_input.trim().to_owned();
             if !expr.is_empty() {
+                // The engine keeps the history.
                 actions.push(Action::Command("debug.consoleEvaluate", json!({ "expression": expr })));
-                if view.history.last() != Some(&expr) {
-                    view.history.push(expr);
-                    if view.history.len() > MAX_HISTORY {
-                        view.history.remove(0);
-                    }
-                }
                 view.console_input.clear();
                 view.history_pos = None;
             }
@@ -946,7 +993,12 @@ fn breakpoints(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut DebugUi, acti
         }
     });
     if debug.breakpoints.is_empty() {
-        empty_hint(ui, theme, "No breakpoints. Click a line number in the editor or press ⌘F8 to add one.");
+        empty_hint(
+            ui,
+            theme,
+            "No breakpoints. Click a line number in the editor or press ⌘F8 to add one. Watchpoints are added \
+             from a variable's context menu while paused.",
+        );
         return;
     }
     let mut sorted: Vec<&Breakpoint> = debug.breakpoints.iter().collect();
@@ -1177,7 +1229,9 @@ pub fn attach_window(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
         .show(ui.ctx(), |ui| {
             let mut query = picker.query.clone();
             ui.horizontal(|ui| {
-                let field = ui.add(TextEdit::singleline(&mut query).hint_text("Filter by name, command or pid").desired_width(360.0));
+                let field = ui.add(
+                    TextEdit::singleline(&mut query).hint_text("Filter by name, command or pid").desired_width(360.0),
+                );
                 if !field.has_focus() && !ui.ctx().memory(|m| m.focused().is_some()) {
                     field.request_focus();
                 }
@@ -1235,7 +1289,12 @@ pub fn attach_window(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
         });
     st.debug.attach_scroll = false;
     let (up, down, enter, escape) = ui.ctx().input(|i| {
-        (i.key_pressed(Key::ArrowUp), i.key_pressed(Key::ArrowDown), i.key_pressed(Key::Enter), i.key_pressed(Key::Escape))
+        (
+            i.key_pressed(Key::ArrowUp),
+            i.key_pressed(Key::ArrowDown),
+            i.key_pressed(Key::Enter),
+            i.key_pressed(Key::Escape),
+        )
     });
     if up || down {
         cmds.push(("debug.attach.move", json!({ "delta": if up { -1 } else { 1 } })));

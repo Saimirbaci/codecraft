@@ -24,6 +24,8 @@
 mod client;
 pub mod discover;
 pub mod launch;
+pub mod lldb;
+pub mod memory;
 pub mod processes;
 mod transport;
 pub mod types;
@@ -155,7 +157,7 @@ pub fn initialize_arguments(adapter_id: &str) -> Value {
         "supportsVariableType": true,
         "supportsVariablePaging": false,
         "supportsRunInTerminalRequest": false,
-        "supportsMemoryReferences": false,
+        "supportsMemoryReferences": true,
         "supportsProgressReporting": false,
         "supportsInvalidatedEvent": false,
         "supportsStartDebuggingRequest": true,
@@ -322,6 +324,75 @@ impl DapClient {
 
     pub fn step_out(&self, thread_id: i64) -> Result<RequestId> {
         self.request("stepOut", json!({ "threadId": thread_id }))
+    }
+
+    /// `next`, `stepIn` or `stepOut` (`command`) by `granularity` (`statement`, `line` or
+    /// `instruction`; needs `supportsSteppingGranularity`).
+    pub fn step_by(&self, command: &str, thread_id: i64, granularity: &str) -> Result<RequestId> {
+        self.request(command, json!({ "threadId": thread_id, "granularity": granularity }))
+    }
+
+    /// Read `count` bytes at `memory_reference` + `offset` (`supportsReadMemoryRequest`).
+    pub fn read_memory(&self, memory_reference: &str, offset: i64, count: usize) -> Result<RequestId> {
+        self.request("readMemory", json!({ "memoryReference": memory_reference, "offset": offset, "count": count }))
+    }
+
+    /// Write `data` at `memory_reference` + `offset` (`supportsWriteMemoryRequest`).
+    pub fn write_memory(&self, memory_reference: &str, offset: i64, data: &[u8]) -> Result<RequestId> {
+        self.request(
+            "writeMemory",
+            json!({
+                "memoryReference": memory_reference,
+                "offset": offset,
+                "allowPartial": false,
+                "data": memory::base64_encode(data),
+            }),
+        )
+    }
+
+    /// Disassemble `instruction_count` instructions starting `instruction_offset` instructions
+    /// from `memory_reference` (`supportsDisassembleRequest`).
+    pub fn disassemble(
+        &self,
+        memory_reference: &str,
+        instruction_offset: i64,
+        instruction_count: usize,
+    ) -> Result<RequestId> {
+        self.request(
+            "disassemble",
+            json!({
+                "memoryReference": memory_reference,
+                "offset": 0,
+                "instructionOffset": instruction_offset,
+                "instructionCount": instruction_count,
+                "resolveSymbols": true,
+            }),
+        )
+    }
+
+    /// Whether (and how) the child `name` of `variables_reference` can be watched
+    /// (`supportsDataBreakpoints`). With no reference, `name` is an expression.
+    pub fn data_breakpoint_info(
+        &self,
+        variables_reference: Option<i64>,
+        name: &str,
+        frame_id: Option<i64>,
+    ) -> Result<RequestId> {
+        let mut args = json!({ "name": name });
+        if let Some(map) = args.as_object_mut() {
+            if let Some(reference) = variables_reference.filter(|r| *r > 0) {
+                map.insert("variablesReference".into(), reference.into());
+            }
+            if let Some(frame) = frame_id {
+                map.insert("frameId".into(), frame.into());
+            }
+        }
+        self.request("dataBreakpointInfo", args)
+    }
+
+    /// Replace all watchpoints (an empty list clears them).
+    pub fn set_data_breakpoints(&self, breakpoints: &[DataBreakpoint]) -> Result<RequestId> {
+        self.request("setDataBreakpoints", json!({ "breakpoints": breakpoints }))
     }
 
     pub fn pause(&self, thread_id: i64) -> Result<RequestId> {

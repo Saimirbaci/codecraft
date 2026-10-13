@@ -35,6 +35,11 @@ pub struct Capabilities {
     pub supports_single_thread_execution_requests: bool,
     pub support_terminate_debuggee: bool,
     pub supports_value_formatting_options: bool,
+    pub supports_read_memory_request: bool,
+    pub supports_write_memory_request: bool,
+    pub supports_disassemble_request: bool,
+    pub supports_data_breakpoints: bool,
+    pub supports_instruction_breakpoints: bool,
     pub exception_breakpoint_filters: Vec<ExceptionBreakpointsFilter>,
 }
 
@@ -175,6 +180,8 @@ pub struct Variable {
     pub named_variables: Option<i64>,
     pub indexed_variables: Option<i64>,
     pub evaluate_name: Option<String>,
+    /// The value's memory location (adapters send it when the client supports memory references).
+    pub memory_reference: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +199,72 @@ pub struct EvaluateBody {
     pub variables_reference: i64,
     pub named_variables: Option<i64>,
     pub indexed_variables: Option<i64>,
+    pub memory_reference: Option<String>,
+}
+
+/// `readMemory` response body. `data` is base64; bytes after it up to `unreadableBytes` could not
+/// be read.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ReadMemoryBody {
+    pub address: String,
+    pub unreadable_bytes: Option<i64>,
+    pub data: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct WriteMemoryBody {
+    pub offset: Option<i64>,
+    pub bytes_written: Option<i64>,
+}
+
+/// One instruction of a `disassemble` response.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DisassembledInstruction {
+    pub address: String,
+    pub instruction_bytes: Option<String>,
+    pub instruction: String,
+    pub symbol: Option<String>,
+    pub location: Option<Source>,
+    pub line: Option<i64>,
+    pub column: Option<i64>,
+    pub end_line: Option<i64>,
+    /// `normal` or `invalid` (padding the adapter could not decode).
+    pub presentation_hint: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisassembleBody {
+    pub instructions: Vec<DisassembledInstruction>,
+}
+
+/// `dataBreakpointInfo` response body: `dataId` is `None` when the value can't be watched
+/// (`description` says why).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DataBreakpointInfoBody {
+    pub data_id: Option<String>,
+    pub description: String,
+    /// `read`, `write`, `readWrite`.
+    pub access_types: Option<Vec<String>>,
+    pub can_persist: Option<bool>,
+}
+
+/// A watchpoint (`setDataBreakpoints` arguments).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DataBreakpoint {
+    pub data_id: String,
+    /// `read`, `write` or `readWrite`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hit_condition: Option<String>,
 }
 
 // ---------------------------------------------------------------- events
@@ -286,6 +359,27 @@ mod tests {
         .unwrap();
         assert_eq!(frames.stack_frames.first().and_then(|f| f.source.as_ref()?.path.clone()), Some("/a.rs".into()));
         assert!(parse::<ThreadsBody>(&json!({"threads": "nope"})).is_err());
+    }
+
+    #[test]
+    fn memory_and_disassembly_bodies_parse() {
+        let caps: Capabilities =
+            parse(&json!({"supportsReadMemoryRequest": true, "supportsDataBreakpoints": true})).unwrap();
+        assert!(caps.supports_read_memory_request && caps.supports_data_breakpoints);
+        assert!(!caps.supports_disassemble_request);
+        let mem: ReadMemoryBody = parse(&json!({"address": "0x10", "data": "KgA=", "unreadableBytes": 2})).unwrap();
+        assert_eq!((mem.address.as_str(), mem.unreadable_bytes), ("0x10", Some(2)));
+        let dis: DisassembleBody = parse(&json!({"instructions": [
+            {"address": "0x100003EF4", "instruction": "ldr w8, [sp]", "instructionBytes": "e8 1b 40 b9", "line": 6,
+             "location": {"name": "t.c", "path": "/t.c"}}
+        ]}))
+        .unwrap();
+        assert_eq!(dis.instructions[0].line, Some(6));
+        let info: DataBreakpointInfoBody = parse(&json!({"dataId": null, "description": "no"})).unwrap();
+        assert!(info.data_id.is_none());
+        let bp =
+            DataBreakpoint { data_id: "16FDFCCF8/4".into(), access_type: Some("write".into()), ..Default::default() };
+        assert_eq!(serde_json::to_value(bp).unwrap(), json!({"dataId": "16FDFCCF8/4", "accessType": "write"}));
     }
 
     #[test]
