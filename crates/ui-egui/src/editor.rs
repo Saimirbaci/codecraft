@@ -13,14 +13,13 @@ use codecraft_engine::Session;
 use codecraft_syntax::{FoldRange, HighlightKind, Highlights};
 use codecraft_text::Document;
 use codecraft_text::wrap::WrapConfig;
-use codecraft_workspace::{EditorId, Problem, Severity};
+use codecraft_workspace::{EditorId, InlayKind, Problem, Severity, WhitespaceMode};
 
 use crate::UiState;
 use crate::theme::Theme;
 
 const MAX_LAYOUT_CHARS: usize = 20_000;
 const STRIPE_W: f32 = 12.0;
-const RIGHT_MARGIN_COL: usize = 100;
 
 pub fn editor_id(e: EditorId) -> Id {
     Id::new(("codecraft-editor", e.0))
@@ -120,12 +119,37 @@ impl DisplayMap {
     }
 }
 
+/// Galley text that is not document text: an inlay hint or the IME pre-edit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Virtual {
+    /// Index into [`Decor::inlays`].
+    Inlay(usize),
+    Preedit,
+}
+
+#[derive(Clone, Debug)]
+struct VirtualSpan {
+    what: Virtual,
+    /// Galley chars it occupies.
+    galley: std::ops::Range<usize>,
+}
+
+/// A whitespace char Show Whitespaces marks: its galley chars (a tab spans several).
+#[derive(Clone, Copy, Debug)]
+struct WsMark {
+    galley: usize,
+    width: usize,
+    tab: bool,
+}
+
 /// A laid-out line and the mapping from char columns to galley chars (tabs expand).
 struct LineLayout {
     galley: Arc<Galley>,
     /// `xcols[c]` = galley char index of char column `c`; `None` = identity.
     xcols: Option<Vec<usize>>,
     len: usize,
+    virtuals: Vec<VirtualSpan>,
+    whitespace: Vec<WsMark>,
 }
 
 impl LineLayout {
@@ -138,7 +162,24 @@ impl LineLayout {
     }
 
     fn x_of(&self, col: usize) -> f32 {
-        self.galley.pos_from_cursor(CCursor::new(self.xcol(col))).min.x
+        self.gx(self.xcol(col))
+    }
+
+    /// x of a galley char index.
+    fn gx(&self, index: usize) -> f32 {
+        self.galley.pos_from_cursor(CCursor::new(index)).min.x
+    }
+
+    /// The virtual span (inlay or pre-edit) under x, with the galley char index there.
+    fn virtual_at(&self, x: f32) -> Option<(&VirtualSpan, usize)> {
+        self.virtuals.iter().find_map(|v| {
+            let (x0, x1) = (self.gx(v.galley.start), self.gx(v.galley.end));
+            if x < x0 || x >= x1 {
+                return None;
+            }
+            let i: usize = self.galley.cursor_from_pos(vec2(x, self.galley.size().y * 0.5)).index.into();
+            Some((v, i.clamp(v.galley.start, v.galley.end.saturating_sub(1).max(v.galley.start))))
+        })
     }
 
     fn col_at_x(&self, x: f32) -> usize {
@@ -154,12 +195,37 @@ impl LineLayout {
     }
 }
 
-/// Language-server decorations for the current document revision (stale ones are not passed).
+/// Language-server decorations for the current document revision (stale ones are not passed),
+/// plus what else the view draws into the text: the IME pre-edit and whitespace marks.
 #[derive(Clone, Copy, Default)]
 struct Decor<'a> {
     semantic: Option<&'a [Vec<codecraft_workspace::SemanticSpan>]>,
     /// Inlay hints sorted by offset.
     inlays: &'a [codecraft_workspace::InlayHint],
+    /// Uncommitted IME composition: char offset and text.
+    preedit: Option<(usize, &'a str)>,
+    /// Show Whitespaces (and which).
+    whitespace: Option<WhitespaceMode>,
+}
+
+/// Which whitespace chars of a line Show Whitespaces marks: `(leading end, trailing start)` char
+/// columns; whitespace before the first or after the last is leading/trailing. A blank line is
+/// all trailing.
+fn whitespace_bounds(chars: &[char]) -> (usize, usize) {
+    let first = chars.iter().position(|c| !c.is_whitespace());
+    let last = chars.iter().rposition(|c| !c.is_whitespace());
+    match (first, last) {
+        (Some(f), Some(l)) => (f, l + 1),
+        _ => (0, 0),
+    }
+}
+
+fn marks_whitespace(mode: WhitespaceMode, col: usize, bounds: (usize, usize)) -> bool {
+    match mode {
+        WhitespaceMode::All => true,
+        WhitespaceMode::LeadingTrailing => col < bounds.0 || col >= bounds.1,
+        WhitespaceMode::Trailing => col >= bounds.1,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -214,31 +280,59 @@ fn layout_line(
     let unresolved: Vec<bool> = unresolved.get(seg.clone()).unwrap_or(&[]).to_vec();
     let n = chars.len();
     let has_tabs = chars.contains(&'\t');
-    // Inlay hints on this row, as (column within the row, hint).
+    // Inlay hints on this row, as (column within the row, index into `decor.inlays`).
     let line_start = doc.line_start(line);
+    let in_row = |offset: usize| {
+        offset >= line_start + seg.start
+            && (offset < line_start + seg.end || (last_row && offset == line_start + seg.end))
+    };
     let first = decor.inlays.partition_point(|h| h.offset < line_start + seg.start);
-    let inlays: Vec<(usize, &codecraft_workspace::InlayHint)> = decor
+    let inlays: Vec<(usize, usize)> = decor
         .inlays
         .get(first..)
         .unwrap_or(&[])
         .iter()
-        .take_while(|h| h.offset < line_start + seg.end || (last_row && h.offset == line_start + seg.end))
-        .map(|h| (h.offset.saturating_sub(line_start + seg.start), h))
+        .take_while(|h| in_row(h.offset))
+        .enumerate()
+        .map(|(i, h)| (h.offset.saturating_sub(line_start + seg.start), first + i))
         .collect();
-    let mapped = has_tabs || !inlays.is_empty();
+    // The IME pre-edit, if the caret is on this row.
+    let preedit = decor
+        .preedit
+        .filter(|(o, t)| !t.is_empty() && in_row(*o))
+        .map(|(o, t)| (o.saturating_sub(line_start + seg.start), t));
+    let mapped = has_tabs || !inlays.is_empty() || preedit.is_some();
     let mut job = LayoutJob::default();
     job.wrap.max_width = f32::INFINITY;
     let mut xcols: Vec<usize> = if mapped { Vec::with_capacity(n + 1) } else { Vec::new() };
+    let mut virtuals: Vec<VirtualSpan> = Vec::new();
     let mut gi = 0usize;
     let hint_font = FontId::new((font.size * 0.86).max(8.0), font.family.clone());
     let mut next_inlay = 0usize;
-    let mut emit_inlays = |job: &mut LayoutJob, col: usize, gi: &mut usize| {
-        while let Some((c, h)) = inlays.get(next_inlay) {
+    // Pre-edit text (at the caret) first, then the inlay hints at a column.
+    let mut emit_virtuals = |job: &mut LayoutJob, virtuals: &mut Vec<VirtualSpan>, col: usize, gi: &mut usize| {
+        if let Some((c, text)) = preedit
+            && c == col
+        {
+            let start = *gi;
+            *gi += text.chars().count();
+            let fmt = TextFormat {
+                font_id: font.clone(),
+                color: theme.text_editor,
+                underline: Stroke::new(1.0, theme.text_editor),
+                ..TextFormat::default()
+            };
+            job.append(text, 0.0, fmt);
+            virtuals.push(VirtualSpan { what: Virtual::Preedit, galley: start..*gi });
+        }
+        while let Some((c, idx)) = inlays.get(next_inlay) {
             if *c != col {
                 break;
             }
+            let Some(h) = decor.inlays.get(*idx) else { break };
             let label =
                 format!("{}{}{}", if h.pad_left { " " } else { "" }, h.label, if h.pad_right { " " } else { "" });
+            let start = *gi;
             *gi += label.chars().count();
             let fmt = TextFormat {
                 font_id: hint_font.clone(),
@@ -248,37 +342,49 @@ fn layout_line(
                 ..TextFormat::default()
             };
             job.append(&label, 0.0, fmt);
+            virtuals.push(VirtualSpan { what: Virtual::Inlay(*idx), galley: start..*gi });
             next_inlay += 1;
         }
     };
+    // Show Whitespaces: which of the row's whitespace chars get a mark.
+    let bounds = whitespace_bounds(&full);
+    let mut whitespace: Vec<WsMark> = Vec::new();
     let mut col = 0usize;
     while col < n {
         if mapped {
             xcols.push(gi);
         }
-        emit_inlays(&mut job, col, &mut gi);
+        emit_virtuals(&mut job, &mut virtuals, col, &mut gi);
         // A run of chars with the same style.
         let style = |i: usize| (kinds.get(i).copied().flatten(), mutable.get(i).copied(), unresolved.get(i).copied());
         let st0 = style(col);
         let mut end = col + 1;
-        while end < n && style(end) == st0 && !inlays.iter().any(|(c, _)| *c == end) {
+        while end < n
+            && style(end) == st0
+            && !inlays.iter().any(|(c, _)| *c == end)
+            && preedit.is_none_or(|(c, _)| c != end)
+        {
             end += 1;
         }
-        let mut seg = String::new();
+        let mut seg_text = String::new();
         for (i, c) in chars.get(col..end).unwrap_or(&[]).iter().enumerate() {
             if mapped && i > 0 {
                 xcols.push(gi);
             }
-            if *c == '\t' {
-                let w = tab - (x % tab.max(1));
-                seg.extend(std::iter::repeat_n(' ', w));
-                x += w;
-                gi += w;
-            } else {
-                seg.push(*c);
-                x += 1;
-                gi += 1;
+            let w = if *c == '\t' { tab - (x % tab.max(1)) } else { 1 };
+            if let Some(mode) = decor.whitespace
+                && (*c == ' ' || *c == '\t')
+                && marks_whitespace(mode, seg.start + col + i, bounds)
+            {
+                whitespace.push(WsMark { galley: gi, width: w, tab: *c == '\t' });
             }
+            if *c == '\t' {
+                seg_text.extend(std::iter::repeat_n(' ', w));
+            } else {
+                seg_text.push(*c);
+            }
+            x += w;
+            gi += w;
         }
         let (kind, is_mut, is_unresolved) = st0;
         let mut color = kind.map(|k| theme.syntax(k)).unwrap_or(theme.text_editor);
@@ -289,15 +395,15 @@ fn layout_line(
         if is_mut == Some(true) {
             fmt.underline = Stroke::new(1.0, color.gamma_multiply(0.7));
         }
-        job.append(&seg, 0.0, fmt);
+        job.append(&seg_text, 0.0, fmt);
         col = end;
     }
     if mapped {
         xcols.push(gi);
     }
-    emit_inlays(&mut job, n, &mut gi);
+    emit_virtuals(&mut job, &mut virtuals, n, &mut gi);
     let galley = ui.fonts_mut(|f| f.layout_job(job));
-    LineLayout { galley, xcols: mapped.then_some(xcols), len: n }
+    LineLayout { galley, xcols: mapped.then_some(xcols), len: n, virtuals, whitespace }
 }
 
 fn is_ident(c: char) -> bool {
@@ -440,6 +546,9 @@ struct RowLayout {
     /// The row ends its line.
     last: bool,
     y: f32,
+    /// Continuation rows of a wrapped line start right of the text origin by the line's
+    /// indentation (pixels).
+    indent_x: f32,
     ll: LineLayout,
 }
 
@@ -457,11 +566,97 @@ impl RowLayout {
 
     /// x of a line column within this row (relative to the text origin).
     fn x(&self, col: usize) -> f32 {
-        self.ll.x_of(col.saturating_sub(self.start).min(self.end - self.start))
+        self.indent_x + self.ll.x_of(col.saturating_sub(self.start).min(self.end.saturating_sub(self.start)))
+    }
+
+    /// x right after the row's last char and any hints after it (relative to the text origin).
+    fn x_end(&self) -> f32 {
+        self.indent_x + self.ll.galley.size().x
+    }
+
+    /// x of a galley char index (relative to the text origin).
+    fn gx(&self, index: usize) -> f32 {
+        self.indent_x + self.ll.gx(index)
+    }
+}
+
+/// Pixels a row is indented by: continuation rows of a wrapped line keep its indentation.
+fn row_indent_x(doc: &Document, line: usize, start: usize, wrap: Option<WrapConfig>, char_w: f32) -> f32 {
+    match wrap {
+        Some(cfg) if start > 0 => {
+            codecraft_text::wrap::line_indent(&doc.line_text(line).unwrap_or_default(), cfg) as f32 * char_w
+        }
+        _ => 0.0,
+    }
+}
+
+/// Paint Show Whitespaces marks of a row: a dot per space, an arrow per tab.
+fn paint_whitespace(painter: &egui::Painter, r: &RowLayout, origin: f32, cy: f32, char_w: f32, color: Color32) {
+    let radius = (char_w * 0.09).clamp(0.8, 1.6);
+    for m in &r.ll.whitespace {
+        let x0 = origin + r.gx(m.galley);
+        let x1 = origin + r.gx(m.galley + m.width);
+        if m.tab {
+            let (a, b) = (x0 + char_w * 0.25, (x1 - char_w * 0.25).max(x0 + char_w * 0.5));
+            let stroke = Stroke::new(1.0, color);
+            let head = (char_w * 0.3).clamp(2.0, 4.0);
+            painter.line_segment([pos2(a, cy), pos2(b, cy)], stroke);
+            painter.line_segment([pos2(b - head, cy - head), pos2(b, cy)], stroke);
+            painter.line_segment([pos2(b - head, cy + head), pos2(b, cy)], stroke);
+        } else {
+            painter.circle_filled(pos2((x0 + x1) * 0.5, cy), radius, color);
+        }
     }
 }
 
 type MapCache = Arc<(u64, Arc<DisplayMap>)>;
+
+/// An inlay hint under the pointer.
+struct InlayHit {
+    /// The hint's char offset (its identity in the document's hint list).
+    offset: usize,
+    /// The label part under the pointer, if the hint has parts.
+    part: Option<usize>,
+    /// Cmd+click goes somewhere (a part location, or a type's declaration).
+    navigable: bool,
+    /// Row top and the screen x range of the part (or whole hint).
+    y: f32,
+    x: (f32, f32),
+}
+
+/// The IME composition shown in a focused editor, with the caret position in it (chars).
+/// `Preedit` events set it and `Commit` clears it (the shell's input routing types the
+/// committed text); losing focus drops it.
+fn ime_preedit(ui: &egui::Ui, id: Id) -> Option<(String, usize)> {
+    let key = id.with("ime-preedit");
+    if !ui.memory(|m| m.has_focus(id)) {
+        ui.data_mut(|d| d.remove::<(String, usize)>(key));
+        return None;
+    }
+    let events: Vec<egui::ImeEvent> = ui.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|e| match e {
+                egui::Event::Ime(ev) => Some(ev.clone()),
+                _ => None,
+            })
+            .collect()
+    });
+    for ev in events {
+        match ev {
+            egui::ImeEvent::Preedit { text, active_range_chars } if !text.is_empty() => {
+                let n = text.chars().count();
+                let cursor = active_range_chars.map_or(n, |r| r.end.min(n));
+                ui.data_mut(|d| d.insert_temp(key, (text, cursor)));
+            }
+            egui::ImeEvent::Preedit { .. } | egui::ImeEvent::Commit(_) => {
+                ui.data_mut(|d| d.remove::<(String, usize)>(key));
+            }
+            _ => {}
+        }
+    }
+    ui.data(|d| d.get_temp::<(String, usize)>(key))
+}
 
 /// Paint the editor and handle pointer input. Returns the caret's screen position.
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId) {
@@ -490,6 +685,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         })
         .unwrap_or_default();
     let column_mode = s.editing.column_mode.contains(&eid);
+    // A box selection reaching past line ends (its carets are drawn in virtual space).
+    let vbox = s.column_box(eid);
+    let preedit = ime_preedit(ui, editor_id(eid));
     let crumbs_shown = s.ws.doc(editor.doc).is_some_and(|d| crate::navbar::has_breadcrumbs(d.language));
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
@@ -505,6 +703,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         } else {
             &[]
         },
+        preedit: preedit.as_ref().map(|(t, _)| (editor.selections.primary().head, t.as_str())),
+        whitespace: settings.show_whitespace.then_some(settings.whitespace_mode),
     };
     let folds = od.cached_folds();
     let tab = settings.tab_size.max(1);
@@ -669,7 +869,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         let end = map.row_end(row, line_len).max(start);
         let last = map.is_last_of_line(row);
         let ll = layout_line(ui, doc, hl, decor, line, start..end, &font, &theme, tab);
-        let r = RowLayout { line, start, end, last, y, ll };
+        let indent_x = row_indent_x(doc, line, start, wrap, char_w);
+        let r = RowLayout { line, start, end, last, y, indent_x, ll };
         let line_start = doc.line_start(line);
         let text_y = y + (line_h - row_h) * 0.5;
         let line_rect = Rect::from_min_max(pos2(rect.left(), y), pos2(rect.right(), y + line_h));
@@ -754,6 +955,23 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             let rr = Rect::from_min_max(pos2(x_at(a), y), pos2(x2, y + line_h));
             text_painter.rect_filled(rr, CornerRadius::ZERO, theme.selection);
         }
+        // A box selection's part in virtual space (past the end of a short line).
+        let mut virtual_caret: Option<f32> = None;
+        if let Some((a, h)) = vbox
+            && last
+            && (a.line.min(h.line)..=a.line.max(h.line)).contains(&line)
+        {
+            let width = codecraft_text::column::line_width(doc, line, tab);
+            let vx = |c: usize| x_at(line_len) + c.saturating_sub(width) as f32 * char_w;
+            let (left, right) = (a.column.min(h.column), a.column.max(h.column));
+            if right > width && right > left {
+                let rr = Rect::from_min_max(pos2(vx(left.max(width)), y), pos2(vx(right), y + line_h));
+                text_painter.rect_filled(rr, CornerRadius::ZERO, theme.selection);
+            }
+            if h.column > width {
+                virtual_caret = Some(vx(h.column));
+            }
+        }
         // Live template variables: the current one framed in the link colour.
         for (tr, current) in &template_ranges {
             if tr.end < line_start || tr.start > line_end_full {
@@ -778,11 +996,14 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             }
         }
         // Text.
-        text_painter.galley(pos2(text_x0 - scroll_x, text_y), r.ll.galley.clone(), theme.text_editor);
+        text_painter.galley(pos2(text_x0 - scroll_x + r.indent_x, text_y), r.ll.galley.clone(), theme.text_editor);
+        if decor.whitespace.is_some() {
+            paint_whitespace(&text_painter, &r, text_x0 - scroll_x, y + line_h * 0.5, char_w, theme.whitespace);
+        }
         if last {
             // Inline debugger values after the line end (while suspended).
             for (_, text) in marks.inline.iter().filter(|(l, _)| *l == line) {
-                let x = text_x0 - scroll_x + r.ll.x_of(r.ll.len) + 2.0 * char_w;
+                let x = text_x0 - scroll_x + r.x_end() + 2.0 * char_w;
                 text_painter.text(
                     pos2(x, y + line_h * 0.5),
                     Align2::LEFT_CENTER,
@@ -793,7 +1014,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             }
             // Folded placeholder.
             if editor.folded.contains(&line) && fold_starts.contains(&line) {
-                let x = text_x0 - scroll_x + r.ll.x_of(r.ll.len) + char_w;
+                let x = text_x0 - scroll_x + r.x_end() + char_w;
                 let rr = Rect::from_min_size(pos2(x, y + 2.0), vec2(char_w * 3.5, line_h - 4.0));
                 text_painter.rect_filled(rr, CornerRadius::same(3), theme.bracket_match);
                 text_painter.text(rr.center(), Align2::CENTER_CENTER, "…", font.clone(), theme.text_muted);
@@ -801,7 +1022,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         }
         // Right margin (not while soft-wrapping).
         if wrap.is_none() {
-            let mx = text_x0 - scroll_x + RIGHT_MARGIN_COL as f32 * char_w;
+            let mx = text_x0 - scroll_x + settings.right_margin.min(10_000) as f32 * char_w;
             if mx > text_rect.left() {
                 text_painter.vline(mx, y..=y + line_h, Stroke::new(1.0, theme.right_margin));
             }
@@ -823,11 +1044,19 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
             let x2 = x_at(b).max(x1 + char_w);
             wavy(&text_painter, x1, x2, y + line_h - 2.0, severity_color(&theme, p.severity));
         }
-        // Carets.
+        // Carets (the primary one after the IME pre-edit; box carets in virtual space).
+        let preedit_x = r.ll.virtuals.iter().find(|v| v.what == Virtual::Preedit).map(|v| {
+            let cursor = preedit.as_ref().map_or(v.galley.len(), |(_, c)| (*c).min(v.galley.len()));
+            text_x0 - scroll_x + r.gx(v.galley.start + cursor)
+        });
         for sel in editor.selections.ranges() {
             let h = sel.head;
             if h >= line_start && h <= line_end_full && doc.char_to_line(h) == line && r.shows(h - line_start) {
-                let x = x_at(h - line_start);
+                let x = match (virtual_caret, preedit_x) {
+                    (_, Some(px)) if sel == &primary => px,
+                    (Some(vx), _) if h == line_end_full => vx,
+                    _ => x_at(h - line_start),
+                };
                 if sel == &primary {
                     caret_screen = Some(pos2(x, y + line_h));
                 }
@@ -969,10 +1198,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         let last = map.is_last_of_line(row);
         let x = pos.x - text_x0 + scroll_x;
         let (rel, x_end) = match rows.iter().find(|r| r.line == line && r.start == start) {
-            Some(r) => (r.ll.col_at_x(x), r.ll.x_of(r.ll.len)),
+            Some(r) => (r.ll.col_at_x(x - r.indent_x), r.indent_x + r.ll.x_of(r.ll.len)),
             None => {
                 let ll = layout_line(ui, doc, hl, decor, line, start..end, &font, &theme, tab);
-                (ll.col_at_x(x), ll.x_of(ll.len))
+                let ix = row_indent_x(doc, line, start, wrap, char_w);
+                (ll.col_at_x(x - ix), ix + ll.x_of(ll.len))
             }
         };
         let max = if last { end } else { end.saturating_sub(1).max(start) };
@@ -992,6 +1222,38 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         (p.line, p.column + beyond)
     };
     let box_key = id.with("box-anchor");
+    // The inlay hint (and label part) under a point.
+    let inlay_at = |pos: Pos2, rows: &[RowLayout]| -> Option<InlayHit> {
+        let r = rows.iter().find(|r| pos.y >= r.y && pos.y < r.y + line_h)?;
+        let (v, gi) = r.ll.virtual_at(pos.x - text_x0 + scroll_x - r.indent_x)?;
+        let Virtual::Inlay(index) = v.what else { return None };
+        let h = decor.inlays.get(index)?;
+        let pad = usize::from(h.pad_left);
+        let k = gi.saturating_sub(v.galley.start).checked_sub(pad);
+        let mut acc = 0usize;
+        let mut part = None;
+        for (i, p) in h.parts.iter().enumerate() {
+            let n = p.value.chars().count();
+            if k.is_some_and(|k| k >= acc && k < acc + n) {
+                part = Some((i, v.galley.start + pad + acc..v.galley.start + pad + acc + n));
+                break;
+            }
+            acc += n;
+        }
+        let navigable = h.kind == InlayKind::Type
+            || match &part {
+                Some((i, _)) => h.parts.get(*i).is_some_and(|p| p.location.is_some()),
+                None => h.parts.iter().any(|p| p.location.is_some()),
+            };
+        let underline = part.as_ref().map_or(v.galley.clone(), |(_, g)| g.clone());
+        Some(InlayHit {
+            offset: h.offset,
+            part: part.map(|(i, _)| i),
+            navigable,
+            y: r.y,
+            x: (text_x0 - scroll_x + r.gx(underline.start), text_x0 - scroll_x + r.gx(underline.end)),
+        })
+    };
 
     let mut commands: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let pointer = ui.input(|i| (i.pointer.primary_pressed(), i.pointer.interact_pos(), i.modifiers));
@@ -1028,6 +1290,12 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                     commands.push(("editor.setSelection", json!({ "anchor": start, "head": end })));
                 }
             }
+        } else if let Some(h) =
+            inlay_at(pos, &rows).filter(|h| h.navigable && (pointer.2.mac_cmd || pointer.2.command))
+        {
+            // Cmd+click on an inlay hint: its label part's target (or the type's declaration).
+            commands.push(("editor.click", json!({ "offset": h.offset })));
+            commands.push(("editor.inlayHint.navigate", json!({ "offset": h.offset, "part": h.part })));
         } else {
             let offset = hit(pos, &rows, ui);
             let m = pointer.2;
@@ -1086,9 +1354,34 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         st.drag_anchor_active = false;
     }
 
-    // Diagnostic tooltip.
+    // Inlay hint tooltip; Cmd shows which hints navigate.
     let mut response = response;
+    let inlay_hover = response
+        .hover_pos()
+        .filter(|p| text_rect.contains(*p) && !ui.input(|i| i.pointer.any_down()))
+        .and_then(|p| inlay_at(p, &rows));
+    if let Some(h) = &inlay_hover {
+        let hint = decor.inlays.iter().find(|x| x.offset == h.offset);
+        let tip = hint.and_then(|x| {
+            h.part.and_then(|p| x.parts.get(p)).and_then(|p| p.tooltip.clone()).or_else(|| x.tooltip.clone())
+        });
+        if h.navigable && ui.input(|i| i.modifiers.command) {
+            text_painter.hline(h.x.0..=h.x.1, h.y + line_h - 2.0, Stroke::new(1.0, theme.link));
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let text = match (tip, h.navigable) {
+            (Some(t), true) => Some(format!("{t}\n\nCmd+click to navigate")),
+            (Some(t), false) => Some(t),
+            (None, true) => Some("Cmd+click to navigate".to_string()),
+            (None, false) => None,
+        };
+        if let Some(t) = text {
+            response = response.on_hover_text_at_pointer(t);
+        }
+    }
+    // Diagnostic tooltip.
     if let Some(pos) = response.hover_pos()
+        && inlay_hover.is_none()
         && text_rect.contains(pos)
         && !ui.input(|i| i.pointer.any_down())
     {
