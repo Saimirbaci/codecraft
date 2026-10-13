@@ -559,6 +559,49 @@
  },
  {
   "path": [
+   "File",
+   "Manage IDE Settings"
+  ],
+  "title": "Import Settings…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "File",
+   "Manage IDE Settings"
+  ],
+  "title": "Export Settings…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "File",
+   "Manage IDE Settings"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "File",
+   "Manage IDE Settings"
+  ],
+  "title": "Restore Default Settings…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "File",
+   "Manage IDE Settings"
+  ],
+  "title": "Backup and Sync…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "File"
   ],
   "title": "New Projects Setup",
@@ -697,6 +740,33 @@
   "title": "Paste",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Edit",
+   "Paste"
+  ],
+  "title": "Paste",
+  "shortcut": "Cmd+V",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Paste"
+  ],
+  "title": "Paste from History…",
+  "shortcut": "Shift+Cmd+V",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Paste"
+  ],
+  "title": "Paste as Plain Text",
+  "shortcut": "Alt+Shift+Cmd+V",
+  "submenu": false
  },
  {
   "path": [
@@ -919,6 +989,85 @@
  },
  {
   "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Find Usages",
+  "shortcut": "Alt+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Find Usages Settings…",
+  "shortcut": "Alt+Shift+Cmd+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Show Usages",
+  "shortcut": "Alt+Cmd+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Find Usages in File",
+  "shortcut": "Cmd+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Highlight Usages in File",
+  "shortcut": "Shift+Cmd+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Next Highlighted Usage",
+  "shortcut": "Ctrl+Alt+Down",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Previous Highlighted Usage",
+  "shortcut": "Ctrl+Alt+Up",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Find Usages"
+  ],
+  "title": "Recent Find Usages",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Edit"
   ],
   "separator": true
@@ -1089,11 +1238,90 @@
  },
  {
   "path": [
+   "Edit",
+   "Macros"
+  ],
+  "title": "Play Back Last Macro",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Macros"
+  ],
+  "title": "Start Macro Recording",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Macros"
+  ],
+  "title": "Edit Macros",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Macros"
+  ],
+  "title": "Play Saved Macros…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Edit"
   ],
   "title": "Bookmarks",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Edit",
+   "Bookmarks"
+  ],
+  "title": "Previous Line Bookmark",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Bookmarks"
+  ],
+  "title": "Next Line Bookmark",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Bookmarks"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Edit",
+   "Bookmarks"
+  ],
+  "title": "Show Line Bookmarks…",
+  "shortcut": "Cmd+F3",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Edit",
+   "Bookmarks"
+  ],
+  "title": "Go to Mnemonic…",
+  "shortcut": "Alt+Cmd+F3",
+  "submenu": false
  },
  {
   "path": [
@@ -1482,6 +1710,391 @@
   "title": "Appearance",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Enter Presentation Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Enter Distraction Free Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Enter Full Screen",
+  "shortcut": "Ctrl+Cmd+F",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Enter Zen Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Compact Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Zoom IDE (Current: 100%)…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Presentation Assistant",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Toolbar",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Navigation Bar",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Navigation Bar"
+  ],
+  "title": "Top",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Navigation Bar"
+  ],
+  "title": "In Status Bar",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Navigation Bar"
+  ],
+  "title": "Don't Show",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Navigation Bar"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Navigation Bar"
+  ],
+  "title": "Show Members",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Tool Window Bars",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Status Bar",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance"
+  ],
+  "title": "Status Bar Widgets",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Status Text",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "File System Sync",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Rust External Linter",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Remote Development Wire Stats",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Aggregator",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Grid Position",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Default Deployment Server",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Line:Column Number",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Language Services",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Line Separator",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "File Encoding",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Power Save Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Editor Selection Mode",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Indentation",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "JSON Schema",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Git Branch",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Read-Only Attribute",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Rust Resolve Context",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "GitHub Copilot",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "View",
+   "Appearance",
+   "Status Bar Widgets"
+  ],
+  "title": "Memory Indicator",
+  "shortcut": "",
+  "submenu": false
  },
  {
   "path": [
@@ -2234,6 +2847,76 @@
  },
  {
   "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Silent Code Cleanup",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Run Inspection by Name…",
+  "shortcut": "Alt+Shift+Cmd+I",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Configure Current File Analysis…",
+  "shortcut": "Alt+Shift+Cmd+H",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "View Offline Inspection Results…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Locate Duplicates…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Data Flow to Here…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Analyze Code"
+  ],
+  "title": "Data Flow from Here…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Code"
   ],
   "title": "Analyze Stack Trace or Thread Dump…",
@@ -2297,6 +2980,258 @@
   "title": "Folding",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand",
+  "shortcut": "Cmd++",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand Recursively",
+  "shortcut": "Alt+Cmd++",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand All",
+  "shortcut": "Shift+Cmd++",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Collapse",
+  "shortcut": "Cmd+-",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Collapse Recursively",
+  "shortcut": "Alt+Cmd+-",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Collapse All",
+  "shortcut": "Shift+Cmd+-",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand to Level",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand to Level"
+  ],
+  "title": "1",
+  "shortcut": "Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand to Level"
+  ],
+  "title": "2",
+  "shortcut": "Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand to Level"
+  ],
+  "title": "3",
+  "shortcut": "Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand to Level"
+  ],
+  "title": "4",
+  "shortcut": "Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand to Level"
+  ],
+  "title": "5",
+  "shortcut": "Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand All to Level",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand All to Level"
+  ],
+  "title": "1",
+  "shortcut": "Alt+Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand All to Level"
+  ],
+  "title": "2",
+  "shortcut": "Alt+Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand All to Level"
+  ],
+  "title": "3",
+  "shortcut": "Alt+Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand All to Level"
+  ],
+  "title": "4",
+  "shortcut": "Alt+Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding",
+   "Expand All to Level"
+  ],
+  "title": "5",
+  "shortcut": "Alt+Cmd+*",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Expand Doc Comments",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Collapse Doc Comments",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Toggle Folding",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Fold Selection / Remove Region",
+  "shortcut": "Cmd+.",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Code",
+   "Folding"
+  ],
+  "title": "Fold Code Block",
+  "shortcut": "Shift+Cmd+.",
+  "submenu": false
  },
  {
   "path": [
@@ -2540,6 +3475,15 @@
  },
  {
   "path": [
+   "Run",
+   "Profile 'Run'"
+  ],
+  "title": "Profile 'Run'",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Run"
   ],
   "title": "Run 'Run' with Valgrind Memcheck",
@@ -2651,6 +3595,164 @@
   "title": "Debugging Actions",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Compile and Reload Modified Files",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Step Over",
+  "shortcut": "F8",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Force Step Over",
+  "shortcut": "Alt+Shift+F8",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Step Into",
+  "shortcut": "F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Force Step Into",
+  "shortcut": "Alt+Shift+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Smart Step Into",
+  "shortcut": "Shift+F7",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Step Out",
+  "shortcut": "Shift+F8",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Run to Cursor",
+  "shortcut": "Alt+F9",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Force Run to Cursor",
+  "shortcut": "Alt+Cmd+F9",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Reset Frame",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Pause All Programs",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Resume Program",
+  "shortcut": "Alt+Cmd+R",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Resume All Programs",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Stop All Programs",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Evaluate Expression…",
+  "shortcut": "Alt+F8",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Run",
+   "Debugging Actions"
+  ],
+  "title": "Show Execution Point",
+  "shortcut": "Alt+F10",
+  "submenu": false
  },
  {
   "path": [
@@ -2780,6 +3882,154 @@
  },
  {
   "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Switch Task…",
+  "shortcut": "Alt+Shift+T",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Open Task…",
+  "shortcut": "Alt+Shift+N",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Close Active Task…",
+  "shortcut": "Alt+Shift+W",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Edit 'Default task'",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Add Change List for 'Default task'",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Show Description",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Open in Browser",
+  "shortcut": "Alt+Shift+B",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Analyze Stack Trace From Task…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Configure Servers…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Time Tracking",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts",
+   "Time Tracking"
+  ],
+  "title": "Start Timer",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Save Context…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Load Context…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Tasks & Contexts"
+  ],
+  "title": "Clear Context",
+  "shortcut": "Alt+Shift+X",
+  "submenu": false
+ },
+ {
+  "path": [
    "Tools"
   ],
   "separator": true
@@ -2808,11 +4058,115 @@
  },
  {
   "path": [
+   "Tools",
+   "Services"
+  ],
+  "title": "Docker Registry…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Services"
+  ],
+  "title": "Docker",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Services",
+   "Docker"
+  ],
+  "title": "Connection…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Services",
+   "Docker"
+  ],
+  "title": "Connections From Contexts",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Services"
+  ],
+  "title": "Dev Containers",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Services",
+   "Dev Containers"
+  ],
+  "title": "New Dev Container Configuration…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Services",
+   "Dev Containers"
+  ],
+  "title": "Manage Dev Container Backends",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Services",
+   "Dev Containers"
+  ],
+  "title": "Show Dev Containers",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Tools"
   ],
   "title": "Markdown",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Tools",
+   "Markdown"
+  ],
+  "title": "Import Word Document…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Markdown"
+  ],
+  "title": "Export Markdown File To…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Markdown"
+  ],
+  "title": "Configure Pandoc…",
+  "shortcut": "",
+  "submenu": false
  },
  {
   "path": [
@@ -3055,6 +4409,33 @@
  },
  {
   "path": [
+   "Tools",
+   "Rust"
+  ],
+  "title": "Reformat File with Rustfmt",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Rust"
+  ],
+  "title": "Reformat Cargo Project with Rustfmt",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "Rust"
+  ],
+  "title": "Rust REPL",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Tools"
   ],
   "title": "HTTP Client",
@@ -3184,6 +4565,115 @@
   "title": "GitHub Copilot",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Sign in to GitHub",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Open GitHub Copilot Chat",
+  "shortcut": "Ctrl+Shift+C",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Edit Settings...",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Show Keymap Settings...",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "View Copilot Documentation...",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Send Feedback…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Log Diagnostics",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Log CA Certificates",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Tools",
+   "GitHub Copilot"
+  ],
+  "title": "Log Models",
+  "shortcut": "",
+  "submenu": false
  },
  {
   "path": [
@@ -3623,6 +5113,95 @@
  },
  {
   "path": [
+   "Window",
+   "Layouts"
+  ],
+  "title": "Default",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts"
+  ],
+  "title": "Custom",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts",
+   "Custom"
+  ],
+  "title": "Restore",
+  "shortcut": "Shift+F12",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts",
+   "Custom"
+  ],
+  "title": "Save Changes",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts",
+   "Custom"
+  ],
+  "title": "Rename",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts",
+   "Custom"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts",
+   "Custom"
+  ],
+  "title": "Delete…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Window",
+   "Layouts"
+  ],
+  "title": "Save Current Layout as New…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Window"
   ],
   "separator": true
@@ -3634,6 +5213,168 @@
   "title": "Active Tool Window",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Hide Active Tool Window",
+  "shortcut": "Shift+Escape",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Hide Side Tool Windows",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Hide All Windows",
+  "shortcut": "Shift+Cmd+F12",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Jump to Last Tool Window",
+  "shortcut": "F12",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Maximize Tool Window",
+  "shortcut": "Shift+Cmd+'",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Select Next Tab",
+  "shortcut": "Shift+Cmd+]",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Select Previous Tab",
+  "shortcut": "Shift+Cmd+[",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Close Active Tab",
+  "shortcut": "Ctrl+Shift+F4",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "View Mode",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Move to",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Group Tabs",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window"
+  ],
+  "title": "Resize",
+  "shortcut": "",
+  "submenu": true
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window",
+   "Resize"
+  ],
+  "title": "Stretch to Left",
+  "shortcut": "Ctrl+Alt+Left",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window",
+   "Resize"
+  ],
+  "title": "Stretch to Right",
+  "shortcut": "Ctrl+Alt+Right",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window",
+   "Resize"
+  ],
+  "title": "Stretch to Top",
+  "shortcut": "Ctrl+Alt+Up",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Active Tool Window",
+   "Resize"
+  ],
+  "title": "Stretch to Bottom",
+  "shortcut": "Ctrl+Alt+Down",
+  "submenu": false
  },
  {
   "path": [
@@ -3935,6 +5676,24 @@
  },
  {
   "path": [
+   "Window",
+   "Notifications"
+  ],
+  "title": "Close First",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Window",
+   "Notifications"
+  ],
+  "title": "Close All",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
    "Window"
   ],
   "title": "Processes",
@@ -4166,6 +5925,131 @@
   "title": "Diagnostic Tools",
   "shortcut": "",
   "submenu": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Activity Monitor…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Dump Threads",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Debug Log Settings…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Special Files and Folders…",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Start CPU Usage Profiling",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Start Async profiler",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Capture Memory Snapshot",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Profile Indexing",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "separator": true
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "C/C++: Enable Event Tracing",
+  "shortcut": "",
+  "submenu": false
+ },
+ {
+  "path": [
+   "Help",
+   "Diagnostic Tools"
+  ],
+  "title": "Open Indexing Diagnostics",
+  "shortcut": "",
+  "submenu": false
  },
  {
   "path": [

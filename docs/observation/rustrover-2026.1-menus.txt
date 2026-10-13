@@ -66,6 +66,11 @@
 [File] Invalidate Caches…
   ----
 [File] Manage IDE Settings ▸
+  Import Settings…
+  Export Settings…
+    ----
+  Restore Default Settings…
+  Backup and Sync…
 [File] New Projects Setup ▸
   Settings for New Projects…
   Run Configuration Templates…
@@ -84,6 +89,9 @@
 [Edit] Copy as Plain Text
 [Edit] Copy Path/Reference…
 [Edit] Paste ▸
+  Paste   (Cmd+V)
+  Paste from History…   (Shift+Cmd+V)
+  Paste as Plain Text   (Alt+Shift+Cmd+V)
 [Edit] Delete   (Backspace)
   ----
 [Edit] Search In Selection   (Ctrl+Alt+E)
@@ -110,6 +118,15 @@
   Find by XPath…   (Alt+Cmd+X)
   Evaluate JSONPath Expression…
 [Edit] Find Usages ▸
+  Find Usages   (Alt+F7)
+  Find Usages Settings…   (Alt+Shift+Cmd+F7)
+  Show Usages   (Alt+Cmd+F7)
+    ----
+  Find Usages in File   (Cmd+F7)
+  Highlight Usages in File   (Shift+Cmd+F7)
+  Next Highlighted Usage   (Ctrl+Alt+Down)
+  Previous Highlighted Usage   (Ctrl+Alt+Up)
+  Recent Find Usages
   ----
 [Edit] Column Selection Mode   (Shift+Cmd+8)
 [Edit] Select All   (Cmd+A)
@@ -132,7 +149,16 @@
   To Tabs
   ----
 [Edit] Macros ▸
+  Play Back Last Macro
+  Start Macro Recording
+  Edit Macros
+  Play Saved Macros…
 [Edit] Bookmarks ▸
+  Previous Line Bookmark
+  Next Line Bookmark
+    ----
+  Show Line Bookmarks…   (Cmd+F3)
+  Go to Mnemonic…   (Alt+Cmd+F3)
   ----
 [Edit] Emoji & Symbols   (Ctrl+Cmd+Space)
 [Edit] Encode XML/HTML Special Characters
@@ -177,6 +203,47 @@
   TypeScript
   Zig
 [View] Appearance ▸
+  Enter Presentation Mode
+  Enter Distraction Free Mode
+  Enter Full Screen   (Ctrl+Cmd+F)
+  Enter Zen Mode
+    ----
+  Compact Mode
+  Zoom IDE (Current: 100%)…
+    ----
+  Presentation Assistant
+    ----
+  Toolbar
+  Navigation Bar ▸
+    Top
+    In Status Bar
+    Don't Show
+      ----
+    Show Members
+  Tool Window Bars
+  Status Bar
+  Status Bar Widgets ▸
+    Status Text
+      ----
+    File System Sync
+    Rust External Linter
+    Remote Development Wire Stats
+    Aggregator
+    Grid Position
+    Default Deployment Server
+    Line:Column Number
+    Language Services
+    Line Separator
+    File Encoding
+    Power Save Mode
+    Editor Selection Mode
+    Indentation
+    JSON Schema
+    Git Branch
+    Read-Only Attribute
+    Rust Resolve Context
+    GitHub Copilot
+    Memory Indicator
   ----
 [View] Quick Definition   (Alt+Space)
 [View] Quick Type Definition
@@ -273,6 +340,14 @@
 [Code] Inspect Code…
 [Code] Code Cleanup…
 [Code] Analyze Code ▸
+  Silent Code Cleanup
+  Run Inspection by Name…   (Alt+Shift+Cmd+I)
+  Configure Current File Analysis…   (Alt+Shift+Cmd+H)
+  View Offline Inspection Results…
+  Locate Duplicates…
+    ----
+  Data Flow to Here…
+  Data Flow from Here…
 [Code] Analyze Stack Trace or Thread Dump…
   ----
 [Code] Insert Live Template…   (Cmd+J)
@@ -282,6 +357,34 @@
 [Code] Unwrap/Remove…   (Shift+Cmd+Backspace)
   ----
 [Code] Folding ▸
+  Expand   (Cmd++)
+  Expand Recursively   (Alt+Cmd++)
+  Expand All   (Shift+Cmd++)
+    ----
+  Collapse   (Cmd+-)
+  Collapse Recursively   (Alt+Cmd+-)
+  Collapse All   (Shift+Cmd+-)
+    ----
+  Expand to Level ▸
+    1   (Cmd+*)
+    2   (Cmd+*)
+    3   (Cmd+*)
+    4   (Cmd+*)
+    5   (Cmd+*)
+  Expand All to Level ▸
+    1   (Alt+Cmd+*)
+    2   (Alt+Cmd+*)
+    3   (Alt+Cmd+*)
+    4   (Alt+Cmd+*)
+    5   (Alt+Cmd+*)
+    ----
+  Expand Doc Comments
+  Collapse Doc Comments
+    ----
+  Toggle Folding
+    ----
+  Fold Selection / Remove Region   (Cmd+.)
+  Fold Code Block   (Shift+Cmd+.)
   ----
 [Code] Comment with Line Comment   (Cmd+/)
 [Code] Comment with Block Comment   (Alt+Cmd+/)
@@ -313,6 +416,7 @@
 [Run] Debug 'Run'   (Ctrl+D)
 [Run] Run 'Run' with Coverage
 [Run] Profile 'Run' ▸
+  Profile 'Run'
 [Run] Run 'Run' with Valgrind Memcheck
   ----
 [Run] Run…   (Ctrl+Alt+R)
@@ -328,6 +432,24 @@
 [Run] Show Running List
   ----
 [Run] Debugging Actions ▸
+  Compile and Reload Modified Files
+    ----
+  Step Over   (F8)
+  Force Step Over   (Alt+Shift+F8)
+  Step Into   (F7)
+  Force Step Into   (Alt+Shift+F7)
+  Smart Step Into   (Shift+F7)
+  Step Out   (Shift+F8)
+  Run to Cursor   (Alt+F9)
+  Force Run to Cursor   (Alt+Cmd+F9)
+  Reset Frame
+  Pause All Programs
+  Resume Program   (Alt+Cmd+R)
+  Resume All Programs
+  Stop All Programs
+    ----
+  Evaluate Expression…   (Alt+F8)
+  Show Execution Point   (Alt+F10)
 [Run] Toggle Breakpoint ▸
   Line Breakpoint   (Cmd+F8)
   Temporary Line Breakpoint   (Alt+Shift+Cmd+F8)
@@ -344,11 +466,39 @@
 [Tools] AI Assistant
   ----
 [Tools] Tasks & Contexts ▸
+  Switch Task…   (Alt+Shift+T)
+  Open Task…   (Alt+Shift+N)
+  Close Active Task…   (Alt+Shift+W)
+    ----
+  Edit 'Default task'
+  Add Change List for 'Default task'
+  Show Description
+  Open in Browser   (Alt+Shift+B)
+  Analyze Stack Trace From Task…
+    ----
+  Configure Servers…
+  Time Tracking ▸
+    Start Timer
+    ----
+  Save Context…
+  Load Context…
+  Clear Context   (Alt+Shift+X)
   ----
 [Tools] Create Command Line Launcher…
   ----
 [Tools] Services ▸
+  Docker Registry…
+  Docker ▸
+    Connection…
+    Connections From Contexts
+  Dev Containers ▸
+    New Dev Container Configuration…
+    Manage Dev Container Backends
+    Show Dev Containers
 [Tools] Markdown ▸
+  Import Word Document…
+  Export Markdown File To…
+  Configure Pandoc…
 [Tools] XML Actions ▸
   Convert Schema...
 [Tools] Qodana ▸
@@ -377,6 +527,9 @@
   Browse Remote Host
 [Tools] Start SSH Session…
 [Tools] Rust ▸
+  Reformat File with Rustfmt
+  Reformat Cargo Project with Rustfmt
+  Rust REPL
 [Tools] HTTP Client ▸
   Create Request in HTTP Client
   Open HTTP Requests Collection
@@ -392,6 +545,19 @@
 [Tools] Run setup.py Task…
 [Tools] Manage Python Packages…
 [Tools] GitHub Copilot ▸
+  Sign in to GitHub
+    ----
+  Open GitHub Copilot Chat   (Ctrl+Shift+C)
+    ----
+  Edit Settings...
+  Show Keymap Settings...
+    ----
+  View Copilot Documentation...
+  Send Feedback…
+    ----
+  Log Diagnostics
+  Log CA Certificates
+  Log Models
 [Git] Commit…   (Cmd+K)
 [Git] Push…   (Shift+Cmd+K)
 [Git] Update Project...   (Cmd+T)
@@ -446,8 +612,36 @@
 [Window] Zoom   (Ctrl+Cmd+=)
 [Window] Move to Built-in Display
 [Window] Layouts ▸
+  Default
+    ----
+  Custom ▸
+    Restore   (Shift+F12)
+    Save Changes
+    Rename
+      ----
+    Delete…
+    ----
+  Save Current Layout as New…
   ----
 [Window] Active Tool Window ▸
+  Hide Active Tool Window   (Shift+Escape)
+  Hide Side Tool Windows
+  Hide All Windows   (Shift+Cmd+F12)
+  Jump to Last Tool Window   (F12)
+  Maximize Tool Window   (Shift+Cmd+')
+    ----
+  Select Next Tab   (Shift+Cmd+])
+  Select Previous Tab   (Shift+Cmd+[)
+  Close Active Tab   (Ctrl+Shift+F4)
+    ----
+  View Mode ▸
+  Move to ▸
+  Group Tabs
+  Resize ▸
+    Stretch to Left   (Ctrl+Alt+Left)
+    Stretch to Right   (Ctrl+Alt+Right)
+    Stretch to Top   (Ctrl+Alt+Up)
+    Stretch to Bottom   (Ctrl+Alt+Down)
 [Window] Editor Tabs ▸
   Select Next Tab   (Shift+Cmd+])
   Select Previous Tab   (Shift+Cmd+[)
@@ -482,6 +676,8 @@
     ----
   Configure Editor Tabs…
 [Window] Notifications ▸
+  Close First
+  Close All
 [Window] Processes ▸
   Show
   Auto Show
@@ -513,6 +709,21 @@
 [Help] Capture Memory Snapshot
   ----
 [Help] Diagnostic Tools ▸
+  Activity Monitor…
+  Dump Threads
+    ----
+  Debug Log Settings…
+  Special Files and Folders…
+    ----
+  Start CPU Usage Profiling
+  Start Async profiler
+    ----
+  Capture Memory Snapshot
+    ----
+  Profile Indexing
+    ----
+  C/C++: Enable Event Tracing
+  Open Indexing Diagnostics
 [Help] Change Memory Settings
 [Help] Edit Custom Properties…
 [Help] Edit Custom VM Options…
