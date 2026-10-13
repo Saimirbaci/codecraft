@@ -43,7 +43,7 @@ pub struct LocationItem {
 }
 
 /// One completion proposal (already converted out of LSP types).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionItem {
     pub label: String,
     /// Shown greyed after the label (signature / type).
@@ -64,6 +64,25 @@ pub struct CompletionItem {
     pub additional_edits: Vec<(Range<usize>, String)>,
     pub documentation: Option<String>,
     pub deprecated: bool,
+    /// The LSP snippet source (`name(${1:a})$0`) when the item inserts a snippet; `insert_text`
+    /// is then its plain text.
+    #[serde(default)]
+    pub snippet: Option<String>,
+    /// Indent inserted lines like the line being completed (LSP `adjustIndentation`).
+    #[serde(default)]
+    pub adjust_indent: bool,
+    /// The server suggests selecting this item.
+    #[serde(default)]
+    pub preselect: bool,
+    /// Documentation and auto-import edits are complete (`completionItem/resolve` done or not needed).
+    #[serde(default)]
+    pub resolved: bool,
+    /// The type of the value the item produces (Type-Matching completion).
+    #[serde(default)]
+    pub value_type: Option<String>,
+    /// The server's item, sent back for `completionItem/resolve`.
+    #[serde(skip)]
+    pub lsp: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +96,51 @@ pub struct CompletionPopup {
     pub selected: usize,
     /// Waiting for the language server.
     pub pending: bool,
+    /// The text typed since `anchor` that `visible` was filtered with.
+    #[serde(default)]
+    pub prefix: String,
+    /// Matched char indices in each visible item's label (parallel to `visible`).
+    #[serde(default)]
+    pub highlights: Vec<Vec<usize>>,
+    /// The server's list is incomplete: typing more asks again.
+    #[serde(default)]
+    pub incomplete: bool,
+    /// Opened automatically while typing (shown only once items arrive).
+    #[serde(default)]
+    pub auto: bool,
+    /// Request generation the items belong to (older responses are dropped).
+    #[serde(default)]
+    pub generation: u64,
+    /// Code › Code Completion › Type-Matching.
+    #[serde(default)]
+    pub type_matching: bool,
+    /// The type expected at the caret, when known (Type-Matching).
+    #[serde(default)]
+    pub expected_type: Option<String>,
+    /// A line above the list (e.g. "Type-Matching: String").
+    #[serde(default)]
+    pub header: Option<String>,
+}
+
+impl Default for CompletionPopup {
+    fn default() -> Self {
+        Self {
+            editor: EditorId(0),
+            anchor: 0,
+            items: Vec::new(),
+            visible: Vec::new(),
+            selected: 0,
+            pending: false,
+            prefix: String::new(),
+            highlights: Vec::new(),
+            incomplete: false,
+            auto: false,
+            generation: 0,
+            type_matching: false,
+            expected_type: None,
+            header: None,
+        }
+    }
 }
 
 /// A code action (Alt+Enter) or other choice backed by the language server.
@@ -201,6 +265,8 @@ pub enum NewItemKind {
     File,
     Directory,
     CargoCrate,
+    /// File › New › Python Package: a directory with `__init__.py`.
+    PythonPackage,
 }
 
 /// The editor's find/replace bar (Cmd+F / Cmd+R).

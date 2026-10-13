@@ -151,6 +151,10 @@ fn rename(s: &mut Session, p: &Value) -> CmdResult {
         None | Some(Value::Null) => None,
         Some(_) => Some(opt_str(p, "newName").ok_or_else(|| CommandError::BadParams("`newName` must be a string".into()))?),
     };
+    // Shift+F6 again (or an agent's rename) while renaming in place finishes that rename.
+    if s.completion.rename.is_some() {
+        return crate::inline_rename::commit(s, new_name);
+    }
     crate::refactor::rename(s, new_name, crate::params::bool_or(p, "preview", false))?;
     ok()
 }

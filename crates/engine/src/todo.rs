@@ -309,7 +309,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         }
     }
     // Open documents (unsaved edits included) while the tool window is shown.
-    if let Some(root) = root.filter(|_| !s.todo.scanning && s.ws.layout.is_visible(ToolWindowId::Todo)) {
+    if let Some(root) = root.filter(|_| !s.todo.scanning && !s.power_save() && s.ws.layout.is_visible(ToolWindowId::Todo)) {
         let mut updates = Vec::new();
         for od in s.ws.docs() {
             let Some(p) = od.path.as_ref().filter(|p| p.starts_with(&root) && !in_private_dir(&root, p)) else {

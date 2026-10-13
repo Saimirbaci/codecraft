@@ -262,6 +262,10 @@ fn new_item(s: &mut Session, p: &Value, kind: NewItemKind) -> CmdResult {
             cargo_new(&path, crate::params::bool_or(p, "lib", false))?;
             s.jobs_rescan();
         }
+        NewItemKind::PythonPackage => {
+            crate::misc_cmds::create_python_package(&path)?;
+            s.jobs_rescan();
+        }
     }
     if let Some(proj) = &mut s.ws.project {
         proj.reveal(&path);

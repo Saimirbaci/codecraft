@@ -302,11 +302,13 @@ fn rows(s: &Session, st: &mut UiState) -> Vec<Row> {
         Popup::Completion(c) => c
             .visible
             .iter()
-            .filter_map(|i| c.items.get(*i).map(|it| (i, it)))
+            .enumerate()
+            .filter_map(|(row, i)| c.items.get(*i).map(|it| (row, i, it)))
             .take(300)
-            .map(|(i, it)| Row {
+            .map(|(row, i, it)| Row {
                 title: it.label.clone(),
-                highlight: Vec::new(),
+                // Matched chars of the typed prefix (camel humps included).
+                highlight: c.highlights.get(row).cloned().unwrap_or_default(),
                 detail: it.detail.clone().unwrap_or_default(),
                 icon: completion_icon(&it.kind),
                 action: RowAction::CompletionIndex(*i),
@@ -362,6 +364,7 @@ fn accept(s: &mut Session, st: &mut UiState, index: Option<usize>) {
                 NewItemKind::File => "file.new.file",
                 NewItemKind::Directory => "file.new.directory",
                 NewItemKind::CargoCrate => "file.new.cargoCrate",
+                NewItemKind::PythonPackage => "file.new.pythonPackage",
             };
             if !name.trim().is_empty() {
                 s.popup = None;
@@ -629,8 +632,20 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         Some(Popup::Completion(c)) => {
             let sel = c.selected;
             let pending = c.pending;
-            let doc = c.visible.get(sel).and_then(|i| c.items.get(*i)).and_then(|it| it.documentation.clone());
+            let (auto, header) = (c.auto, c.header.clone());
+            // Documentation of the selected item (resolved lazily), under its signature.
+            let doc = c.visible.get(sel).and_then(|i| c.items.get(*i)).and_then(|it| {
+                let doc = it.documentation.clone().filter(|d| !d.trim().is_empty())?;
+                Some(match it.detail.as_deref().filter(|d| !d.trim().is_empty()) {
+                    Some(detail) => format!("```\n{detail}\n```\n{doc}"),
+                    None => doc,
+                })
+            });
             let rows = rows(s, st);
+            // The automatic list appears only once there is something to show.
+            if auto && pending && rows.is_empty() {
+                return;
+            }
             let anchor = st.caret_screen.unwrap_or(screen.center());
             egui::Area::new(egui::Id::new("codecraft-completion"))
                 .order(egui::Order::Foreground)
@@ -639,6 +654,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     ui.horizontal_top(|ui| {
                         frame(st).inner_margin(Margin::same(4)).show(ui, |ui| {
                             ui.set_width(440.0);
+                            if let Some(h) = &header {
+                                ui.label(RichText::new(h).small().color(st.theme.text_muted));
+                            }
                             if pending && rows.is_empty() {
                                 ui.horizontal(|ui| {
                                     ui.add(egui::Spinner::new().size(12.0));
@@ -720,6 +738,7 @@ fn input_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: f3
         Popup::NewItem { kind: NewItemKind::File, name, .. } => ("New File", name),
         Popup::NewItem { kind: NewItemKind::Directory, name, .. } => ("New Directory", name),
         Popup::NewItem { kind: NewItemKind::CargoCrate, name, .. } => ("New Cargo Crate", name),
+        Popup::NewItem { kind: NewItemKind::PythonPackage, name, .. } => ("New Python Package", name),
         _ => return,
     };
     let mut accept_now = false;

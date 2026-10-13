@@ -40,6 +40,68 @@ pub struct InlayHint {
     pub kind: InlayKind,
     pub pad_left: bool,
     pub pad_right: bool,
+    /// The label in parts (when the server sends them); their values concatenate to `label`.
+    #[serde(default)]
+    pub parts: Vec<InlayLabelPart>,
+    /// Hover text for the whole hint.
+    #[serde(default)]
+    pub tooltip: Option<String>,
+}
+
+/// A part of an inlay hint's label: hover text and a location Cmd+click goes to.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayLabelPart {
+    pub value: String,
+    #[serde(default)]
+    pub tooltip: Option<String>,
+    #[serde(default)]
+    pub location: Option<InlayLocation>,
+}
+
+/// Where an inlay label part points, as the language server gave it: zero-based line and a
+/// UTF-16 column (converted to a char column when navigating, since the file may not be open).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InlayLocation {
+    pub path: PathBuf,
+    pub line: usize,
+    pub utf16_column: u32,
+}
+
+/// How a document's text is stored on disk (File › File Properties › File Encoding).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TextEncoding {
+    #[default]
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    /// ISO-8859-1: every byte is one char (U+0000–U+00FF).
+    Latin1,
+}
+
+impl TextEncoding {
+    pub const ALL: [TextEncoding; 4] = [Self::Utf8, Self::Utf16Le, Self::Utf16Be, Self::Latin1];
+
+    /// The name RustRover's status bar shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Utf16Le => "UTF-16LE",
+            Self::Utf16Be => "UTF-16BE",
+            Self::Latin1 => "ISO-8859-1",
+        }
+    }
+
+    /// By name, case-insensitively (`utf-8`, `utf16le`, `latin1`, `iso-8859-1`, …).
+    pub fn from_name(name: &str) -> Option<Self> {
+        let n: String = name.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+        match n.as_str() {
+            "utf8" => Some(Self::Utf8),
+            "utf16le" | "utf16" => Some(Self::Utf16Le),
+            "utf16be" => Some(Self::Utf16Be),
+            "latin1" | "iso88591" => Some(Self::Latin1),
+            _ => None,
+        }
+    }
 }
 
 /// A document open in the IDE (shared by the editors that show it).
@@ -51,6 +113,10 @@ pub struct OpenDocument {
     pub doc: Document,
     pub language: Language,
     pub read_only: bool,
+    /// The encoding the file was read in and is saved in.
+    pub encoding: TextEncoding,
+    /// The file starts with a byte order mark (kept on save).
+    pub bom: bool,
     /// Modification time when last loaded or saved (external change detection).
     pub disk_mtime: Option<SystemTime>,
     /// LSP document version (incremented on every sync).
@@ -78,6 +144,8 @@ impl OpenDocument {
             doc,
             language,
             read_only: false,
+            encoding: TextEncoding::Utf8,
+            bom: false,
             disk_mtime: None,
             lsp_version: 0,
             lsp_synced: None,
@@ -215,6 +283,10 @@ pub struct Editor {
     /// Start lines of collapsed fold regions.
     pub folded: BTreeSet<usize>,
     pub pinned: bool,
+    /// A preview tab (single click in the Project view): replaced by the next preview until it is
+    /// edited or kept open. Shown in italics.
+    #[serde(default)]
+    pub preview: bool,
     /// Ask the view to scroll the primary caret into view on the next frame.
     pub reveal_caret: bool,
 }
@@ -229,6 +301,7 @@ impl Editor {
             scroll_x: 0.0,
             folded: BTreeSet::new(),
             pinned: false,
+            preview: false,
             reveal_caret: true,
         }
     }

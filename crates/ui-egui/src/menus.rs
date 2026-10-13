@@ -16,7 +16,7 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("View", "view.quickDocumentation"),
     ("View", "view.hideAllToolWindows"),
     ("View › Active Editor", "view.toggleSoftWrap"),
-    ("View", "view.toggleWhitespace"),
+    ("View › Active Editor", "view.toggleWhitespace"),
     ("View", "view.toggleLineNumbers"),
     ("Code", "code.showContextActions"),
     // RustRover's Refactor menu fills Extract/Inline/Change Signature for the caret's context.

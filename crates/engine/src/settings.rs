@@ -56,8 +56,11 @@ pub struct SettingDef {
 }
 
 pub const PAGE_APPEARANCE: &str = "Appearance & Behavior › Appearance";
+pub const PAGE_SYSTEM: &str = "Appearance & Behavior › System Settings";
 pub const PAGE_KEYMAP: &str = "Keymap";
 pub const PAGE_EDITOR_GENERAL: &str = "Editor › General";
+pub const PAGE_EDITOR_TABS: &str = "Editor › Editor Tabs";
+pub const PAGE_CODE_COMPLETION: &str = "Editor › Code Completion";
 pub const PAGE_FONT: &str = "Editor › Font";
 pub const PAGE_COLOR_SCHEME: &str = "Editor › Color Scheme";
 pub const PAGE_CODE_STYLE: &str = "Editor › Code Style";
@@ -70,8 +73,11 @@ pub const PAGE_OTHER: &str = "Other";
 /// The Settings tree, in display order (`›` separates levels).
 pub const PAGES: &[&str] = &[
     PAGE_APPEARANCE,
+    PAGE_SYSTEM,
     PAGE_KEYMAP,
     PAGE_EDITOR_GENERAL,
+    PAGE_EDITOR_TABS,
+    PAGE_CODE_COMPLETION,
     PAGE_FONT,
     PAGE_COLOR_SCHEME,
     PAGE_CODE_STYLE,
@@ -107,6 +113,7 @@ pub const COLOR_TOKENS: &[&str] = &[
     "line_number",
     "line_number_active",
     "indent_guide",
+    "whitespace",
     "right_margin",
     "find_match",
     "find_match_current",
@@ -184,6 +191,13 @@ pub const SETTINGS: &[SettingDef] = &[
         "Show the menus in the macOS menu bar instead of inside the window (macOS only)",
         Kind::Bool,
     ),
+    def(
+        "reopen_last_project",
+        "Reopen projects on startup",
+        PAGE_SYSTEM,
+        "Reopen the last project(s) with their windows, tabs and splits when CodeCraft starts",
+        Kind::Bool,
+    ),
     def("keymap", "Keymap", PAGE_KEYMAP, "macOS or Windows/Linux; empty = the platform default", Kind::Keymap),
     def(
         "keymap_overrides",
@@ -194,6 +208,13 @@ pub const SETTINGS: &[SettingDef] = &[
     ),
     def("soft_wrap", "Soft-wrap files", PAGE_EDITOR_GENERAL, "Wrap long lines at the editor width", Kind::Bool),
     def("show_whitespace", "Show whitespaces", PAGE_EDITOR_GENERAL, "Render spaces and tabs", Kind::Bool),
+    def(
+        "whitespace_mode",
+        "Whitespaces shown",
+        PAGE_EDITOR_GENERAL,
+        "all, leading_trailing (indentation and line ends) or trailing",
+        Kind::Text,
+    ),
     def("show_line_numbers", "Show line numbers", PAGE_EDITOR_GENERAL, "Line numbers in the gutter", Kind::Bool),
     def(
         "show_inlay_hints",
@@ -207,6 +228,49 @@ pub const SETTINGS: &[SettingDef] = &[
         "Scroll to results during typing",
         PAGE_EDITOR_GENERAL,
         "Find selects the first match as you type",
+        Kind::Bool,
+    ),
+    def("show_editor_tabs", "Show tabs", PAGE_EDITOR_TABS, "Show the tab bar above each editor", Kind::Bool),
+    def(
+        "preview_tab",
+        "Enable preview tab",
+        PAGE_EDITOR_TABS,
+        "A single click in the Project view opens a preview tab that the next one replaces",
+        Kind::Bool,
+    ),
+    def(
+        "editor_tab_limit",
+        "Tab limit",
+        PAGE_EDITOR_TABS,
+        "Close unmodified tabs beyond this many per editor group; 0 = no limit",
+        Kind::Int { min: 0, max: 100 },
+    ),
+    def(
+        "rename_in_place",
+        "Rename in the editor",
+        PAGE_EDITOR_GENERAL,
+        "Refactor › Rename edits the name in place (Enter refactors, Escape cancels); off = the rename dialog",
+        Kind::Bool,
+    ),
+    def(
+        "completion_auto_popup",
+        "Show suggestions as you type",
+        PAGE_CODE_COMPLETION,
+        "Open the completion list automatically after an identifier start or a trigger character (`.`, `::`)",
+        Kind::Bool,
+    ),
+    def(
+        "completion_auto_popup_delay_ms",
+        "Auto-popup delay (ms)",
+        PAGE_CODE_COMPLETION,
+        "Wait this long after typing before the list appears",
+        Kind::Int { min: 0, max: 2000 },
+    ),
+    def(
+        "completion_argument_placeholders",
+        "Insert argument placeholders",
+        PAGE_CODE_COMPLETION,
+        "Complete functions as `name(a, b)` with Tab stops for the arguments; off = `name()` with the caret inside",
         Kind::Bool,
     ),
     def("editor_font_size", "Size", PAGE_FONT, "Editor font size", Kind::Float { min: 6.0, max: 72.0 }),
@@ -226,6 +290,13 @@ pub const SETTINGS: &[SettingDef] = &[
         Kind::UserSchemes,
     ),
     def("tab_size", "Tab size", PAGE_CODE_STYLE, "Columns per tab and indent", Kind::Int { min: 1, max: 16 }),
+    def(
+        "right_margin",
+        "Hard wrap at",
+        PAGE_CODE_STYLE,
+        "Right margin (columns) for Fill Paragraph",
+        Kind::Int { min: 10, max: 1000 },
+    ),
     def(
         "rust_analyzer_path",
         "rust-analyzer",
@@ -460,7 +531,8 @@ pub fn diff(old: &Settings, new: &Settings) -> Change {
     Change {
         restart_lsp: old.use_clippy != new.use_clippy
             || old.rust_analyzer_path != new.rust_analyzer_path
-            || old.rust_analyzer_low_memory != new.rust_analyzer_low_memory,
+            || old.rust_analyzer_low_memory != new.rust_analyzer_low_memory
+            || old.completion_argument_placeholders != new.completion_argument_placeholders,
     }
 }
 

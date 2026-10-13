@@ -1155,6 +1155,8 @@ fn item(label: &str, insert: String, kind: &str, detail: Option<String>, rank: u
         additional_edits: Vec::new(),
         documentation: None,
         deprecated: false,
+        resolved: true,
+        ..CompletionItem::default()
     }
 }
 
@@ -1316,6 +1318,7 @@ fn complete(s: &mut Session, p: &Value) -> CmdResult {
         visible: Vec::new(),
         selected: 0,
         pending: false,
+        ..CompletionPopup::default()
     }));
     s.refresh_completion_filter();
     Ok(json!({ "items": n }))

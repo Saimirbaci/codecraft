@@ -84,6 +84,8 @@ pub(crate) fn client_capabilities() -> Value {
                     "insertReplaceSupport": false,
                     "resolveSupport": { "properties": ["documentation", "detail", "additionalTextEdits"] },
                     "labelDetailsSupport": true,
+                    // Multi-line items are indented like the line being completed.
+                    "insertTextModeSupport": { "valueSet": [1, 2] },
                 },
                 "completionItemKind": { "valueSet": (1..=25).collect::<Vec<u32>>() },
                 "contextSupport": true,

@@ -21,6 +21,7 @@ pub mod approvals;
 pub mod catalog;
 mod code_cmds;
 pub mod commands;
+pub mod completion;
 pub mod commit_ai;
 mod convert;
 pub mod database;
@@ -37,16 +38,22 @@ mod feedback_cmds;
 mod file_cmds;
 mod ide_cmds;
 pub mod ide_server;
+mod inspection_cmds;
+pub mod inspections;
+pub mod inline_rename;
 mod jobs;
 pub mod keymaps;
 mod lang_cmds;
 pub mod local_history;
 mod local_history_cmds;
 mod lsp;
+pub mod misc;
+mod misc_cmds;
 mod navigate_cmds;
 mod params;
 pub mod refactor;
 mod refactor_cmds;
+mod render_cmds;
 mod reformat;
 pub mod popup;
 mod run_cmds;
@@ -55,8 +62,10 @@ pub mod run_config_store;
 pub mod run_configs;
 mod runs;
 pub mod scratch;
+pub mod session_store;
 pub mod settings;
 mod settings_cmds;
+pub mod snippet;
 mod split_cmds;
 pub mod structure;
 pub mod templates;
@@ -170,6 +179,8 @@ pub struct Session {
     pub refactor: refactor::RefactorState,
     /// Live templates, choosers, navigation bar, column mode, soft-wrap geometry (M3b).
     pub editing: editing::EditingState,
+    /// Completion bookkeeping and the in-place rename (M10 track B).
+    pub completion: completion::CompletionState,
     /// Line bookmarks (track X).
     pub bookmarks: bookmarks::BookmarksState,
     /// The TODO tool window's scan (track X).
@@ -178,10 +189,16 @@ pub struct Session {
     pub local_history: local_history::LocalHistoryState,
     /// Scratch files (track X).
     pub scratch: scratch::ScratchState,
+    /// Inspect Code results, Code Cleanup and stack traces (M10 track D).
+    pub inspections: inspections::InspectionsState,
     /// Settings dialog draft and Quick Switch Scheme (M8).
     pub prefs: settings::PrefsState,
     /// User run configurations and the Edit Configurations dialog (M8).
     pub run_store: run_config_store::RunConfigStore,
+    /// Menu sweep state: preview tabs, Compare With, processes, encodings (M10 track F).
+    pub misc: misc::MiscState,
+    /// Session save/restore switches (M10 track A; off unless the app turns it on).
+    pub session_store: session_store::SessionStore,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -229,12 +246,16 @@ impl Session {
             testing: testing::TestingState::default(),
             refactor: refactor::RefactorState::default(),
             editing: editing::EditingState::default(),
+            completion: completion::CompletionState::default(),
             bookmarks: bookmarks::BookmarksState::default(),
             todo: todo::TodoState::default(),
             local_history: local_history::LocalHistoryState::default(),
             scratch: scratch::ScratchState::default(),
+            inspections: inspections::InspectionsState::default(),
             prefs: settings::PrefsState::default(),
             run_store: run_config_store::RunConfigStore::default(),
+            misc: misc::MiscState::default(),
+            session_store: session_store::SessionStore::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -284,6 +305,7 @@ impl Session {
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
         changed |= self.pump_lsp();
+        changed |= completion::pump(self);
         changed |= runs::pump(self);
         changed |= jobs::pump(self);
         changed |= self.approvals.pump();
@@ -299,6 +321,10 @@ impl Session {
         changed |= bookmarks::pump(self);
         changed |= todo::pump(self);
         changed |= local_history::pump(self);
+        changed |= inspections::pump(self);
+        changed |= inspections::fixes::pump(self);
+        changed |= misc::pump(self);
+        session_store::autosave(self);
         self.ws.sync_views();
         changed
     }
@@ -314,21 +340,28 @@ impl Session {
             || self.debug.busy()
             || self.vcs.busy()
             || self.testing.busy()
+            || self.inspections.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
     pub fn jobs_running(&self) -> bool {
-        self.runs.any_running() || self.jobs.any_running() || self.db.busy() || self.debug.settling()
+        self.runs.any_running()
+            || self.jobs.any_running()
+            || self.db.busy()
+            || self.debug.settling()
+            || self.inspections.busy()
     }
 
     /// Stop the language server and running processes (window closing).
     pub fn shutdown(&mut self) {
+        session_store::save_on_close(self);
         debug::shutdown(self);
         database::shutdown(self);
         agents::shutdown(self);
         ide_server::shutdown(self);
         terminal::shutdown(self);
         vcs::shutdown(self);
+        inspections::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);
@@ -423,17 +456,22 @@ impl Session {
         let doc = match self.ws.doc_by_path(&path) {
             Some(d) => d,
             None => {
-                let text = codecraft_fs::read_text_file(&path).map_err(|e| CommandError::Failed(e.to_string()))?;
+                let (text, encoding, bom) = misc::encoding::read_document(&path).map_err(CommandError::Failed)?;
+                let language = misc::language_for(&self.ws.settings, &path);
                 let id = self.ws.add_document(Some(path.clone()), &text);
                 if let Some(od) = self.ws.doc_mut(id) {
                     od.disk_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                     od.read_only = std::fs::metadata(&path).map(|m| m.permissions().readonly()).unwrap_or(false);
+                    od.encoding = encoding;
+                    od.bom = bom;
+                    od.language = language;
                 }
                 self.lsp_did_open(id);
                 id
             }
         };
         let editor = self.ws.open_editor(doc).ok_or_else(|| CommandError::Failed("cannot open editor".into()))?;
+        misc::after_open(self, editor);
         if let Some(p) = &mut self.ws.project
             && path.starts_with(&p.root)
         {
@@ -491,7 +529,7 @@ impl Session {
             if !od.doc.is_modified() {
                 continue;
             }
-            match codecraft_fs::write_text_file_atomic(&path, &od.doc.to_disk_text()) {
+            match misc::encoding::write_document(&path, od) {
                 Ok(()) => {
                     od.doc.mark_saved();
                     od.disk_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();

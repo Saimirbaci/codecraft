@@ -29,6 +29,7 @@ mod json;
 mod lex;
 mod markdown;
 mod python;
+mod regions;
 mod rust;
 mod shell;
 mod sql;
@@ -41,6 +42,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 pub use incremental::IncrementalHighlighter;
+pub use regions::{CustomRegion, custom_regions};
 
 use crate::common::{Doc, Span};
 
@@ -298,6 +300,8 @@ pub enum FoldKind {
     Comment,
     /// A run of consecutive `use` declarations.
     Imports,
+    /// A custom folding region (`// region` … `// endregion`, see [`custom_regions`]).
+    Region,
 }
 
 /// A foldable region: lines `start_line..=end_line`; folding hides lines after `start_line`.
@@ -319,8 +323,24 @@ pub struct FoldRange {
 /// brackets, multi-line strings (docstrings as comments), comments, import runs. Zig: bracket
 /// blocks, comments, `\\` string runs, `@import` runs. TypeScript/JavaScript: bracket blocks,
 /// comments, multi-line JSX elements, import/require runs. SQL: parenthesized groups,
-/// `BEGIN`/`CASE`/`IF`/`LOOP`…`END` blocks, dollar-quoted bodies, comments.
+/// `BEGIN`/`CASE`/`IF`/`LOOP`…`END` blocks, dollar-quoted bodies, comments. Every language:
+/// custom folding regions ([`custom_regions`]).
 pub fn folding_ranges(language: Language, text: &str) -> Vec<FoldRange> {
+    with_regions(language, text, language_folds(language, text))
+}
+
+/// `folds` plus the custom folding regions of `text` (a region wins over another fold of the
+/// same lines).
+pub(crate) fn with_regions(language: Language, text: &str, mut folds: Vec<FoldRange>) -> Vec<FoldRange> {
+    let regions = custom_regions(language, text);
+    if regions.is_empty() {
+        return folds;
+    }
+    folds.extend(regions.iter().map(|r| FoldRange { start_line: r.start_line, end_line: r.end_line, kind: FoldKind::Region }));
+    common::finish_folds(folds)
+}
+
+fn language_folds(language: Language, text: &str) -> Vec<FoldRange> {
     match language {
         Language::Rust => rust::folding_ranges(text),
         Language::Toml => toml::folding_ranges(&Doc::new(text)),

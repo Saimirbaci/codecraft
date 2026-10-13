@@ -155,14 +155,21 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     } else {
                         format!("{}:{}", pos.line + 1, pos.column + 1)
                     };
-                    (d.read_only, indent, d.doc.line_ending(), caret, d.language.name())
+                    let enc = format!("{}{}", d.encoding.label(), if d.bom { " BOM" } else { "" });
+                    (d.read_only, indent, d.doc.line_ending(), caret, d.language.name(), enc)
                 });
-                if let Some((read_only, indent, le, caret, language)) = info {
+                if let Some((read_only, indent, le, caret, language, enc)) = info {
                     if read_only {
                         ui.label(small("🔒".into()));
                     }
                     ui.label(small(indent));
-                    ui.label(small("UTF-8".into()));
+                    if ui
+                        .add(egui::Label::new(small(enc)).sense(Sense::click()))
+                        .on_hover_text("File Encoding")
+                        .clicked()
+                    {
+                        run_command(s, st, "file.fileProperties.fileEncoding", &Value::Null);
+                    }
                     ui.menu_button(small(le.label().into()), |ui| {
                         if ui.button("LF - Unix and macOS (\\n)").clicked() {
                             ui.close();
@@ -211,6 +218,15 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                         if resp.on_hover_text(tip).clicked() {
                             run_command(s, st, "lsp.restart", &Value::Null);
                         }
+                    }
+                }
+                if s.power_save() {
+                    let resp = ui.add(
+                        egui::Label::new(RichText::new("Power Save").size(12.0).color(st.theme.warning))
+                            .sense(Sense::click()),
+                    );
+                    if resp.on_hover_text("Power Save Mode is on: click to turn it off").clicked() {
+                        run_command(s, st, "file.powerSaveMode", &Value::Null);
                     }
                 }
                 let (errors, warnings) = s.ws.problem_counts();
@@ -415,7 +431,11 @@ fn splitter(ui: &mut egui::Ui, s: &mut Session, st: &UiState, sp: &Splitter) {
 /// One group: tab bar, (focused only) find bar and console toolbar, then the editor.
 /// Returns the tab bar's rect and its tabs' rects (for dropping dragged tabs).
 fn group(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focused: bool, split: bool) -> TabBar {
-    let bar = tabs(ui, s, st, g, focused, split);
+    let bar = if s.ws.settings.show_editor_tabs {
+        tabs(ui, s, st, g, focused, split)
+    } else {
+        TabBar { rect: Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 0.0)), tabs: Vec::new() }
+    };
     if focused {
         if s.find_bar.is_some() {
             find_bar(ui, s, st);
@@ -499,6 +519,7 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
             ui.horizontal_centered(|ui| {
                 let mut activate = None;
                 let mut close = None;
+                let mut keep = None;
                 for id in tab_ids {
                     let Some(e) = s.ws.editor(id) else { continue };
                     let Some(d) = s.ws.doc(e.doc) else { continue };
@@ -523,6 +544,8 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
                     };
                     let text = RichText::new(title).size(13.0).color(color);
                     let text = if has_errors { text.underline() } else { text };
+                    // A preview tab (single click in the Project view) is shown in italics.
+                    let text = if e.preview { text.italics() } else { text };
                     let resp = ui
                         .add(
                             egui::Button::new(text)
@@ -539,6 +562,9 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
                     }
                     if resp.clicked() {
                         activate = Some(id);
+                    }
+                    if resp.double_clicked() {
+                        keep = Some(id);
                     }
                     if resp.middle_clicked() {
                         close = Some(id);
@@ -588,6 +614,9 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
                 }
                 if let Some(id) = close {
                     run_command(s, st, "window.editorTabs.close", &json!({ "editor": id.0 }));
+                }
+                if let Some(id) = keep {
+                    run_command(s, st, "window.editorTabs.keepTabOpen", &json!({ "editor": id.0 }));
                 }
             });
         });

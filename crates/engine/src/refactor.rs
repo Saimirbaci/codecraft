@@ -392,9 +392,14 @@ fn on_prepare_rename(
         Err(e) if e.code == -32601 => Value::Null,
         Err(e) => return cannot("Cannot Rename", s, &e.message),
     };
+    let mut range = None;
     let placeholder = match serde_json::from_value::<Option<lt::PrepareRenameResponse>>(value.clone()) {
-        Ok(Some(lt::PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. })) => placeholder,
+        Ok(Some(lt::PrepareRenameResponse::RangeWithPlaceholder { range: r, placeholder })) => {
+            range = Some(r);
+            placeholder
+        }
         Ok(Some(lt::PrepareRenameResponse::Range(r))) => {
+            range = Some(r);
             s.ws.editor(editor)
                 .and_then(|e| s.ws.doc(e.doc))
                 .map(|d| d.doc.slice(convert::from_lsp_range(&d.doc, &r)))
@@ -408,6 +413,12 @@ fn on_prepare_rename(
     };
     if placeholder.is_empty() {
         return cannot("Cannot Rename", s, "Nothing to rename at the caret");
+    }
+    // With the symbol's range, rename in place (M10); the popup is the fallback.
+    if let Some(r) = range
+        && crate::inline_rename::try_start(s, editor, &r, &placeholder)
+    {
+        return;
     }
     s.popup = Some(Popup::Rename { editor, offset, name: placeholder });
 }

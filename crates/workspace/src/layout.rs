@@ -24,6 +24,8 @@ pub enum ToolWindowId {
     Agent,
     Coverage,
     Hierarchy,
+    DatabaseChanges,
+    InspectionResults,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -34,7 +36,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 19] = [
+    pub const ALL: [ToolWindowId; 21] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -54,6 +56,8 @@ impl ToolWindowId {
         Self::Agent,
         Self::Coverage,
         Self::Hierarchy,
+        Self::DatabaseChanges,
+        Self::InspectionResults,
     ];
 
     pub fn title(self) -> &'static str {
@@ -77,6 +81,8 @@ impl ToolWindowId {
             Self::Agent => "Agent",
             Self::Coverage => "Coverage",
             Self::Hierarchy => "Hierarchy",
+            Self::DatabaseChanges => "Database Changes",
+            Self::InspectionResults => "Inspection Results",
         }
     }
 
@@ -133,6 +139,8 @@ impl ToolWindowId {
             Self::Agent => "agent",
             Self::Coverage => "coverage",
             Self::Hierarchy => "hierarchy",
+            Self::DatabaseChanges => "databaseChanges",
+            Self::InspectionResults => "inspectionResults",
         }
     }
 

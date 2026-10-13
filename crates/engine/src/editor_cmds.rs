@@ -1,10 +1,10 @@
 //! Editor actions without a menu entry: typing, caret motion, mouse, completion and popups.
 //! Shortcuts follow RustRover's macOS keymap.
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use codecraft_text::movement::{self, Motion};
-use codecraft_text::{Change, ChangeSet, Edit, EditGroup, Selection, SelectionSet, ops};
+use codecraft_text::{EditGroup, Selection, SelectionSet, ops};
 
 use crate::commands::{CmdResult, CommandSpec, Context, has_editor, ok, spec};
 use crate::params::{bool_or, opt_usize, req_str, req_usize};
@@ -224,14 +224,14 @@ fn move_generic(s: &mut Session, p: &Value) -> CmdResult {
     mv(s, m, bool_or(p, "extend", false))
 }
 
-fn is_ident_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
 fn type_text(s: &mut Session, p: &Value) -> CmdResult {
     let text = req_str(p, "text")?.to_string();
     if text.is_empty() {
         return ok();
+    }
+    // A box selection reaching past line ends pads them first (virtual space).
+    if let Some(r) = crate::render_cmds::type_in_virtual_box(s, &text) {
+        return r;
     }
     let mut chars = text.chars();
     let single = match (chars.next(), chars.next()) {
@@ -245,42 +245,9 @@ fn type_text(s: &mut Session, p: &Value) -> CmdResult {
         None => ops::insert_text(d, sel, &text),
     })?;
     if let Some(c) = single {
-        auto_popup(s, c);
+        crate::completion::after_typed(s, c);
     }
     ok()
-}
-
-/// Show completion automatically while typing an identifier or after `.` / `::`.
-fn auto_popup(s: &mut Session, typed: char) {
-    if s.lsp_ready().is_err() {
-        return;
-    }
-    if matches!(s.popup, Some(Popup::Completion(_))) {
-        return;
-    }
-    let Some((e, d)) = s.ws.active() else { return };
-    if e.selections.len() != 1 || d.language != codecraft_syntax::Language::Rust {
-        return;
-    }
-    let caret = e.selections.primary().head;
-    let trigger = if is_ident_char(typed) {
-        // Start of a new identifier only (not in the middle of numbers, strings are not checked).
-        let before = caret.checked_sub(2).and_then(|i| d.doc.char_at(i));
-        !typed.is_ascii_digit() && !before.is_some_and(is_ident_char)
-    } else if typed == '.' {
-        caret
-            .checked_sub(2)
-            .and_then(|i| d.doc.char_at(i))
-            .is_some_and(|c| is_ident_char(c) || c == ')' || c == ']' || c == '?')
-    } else if typed == ':' {
-        caret.checked_sub(2).and_then(|i| d.doc.char_at(i)) == Some(':')
-    } else {
-        false
-    };
-    if trigger {
-        let anchor = if is_ident_char(typed) { caret.saturating_sub(1) } else { caret };
-        let _ = s.lsp_completion(anchor);
-    }
 }
 
 fn enter(s: &mut Session, _: &Value) -> CmdResult {
@@ -288,6 +255,10 @@ fn enter(s: &mut Session, _: &Value) -> CmdResult {
         && !c.visible.is_empty()
     {
         return accept_completion(s, &Value::Null);
+    }
+    // In-place rename: Enter refactors.
+    if s.completion.rename.is_some() {
+        return crate::inline_rename::commit(s, None);
     }
     s.edit_active(EditGroup::Standalone, ops::newline)?;
     ok()
@@ -297,6 +268,10 @@ fn escape(s: &mut Session, _: &Value) -> CmdResult {
     if s.popup.is_some() {
         s.popup = None;
         return ok();
+    }
+    // In-place rename: Escape restores the name.
+    if s.completion.rename.is_some() {
+        return crate::inline_rename::cancel(s);
     }
     if s.find_bar.is_some() {
         s.find_bar = None;
@@ -369,37 +344,5 @@ fn select_completion(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn accept_completion(s: &mut Session, p: &Value) -> CmdResult {
-    let Some(Popup::Completion(c)) = s.popup.take() else { return ok() };
-    let idx = opt_usize(p, "index")?.unwrap_or(c.selected);
-    let Some(item) = c.visible.get(idx).and_then(|i| c.items.get(*i)).cloned() else { return ok() };
-    let anchor = item.replace_start.unwrap_or(c.anchor);
-    s.edit_active(EditGroup::Standalone, |d, sel, _| {
-        let caret = sel.primary().head;
-        let start = anchor.min(caret);
-        // Replace the rest of the identifier after the caret too (RustRover's Tab behaviour).
-        let mut end = caret;
-        while d.char_at(end).is_some_and(is_ident_char) {
-            end += 1;
-        }
-        let mut changes = vec![Change::new(start, end, item.insert_text.clone())];
-        for (r, text) in &item.additional_edits {
-            if r.end <= start || r.start >= end {
-                changes.push(Change::new(r.start, r.end, text.clone()));
-            }
-        }
-        match ChangeSet::new(changes) {
-            Ok(cs) => {
-                let inserted_end = cs.map_pos(end, codecraft_text::Assoc::After);
-                // The snippet's final cursor (`name($0)` puts the caret inside the parentheses).
-                let len = item.insert_text.chars().count();
-                let caret = match item.cursor {
-                    Some(c) if c <= len => inserted_end.saturating_sub(len - c),
-                    _ => inserted_end,
-                };
-                Edit { changes: cs, selections: SelectionSet::caret(caret) }
-            }
-            Err(_) => Edit::none(sel.clone()),
-        }
-    })?;
-    Ok(json!({ "inserted": item.label }))
+    crate::completion::accept(s, p)
 }

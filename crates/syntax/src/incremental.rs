@@ -129,7 +129,9 @@ impl IncrementalHighlighter {
     /// [`folding_ranges`](crate::folding_ranges).
     pub fn folding_ranges(&self, text: &str) -> Vec<FoldRange> {
         match &self.rust {
-            Some(st) if self.language == Language::Rust => rust::folding_ranges_from(text, &st.toks),
+            Some(st) if self.language == Language::Rust => {
+                crate::with_regions(Language::Rust, text, rust::folding_ranges_from(text, &st.toks))
+            }
             _ => crate::folding_ranges(self.language, text),
         }
     }

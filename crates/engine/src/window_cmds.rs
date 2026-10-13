@@ -61,7 +61,7 @@ pub(crate) fn close(s: &mut Session, id: EditorId) {
     if let Some(od) = s.ws.close_editor(id) {
         if od.doc.is_modified()
             && let Some(path) = &od.path
-            && let Err(e) = codecraft_fs::write_text_file_atomic(path, &od.doc.to_disk_text())
+            && let Err(e) = crate::misc::encoding::write_document(path, &od)
         {
             // RustRover saves on close; if that fails keep the user informed.
             s.status = format!("Cannot save {}: {e}", path.display());

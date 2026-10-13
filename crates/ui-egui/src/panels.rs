@@ -33,6 +33,8 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::Todo => "☑",
         ToolWindowId::Coverage => "☂",
         ToolWindowId::Hierarchy => "⊶",
+        ToolWindowId::DatabaseChanges => "⇅",
+        ToolWindowId::InspectionResults => "🔎",
     }
 }
 
@@ -176,6 +178,8 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Todo => crate::bookmarks_panel::show_todo(ui, s, st),
         ToolWindowId::Coverage => crate::testing_panel::show_coverage(ui, s, st),
         ToolWindowId::Hierarchy => crate::refactor_ui::show_hierarchy(ui, s, st),
+        ToolWindowId::DatabaseChanges => crate::misc_ui::show_database_changes(ui, s, st),
+        ToolWindowId::InspectionResults => crate::inspections_ui::show(ui, s, st),
     }
 }
 
@@ -236,6 +240,7 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let mut toggle: Option<PathBuf> = None;
     let mut select: Option<PathBuf> = None;
     let mut open: Option<PathBuf> = None;
+    let mut preview: Option<PathBuf> = None;
     let mut cmd: Option<(&'static str, Value)> = None;
     ScrollArea::both().auto_shrink([false, false]).show_rows(ui, row_h, rows.len(), |ui, range| {
         for (id, depth) in rows.get(range).unwrap_or(&[]) {
@@ -316,6 +321,9 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if node.is_dir && resp.interact_pointer_pos().is_some_and(|p| p.x < x0 + 12.0) {
                     toggle = Some(node.path.clone());
                 }
+                if !node.is_dir {
+                    preview = Some(node.path.clone());
+                }
             }
             if resp.double_clicked() {
                 if node.is_dir {
@@ -382,6 +390,9 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
     if let Some(path) = open {
         run_command(s, st, "file.open", &json!({ "path": path }));
+    } else if let Some(path) = preview {
+        // A single click opens (or selects) the file in the preview tab.
+        run_command(s, st, "projectView.openPreview", &json!({ "path": path }));
     }
     if let Some((c, params)) = cmd {
         run_command(s, st, c, &params);

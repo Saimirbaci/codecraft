@@ -47,6 +47,7 @@ impl Session {
         self.close_project();
         self.ws.project = Some(Project::new(root.clone()));
         self.ws.note_recent_project(root.clone());
+        crate::session_store::restore_on_open(self);
         self.ws.tasks.insert(
             TASK_PROJECT.into(),
             BackgroundTask {
@@ -71,6 +72,7 @@ impl Session {
 
     /// Close the project: tabs, runs, language server.
     pub fn close_project(&mut self) {
+        crate::session_store::save_on_close(self);
         let _ = self.save_all();
         crate::runs::stop_all(self);
         self.stop_lsp();

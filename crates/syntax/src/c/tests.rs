@@ -241,7 +241,8 @@ int g;
             fold(6, 10, FoldKind::Block),
             fold(7, 9, FoldKind::Block),
             fold(11, 12, FoldKind::Comment),
-            fold(13, 15, FoldKind::Block),
+            // `#pragma region` is a custom folding region.
+            fold(13, 15, FoldKind::Region),
         ]
     );
 }

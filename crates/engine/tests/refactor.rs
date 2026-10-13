@@ -212,8 +212,10 @@ fn rust_analyzer_refactorings() {
     );
     s.popup = None;
 
-    // Rename asks first (prepareRename) and offers the symbol's name.
+    // Rename asks first (prepareRename) and offers the symbol's name in the popup (in-place
+    // rename is off here; `completion_e2e.rs` covers it).
     // (rust-analyzer may still be loading the `util` module: retry while it says no.)
+    s.ws.settings.rename_in_place = false;
     let at = offset_of(&s, "greet(\"x\")") + 1;
     let start = Instant::now();
     loop {

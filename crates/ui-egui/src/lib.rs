@@ -21,9 +21,11 @@ mod editor;
 mod feedback;
 mod fonts;
 mod history_ui;
+mod inspections_ui;
 pub mod keymap;
 mod markdown;
 mod menus;
+mod misc_ui;
 mod native_menu;
 mod navbar;
 mod panels;
@@ -163,18 +165,34 @@ pub struct App {
     native_menu: native_menu::NativeMenu,
     /// Projects opened in their own windows (each with its own session).
     windows: project_windows::ProjectWindows,
+    /// When the persisted state was last checked for a periodic save, and what was saved.
+    state_saved: (Instant, String),
 }
+
+/// How the desktop app starts.
+#[derive(Clone, Debug, Default)]
+pub struct Launch {
+    /// A path from the command line (file or directory); otherwise the last project(s).
+    pub open: Option<PathBuf>,
+    /// `--no-restore`: reopen no project and no editors (sessions are still saved).
+    pub no_restore: bool,
+}
+
+/// How often the persisted state is saved while it changes (so a crash loses little).
+const STATE_AUTOSAVE_EVERY: Duration = Duration::from_secs(30);
 
 impl App {
     /// `open`: a path from the command line (file or directory); otherwise the last project.
     pub fn new(open: Option<PathBuf>) -> Self {
-        Self::build(open, PersistedState::load(), true)
+        let mut session = Session::new();
+        session.session_store.enable();
+        Self::build(open, PersistedState::load(), true, true, session)
     }
 
     /// An app with default state that is never saved and never starts rust-analyzer
     /// (tests, offscreen snapshots).
     pub fn ephemeral(open: Option<PathBuf>) -> Self {
-        let mut app = Self::build(None, PersistedState::default(), false);
+        let mut app = Self::build(None, PersistedState::default(), false, false, Session::new());
         app.session.lsp_enabled = false;
         if let Some(path) = open {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
@@ -192,8 +210,35 @@ impl App {
         self.windows.session(index)
     }
 
-    fn build(open: Option<PathBuf>, persisted: PersistedState, persist: bool) -> Self {
+    /// An app that starts from `persisted` like the desktop app (reopening the last project and
+    /// windows with their editors) and saves project sessions (`fallback_dir` for read-only
+    /// projects), but never writes the app's own state file and never starts language servers
+    /// (tests).
+    pub fn restoring(persisted: PersistedState, fallback_dir: PathBuf) -> Self {
         let mut session = Session::new();
+        session.lsp_enabled = false;
+        session.session_store.enable();
+        session.session_store.fallback_dir = Some(fallback_dir);
+        Self::build(None, persisted, false, true, session)
+    }
+
+    /// Save every project window's session and return the app state as it would be persisted
+    /// now (the main window's project and settings, the other windows' projects).
+    pub fn capture_state(&mut self) -> PersistedState {
+        if let Err(e) = codecraft_engine::session_store::save_now(&mut self.session) {
+            log::warn!("cannot save the session: {e}");
+        }
+        self.windows.save_sessions();
+        let mut p = self.persisted.clone();
+        p.capture(&self.session, &self.ui);
+        p.open_windows = self.windows.project_roots();
+        p
+    }
+
+    /// `persist`: save the app state file; `reopen`: open the last project and windows (when
+    /// the `reopen_last_project` setting allows it).
+    fn build(open: Option<PathBuf>, persisted: PersistedState, persist: bool, reopen: bool, session: Session) -> Self {
+        let mut session = session;
         persisted.apply(&mut session);
         let mut ui = UiState::new();
         ui.window_sizes = persisted.window_sizes.clone();
@@ -205,12 +250,39 @@ impl App {
             fonts_installed: false,
             native_menu: native_menu::NativeMenu::default(),
             windows: project_windows::ProjectWindows::default(),
+            state_saved: (Instant::now(), String::new()),
         };
-        let target = open.or_else(|| app.persisted.last_project.clone().filter(|p| p.is_dir()));
+        let reopen = reopen && app.session.ws.settings.reopen_last_project;
+        let explicit = open.is_some();
+        let target = open.or_else(|| app.persisted.last_project.clone().filter(|p| reopen && p.is_dir()));
         if let Some(path) = target {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
         }
+        // The other project windows open at the last exit come back too (not when a path was
+        // given on the command line).
+        if reopen && !explicit {
+            let main = app.session.ws.project.as_ref().map(|p| p.root.clone());
+            for path in app.persisted.windows_to_reopen(main.as_deref()) {
+                app.windows.open(path, &app.session, &app.persisted);
+            }
+        }
         app
+    }
+
+    /// Save the app state every [`STATE_AUTOSAVE_EVERY`] when it changed.
+    fn autosave_state(&mut self) {
+        if !self.persist || self.state_saved.0.elapsed() < STATE_AUTOSAVE_EVERY {
+            return;
+        }
+        let mut p = self.persisted.clone();
+        p.capture(&self.session, &self.ui);
+        p.open_windows = self.windows.project_roots();
+        self.state_saved.0 = Instant::now();
+        let Ok(json) = serde_json::to_string(&p) else { return };
+        if json != self.state_saved.1 {
+            p.save();
+            self.state_saved.1 = json;
+        }
     }
 
     fn editor_focused(ctx: &egui::Context, s: &Session) -> Option<EditorId> {
@@ -267,7 +339,7 @@ impl App {
         }
 
         // Bookmark, scratch and Local History dialogs read their keys themselves.
-        if bookmarks_panel::wants_keyboard(s) || history_ui::wants_keyboard(s) {
+        if bookmarks_panel::wants_keyboard(s) || history_ui::wants_keyboard(s) || misc_ui::wants_keyboard(s) {
             return;
         }
 
@@ -443,6 +515,8 @@ impl App {
         debug_panel::attach_window(ui, s, st);
         bookmarks_panel::windows(ui, s, st);
         history_ui::windows(ui, s, st);
+        inspections_ui::windows(ui, s, st);
+        misc_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         windows::capture(ui.ctx(), st);
@@ -504,6 +578,7 @@ impl eframe::App for App {
             self.fonts_installed = true;
         }
         Self::window_logic(ctx, &mut self.session, &mut self.ui);
+        self.autosave_state();
         // The native menu shows the focused window's enabled states.
         let focused = self.windows.focused(ctx).and_then(|i| self.windows.session(i));
         self.native_menu.update(ctx, focused.unwrap_or(&self.session));
@@ -555,10 +630,12 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        let open_windows = self.windows.project_roots();
         self.windows.shutdown();
         let _ = self.session.save_all();
         if self.persist {
             self.persisted.capture(&self.session, &self.ui);
+            self.persisted.open_windows = open_windows;
             self.persisted.save();
         }
         self.session.shutdown();
@@ -567,6 +644,12 @@ impl eframe::App for App {
 
 /// Launch the desktop app.
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
+    launch(Launch { open, no_restore: false })
+}
+
+/// Launch the desktop app with command-line options.
+pub fn launch(launch: Launch) -> eframe::Result {
+    let Launch { open, no_restore } = launch;
     let persisted = PersistedState::load();
     let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
     let options = eframe::NativeOptions {
@@ -580,7 +663,10 @@ pub fn run(open: Option<PathBuf>) -> eframe::Result {
         "CodeCraft",
         options,
         Box::new(move |_cc| {
-            let mut app = App::build(open, persisted, true);
+            let mut session = Session::new();
+            session.session_store.autosave = true;
+            session.session_store.restore_on_open = !no_restore;
+            let mut app = App::build(open, persisted, true, !no_restore, session);
             app.native_menu.allowed = true;
             Ok(Box::new(app))
         }),

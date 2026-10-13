@@ -30,6 +30,9 @@ pub struct TemplateSession {
     pub current: usize,
     /// Where the caret goes after the last variable (`$END$`).
     pub end: Option<usize>,
+    /// Values offered for each variable (LSP snippet choices `${1|a,b|}`; empty = free text).
+    #[serde(default)]
+    pub choices: Vec<Vec<String>>,
 }
 
 impl TemplateSession {
@@ -59,6 +62,8 @@ pub enum ChooserKind {
     SurroundWith,
     /// Code › Unwrap/Remove….
     UnwrapRemove,
+    /// The values of an LSP snippet choice placeholder (`${1|a,b|}`).
+    SnippetChoice,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +255,7 @@ pub(crate) fn after_edit(s: &mut Session, editor: EditorId, changes: &ChangeSet)
         s.editing.expand = None;
         s.editing.block = None;
     }
+    crate::inline_rename::on_edit(s, editor);
     let place = s.ws.editor(editor).and_then(|e| {
         let d = s.ws.doc(e.doc)?;
         let head = e.selections.primary().head;
@@ -272,6 +278,7 @@ mod tests {
             vars: vec![vec![4..4, 10..10], vec![12..15]],
             current: 0,
             end: Some(20),
+            choices: Vec::new(),
         };
         // Type "ab" at both occurrences of the first variable.
         let cs = ChangeSet::new(vec![

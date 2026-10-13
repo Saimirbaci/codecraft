@@ -291,6 +291,11 @@ pub fn write_text_file_atomic(path: &Path, contents: &str) -> Result<()> {
     io::write_atomic(path, contents.as_bytes())
 }
 
+/// [`write_text_file_atomic`] for already-encoded bytes (UTF-16, Latin-1, a byte order mark).
+pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    io::write_atomic(path, contents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

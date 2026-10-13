@@ -18,6 +18,7 @@ mod layout;
 mod problems;
 mod project;
 mod run;
+mod session_state;
 mod splits;
 
 use std::collections::BTreeMap;
@@ -25,11 +26,17 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub use document::{DocId, Editor, EditorId, InlayHint, InlayKind, OpenDocument, SemanticSpan};
+pub use document::{
+    DocId, Editor, EditorId, InlayHint, InlayKind, InlayLabelPart, InlayLocation, OpenDocument, SemanticSpan, TextEncoding,
+};
 pub use layout::{Layout, Side, ToolWindowId};
 pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
 pub use run::{ConsoleKind, ConsoleLine, RunStatus, RunTab, RunTabId, TestRecord};
+pub use session_state::{
+    GroupSnapshot, MAX_GROUPS, MAX_TABS, RestoreSummary, SNAPSHOT_VERSION, SelectionSnapshot, SessionSnapshot,
+    TabSnapshot,
+};
 pub use splits::{EditorGroup, GroupId, MIN_RATIO, SplitAxis, SplitNode, Stretch};
 
 use codecraft_fs::FileMatch;
@@ -86,6 +93,8 @@ pub struct Settings {
     pub line_spacing: f32,
     pub tab_size: usize,
     pub show_whitespace: bool,
+    /// Which whitespace `show_whitespace` paints.
+    pub whitespace_mode: WhitespaceMode,
     pub soft_wrap: bool,
     /// Edit › Find › Scroll to Results During Typing: select the first match as the query is typed.
     pub find_scroll_to_results: bool,
@@ -120,6 +129,46 @@ pub struct Settings {
     pub user_schemes: Vec<ColorScheme>,
     /// Show the menus in the macOS global menu bar instead of inside the window (macOS only).
     pub native_menu_bar: bool,
+    /// Code Completion: show the list automatically while typing.
+    pub completion_auto_popup: bool,
+    /// Code Completion: delay before the automatic list appears (ms).
+    pub completion_auto_popup_delay_ms: u64,
+    /// Code Completion: insert argument placeholders when completing a function (rust-analyzer
+    /// `fill_arguments`); off = `name()` with the caret inside, like RustRover.
+    pub completion_argument_placeholders: bool,
+    /// Refactor › Rename edits the name in the editor (off = the rename dialog).
+    pub rename_in_place: bool,
+    /// Reopen the last project(s) and their editors on startup (System Settings).
+    pub reopen_last_project: bool,
+    /// File › Power Save Mode: no completion auto-popup, inlay/semantic requests, check on save
+    /// or live TODO scanning.
+    pub power_save_mode: bool,
+    /// File › File Properties › Associate with File Type: file name glob (`*.inc`, `Justfile`) →
+    /// language name (`Rust`, `Plain text`, …).
+    pub file_type_associations: BTreeMap<String, String>,
+    /// Right margin (columns) for Edit › Fill Paragraph.
+    pub right_margin: usize,
+    /// Settings › Editor › Editor Tabs: show the tab bar.
+    pub show_editor_tabs: bool,
+    /// Close the least recently opened unmodified, unpinned tab beyond this many per group; 0 = no limit.
+    pub editor_tab_limit: usize,
+    /// A single click in the Project view opens a preview tab.
+    pub preview_tab: bool,
+    /// Window › Processes › Auto Show: open the Processes window when a background task starts.
+    pub processes_auto_show: bool,
+}
+
+/// Which whitespace the editor paints while Show Whitespaces is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WhitespaceMode {
+    /// Every space and tab.
+    #[default]
+    All,
+    /// Indentation and whitespace at line ends.
+    LeadingTrailing,
+    /// Whitespace at line ends only.
+    Trailing,
 }
 
 /// A user colour scheme: a built-in scheme plus colour overrides by token name (`keyword`,
@@ -140,6 +189,7 @@ impl Default for Settings {
             line_spacing: 1.2,
             tab_size: 4,
             show_whitespace: false,
+            whitespace_mode: WhitespaceMode::All,
             soft_wrap: false,
             find_scroll_to_results: true,
             show_line_numbers: true,
@@ -159,6 +209,18 @@ impl Default for Settings {
             color_scheme: String::new(),
             user_schemes: Vec::new(),
             native_menu_bar: cfg!(target_os = "macos"),
+            completion_auto_popup: true,
+            completion_auto_popup_delay_ms: 100,
+            completion_argument_placeholders: false,
+            rename_in_place: true,
+            reopen_last_project: true,
+            power_save_mode: false,
+            file_type_associations: BTreeMap::new(),
+            right_margin: 100,
+            show_editor_tabs: true,
+            editor_tab_limit: 0,
+            preview_tab: true,
+            processes_auto_show: false,
         }
     }
 }
@@ -275,7 +337,7 @@ impl Workspace {
         self.next_editor += 1;
         let id = EditorId(self.next_editor);
         let editor = match like.and_then(|l| self.editors.get(&l)) {
-            Some(l) => Editor { id, pinned: false, reveal_caret: true, ..l.clone() },
+            Some(l) => Editor { id, pinned: false, preview: false, reveal_caret: true, ..l.clone() },
             None => Editor::new(id, doc),
         };
         let top = self.docs.get(&doc).map(|d| top_offset(&d.doc, editor.scroll_line)).unwrap_or(0);

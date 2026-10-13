@@ -386,7 +386,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
 /// Settings › Rust › Run external linter on save: `cargo check` (or Clippy) after Save All in a
 /// Cargo project, unless a Cargo process is already running.
 pub(crate) fn check_on_save(s: &mut Session) {
-    if !s.ws.settings.check_on_save || s.runs.any_running() {
+    if !s.ws.settings.check_on_save || s.power_save() || s.runs.any_running() {
         return;
     }
     let Some(root) = s.ws.project.as_ref().and_then(|p| p.cargo.as_ref()).map(|m| m.workspace_root.clone()) else {

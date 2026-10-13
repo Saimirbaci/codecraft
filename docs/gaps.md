@@ -25,8 +25,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    Requests, Sync Fork, Share on GitHub or GitLab API features (GitLab clone is plain git).
 3. ~~No terminal tool window~~ (landed in M3, with `claude` launched already connected).
 4. ~~Highlighting is lexical only~~ (M3: semantic tokens with mutable underline and unresolved
-   references, inlay hints for types and parameters). Remaining: parameter-name hints are not
-   clickable; hints are not shown in non-active split views.
+   references, inlay hints for types and parameters). ~~Parameter-name hints are not clickable;
+   hints are not shown in non-active split views~~ (M10, 2026-10-13: semantic tokens and inlay
+   hints are requested for the selected tab of every visible split group, with settling and
+   in-flight tracking per document; hidden tabs never ask. Inlay label parts keep their tooltips
+   and locations: hovering shows the tooltip, Cmd+click goes to the part's location (or, for a
+   type hint without one, to the type's declaration); `editor.inlayHints` lists them for
+   agents). Remaining: no `inlayHint/resolve` (rust-analyzer sends locations eagerly); hints are
+   requested for the whole file, not the visible range.
 5. ~~Full-file re-lex on every edit (and full-text LSP sync)~~ (M4, 2026-10-13: Rust highlighting
    is incremental (re-lex and re-classify a window around the edit, exactly equal to a full lex;
    ~17x faster per keystroke on a 10k-line file) and folds reuse its tokens; documents sync to
@@ -49,9 +55,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    bar, with live enabled states, checkmarks for the View toggles, native key equivalents and the
    system's Services/Hide/Minimize/Zoom; Settings › Appearance switches back to the in-window bar.
    Project windows: File › Open asks This Window / New Window, Next/Previous Project Window,
-   Help › Help; `cargo xtask bundle|dmg|package-linux|package-windows`). Remaining: Merge All
-   Project Windows (macOS window tabs) is not implemented; project windows are not restored on
-   restart; plain-key and Alt+character shortcuts (Backspace, Tab, Alt+/) are not native key
+   Help › Help; `cargo xtask bundle|dmg|package-linux|package-windows`). (2026-10-13: project
+   windows open at exit are reopened on start with the main window's last project, each with
+   its editors; Settings › Appearance & Behavior › System Settings › Reopen projects on startup,
+   `codecraft --no-restore`.) Remaining: Merge All
+   Project Windows (macOS window tabs) is not implemented; window positions and sizes of the extra
+   project windows are not restored (they open at the main window's size); plain-key and Alt+character shortcuts (Backspace, Tab, Alt+/) are not native key
    equivalents, so the native menu shows no shortcut for them; enabled states refresh every 250 ms
    instead of when a menu opens; no Developer ID signing or notarization in CI; the Windows zip task
    is untested on Windows.
@@ -59,14 +68,44 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    Unsplit/Unsplit All, Next/Previous Splitter, Change Orientation, Maximize/Normalize, Stretch
    Editor, draggable splitters, a tab bar per group, tabs dragged between groups, several views
    of one file whose carets follow each other's edits). Remaining: no detachable tool windows or
-   editor windows; Keep Tab Open (no preview tab) and Show Hidden Tabs are not implemented; the
-   split layout is not restored on restart (open tabs are not restored either).
-9. Completion: no snippet placeholders (snippets are flattened), no completion item resolve,
-   no auto-popup tuning (RustRover's delays and fuzzy ranking).
+   editor windows. ~~Keep Tab Open (no preview tab) and Show Hidden Tabs are not implemented~~
+   (M10 track F, 2026-10-13: a single click in the Project view opens an italic preview tab
+   that the next one replaces until it is edited, double-clicked or kept; Show Hidden Tabs lists
+   the group's tabs; Settings › Editor › Editor Tabs: show tabs, preview tab, tab limit).
+   (2026-10-13: the split layout, each group's tabs with carets, scroll, folds and pinned state,
+   the focused group and the tool-window layout are saved per project in
+   `.codecraft/workspace.json` (the config directory when the project is read-only) on close,
+   project switch and every 30 s while they change, and restored when the project opens;
+   `session.save`/`session.restore`/`session.state` for agents.) Remaining: unsaved buffers'
+   text is not restored (Quit still prompts); untitled buffers and scratch files without a path
+   are not restored; per-tab soft-wrap/column-mode state is not saved.
+9. ~~Completion: no snippet placeholders (snippets are flattened), no completion item resolve,
+   no auto-popup tuning (RustRover's delays and fuzzy ranking)~~ (M10, 2026-10-13: LSP snippets
+   (`$1`, `${2:x}`, nesting, mirrors, `${3|a,b|}` choices in a chooser, `$0`, `TM_*`/`CLIPBOARD`
+   variables with regex transforms, escapes) start a live template session: Tab/Shift+Tab walk the
+   placeholders and mirrors are edited together; multi-line items take the line's indentation;
+   the selected item is resolved after 80 ms (documentation beside the list, auto-import
+   `additionalTextEdits` applied in the accept's undo step, also when the answer comes after the
+   accept); ranking is case-insensitive prefix, then camel humps (`hm` → `HashMap`, `gm` →
+   `get_mut`), then humps from a later word, each tier by the server's `sortText`, matched chars
+   highlighted, `preselect` honoured; the auto-popup uses the server's trigger characters
+   (`.`/`::` for Rust) after a delay (Settings › Editor › Code Completion: on/off, delay, argument
+   placeholders), re-requests incomplete lists and drops stale answers; Type-Matching
+   (Ctrl+Shift+Space) keeps items of the expected type from `let x: T =` or the parameter being
+   passed (signature help), else ranks by relevance and says so). Remaining: no commit characters,
+   no "smart" type inference beyond those two sources (return position, struct fields), no
+   second-press (Ctrl+Space twice) widening, no per-language auto-popup settings, no transforms on
+   tab stops (`${1/…/…/}` mirrors stay plain), nested snippet sessions replace the outer one.
 10. ~~Rename has no preview or conflict dialog~~ (M7, 2026-10-13: multi-file renames, code actions and
     file moves open the refactoring preview with per-file checkboxes and diffs; `prepareRename` and
-    rename errors show "Cannot Rename"). Remaining: rename is a popup, not RustRover's in-place
-    inline rename; name conflicts are only those rust-analyzer reports.
+    rename errors show "Cannot Rename"). ~~Rename is a popup, not RustRover's in-place inline
+    rename~~ (M10, 2026-10-13: Shift+F6 edits the name in the editor with the file's occurrences
+    (`documentHighlight`) framed and mirrored; Enter (or Tab, or clicking elsewhere) renames
+    through the server from the original text as one undo step, multi-file results open the
+    preview; Escape restores; the popup remains when `prepareRename` gives no range or with
+    Settings › Editor › General › Rename in the editor off; `refactor.rename {newName}` stays
+    headless). Remaining: name conflicts are only those rust-analyzer reports; occurrences in other
+    open files are not mirrored live; no "rename comments and strings" options.
 11. ~~Run configurations are derived only~~ (M8, 2026-10-13: Run › Edit Configurations… lists the
     project's derived configurations and user ones (Cargo command or any command line, env vars,
     working directory), creates/copies/deletes/edits them with Apply/OK/Cancel and saves them in
@@ -90,8 +129,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     and Tools › AI Agents; Apply/OK/Cancel over an engine-side draft; `settings.get/set/list/
     reset` validate keys and values; View › Quick Switch Scheme (Ctrl+`) switches scheme, keymap
     and theme). Remaining: Code Style has only the tab size; no font family choice; Live
-    Templates are read-only in Settings; show-whitespace is a setting the editor does not paint
-    yet; colour schemes cannot be imported/exported as files.
+    Templates are read-only in Settings; ~~show-whitespace is a setting the editor does not paint
+    yet~~ (M10, 2026-10-13: spaces as dots and tabs as arrows in the `whitespace` colour token;
+    `whitespace_mode` all / leading_trailing / trailing; View › Active Editor › Show
+    Whitespaces); colour schemes cannot be imported/exported as files.
 14. ~~No file watching~~ (M3: FSEvents/inotify watcher reloads unmodified files and refreshes the tree and Git).
 15. ~~Reformat with rustfmt replaces the whole document~~ (M4, 2026-10-13: only changed lines are
     replaced and carets keep their token through whitespace changes).
@@ -100,7 +141,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 
 ## Low
 
-17. No IME pre-edit (composition) rendering; committed text works.
+17. ~~No IME pre-edit (composition) rendering; committed text works~~ (M10, 2026-10-13: the
+    pre-edit is drawn underlined at the caret without touching the document, the caret follows
+    the IME's active range, the commit is typed as one edit, and the IME cursor area is the
+    caret so the candidate window opens there). Remaining: `DeleteSurrounding` is ignored.
 18. ~~Project view lacks drag and drop, delete and rename operations~~ (M7, 2026-10-13: Rename/Move/
     Copy/Safe Delete in the context menu and on F6/F5/Cmd+Backspace, drag and drop onto directories,
     `.rs` renames update `mod` declarations through rust-analyzer). Remaining: External Libraries;
@@ -151,11 +195,80 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 
 24. Soft wrap, column selection (Shift+Cmd+8, Alt+drag), breadcrumbs, the navigation bar
     (Cmd+Up), live templates, Unwrap/Remove, Complete Current Statement, Auto-Indent Lines,
-    Move Element Left/Right, Next Edit Location and Cyclic Expand Word landed. Remaining: wrapped
-    rows do not keep the line's indentation; box selection has no virtual space (short lines get
-    a caret at their end); live template variables have no expressions (`completeSmart()`,
+    Move Element Left/Right, Next Edit Location and Cyclic Expand Word landed. ~~Wrapped rows do
+    not keep the line's indentation; box selection has no virtual space~~ (M10, 2026-10-13:
+    continuation rows are indented by the line's leading whitespace, at most half the row width,
+    with caret motion, clicks and painting agreeing; box carets past short line ends are drawn
+    at their virtual column and typing pads those lines with spaces in one undo step. Custom
+    folding regions (`// region`/`// endregion`, `#region`, `<editor-fold>`, `#pragma region`)
+    fold like other ranges, and Navigate › Custom Folding… (Alt+Cmd+.) lists them). Remaining:
+    Backspace/Delete in virtual space and Shift+arrows past line ends without column mode; no
+    "use original line's indent" setting (always on); live template variables have no expressions (`completeSmart()`,
     `suggestVariableName()`); breadcrumbs and Unwrap/Remove are lexical (no LSP document
     symbols); Auto-Indent Lines covers brace languages only; Optimize Imports for Rust
     (2026-10-13) sorts single-line `use` groups and applies rust-analyzer's "Remove all unused
     imports" over the file, but does not merge imports; no live template settings page (edit
     `templates.json`).
+
+## M10 menu sweep (2026-10-13)
+
+25. The cheap remaining menu items are live (track F): View › Tool Windows › Database Changes
+    (pending grid edits of every open table with Submit/Revert per table and for all);
+    Recently Changed Files (modified buffers, then files by their latest Local History
+    snapshot) and Recent Changes (Alt+Shift+C); Compare With… (file chooser or Browse…, side-by-
+    side diff) and Compare with Clipboard (selection or file); Quick Type Definition (LSP
+    `typeDefinition` in a popup); Context Info (Ctrl+Shift+Q: header lines of the enclosing
+    items); Run › Stop Background Processes… (Shift+Cmd+F2: runs, debug session, language
+    servers, agents, database queries, Git operation), Show Running List, Window › Processes ›
+    Show/Auto Show; File Properties › File Encoding (UTF-8, UTF-16 LE/BE, ISO-8859-1 detected
+    on open, kept on save, Reload or Convert; the status bar shows it), Add/Remove BOM (the BOM
+    survives saves), Make file read-only (toggles the file's write bits and the editor),
+    Associate with File Type… (glob → language, in settings); Power Save Mode (no completion
+    auto-popup, semantic tokens/inlay hints, check on save or live TODO scan; status bar badge);
+    Export › Files or Selection to HTML… and Print… (highlighted HTML in the theme's colours,
+    opened in the browser to print); New › Python Package; New Projects Setup (opens Settings /
+    Edit Configurations); Edit › Fill Paragraph (comments and plain text, Settings › Code Style ›
+    Hard wrap at, default 100); Git › GitHub/GitLab › Manage Accounts… (`gh`/`glab auth status`
+    with a login hint; login is never run). Remaining: other save paths (agent and refactoring
+    writes, the IDE server) still write UTF-8 without a BOM; UTF-16 without a BOM is detected
+    only for mostly-ASCII text; no other encodings (Shift-JIS, Windows-1252…); a language
+    association does not move an already-open file to a different language server until it is
+    reopened; Print has no page setup (the browser prints); the tab limit closes the leftmost
+    tab, not the least recently used; menus show no checkmarks for Power Save Mode / Auto Show;
+    Compare with Clipboard reads the system clipboard on macOS only (elsewhere CodeCraft's own
+    last copy); Settings for New Projects edits the global settings (there are no per-project
+    defaults).
+
+## M10 inspections (2026-10-13)
+
+26. Code › Inspect Code…, Code Cleanup…, Analyze Stack Trace or Thread Dump… and Rearrange Code
+    are live (track D). Inspect Code asks for a scope (whole project, uncommitted files from the
+    Git status, the current file or its directory; `{scope, path, tools}` for agents) and runs
+    on a worker thread (Stop kills the process group): Rust through `cargo clippy
+    --message-format=json --all-targets` (cargo check when Settings › Rust turns Clippy off, or
+    when Clippy is not installed, with a hint), plus ruff, ESLint (project `node_modules/.bin`
+    first), clang-tidy (`-p` with a `compile_commands.json`) and `zig fmt --check` when installed
+    and the scope has files for them. View › Tool Windows › Inspection Results: a tree by
+    inspection (most severe first) → file → problem with severity filters, Rerun/Stop, a
+    description panel (rustc's rendered diagnostic, the lint's docs link), double-click to jump.
+    Quick-fixes come from rustc/Clippy suggestions (multi-span; maybe-incorrect ones marked),
+    ruff fixes (safe/unsafe), ESLint fixes and suggestions, and `zig fmt` (whole-file reformat);
+    they become an LSP `WorkspaceEdit` applied through the refactoring preview (single-file fixes
+    at once, "Fix all 'lint' problems" and Fix All previewed; overlapping fixes are left for a
+    rerun; files edited since the inspection refuse fixes; the other problems of a fixed file
+    move with the edit). Suppress: `#[allow(lint)]` on the enclosing Rust item, `# noqa: CODE`,
+    `// eslint-disable-next-line rule`, `// NOLINT(check)`. Code Cleanup applies every
+    machine-applicable fix of the scope, then rustfmt / ruff format / zig fmt, as one preview.
+    Analyze Stack Trace (paste box prefilled from the clipboard) recognizes Rust panics and
+    backtraces, Python tracebacks, Zig and sanitizer traces and JavaScript stacks; file locations
+    are links resolved against the project, library frames dimmed. Rearrange Code sorts a Rust
+    file's top-level items (use, mod declarations, macro_rules!, consts, statics, types, traits,
+    impls, fns, inline mods) in the preview. Remaining: RustRover's own inspections (its
+    inspection profiles, severities editor, "Inspect Code" for a custom scope, offline/exported
+    results) are not reproduced: only external linters run; clippy always checks the whole
+    workspace (results are filtered to the scope); the Rust suppression is a line-based heuristic
+    (innermost item by indentation); clang-tidy fixes (`--export-fixes`) are not read; findings
+    are not shown as editor highlights; Code Cleanup has no profile of what to apply; Rearrange
+    Code does not reorder items inside `impl`/`mod` bodies and refuses files with item-level
+    macro invocations; Analyze Stack Trace has no thread-dump view (Java-style dumps are plain
+    text) and opens in its own window instead of a Run tool window tab.

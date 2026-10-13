@@ -14,8 +14,8 @@ use codecraft_lsp::{LspClient, RequestId, ResponseError, ServerConfig, ServerEve
 use codecraft_syntax::Language;
 use codecraft_workspace::{BackgroundTask, DocId, EditorId, FindResults, NotificationLevel, ToolWindowId};
 
-use crate::convert::{self, from_lsp_pos, utf16_col_to_char};
-use crate::popup::{ActionItem, CompletionItem, CompletionPopup, LocationItem, StructureItem, SymbolItem};
+use crate::convert::{self, utf16_col_to_char};
+use crate::popup::{ActionItem, LocationItem, StructureItem, SymbolItem};
 use crate::{CommandError, LspStatus, Popup, Session};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,12 +26,14 @@ pub(crate) enum GotoKind {
     TypeDefinition,
     /// Alt+Space: show the definition's source in a popup.
     QuickDefinition,
+    /// View › Quick Type Definition: the type's declaration in a popup.
+    QuickTypeDefinition,
 }
 
 pub(crate) enum Pending {
     Goto { kind: GotoKind, editor: EditorId, offset: usize, path: PathBuf },
     Hover { editor: EditorId, offset: usize },
-    Completion { editor: EditorId, anchor: usize },
+    Completion { editor: EditorId, anchor: usize, generation: u64 },
     SignatureHelp { editor: EditorId, offset: usize },
     Formatting { doc: DocId, revision: u64 },
     DocumentSymbol,
@@ -46,6 +48,8 @@ pub(crate) enum Pending {
     OrganizeImports { doc: DocId, revision: u64 },
     /// Refactorings and hierarchies (track R); errors are routed too.
     Refactor(crate::refactor::RefactorPending),
+    /// Completion resolve, Type-Matching's expected type, in-place rename (M10 B); errors are routed too.
+    Lookup(crate::completion::LookupPending),
 }
 
 /// One running language server.
@@ -254,7 +258,13 @@ impl Session {
         config.args = command.args.clone();
         match kind {
             ServerKind::RustAnalyzer => {
-                let settings = ra_config(self.ws.settings.use_clippy, self.ws.settings.rust_analyzer_low_memory);
+                let mut settings = ra_config(self.ws.settings.use_clippy, self.ws.settings.rust_analyzer_low_memory);
+                // Code Completion › Insert argument placeholders: `name(${1:a}, ${2:b})`.
+                if self.ws.settings.completion_argument_placeholders
+                    && let Some(c) = settings.pointer_mut("/completion/callable/snippets")
+                {
+                    *c = json!("fill_arguments");
+                }
                 config.initialization_options = Some(settings.clone());
                 config.configuration = Some(settings);
             }
@@ -460,7 +470,9 @@ impl Session {
             |c| match kind {
                 GotoKind::DeclarationOrUsages | GotoKind::QuickDefinition => c.definition(&p, pos.line, pos.character),
                 GotoKind::Implementation => c.implementation(&p, pos.line, pos.character),
-                GotoKind::TypeDefinition => c.type_definition(&p, pos.line, pos.character),
+                GotoKind::TypeDefinition | GotoKind::QuickTypeDefinition => {
+                    c.type_definition(&p, pos.line, pos.character)
+                }
             },
             Pending::Goto { kind, editor, offset, path },
         )?;
@@ -485,16 +497,7 @@ impl Session {
 
     /// Request completion at the caret; `anchor` is the start of the identifier being typed.
     pub(crate) fn lsp_completion(&mut self, anchor: usize) -> Result<(), CommandError> {
-        let (editor, path, _, pos) = self.caret_for_lsp()?;
-        self.popup = Some(Popup::Completion(CompletionPopup {
-            editor,
-            anchor,
-            items: Vec::new(),
-            visible: Vec::new(),
-            selected: 0,
-            pending: true,
-        }));
-        self.lsp_send(|c| c.completion(&path, pos.line, pos.character), Pending::Completion { editor, anchor })
+        crate::completion::request(self, anchor, crate::completion::Mode::Basic, crate::completion::Trigger::Invoked)
     }
 
     pub(crate) fn lsp_format(&mut self) -> Result<(), CommandError> {
@@ -802,6 +805,7 @@ impl Session {
             }
             Pending::InlayHints { doc, revision } => return self.on_inlay_hints(doc, revision, result.ok()),
             Pending::Refactor(p) => return crate::refactor::on_response(self, p, result),
+            Pending::Lookup(p) => return crate::completion::on_response(self, p, result),
             _ => {}
         }
         let value = match result {
@@ -837,7 +841,9 @@ impl Session {
                     None => self.status = "No parameters".into(),
                 }
             }
-            Pending::Completion { editor, anchor } => self.on_completion(editor, anchor, value),
+            Pending::Completion { editor, anchor, generation } => {
+                crate::completion::on_completion(self, editor, anchor, generation, value)
+            }
             Pending::Formatting { doc, revision } => {
                 let edits: Option<Vec<lt::TextEdit>> = serde_json::from_value(value).ok().flatten();
                 let Some(edits) = edits.filter(|e| !e.is_empty()) else { return };
@@ -866,7 +872,7 @@ impl Session {
                 crate::editing_cmds::on_organize_imports(self, doc, revision, value)
             }
             // Handled before the error check above.
-            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } | Pending::Refactor(_) => {}
+            Pending::SemanticTokens { .. } | Pending::InlayHints { .. } | Pending::Refactor(_) | Pending::Lookup(_) => {}
         }
     }
 
@@ -924,12 +930,12 @@ impl Session {
         if locs.is_empty() {
             self.status = match kind {
                 GotoKind::Implementation => "No implementations found".into(),
-                GotoKind::TypeDefinition => "Cannot find type declaration".into(),
+                GotoKind::TypeDefinition | GotoKind::QuickTypeDefinition => "Cannot find type declaration".into(),
                 _ => "Cannot find declaration to go to".into(),
             };
             return;
         }
-        if kind == GotoKind::QuickDefinition {
+        if matches!(kind, GotoKind::QuickDefinition | GotoKind::QuickTypeDefinition) {
             if let Some((path, range)) = locs.first() {
                 let start = range.start.line as usize;
                 let snippet: Vec<String> = (start..start + 15).map(|l| self.line_of(path, l)).collect();
@@ -994,108 +1000,10 @@ impl Session {
         self.ws.layout.show(ToolWindowId::Find);
     }
 
-    fn on_completion(&mut self, editor: EditorId, anchor: usize, value: Value) {
-        let resp: Option<lt::CompletionResponse> = serde_json::from_value(value).ok().flatten();
-        let items = match resp {
-            Some(lt::CompletionResponse::Array(v)) => v,
-            Some(lt::CompletionResponse::List(l)) => l.items,
-            None => Vec::new(),
-        };
-        let Some(Popup::Completion(popup)) = &self.popup else { return };
-        if popup.editor != editor || popup.anchor != anchor {
-            return;
-        }
-        let Some(od) = self.ws.editor(editor).and_then(|e| self.ws.doc(e.doc)) else { return };
-        let doc = &od.doc;
-        let converted: Vec<CompletionItem> = items
-            .into_iter()
-            .take(2000)
-            .map(|it| {
-                let snippet = it.insert_text_format == Some(lt::InsertTextFormat::SNIPPET);
-                let (raw_text, replace_start) = match &it.text_edit {
-                    Some(lt::CompletionTextEdit::Edit(te)) => {
-                        (te.new_text.clone(), Some(from_lsp_pos(doc, &te.range.start)))
-                    }
-                    Some(lt::CompletionTextEdit::InsertAndReplace(ir)) => {
-                        (ir.new_text.clone(), Some(from_lsp_pos(doc, &ir.replace.start)))
-                    }
-                    None => (it.insert_text.clone().unwrap_or_else(|| it.label.clone()), None),
-                };
-                let (insert_text, cursor) =
-                    if snippet { convert::snippet_with_cursor(&raw_text) } else { (raw_text, None) };
-                let additional_edits = it
-                    .additional_text_edits
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|e| (convert::from_lsp_range(doc, &e.range), e.new_text.clone()))
-                    .collect();
-                let detail = it
-                    .label_details
-                    .as_ref()
-                    .and_then(|d| d.description.clone().or_else(|| d.detail.clone()))
-                    .or(it.detail.clone());
-                CompletionItem {
-                    filter_text: it.filter_text.clone().unwrap_or_else(|| it.label.clone()),
-                    sort_text: it.sort_text.clone().unwrap_or_else(|| it.label.clone()),
-                    label: it.label,
-                    detail,
-                    kind: it.kind.map(completion_kind).unwrap_or("text").to_string(),
-                    insert_text,
-                    cursor,
-                    replace_start,
-                    additional_edits,
-                    documentation: it.documentation.as_ref().map(convert::documentation_text),
-                    deprecated: it.deprecated.unwrap_or(false),
-                }
-            })
-            .collect();
-        if let Some(Popup::Completion(popup)) = &mut self.popup {
-            popup.items = converted;
-            popup.pending = false;
-        }
-        self.refresh_completion_filter();
-    }
-
     /// Re-filter the completion list against the identifier typed since the anchor; closes it
     /// when the caret left the identifier or nothing matches.
     pub(crate) fn refresh_completion_filter(&mut self) {
-        let Some(Popup::Completion(popup)) = &self.popup else { return };
-        let Some(e) = self.ws.editor(popup.editor) else {
-            self.popup = None;
-            return;
-        };
-        let Some(d) = self.ws.doc(e.doc) else { return };
-        let caret = e.selections.primary().head;
-        if caret < popup.anchor {
-            self.popup = None;
-            return;
-        }
-        let prefix = d.doc.slice(popup.anchor..caret);
-        if prefix.chars().any(|c| !(c.is_alphanumeric() || c == '_')) {
-            self.popup = None;
-            return;
-        }
-        let pending = popup.pending;
-        let mut scored: Vec<(i64, usize)> = popup
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(i, it)| codecraft_fs::fuzzy_match(&prefix, &it.filter_text).map(|m| (m.score, i)))
-            .collect();
-        scored.sort_by(|a, b| {
-            let sa = popup.items.get(a.1).map(|i| i.sort_text.as_str()).unwrap_or("");
-            let sb = popup.items.get(b.1).map(|i| i.sort_text.as_str()).unwrap_or("");
-            if prefix.is_empty() { sa.cmp(sb) } else { b.0.cmp(&a.0).then(sa.cmp(sb)) }
-        });
-        let visible: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
-        if visible.is_empty() && !pending {
-            self.popup = None;
-            return;
-        }
-        if let Some(Popup::Completion(popup)) = &mut self.popup {
-            popup.visible = visible;
-            popup.selected = popup.selected.min(popup.visible.len().saturating_sub(1));
-        }
+        crate::completion::refresh_filter(self);
     }
 
     fn on_document_symbols(&mut self, value: Value) {
@@ -1230,7 +1138,7 @@ impl Session {
     }
 }
 
-fn completion_kind(k: lt::CompletionItemKind) -> &'static str {
+pub(crate) fn completion_kind(k: lt::CompletionItemKind) -> &'static str {
     match k {
         lt::CompletionItemKind::METHOD => "method",
         lt::CompletionItemKind::FUNCTION | lt::CompletionItemKind::CONSTRUCTOR => "fn",

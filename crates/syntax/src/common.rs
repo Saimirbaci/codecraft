@@ -430,9 +430,10 @@ pub(crate) fn finish_folds(mut folds: Vec<FoldRange>) -> Vec<FoldRange> {
 
 fn kind_rank(kind: FoldKind) -> u8 {
     match kind {
-        FoldKind::Imports => 0,
-        FoldKind::Comment => 1,
-        FoldKind::Block => 2,
+        FoldKind::Region => 0,
+        FoldKind::Imports => 1,
+        FoldKind::Comment => 2,
+        FoldKind::Block => 3,
     }
 }
 

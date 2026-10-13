@@ -330,7 +330,14 @@ fn apply_template(s: &mut Session, t: &Template, range: std::ops::Range<usize>, 
     })?;
     let revision = s.ws.doc(did).map(|d| d.doc.revision()).unwrap_or(0);
     s.editing.session =
-        (!vars.is_empty()).then_some(TemplateSession { editor: eid, revision, vars, current: 0, end: Some(end) });
+        (!vars.is_empty()).then_some(TemplateSession {
+            editor: eid,
+            revision,
+            vars,
+            current: 0,
+            end: Some(end),
+            choices: Vec::new(),
+        });
     s.editing.chooser = None;
     Ok(json!({ "expanded": t.abbreviation, "text": exp.text }))
 }
@@ -372,6 +379,8 @@ fn step_variable(s: &mut Session, forward: bool) -> Result<bool, CommandError> {
     let sels = selection_for(Some(t.current_ranges()), caret);
     s.editing.session = Some(t);
     s.select_active(|_, _| sels);
+    // A snippet choice placeholder offers its values.
+    crate::completion::offer_choices(s);
     Ok(true)
 }
 
@@ -632,6 +641,7 @@ fn chooser_accept(s: &mut Session, p: &Value) -> CmdResult {
             let index = item.key.parse::<usize>().unwrap_or(0);
             unwrap_remove(s, &json!({ "index": index }))
         }
+        ChooserKind::SnippetChoice => crate::completion::apply_choice(s, &item.key),
     }
 }
 

@@ -133,6 +133,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::ide_cmds::specs());
         specs.extend(crate::feedback_cmds::specs());
         specs.extend(crate::editing_cmds::specs());
+        specs.extend(crate::completion::specs());
         specs.extend(crate::split_cmds::specs());
         specs.extend(crate::testing_cmds::specs());
         specs.extend(crate::refactor_cmds::specs());
@@ -142,6 +143,10 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::scratch::specs());
         specs.extend(crate::settings_cmds::specs());
         specs.extend(crate::run_config_cmds::specs());
+        specs.extend(crate::misc_cmds::specs());
+        specs.extend(crate::inspection_cmds::specs());
+        specs.extend(crate::render_cmds::specs());
+        specs.extend(crate::session_store::specs());
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {

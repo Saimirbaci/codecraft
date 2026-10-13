@@ -9,7 +9,7 @@ use crate::lsp::GotoKind;
 use crate::{Popup, Session};
 
 /// Tool windows CodeCraft implements (the others stay disabled in the menu until they exist).
-pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 19] = [
+pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 21] = [
     ToolWindowId::Project,
     ToolWindowId::Find,
     ToolWindowId::Run,
@@ -29,6 +29,8 @@ pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 19] = [
     ToolWindowId::Todo,
     ToolWindowId::Coverage,
     ToolWindowId::Hierarchy,
+    ToolWindowId::DatabaseChanges,
+    ToolWindowId::InspectionResults,
 ];
 
 macro_rules! tool_window {
@@ -60,6 +62,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         tool_window!("view.toolWindows.todo", "TODO", ToolWindowId::Todo),
         tool_window!("view.toolWindows.coverage", "Coverage", ToolWindowId::Coverage),
         tool_window!("view.toolWindows.hierarchy", "Hierarchy", ToolWindowId::Hierarchy),
+        tool_window!("view.toolWindows.databaseChanges", "Database Changes", ToolWindowId::DatabaseChanges),
+        tool_window!("view.toolWindows.inspectionResults", "Inspection Results", ToolWindowId::InspectionResults),
         spec(
             "view.hideAllToolWindows",
             "Hide All Tool Windows",
@@ -86,6 +90,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         ),
         spec("view.quickDefinition", "Quick Definition", None, "", Context::Editor, has_lsp_editor, |s, _| {
             s.lsp_goto(GotoKind::QuickDefinition)?;
+            ok()
+        }),
+        spec("view.quickTypeDefinition", "Quick Type Definition", None, "", Context::Editor, has_lsp_editor, |s, _| {
+            s.lsp_goto(GotoKind::QuickTypeDefinition)?;
             ok()
         }),
         spec("view.parameterInfo", "Parameter Info", None, "", Context::Editor, has_lsp_editor, |s, _| {

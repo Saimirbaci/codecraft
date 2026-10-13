@@ -46,6 +46,10 @@ fn skip(id: &str, params: &Value) -> bool {
     {
         return true;
     }
+    // Manage Accounts runs the real `gh`/`glab auth status` (misc_cmds tests use a fake one).
+    if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
+        return true;
+    }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
         || matches!(
