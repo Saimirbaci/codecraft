@@ -1,0 +1,84 @@
+   Compiling demo v0.1.0 (/w/demo)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.72s
+     Running unittests src/lib.rs (/w/target/debug/deps/demo-97258ec726e1dba6)
+
+running 6 tests
+test tests::slow ... ignored, slow
+test tests::adds ... ok
+test tests::nested::deep ... ok
+test util::tests::twice_works ... ok
+test util::tests::panics - should panic ... ok
+test tests::fails ... FAILED
+
+failures:
+
+---- tests::fails stdout ----
+some output
+
+thread 'tests::fails' (54968886) panicked at src/lib.rs:26:9:
+assertion `left == right` failed: math is broken
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::fails
+
+test result: FAILED. 4 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+     Running tests/integration.rs (/w/target/debug/deps/integration-cf3593614775290e)
+
+running 2 tests
+test it_works ... ok
+test it_fails ... FAILED
+
+failures:
+
+---- it_fails stdout ----
+to stderr
+
+thread 'it_fails' (54968891) panicked at tests/integration.rs:4:41:
+integration failure
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    it_fails
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--test integration`
+   Doc-tests demo
+
+running 2 tests
+test src/lib.rs - sub (line 13) ... FAILED
+test src/lib.rs - add (line 6) ... ok
+
+failures:
+
+---- src/lib.rs - sub (line 13) stdout ----
+Test executable failed (exit status: 101).
+
+stderr:
+
+thread 'main' (54968985) panicked at /tmp/rustdoctestUAHu8M/doctest_bundle_2024.rs:14:1:
+assertion `left == right` failed
+  left: 3
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+
+failures:
+    src/lib.rs - sub (line 13)
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+all doctests ran in 0.41s; merged doctests compilation took 0.25s
+error: doctest failed, to rerun pass `--doc`
+error: 3 targets failed:
+    `--lib`
+    `--test integration`
+    `--doc`

@@ -1,0 +1,37 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.10.11, pytest-8.0.0, pluggy-1.5.0 -- /Library/Frameworks/Python.framework/Versions/3.10/bin/python3
+rootdir: /p/py
+plugins: asyncio-0.23.5, cov-4.1.0, anyio-3.7.1
+asyncio: mode=strict
+collecting ... collected 5 items
+
+tests/test_math.py::test_add PASSED                                      [ 20%]
+tests/test_math.py::test_fail FAILED                                     [ 40%]
+tests/test_math.py::test_skip SKIPPED (later)                            [ 60%]
+tests/test_math.py::TestGroup::test_param[1] PASSED                      [ 80%]
+tests/test_math.py::TestGroup::test_param[2] FAILED                      [100%]
+
+=================================== FAILURES ===================================
+__________________________________ test_fail ___________________________________
+
+    def test_fail():
+>       assert 1 + 1 == 3, "bad math"
+E       AssertionError: bad math
+E       assert (1 + 1) == 3
+
+tests/test_math.py:8: AssertionError
+___________________________ TestGroup.test_param[2] ____________________________
+
+self = <test_math.TestGroup object at 0x1016aded0>, x = 2
+
+    @pytest.mark.parametrize("x", [1, 2])
+    def test_param(self, x):
+>       assert x == 1
+E       assert 2 == 1
+
+tests/test_math.py:17: AssertionError
+- generated xml file: /p/junit.xml -
+=========================== short test summary info ============================
+FAILED tests/test_math.py::test_fail - AssertionError: bad math
+FAILED tests/test_math.py::TestGroup::test_param[2] - assert 2 == 1
+==================== 2 failed, 2 passed, 1 skipped in 0.03s ====================

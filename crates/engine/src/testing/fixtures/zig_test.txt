@@ -1,0 +1,12 @@
+1/3 a.test.adds...OK
+2/3 a.test.fails...FAIL (TestUnexpectedResult)
+/zig/lib/std/testing.zig:607:14: 0x1045b87a3 in expect (test)
+    if (!ok) return error.TestUnexpectedResult;
+             ^
+/p/a.zig:3:16: 0x1045b88b7 in test.fails (test)
+test "fails" { try std.testing.expect(1 + 1 == 3); }
+               ^
+3/3 a.test.skipped...SKIP
+1 passed; 1 skipped; 1 failed.
+error: the following test command failed with exit code 1:
+/home/u/.cache/zig/o/ea6e87835f669f26a7bd9263ea2de61c/test --seed=0xc19b826c

@@ -1,0 +1,19 @@
+Test project /p/cmake-build-debug
+    Start 1: test_add
+1/4 Test #1: test_add .........................   Passed    0.00 sec
+    Start 2: test_fail
+2/4 Test #2: test_fail ........................***Failed    0.01 sec
+expected 4, got 3
+
+    Start 3: test_skip
+3/4 Test #3: test_skip ........................***Skipped   0.00 sec
+    Start 4: test_crash
+4/4 Test #4: test_crash .......................***Exception: SegFault  0.02 sec
+
+50% tests passed, 2 tests failed out of 4
+
+Total Test time (real) =   0.05 sec
+
+The following tests FAILED:
+	  2 - test_fail (Failed)
+	  4 - test_crash (SEGFAULT)

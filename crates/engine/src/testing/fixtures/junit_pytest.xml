@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="2" skipped="1" tests="5" time="0.027" timestamp="2026-10-13T00:28:07.817825" hostname="host"><testcase classname="tests.test_math" name="test_add" time="0.000"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+hello from add
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="tests.test_math" name="test_fail" time="0.000"><failure message="AssertionError: bad math&#10;assert (1 + 1) == 3">def test_fail():
+&gt;       assert 1 + 1 == 3, "bad math"
+E       AssertionError: bad math
+E       assert (1 + 1) == 3
+
+tests/test_math.py:8: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="tests.test_math" name="test_skip" time="0.000"><skipped type="pytest.skip" message="later">/p/py/tests/test_math.py:10: later</skipped><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="tests.test_math.TestGroup" name="test_param[1]" time="0.000"><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase><testcase classname="tests.test_math.TestGroup" name="test_param[2]" time="0.000"><failure message="assert 2 == 1">self = &lt;test_math.TestGroup object at 0x10593e380&gt;, x = 2
+
+    @pytest.mark.parametrize("x", [1, 2])
+    def test_param(self, x):
+&gt;       assert x == 1
+E       assert 2 == 1
+
+tests/test_math.py:17: AssertionError</failure><system-out>--------------------------------- Captured Log ---------------------------------
+
+--------------------------------- Captured Out ---------------------------------
+
+</system-out><system-err>--------------------------------- Captured Err ---------------------------------
+
+</system-err></testcase></testsuite></testsuites>
