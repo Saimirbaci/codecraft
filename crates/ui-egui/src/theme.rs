@@ -228,6 +228,9 @@ impl Theme {
         style.spacing.button_padding = egui::vec2(6.0, 2.0);
         style.spacing.menu_margin = egui::Margin::same(4);
         style.interaction.tooltip_delay = 0.4;
+        // Panel and window edges are easy to grab.
+        style.interaction.resize_grab_radius_side = 8.0;
+        style.interaction.resize_grab_radius_corner = 12.0;
         ctx.set_global_style(style);
     }
 }

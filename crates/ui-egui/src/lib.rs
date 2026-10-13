@@ -28,6 +28,7 @@ mod state;
 mod terminal_panel;
 pub mod theme;
 mod vcs_panels;
+mod windows;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -80,6 +81,8 @@ pub struct UiState {
     pub terminal: terminal_panel::TerminalUi,
     /// Git tool windows, branch popup and dialogs view state.
     pub vcs: vcs_panels::VcsUi,
+    /// Last size of each floating window, by key (see `windows`); persisted.
+    pub window_sizes: std::collections::BTreeMap<String, [f32; 2]>,
 }
 
 impl UiState {
@@ -111,6 +114,7 @@ impl UiState {
             debug: debug_panel::DebugUi::default(),
             terminal: terminal_panel::TerminalUi::default(),
             vcs: vcs_panels::VcsUi::default(),
+            window_sizes: Default::default(),
         }
     }
 }
@@ -156,7 +160,9 @@ impl App {
     fn build(open: Option<PathBuf>, persisted: PersistedState, persist: bool) -> Self {
         let mut session = Session::new();
         persisted.apply(&mut session);
-        let mut app = Self { session, ui: UiState::new(), persisted, persist, fonts_installed: false };
+        let mut ui = UiState::new();
+        ui.window_sizes = persisted.window_sizes.clone();
+        let mut app = Self { session, ui, persisted, persist, fonts_installed: false };
         let target = open.or_else(|| app.persisted.last_project.clone().filter(|p| p.is_dir()));
         if let Some(path) = target {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
@@ -365,6 +371,13 @@ impl eframe::App for App {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.window_title()));
+        // Remember the main window size (eframe's own persistence is not enabled).
+        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+            let size = [r.width(), r.height()];
+            if self.persisted.window_size != Some(size) && !ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+                self.persisted.window_size = Some(size);
+            }
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -383,6 +396,7 @@ impl eframe::App for App {
         popups::show(ui, s, st);
         approvals_ui::show(ui, s, st);
         feedback::overlay(ui, s, st);
+        windows::capture(ui.ctx(), st);
         if st.focus_editor
             && let Some(id) = s.ws.active_editor
         {
@@ -402,7 +416,7 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         let _ = self.session.save_all();
         if self.persist {
-            self.persisted.capture(&self.session);
+            self.persisted.capture(&self.session, &self.ui);
             self.persisted.save();
         }
         self.session.shutdown();
@@ -411,13 +425,14 @@ impl eframe::App for App {
 
 /// Launch the desktop app.
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
+    let persisted = PersistedState::load();
+    let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CodeCraft")
-            .with_inner_size([1400.0, 900.0])
+            .with_inner_size(size)
             .with_min_inner_size([640.0, 400.0]),
-        persist_window: true,
         ..Default::default()
     };
-    eframe::run_native("CodeCraft", options, Box::new(move |_cc| Ok(Box::new(App::new(open)))))
+    eframe::run_native("CodeCraft", options, Box::new(move |_cc| Ok(Box::new(App::build(open, persisted, true)))))
 }

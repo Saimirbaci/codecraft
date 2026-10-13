@@ -103,9 +103,10 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let frame =
         Frame::new().fill(st.theme.panel_bg).inner_margin(Margin::same(6)).stroke(Stroke::new(1.0, st.theme.border));
     if let Some(tw) = s.ws.layout.bottom {
-        let resp = egui::Panel::bottom("tw-bottom")
+        let size = s.ws.layout.size_of(tw, s.ws.layout.bottom_height);
+        let resp = egui::Panel::bottom(format!("tw-bottom-{}", tw.key()))
             .resizable(true)
-            .default_size(s.ws.layout.bottom_height)
+            .default_size(size)
             .size_range(80.0..=1200.0)
             .frame(frame)
             .show(ui, |ui| {
@@ -115,11 +116,13 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 tool_window(ui, s, st, tw);
             });
         s.ws.layout.bottom_height = resp.response.rect.height();
+        s.ws.layout.remember_size(tw, s.ws.layout.bottom_height);
     }
     if let Some(tw) = s.ws.layout.left {
-        let resp = egui::Panel::left("tw-left")
+        let size = s.ws.layout.size_of(tw, s.ws.layout.left_width);
+        let resp = egui::Panel::left(format!("tw-left-{}", tw.key()))
             .resizable(true)
-            .default_size(s.ws.layout.left_width)
+            .default_size(size)
             .size_range(140.0..=900.0)
             .frame(frame)
             .show(ui, |ui| {
@@ -129,11 +132,13 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 tool_window(ui, s, st, tw);
             });
         s.ws.layout.left_width = resp.response.rect.width();
+        s.ws.layout.remember_size(tw, s.ws.layout.left_width);
     }
     if let Some(tw) = s.ws.layout.right {
-        let resp = egui::Panel::right("tw-right")
+        let size = s.ws.layout.size_of(tw, s.ws.layout.right_width);
+        let resp = egui::Panel::right(format!("tw-right-{}", tw.key()))
             .resizable(true)
-            .default_size(s.ws.layout.right_width)
+            .default_size(size)
             .size_range(160.0..=900.0)
             .frame(frame)
             .show(ui, |ui| {
@@ -143,6 +148,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 tool_window(ui, s, st, tw);
             });
         s.ws.layout.right_width = resp.response.rect.width();
+        s.ws.layout.remember_size(tw, s.ws.layout.right_width);
     }
 }
 

@@ -953,25 +953,19 @@ fn compare_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let Some(d) = s.vcs.compare.clone() else { return };
     let theme = st.theme.clone();
     let mut open = true;
-    egui::Window::new(format!(
-        "{}: {} ↔ {}",
-        d.path,
-        if d.old_title.is_empty() { "…" } else { &d.old_title },
-        d.new_title
-    ))
-    .id(Id::new("vcs-compare"))
-    .open(&mut open)
-    .collapsible(false)
-    .resizable(true)
-    .default_size([900.0, 560.0])
-    .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-    .show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut st.vcs.side_by_side, "Side by side");
+    let title = format!("{}: {} ↔ {}", d.path, if d.old_title.is_empty() { "…" } else { &d.old_title }, d.new_title);
+    crate::windows::resizable(egui::Window::new(title).default_size([900.0, 560.0]), st, "vcs-compare")
+        .id(Id::new("vcs-compare"))
+        .open(&mut open)
+        .collapsible(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut st.vcs.side_by_side, "Side by side");
+            });
+            let h = ui.available_height();
+            file_diff_view(ui, st, &theme, "vcs-compare", &d, h);
         });
-        let h = ui.available_height();
-        file_diff_view(ui, st, &theme, "vcs-compare", &d, h);
-    });
     if !open {
         s.vcs.compare = None;
     }
@@ -1110,12 +1104,10 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         Dialog::Compare { .. } => "Compare with Revision".into(),
     };
     let field_w = 360.0;
-    egui::Window::new(title)
+    crate::windows::resizable(egui::Window::new(title).default_width(480.0), st, "vcs-dialog")
         .id(Id::new("vcs-dialog"))
         .open(&mut open)
         .collapsible(false)
-        .resizable(matches!(d, Dialog::Conflicts { .. } | Dialog::Push { .. } | Dialog::ApplyPatch { .. }))
-        .default_width(480.0)
         .anchor(Align2::CENTER_CENTER, [0.0, -60.0])
         .show(ctx, |ui| {
             let enter = ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Tool windows, with RustRover's default stripe placement and Cmd+digit shortcuts.
@@ -135,6 +137,9 @@ pub struct Layout {
     pub left_width: f32,
     pub bottom_height: f32,
     pub right_width: f32,
+    /// Remembered size (width, or height for bottom windows) of each tool window, by key.
+    #[serde(default)]
+    pub tool_sizes: BTreeMap<String, f32>,
     /// Distraction-free: hide all tool windows (Cmd+Shift+F12, "Hide All Tool Windows").
     pub all_hidden: bool,
 }
@@ -148,12 +153,25 @@ impl Default for Layout {
             left_width: 280.0,
             bottom_height: 260.0,
             right_width: 300.0,
+            tool_sizes: BTreeMap::new(),
             all_hidden: false,
         }
     }
 }
 
 impl Layout {
+    /// The remembered size of `tw`, or `fallback` if it was never resized.
+    pub fn size_of(&self, tw: ToolWindowId, fallback: f32) -> f32 {
+        self.tool_sizes.get(tw.key()).copied().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(fallback)
+    }
+
+    /// Remember the size of `tw` (ignores non-finite or non-positive values).
+    pub fn remember_size(&mut self, tw: ToolWindowId, size: f32) {
+        if size.is_finite() && size > 0.0 {
+            self.tool_sizes.insert(tw.key().to_string(), size);
+        }
+    }
+
     pub fn slot(&self, side: Side) -> Option<ToolWindowId> {
         match side {
             Side::Left => self.left,

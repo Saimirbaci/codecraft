@@ -817,9 +817,11 @@ fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let mut open = true;
     let mut set: Vec<(&'static str, Value)> = Vec::new();
     let mut cfg = s.ws.settings.clone();
-    egui::Window::new("Settings").open(&mut open).collapsible(false).resizable(true).default_width(520.0).show(
-        ctx,
-        |ui| {
+    crate::windows::resizable(egui::Window::new("Settings").default_width(520.0), st, "settings")
+        .id(egui::Id::new("settings-window"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
             ui.heading("Editor");
             egui::Grid::new("settings-grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
                 ui.label("Font size");
@@ -929,8 +931,7 @@ fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             ui.label(
                 RichText::new(format!("Editor font: {}", st.mono_font_name)).color(st.theme.text_muted).size(11.0),
             );
-        },
-    );
+        });
     for (k, v) in set {
         run_command(s, st, "settings.set", &json!({ "key": k, "value": v }));
     }
@@ -941,16 +942,20 @@ fn settings(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
 
 fn about(ctx: &egui::Context, s: &mut Session, st: &UiState) {
     let mut open = true;
-    egui::Window::new("About CodeCraft").open(&mut open).collapsible(false).resizable(false).show(ctx, |ui| {
-        ui.label(RichText::new("CodeCraft").size(22.0).strong());
-        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-        ui.add_space(6.0);
-        ui.label("A native Rust IDE written in Rust: a clean-room reimplementation of RustRover's workflow.");
-        ui.label(
-            RichText::new("Language intelligence by rust-analyzer. Licensed MIT OR Apache-2.0.")
-                .color(st.theme.text_muted),
-        );
-    });
+    crate::windows::resizable(egui::Window::new("About CodeCraft"), st, "about")
+        .id(egui::Id::new("about-window"))
+        .open(&mut open)
+        .collapsible(false)
+        .show(ctx, |ui| {
+            ui.label(RichText::new("CodeCraft").size(22.0).strong());
+            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.add_space(6.0);
+            ui.label("A native Rust IDE written in Rust: a clean-room reimplementation of RustRover's workflow.");
+            ui.label(
+                RichText::new("Language intelligence by rust-analyzer. Licensed MIT OR Apache-2.0.")
+                    .color(st.theme.text_muted),
+            );
+        });
     if !open {
         s.popup = None;
     }

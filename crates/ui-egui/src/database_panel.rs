@@ -556,12 +556,10 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let mut action: Option<&'static str> = None;
     let theme = st.theme.clone();
     let error = st.db.dialog_error.clone();
-    egui::Window::new(title)
+    crate::windows::resizable(egui::Window::new(title).default_width(480.0), st, "db-datasource")
         .id(egui::Id::new("db-datasource-dialog"))
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
-        .default_width(480.0)
         .anchor(Align2::CENTER_CENTER, [0.0, -40.0])
         .show(ctx, |ui| {
             let f = &mut d.form;

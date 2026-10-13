@@ -111,16 +111,16 @@ pub(super) fn show(ctx: &egui::Context, s: &mut Session, st: &mut UiState, scree
     let theme = st.theme.clone();
     let mut open = true;
     let width = 340.0;
-    egui::Window::new(RichText::new("Feedback for an agent").strong())
+    crate::windows::resizable(egui::Window::new(RichText::new("Feedback for an agent").strong()), st, "feedback")
         .id(id)
         .order(Order::Foreground)
         .open(&mut open)
         .collapsible(false)
-        .resizable(false)
+        .min_width(width)
         .default_pos(pos2(screen.right() - width - 24.0, screen.top() + 64.0))
         .default_width(width)
         .show(ctx, |ui| {
-            ui.set_width(width);
+            ui.set_min_width(width);
             ui.add_enabled_ui(!busy, |ui| body(ui, s, st, &theme));
             if busy {
                 ui.horizontal(|ui| {
@@ -279,7 +279,7 @@ pub(super) fn history(ctx: &egui::Context, s: &mut Session, st: &mut UiState, on
     let theme = st.theme.clone();
     let mut open = true;
     let mut action: Option<(&'static str, Value)> = None;
-    egui::Window::new("Feedback History")
+    crate::windows::resizable(egui::Window::new("Feedback History"), st, "feedback-history")
         .id(id)
         .order(Order::Foreground)
         .open(&mut open)
