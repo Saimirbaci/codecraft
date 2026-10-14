@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-pub use config::{DATA_SOURCE_COLORS, DataSourceConfig, DbKind, SslMode, TlsFiles};
+pub use config::{DATA_SOURCE_COLORS, DataSourceConfig, DbKind, SshAuth, SshTunnelConfig, SslMode, TlsFiles};
 pub use secrets::{KeychainStore, MemoryStore, SecretStore};
 pub use split::{Dialect, Statement, TxEffect, is_modifying, split_statements, statement_at, transaction_effect};
 

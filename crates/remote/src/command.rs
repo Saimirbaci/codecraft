@@ -108,6 +108,18 @@ pub fn ssh_exit_master(server: &SshServer, opts: &SshOptions) -> RemoteResult<Op
     Ok(Some(out))
 }
 
+/// How a tunnel authenticates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TunnelAuth {
+    /// Keys and the agent only (`BatchMode=yes`: never a prompt).
+    #[default]
+    Batch,
+    /// A password, answered by `SSH_ASKPASS` (no public keys tried).
+    Password,
+    /// A key whose passphrase `SSH_ASKPASS` answers.
+    Passphrase,
+}
+
 /// `ssh -N -L 127.0.0.1:<local>:<host>:<port>`: a tunnel of its own (never through the master,
 /// so killing the process closes the forward).
 pub fn ssh_tunnel(
@@ -117,14 +129,42 @@ pub fn ssh_tunnel(
     target_host: &str,
     target_port: u16,
 ) -> RemoteResult<Vec<String>> {
+    ssh_tunnel_auth(server, opts, local_port, target_host, target_port, TunnelAuth::Batch)
+}
+
+/// [`ssh_tunnel`] with an authentication mode. A host seen for the first time is added to
+/// `known_hosts` (`StrictHostKeyChecking=accept-new`, what answering "yes" does); a changed host
+/// key is still refused.
+pub fn ssh_tunnel_auth(
+    server: &SshServer,
+    opts: &SshOptions,
+    local_port: u16,
+    target_host: &str,
+    target_port: u16,
+    auth: TunnelAuth,
+) -> RemoteResult<Vec<String>> {
     let host = target_host.trim();
     if host.is_empty() || host.starts_with('-') || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(RemoteError::Invalid(format!("invalid tunnel target host `{target_host}`")));
     }
     let host = if host.contains(':') && !host.starts_with('[') { format!("[{host}]") } else { host.to_string() };
-    let mut out = opts.base(true, false);
+    let mut out = opts.base(auth == TunnelAuth::Batch, false);
+    match auth {
+        TunnelAuth::Batch => {}
+        TunnelAuth::Password => {
+            out.extend(opt("PreferredAuthentications=password,keyboard-interactive"));
+            out.extend(opt("PubkeyAuthentication=no"));
+            out.extend(opt("NumberOfPasswordPrompts=1"));
+        }
+        TunnelAuth::Passphrase => {
+            out.extend(opt("PreferredAuthentications=publickey"));
+            out.extend(opt("NumberOfPasswordPrompts=1"));
+        }
+    }
+    out.extend(opt("StrictHostKeyChecking=accept-new"));
     out.extend(opt("ExitOnForwardFailure=yes"));
     out.extend(opt("ServerAliveInterval=30"));
+    out.extend(opt("ServerAliveCountMax=3"));
     out.push("-N".into());
     out.push("-L".into());
     out.push(format!("127.0.0.1:{local_port}:{host}:{target_port}"));
@@ -452,6 +492,18 @@ mod tests {
         assert!(v6.contains(&"127.0.0.1:1:[::1]:5".to_string()));
         assert!(ssh_tunnel(&alias(), &shared(), 1, "-oProxyCommand=x", 5).is_err());
         assert!(ssh_tunnel(&alias(), &shared(), 1, "a b", 5).is_err());
+    }
+
+    #[test]
+    fn tunnel_auth_modes() {
+        let has = |v: &[String], o: &str| v.windows(2).any(|w| w[0] == "-o" && w[1] == o);
+        let batch = ssh_tunnel(&alias(), &shared(), 1, "db", 5).unwrap();
+        assert!(has(&batch, "BatchMode=yes") && has(&batch, "StrictHostKeyChecking=accept-new"));
+        let pw = ssh_tunnel_auth(&alias(), &shared(), 1, "db", 5, TunnelAuth::Password).unwrap();
+        assert!(!has(&pw, "BatchMode=yes"), "SSH_ASKPASS needs prompts: {pw:?}");
+        assert!(has(&pw, "PubkeyAuthentication=no") && has(&pw, "NumberOfPasswordPrompts=1"));
+        let key = ssh_tunnel_auth(&alias(), &shared(), 1, "db", 5, TunnelAuth::Passphrase).unwrap();
+        assert!(!has(&key, "BatchMode=yes") && has(&key, "PreferredAuthentications=publickey"));
     }
 
     #[test]

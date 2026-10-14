@@ -111,7 +111,7 @@ impl DbState {
         let cfg = self.resolved(&ds.config);
         let nonce = self.next();
         let key = format!("import:{nonce}");
-        let tunnel = self.tunnels.plan(&cfg)?.map(|t| t.keyed(key.clone()));
+        let tunnel = self.plan_tunnel(&cfg)?.map(|t| t.keyed(key.clone()));
         let tunnels = self.tunnels.clone();
         let password = self.worker_password(source);
         let secrets = self.secrets.clone();
@@ -171,7 +171,7 @@ impl DbState {
         }
         let cfg = self.resolved(&ds.config);
         let key = format!("import-run:{}", d.nonce);
-        let tunnel = self.tunnels.plan(&cfg)?.map(|t| t.keyed(key.clone()));
+        let tunnel = self.plan_tunnel(&cfg)?.map(|t| t.keyed(key.clone()));
         let tunnels = self.tunnels.clone();
         let password = self.worker_password(&d.source);
         let secrets = self.secrets.clone();

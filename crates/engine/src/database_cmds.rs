@@ -318,6 +318,65 @@ fn config_from_params(
     if let Some(v) = text("sshTunnel")? {
         cfg.ssh_tunnel = (!v.is_empty()).then_some(v);
     }
+    match p.get("ssh") {
+        None => {}
+        Some(Value::Null) => cfg.ssh = None,
+        Some(Value::String(d)) if d.trim().is_empty() => cfg.ssh = None,
+        // `user@host:port` (agent authentication).
+        Some(Value::String(d)) => {
+            let mut t = codecraft_db::SshTunnelConfig::parse_destination(d)
+                .ok_or_else(|| bad(format!("`ssh`: `{d}` is not [user@]host[:port]")))?;
+            t.secret_saved = cfg.ssh.as_ref().is_some_and(|o| o.secret_saved);
+            cfg.ssh = Some(t);
+        }
+        Some(Value::Object(m)) => {
+            let get = |k: &str| m.get(k).and_then(Value::as_str).map(str::trim).unwrap_or("").to_string();
+            let host = get("host");
+            if host.is_empty() {
+                cfg.ssh = None;
+            } else {
+                if host.starts_with('-') || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(bad(format!("`ssh.host`: `{host}` is not a host name")));
+                }
+                // `user@host:port` typed into the host field fills the other fields.
+                let parsed = codecraft_db::SshTunnelConfig::parse_destination(&host).unwrap_or_default();
+                let port = match m.get("port") {
+                    None | Some(Value::Null) => parsed.port,
+                    Some(Value::String(v)) if v.trim().is_empty() => parsed.port,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                            .and_then(|n| u16::try_from(n).ok())
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| bad("`ssh.port` must be a number between 1 and 65535"))?,
+                    ),
+                };
+                let auth = match m.get("auth").and_then(Value::as_str) {
+                    None => codecraft_db::SshAuth::Agent,
+                    Some(a) => codecraft_db::SshAuth::parse(a)
+                        .ok_or_else(|| bad(format!("`ssh.auth`: unknown `{a}` (agent, key or password)")))?,
+                };
+                let user = match get("user") {
+                    u if u.is_empty() => parsed.user.clone(),
+                    u => u,
+                };
+                if user.starts_with('-') || user.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                    return Err(bad(format!("`ssh.user`: `{user}` is not a user name")));
+                }
+                let host = if parsed.host.is_empty() { host } else { parsed.host };
+                let keep = cfg.ssh.as_ref().is_some_and(|o| o.secret_saved && o.auth == auth);
+                cfg.ssh = Some(codecraft_db::SshTunnelConfig {
+                    host,
+                    port,
+                    user,
+                    auth,
+                    identity_file: get("identityFile"),
+                    secret_saved: keep,
+                });
+            }
+        }
+        Some(_) => return Err(bad("`ssh` must be an object, `user@host:port` or null")),
+    }
     cfg.read_only = bool_or(p, "readOnly", cfg.read_only);
     cfg.confirm_writes = bool_or(p, "confirmWrites", cfg.confirm_writes);
     cfg.manual_commit = bool_or(p, "manualCommit", cfg.manual_commit);
@@ -398,6 +457,7 @@ fn add_data_source(s: &mut Session, p: &Value) -> CmdResult {
         s.db.store_password(&cfg.id, pw, save_pw);
         cfg.password_saved = save_pw;
     }
+    store_ssh_secret(s, &mut cfg, p, false);
     let id = cfg.id.clone();
     s.db.sources.push(crate::database::DataSource {
         config: cfg,
@@ -431,12 +491,14 @@ fn edit_data_source(s: &mut Session, p: &Value) -> CmdResult {
         s.db.forget_password(&id, true);
         cfg.password_saved = false;
     }
+    let had_secret = base.ssh.as_ref().is_some_and(|t| t.secret_saved);
+    let ssh_secret_typed = store_ssh_secret(s, &mut cfg, p, had_secret);
     let reconnect = {
         let mut a = base.clone();
         let mut b = cfg.clone();
         a.name.clear();
         b.name.clear();
-        a != b || password.is_some()
+        a != b || password.is_some() || ssh_secret_typed
     };
     if reconnect {
         s.db.disconnect(Some(&id));
@@ -473,6 +535,36 @@ fn remove_data_source(s: &mut Session, p: &Value) -> CmdResult {
     ok()
 }
 
+/// The SSH password or passphrase from `sshPassword` (with `saveSshPassword`, default true):
+/// remembered for the session and saved in the keychain. An untyped one keeps the saved one,
+/// unless saving was turned off or the tunnel no longer needs a secret. Returns whether one was
+/// typed.
+fn store_ssh_secret(s: &mut Session, cfg: &mut DataSourceConfig, p: &Value, had_secret: bool) -> bool {
+    let account = cfg.ssh_secret_account();
+    let typed = p.get("sshPassword").and_then(Value::as_str).filter(|v| !v.is_empty()).map(str::to_string);
+    let save = bool_or(p, "saveSshPassword", true);
+    let needs = cfg.ssh.as_ref().is_some_and(|t| t.auth != codecraft_db::SshAuth::Agent);
+    let Some(t) = cfg.ssh.as_mut().filter(|_| needs) else {
+        if had_secret {
+            s.db.forget_password(&account, true);
+        }
+        return false;
+    };
+    match typed {
+        Some(secret) => {
+            s.db.store_password(&account, &secret, save);
+            t.secret_saved = save;
+            true
+        }
+        None if !save && t.secret_saved => {
+            s.db.forget_password(&account, true);
+            t.secret_saved = false;
+            false
+        }
+        None => false,
+    }
+}
+
 fn test_connection(s: &mut Session, p: &Value) -> CmdResult {
     sync_project(s);
     let (cfg, password) = if p.is_null() || p.as_object().is_some_and(|m| m.is_empty()) {
@@ -491,6 +583,13 @@ fn test_connection(s: &mut Session, p: &Value) -> CmdResult {
         let id = target_source(s, p)?;
         (s.db.source(&id).map(|d| d.config.clone()).unwrap_or_default(), None)
     };
+    let typed_ssh = match (p.is_null() || p.as_object().is_some_and(|m| m.is_empty()), &s.db.dialog) {
+        (true, Some(d)) => Some(d.form.ssh_password.clone()),
+        _ => p.get("sshPassword").and_then(Value::as_str).map(str::to_string),
+    };
+    if let Some(secret) = typed_ssh.filter(|v| !v.is_empty()) {
+        s.db.remember_secret(&cfg.ssh_secret_account(), &secret);
+    }
     s.status = format!("Testing connection to {}…", cfg.summary());
     let nonce = s.db.test(cfg, password);
     Ok(json!({ "testing": nonce }))

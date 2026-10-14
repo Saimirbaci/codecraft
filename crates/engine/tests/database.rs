@@ -690,8 +690,66 @@ fn ssh_tunnel_is_set_through_the_data_source_params_and_form() {
     assert_eq!(s.db.source(&id).unwrap().config.ssh_tunnel.as_deref(), Some("bastion"));
     let form = codecraft_engine::database::DataSourceForm::from_config(&s.db.source(&id).unwrap().config);
     assert_eq!(form.ssh_tunnel, "bastion");
-    assert_eq!(form.to_params()["sshTunnel"], json!("bastion"));
+    // The form edits it as the tunnel host (a server name still resolves to that server).
+    assert_eq!(form.ssh_host, "bastion");
+    assert_eq!(form.to_params()["ssh"]["host"], json!("bastion"));
+    assert_eq!(form.to_params()["sshTunnel"], json!(""));
     s.execute("db.editDataSource", &json!({ "dataSource": id, "sshTunnel": "" })).unwrap();
     assert_eq!(s.db.source(&id).unwrap().config.ssh_tunnel, None);
     assert!(s.execute("db.editDataSource", &json!({ "dataSource": id, "sshTunnel": 7 })).is_err());
+}
+
+#[test]
+fn ssh_tunnel_with_host_user_and_password_like_datagrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let mut s = session(&root);
+    let r = s
+        .execute(
+            "db.addDataSource",
+            &json!({
+                "kind": "postgres", "name": "Prod", "host": "10.0.0.5", "port": 5432,
+                "ssh": { "host": "203.0.113.7", "port": "22", "user": "ops", "auth": "password" },
+                "sshPassword": "hunter2",
+            }),
+        )
+        .unwrap();
+    let id = r["dataSource"].as_str().unwrap().to_string();
+    let cfg = s.db.source(&id).unwrap().config.clone();
+    let t = cfg.ssh.clone().unwrap();
+    assert_eq!((t.host.as_str(), t.port, t.user.as_str()), ("203.0.113.7", Some(22), "ops"));
+    assert_eq!(t.auth, codecraft_engine::db::SshAuth::Password);
+    assert!(t.secret_saved);
+    let saved = std::fs::read_to_string(root.join(".codecraft/datasources.json")).unwrap();
+    assert!(saved.contains("203.0.113.7") && !saved.contains("hunter2"), "no secrets in the project: {saved}");
+
+    // The form shows it and keeps the saved password when left empty.
+    let form = codecraft_engine::database::DataSourceForm::from_config(&cfg);
+    assert_eq!((form.ssh_host.as_str(), form.ssh_port.as_str(), form.ssh_user.as_str()), ("203.0.113.7", "22", "ops"));
+    let mut params = form.to_params();
+    params["dataSource"] = json!(id);
+    s.execute("db.editDataSource", &params).unwrap();
+    assert!(s.db.source(&id).unwrap().config.ssh.as_ref().unwrap().secret_saved);
+
+    // `user@host:port` in the host field fills the rest; agent authentication needs no secret.
+    s.execute(
+        "db.editDataSource",
+        &json!({ "dataSource": id, "ssh": { "host": "deploy@198.51.100.2:2200", "auth": "agent" } }),
+    )
+    .unwrap();
+    let t = s.db.source(&id).unwrap().config.ssh.clone().unwrap();
+    assert_eq!((t.host.as_str(), t.port, t.user.as_str(), t.secret_saved), ("198.51.100.2", Some(2200), "deploy", false));
+
+    // Bad values are errors.
+    for bad in [
+        json!({ "host": "-oProxyCommand=x" }),
+        json!({ "host": "h", "port": 0 }),
+        json!({ "host": "h", "auth": "telepathy" }),
+        json!({ "host": "h", "user": "a b" }),
+        json!(7),
+    ] {
+        assert!(s.execute("db.editDataSource", &json!({ "dataSource": id, "ssh": bad })).is_err(), "{bad}");
+    }
+    s.execute("db.editDataSource", &json!({ "dataSource": id, "ssh": null })).unwrap();
+    assert!(s.db.source(&id).unwrap().config.ssh.is_none());
 }

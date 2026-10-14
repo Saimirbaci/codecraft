@@ -111,9 +111,14 @@ pub struct DataSourceConfig {
     pub password_saved: bool,
     #[serde(default)]
     pub read_only: bool,
-    /// Connect through an SSH tunnel to this SSH server (`ssh -N -L`, M11 track S).
+    /// Connect through an SSH tunnel to this SSH server (`ssh -N -L`, M11 track S): a server
+    /// name from `~/.ssh/config` / Tools › Deployment, or `[user@]host[:port]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_tunnel: Option<String>,
+    /// An SSH tunnel defined on the data source itself (DataGrip's SSH/SSL tab); wins over
+    /// `ssh_tunnel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<SshTunnelConfig>,
     /// A colour name from [`DATA_SOURCE_COLORS`], shown on the tree node, consoles and results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
@@ -130,10 +135,118 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// How the SSH tunnel authenticates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SshAuth {
+    /// `~/.ssh/config`, the default keys and the SSH agent.
+    #[default]
+    Agent,
+    /// A private key file (its passphrase, if any, in the secret store).
+    Key,
+    /// A password (in the secret store).
+    Password,
+}
+
+impl SshAuth {
+    pub const ALL: [SshAuth; 3] = [SshAuth::Agent, SshAuth::Key, SshAuth::Password];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Key => "key",
+            Self::Password => "password",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "OpenSSH config and agent",
+            Self::Key => "Key pair",
+            Self::Password => "Password",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<SshAuth> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "agent" | "openssh" | "config" => Some(Self::Agent),
+            "key" | "keypair" | "key pair" => Some(Self::Key),
+            "password" => Some(Self::Password),
+            _ => None,
+        }
+    }
+}
+
+/// An SSH tunnel of one data source: `ssh -N -L 127.0.0.1:<port>:<db host>:<db port> user@host`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshTunnelConfig {
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub user: String,
+    pub auth: SshAuth,
+    /// Private key file for [`SshAuth::Key`] (`~/` allowed).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub identity_file: String,
+    /// The password or key passphrase is in the secret store (account [`DataSourceConfig::ssh_secret_account`]).
+    #[serde(skip_serializing_if = "is_false")]
+    pub secret_saved: bool,
+}
+
+impl SshTunnelConfig {
+    /// `[user@]host[:port]` (IPv6 hosts in brackets: `[::1]:22`).
+    pub fn parse_destination(s: &str) -> Option<SshTunnelConfig> {
+        let s = s.trim();
+        if s.is_empty() || s.starts_with('-') || s.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
+        let (user, rest) = match s.rsplit_once('@') {
+            Some((u, r)) if !u.is_empty() => (u.to_string(), r),
+            Some(_) => return None,
+            None => (String::new(), s),
+        };
+        let (host, port) = if let Some(r) = rest.strip_prefix('[') {
+            let (h, after) = r.split_once(']')?;
+            let port = match after.strip_prefix(':') {
+                Some(p) => Some(p.parse::<u16>().ok().filter(|p| *p > 0)?),
+                None if after.is_empty() => None,
+                None => return None,
+            };
+            (h.to_string(), port)
+        } else if rest.matches(':').count() == 1 {
+            let (h, p) = rest.split_once(':')?;
+            (h.to_string(), Some(p.parse::<u16>().ok().filter(|p| *p > 0)?))
+        } else {
+            (rest.to_string(), None)
+        };
+        if host.is_empty() || host.starts_with('-') {
+            return None;
+        }
+        Some(SshTunnelConfig { host, port, user, ..Default::default() })
+    }
+
+    /// `user@host:port` as shown to the user.
+    pub fn display(&self) -> String {
+        let host = if self.host.contains(':') { format!("[{}]", self.host) } else { self.host.clone() };
+        let mut out = if self.user.is_empty() { host } else { format!("{}@{host}", self.user) };
+        if let Some(p) = self.port {
+            out.push_str(&format!(":{p}"));
+        }
+        out
+    }
+}
+
 /// Data source colours (names; the UI maps them to theme colours).
 pub const DATA_SOURCE_COLORS: [&str; 7] = ["red", "orange", "yellow", "green", "blue", "violet", "gray"];
 
 impl DataSourceConfig {
+    /// The secret store account of the SSH tunnel's password or key passphrase.
+    pub fn ssh_secret_account(&self) -> String {
+        format!("{}:ssh", self.id)
+    }
+
     pub fn validate(&self) -> DbResult<()> {
         if self.kind.is_file_based() {
             match &self.path {
@@ -267,5 +380,48 @@ mod tests {
         assert!(cfg.ssl_mode().is_err());
         assert_eq!(DbKind::parse("PostgreSQL"), Some(DbKind::Postgres));
         assert_eq!(DbKind::parse("oracle"), None);
+    }
+}
+
+#[cfg(test)]
+mod ssh_tests {
+    use super::*;
+
+    #[test]
+    fn ssh_destinations_parse() {
+        let d = SshTunnelConfig::parse_destination("10.1.2.3").unwrap();
+        assert_eq!((d.host.as_str(), d.port, d.user.as_str()), ("10.1.2.3", None, ""));
+        let d = SshTunnelConfig::parse_destination("deploy@10.1.2.3:2222").unwrap();
+        assert_eq!((d.host.as_str(), d.port, d.user.as_str()), ("10.1.2.3", Some(2222), "deploy"));
+        assert_eq!(d.display(), "deploy@10.1.2.3:2222");
+        let d = SshTunnelConfig::parse_destination("me@[::1]:22").unwrap();
+        assert_eq!((d.host.as_str(), d.port), ("::1", Some(22)));
+        assert_eq!(d.display(), "me@[::1]:22");
+        let d = SshTunnelConfig::parse_destination("fe80::1").unwrap();
+        assert_eq!((d.host.as_str(), d.port), ("fe80::1", None));
+        for bad in ["", "-oProxyCommand=x", "a b", "@host", "host:0", "host:x", "[::1]x", "u@:22"] {
+            assert!(SshTunnelConfig::parse_destination(bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn ssh_config_round_trips_without_secrets() {
+        let cfg = DataSourceConfig {
+            id: "prod".into(),
+            ssh: Some(SshTunnelConfig {
+                host: "1.2.3.4".into(),
+                user: "ops".into(),
+                auth: SshAuth::Password,
+                secret_saved: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"auth\":\"password\"") && !json.contains("identity_file"), "{json}");
+        let back: DataSourceConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(cfg.ssh_secret_account(), "prod:ssh");
+        assert_eq!(SshAuth::parse("Key pair"), Some(SshAuth::Key));
     }
 }

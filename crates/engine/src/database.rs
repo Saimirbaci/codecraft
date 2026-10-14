@@ -263,13 +263,26 @@ pub struct DataSourceForm {
     pub confirm_writes: bool,
     /// Manual-commit transactions in consoles.
     pub manual_commit: bool,
-    /// SSH server to tunnel through (empty: connect directly).
+    /// SSH server to tunnel through (empty: connect directly). Older configurations; the form
+    /// edits the `ssh_*` fields.
     pub ssh_tunnel: String,
+    /// SSH tunnel host: a host name or IP, `user@host:port`, or a server of `~/.ssh/config`
+    /// (empty: connect directly).
+    pub ssh_host: String,
+    pub ssh_port: String,
+    pub ssh_user: String,
+    pub ssh_auth: codecraft_db::SshAuth,
+    /// Private key file for key-pair authentication.
+    pub ssh_key_file: String,
+    /// Never serialized; empty while editing keeps the saved password or passphrase.
+    #[serde(skip_serializing)]
+    pub ssh_password: String,
+    pub save_ssh_password: bool,
 }
 
 impl DataSourceForm {
     pub fn for_kind(kind: DbKind) -> Self {
-        let mut f = Self { kind, save_password: true, ..Self::default() };
+        let mut f = Self { kind, save_password: true, save_ssh_password: true, ..Self::default() };
         f.set_kind(kind);
         f
     }
@@ -306,6 +319,18 @@ impl DataSourceForm {
             confirm_writes: cfg.confirm_writes,
             manual_commit: cfg.manual_commit,
             ssh_tunnel: cfg.ssh_tunnel.clone().unwrap_or_default(),
+            ssh_host: cfg
+                .ssh
+                .as_ref()
+                .map(|t| t.host.clone())
+                .or_else(|| cfg.ssh_tunnel.clone())
+                .unwrap_or_default(),
+            ssh_port: cfg.ssh.as_ref().and_then(|t| t.port).map(|p| p.to_string()).unwrap_or_default(),
+            ssh_user: cfg.ssh.as_ref().map(|t| t.user.clone()).unwrap_or_default(),
+            ssh_auth: cfg.ssh.as_ref().map(|t| t.auth).unwrap_or_default(),
+            ssh_key_file: cfg.ssh.as_ref().map(|t| t.identity_file.clone()).unwrap_or_default(),
+            ssh_password: String::new(),
+            save_ssh_password: cfg.ssh.as_ref().is_none_or(|t| t.secret_saved),
         }
     }
 
@@ -314,6 +339,23 @@ impl DataSourceForm {
         let mut v = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if let Some(o) = v.as_object_mut() {
             o.insert("password".into(), serde_json::Value::String(self.password.clone()));
+            let host = self.ssh_host.trim();
+            let ssh = if host.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!({
+                    "host": host,
+                    "port": self.ssh_port.trim(),
+                    "user": self.ssh_user.trim(),
+                    "auth": self.ssh_auth.id(),
+                    "identityFile": self.ssh_key_file.trim(),
+                })
+            };
+            o.insert("ssh".into(), ssh);
+            // The `ssh` object replaces the older server-name field.
+            o.insert("sshTunnel".into(), serde_json::Value::String(String::new()));
+            o.insert("sshPassword".into(), serde_json::Value::String(self.ssh_password.clone()));
+            o.insert("saveSshPassword".into(), serde_json::Value::Bool(self.save_ssh_password));
             o.insert("options".into(), serde_json::to_value(parse_options(&self.options)).unwrap_or_default());
         }
         v
@@ -757,7 +799,7 @@ impl DbState {
         }
         let ds = self.source(source).ok_or_else(|| format!("no data source `{source}`"))?;
         let cfg = self.resolved(&ds.config);
-        let tunnel = self.tunnels.plan(&cfg)?;
+        let tunnel = self.plan_tunnel(&cfg)?;
         let password = self.worker_password(source);
         let secrets = self.secrets.clone();
         let events = self.tx.clone();
@@ -1014,7 +1056,7 @@ impl DbState {
     pub(crate) fn test(&mut self, cfg: DataSourceConfig, password: Option<String>) -> u64 {
         let nonce = self.next();
         let cfg = self.resolved(&cfg);
-        let tunnel = self.tunnels.plan(&cfg).map(|t| t.map(|t| t.keyed(format!("test:{nonce}"))));
+        let tunnel = self.plan_tunnel(&cfg).map(|t| t.map(|t| t.keyed(format!("test:{nonce}"))));
         let tunnels = self.tunnels.clone();
         let password = password.or_else(|| self.worker_password(&cfg.id));
         let secrets = self.secrets.clone();
@@ -1046,6 +1088,14 @@ impl DbState {
         nonce
     }
 
+    /// The SSH tunnel of a data source, with its password or passphrase from this session or
+    /// the keychain.
+    pub(crate) fn plan_tunnel(&self, cfg: &DataSourceConfig) -> Result<Option<crate::ssh_tunnel::TunnelPlan>, String> {
+        let account = cfg.ssh_secret_account();
+        let saved = cfg.ssh.as_ref().is_some_and(|t| t.secret_saved);
+        self.tunnels.plan_with(cfg, self.passwords.get(&account).cloned(), saved.then(|| self.secrets.clone()))
+    }
+
     /// Remember a password for the session, and save it in the keychain (in the background).
     pub(crate) fn store_password(&mut self, id: &str, password: &str, save: bool) {
         self.passwords.insert(id.to_string(), password.to_string());
@@ -1058,6 +1108,11 @@ impl DbState {
                 let _ = events.send(Event::SecretFailed(e.to_string()));
             }
         });
+    }
+
+    /// Remember a secret for this session only (Test Connection with a typed SSH password).
+    pub(crate) fn remember_secret(&mut self, account: &str, secret: &str) {
+        self.passwords.insert(account.to_string(), secret.to_string());
     }
 
     /// Forget a data source's password (session and keychain).

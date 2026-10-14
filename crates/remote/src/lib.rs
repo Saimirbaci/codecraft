@@ -27,7 +27,7 @@ pub mod rsync;
 pub mod server;
 pub mod ssh_config;
 
-pub use command::{Direction, RsyncSpec, SshOptions};
+pub use command::{Direction, RsyncSpec, SshOptions, TunnelAuth};
 pub use deploy::{DeploymentConfig, PathMapping, ServerDeployment};
 pub use listing::{EntryKind, RemoteEntry};
 pub use quote::sh_quote;

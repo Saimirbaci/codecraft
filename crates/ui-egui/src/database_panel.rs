@@ -708,12 +708,54 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                     ui.end_row();
                     ui.label("SSH tunnel");
                     ui.add(
-                        TextEdit::singleline(&mut f.ssh_tunnel)
-                            .hint_text("SSH server name (empty: connect directly)")
+                        TextEdit::singleline(&mut f.ssh_host)
+                            .hint_text("host, user@host:port or ~/.ssh/config host (empty: none)")
                             .desired_width(300.0),
                     )
-                    .on_hover_text("A server from ~/.ssh/config or Tools › Deployment; the connection goes through `ssh -L`");
+                    .on_hover_text(
+                        "Connect through `ssh -L`: an IP or host name, user@host:port, or a Host of ~/.ssh/config \
+                         or Tools › Deployment. The database host and port above are as seen from the SSH server.",
+                    );
                     ui.end_row();
+                    if !f.ssh_host.trim().is_empty() {
+                        ui.label("SSH port");
+                        ui.add(TextEdit::singleline(&mut f.ssh_port).hint_text("22").desired_width(80.0));
+                        ui.end_row();
+                        ui.label("SSH user");
+                        ui.add(TextEdit::singleline(&mut f.ssh_user).hint_text("from ~/.ssh/config or your login").desired_width(300.0));
+                        ui.end_row();
+                        ui.label("SSH auth");
+                        egui::ComboBox::from_id_salt("db-ssh-auth").selected_text(f.ssh_auth.label()).width(220.0).show_ui(ui, |ui| {
+                            for a in codecraft_engine::db::SshAuth::ALL {
+                                ui.selectable_value(&mut f.ssh_auth, a, a.label());
+                            }
+                        });
+                        ui.end_row();
+                        if f.ssh_auth == codecraft_engine::db::SshAuth::Key {
+                            ui.label("Private key");
+                            ui.horizontal(|ui| {
+                                ui.add(TextEdit::singleline(&mut f.ssh_key_file).hint_text("~/.ssh/id_ed25519").desired_width(240.0));
+                                if ui.button("…").on_hover_text("Choose the private key file").clicked()
+                                    && let Some(path) = rfd::FileDialog::new()
+                                        .set_directory(std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".ssh")).unwrap_or_default())
+                                        .pick_file()
+                                {
+                                    f.ssh_key_file = path.display().to_string();
+                                }
+                            });
+                            ui.end_row();
+                        }
+                        if f.ssh_auth != codecraft_engine::db::SshAuth::Agent {
+                            let what = if f.ssh_auth == codecraft_engine::db::SshAuth::Password { "SSH password" } else { "Key passphrase" };
+                            ui.label(what);
+                            let hint = if editing.is_some() { "<unchanged>" } else if f.ssh_auth == codecraft_engine::db::SshAuth::Key { "empty if the key has none" } else { "" };
+                            ui.add(TextEdit::singleline(&mut f.ssh_password).password(true).hint_text(hint).desired_width(300.0));
+                            ui.end_row();
+                            ui.label("");
+                            ui.checkbox(&mut f.save_ssh_password, format!("Save {} in the Keychain", what.to_lowercase()));
+                            ui.end_row();
+                        }
+                    }
                 }
                 ui.label("Colour");
                 let current = if f.color.is_empty() { "None".to_string() } else { f.color.clone() };
