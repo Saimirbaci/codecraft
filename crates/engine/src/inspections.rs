@@ -356,6 +356,10 @@ pub struct InspectionsState {
     pub programs: HashMap<Tool, PathBuf>,
     /// Fixes waiting in the refactoring preview.
     pub(crate) pending: Option<fixes::Pending>,
+    /// Run Inspection by Name: the running job keeps only this inspection's findings.
+    pub only: Option<String>,
+    /// Silent Code Cleanup: the running cleanup applies without the preview.
+    pub silent: bool,
 }
 
 impl InspectionsState {
@@ -488,6 +492,8 @@ pub(crate) struct JobSpec {
     pub programs: HashMap<Tool, PathBuf>,
     /// Code Cleanup formats the scope's files after fixing.
     pub format: bool,
+    /// Run Inspection by Name: a lint to turn on (`-W lint`) and keep alone in the results.
+    pub only: Option<String>,
 }
 
 /// Start Inspect Code or Code Cleanup on a scope (cancelling a run in progress).
@@ -499,10 +505,28 @@ pub(crate) fn start(
     tools: Option<Vec<Tool>>,
     format: bool,
 ) -> Result<(), CommandError> {
+    start_with(s, kind, scope_kind, path, tools, format, None, false)
+}
+
+/// [`start`] for Run Inspection by Name (`only`: keep just this inspection) and Silent Code
+/// Cleanup (`silent`: apply without the preview).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_with(
+    s: &mut Session,
+    kind: JobKind,
+    scope_kind: ScopeKind,
+    path: Option<PathBuf>,
+    tools: Option<Vec<Tool>>,
+    format: bool,
+    only: Option<String>,
+    silent: bool,
+) -> Result<(), CommandError> {
     let scope = resolve_scope(s, scope_kind, path)?;
     // Linters read the disk: save first, like RustRover does before running external tools.
     s.save_all()?;
     cancel(s);
+    s.inspections.only = only.clone();
+    s.inspections.silent = silent;
     let root = s.project_root().ok_or_else(|| CommandError::Failed("no project is open".into()))?;
     let cargo = s.ws.project.as_ref().and_then(|p| p.cargo.as_ref());
     let cargo_root = match cargo {
@@ -527,6 +551,7 @@ pub(crate) fn start(
         programs: s.inspections.programs.clone(),
         format,
         scope,
+        only,
     };
     let scope_value = spec.scope.scope.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -595,7 +620,12 @@ pub(crate) fn pump(s: &mut Session) -> bool {
 }
 
 fn finish(s: &mut Session, out: JobOutput) {
-    let JobOutput { results, rewrites, cleanup_errors, .. } = out;
+    let JobOutput { mut results, rewrites, cleanup_errors, .. } = out;
+    if let Some(only) = s.inspections.only.take() {
+        keep_only(&mut results, &only);
+        results.scope_label = format!("'{only}' in {}", results.scope_label);
+    }
+    let silent = std::mem::take(&mut s.inspections.silent);
     let kind = results.kind;
     let failed: Vec<String> =
         results.tools.iter().filter(|t| !t.ok).map(|t| format!("{}: {}", t.tool.label(), t.outcome)).collect();
@@ -619,8 +649,35 @@ fn finish(s: &mut Session, out: JobOutput) {
         }
         if let Err(e) = fixes::open_rewrites(s, "Code Cleanup", &rewrites) {
             s.notify(NotificationLevel::Error, "Code Cleanup", e.to_string());
+            return;
+        }
+        // Silent Code Cleanup applies at once (the pending fixes settle in the next pump).
+        if silent && let Some(pv) = s.refactor.preview.take_if(|pv| pv.title == "Code Cleanup") {
+            let report = s.apply_preview(&pv);
+            s.status = format!("Silent Code Cleanup: {} file(s) changed", report.applied);
+            if !report.errors.is_empty() {
+                s.notify(NotificationLevel::Error, "Silent Code Cleanup", report.errors.join("\n"));
+            }
+            s.refactor.last_report = Some(report);
         }
     }
+}
+
+/// Keep the findings of one inspection (by name, lint code or the name without its tool
+/// prefix), renumbered.
+pub(crate) fn keep_only(results: &mut InspectionResults, only: &str) {
+    let only = only.trim();
+    let bare = |s: &str| s.rsplit("::").next().unwrap_or(s).to_string();
+    results.findings.retain(|f| {
+        f.inspection == only
+            || f.code.as_deref() == Some(only)
+            || f.inspection.split_whitespace().next() == Some(only)
+            || (!only.contains("::") && bare(&f.inspection) == only)
+    });
+    for (i, f) in results.findings.iter_mut().enumerate() {
+        f.id = i;
+    }
+    results.resolved.clear();
 }
 
 // ---------------------------------------------------------------- the worker

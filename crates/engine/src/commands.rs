@@ -193,6 +193,18 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::python_cmds::specs());
         specs.extend(crate::profiler_cmds::specs());
         specs.extend(crate::sql_lang_cmds::specs());
+        specs.extend(crate::ssr_cmds::specs());
+        specs.extend(crate::macros::specs());
+        specs.extend(crate::presentation::specs());
+        specs.extend(crate::analysis::specs());
+        specs.extend(crate::duplicates::specs());
+        specs.extend(crate::data_flow::specs());
+        specs.extend(crate::layouts::specs());
+        specs.extend(crate::file_templates::specs());
+        specs.extend(crate::copyright::specs());
+        specs.extend(crate::tasks_contexts::specs());
+        specs.extend(crate::markdown_export::specs());
+        specs.extend(crate::inline_completion::specs());
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {

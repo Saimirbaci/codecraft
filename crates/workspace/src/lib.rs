@@ -73,6 +73,57 @@ pub struct BackgroundTask {
     pub percentage: Option<u32>,
 }
 
+/// Code › Analyze Code › Configure Current File Analysis: how much of a file's analysis is
+/// highlighted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AnalysisLevel {
+    /// No problems are highlighted.
+    None,
+    /// Only syntax errors (errors without a compiler error code).
+    Syntax,
+    /// Errors and warnings (no weak warnings or hints).
+    Essential,
+    /// Everything.
+    #[default]
+    All,
+}
+
+impl AnalysisLevel {
+    pub const ALL: [AnalysisLevel; 4] = [Self::None, Self::Syntax, Self::Essential, Self::All];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Syntax => "Syntax",
+            Self::Essential => "Essential",
+            Self::All => "All Problems",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" => Some(Self::None),
+            "syntax" => Some(Self::Syntax),
+            "essential" => Some(Self::Essential),
+            "all" | "all problems" | "inspections" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// Whether a problem is highlighted at this level.
+    pub fn shows(self, p: &Problem) -> bool {
+        match self {
+            Self::None => false,
+            Self::Syntax => {
+                p.severity == Severity::Error
+                    && p.code.as_deref().is_none_or(|c| c.to_ascii_lowercase().contains("syntax"))
+            }
+            Self::Essential => matches!(p.severity, Severity::Error | Severity::Warning),
+            Self::All => true,
+        }
+    }
+}
+
 /// Results shown in the Find tool window (Find in Files, Find Usages).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindResults {
@@ -325,6 +376,8 @@ pub struct Workspace {
     pub settings: Settings,
     pub recent_files: Vec<PathBuf>,
     pub recent_projects: Vec<PathBuf>,
+    /// Per-file highlighting level (Configure Current File Analysis); files not listed: All.
+    pub analysis_levels: BTreeMap<PathBuf, AnalysisLevel>,
     history: Vec<Location>,
     history_pos: usize,
     next_doc: u64,
@@ -821,6 +874,18 @@ impl Workspace {
             .collect();
         v.sort_by_key(|p| (p.start, p.severity));
         v
+    }
+
+    /// The highlighting level of a file (Configure Current File Analysis).
+    pub fn analysis_level(&self, path: &Path) -> AnalysisLevel {
+        self.analysis_levels.get(path).copied().unwrap_or_default()
+    }
+
+    /// The problems the editor highlights in a file: [`Workspace::problems_for`] filtered by the
+    /// file's analysis level.
+    pub fn highlighted_problems_for(&self, path: &Path) -> Vec<&Problem> {
+        let level = self.analysis_level(path);
+        self.problems_for(path).into_iter().filter(|p| level.shows(p)).collect()
     }
 
     /// Every problem, grouped by file (sorted by path).

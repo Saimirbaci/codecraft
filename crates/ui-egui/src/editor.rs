@@ -206,6 +206,8 @@ struct Decor<'a> {
     inlays: &'a [codecraft_workspace::InlayHint],
     /// Uncommitted IME composition: char offset and text.
     preedit: Option<(usize, &'a str)>,
+    /// `preedit` is an inline completion proposal (ghost text: muted, caret before it).
+    ghost: bool,
     /// Show Whitespaces (and which).
     whitespace: Option<WhitespaceMode>,
 }
@@ -325,11 +327,15 @@ fn layout_line(
         {
             let start = *gi;
             *gi += text.chars().count();
-            let fmt = TextFormat {
-                font_id: font.clone(),
-                color: theme.text_editor,
-                underline: Stroke::new(1.0, theme.text_editor),
-                ..TextFormat::default()
+            let fmt = if decor.ghost {
+                TextFormat { font_id: font.clone(), color: theme.text_muted, italics: true, ..TextFormat::default() }
+            } else {
+                TextFormat {
+                    font_id: font.clone(),
+                    color: theme.text_editor,
+                    underline: Stroke::new(1.0, theme.text_editor),
+                    ..TextFormat::default()
+                }
             };
             job.append(text, 0.0, fmt);
             virtuals.push(VirtualSpan { what: Virtual::Preedit, galley: start..*gi });
@@ -676,7 +682,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let Some(editor) = s.ws.editor(eid).cloned() else { return };
     let path = s.ws.doc(editor.doc).and_then(|d| d.path.clone());
     let problems: Vec<Problem> =
-        path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
+        path.as_deref().map(|p| s.ws.highlighted_problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
     // Highlight Usages in File (until Escape), while the document is unchanged.
     let usage_ranges: Vec<std::ops::Range<usize>> = s
@@ -706,6 +712,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     // A box selection reaching past line ends (its carets are drawn in virtual space).
     let vbox = s.column_box(eid);
     let preedit = ime_preedit(ui, editor_id(eid));
+    // An inline completion proposal draws like a pre-edit (unless the IME is composing).
+    let ghost = if preedit.is_none() { codecraft_engine::inline_completion::ghost_text(s, eid) } else { None };
     let crumbs_shown = s.ws.doc(editor.doc).is_some_and(|d| crate::navbar::has_breadcrumbs(d.language));
     codecraft_engine::sql_lang::refresh(s, editor.doc);
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
@@ -723,7 +731,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         } else {
             &[]
         },
-        preedit: preedit.as_ref().map(|(t, _)| (editor.selections.primary().head, t.as_str())),
+        preedit: preedit
+            .as_ref()
+            .map(|(t, _)| (editor.selections.primary().head, t.as_str()))
+            .or_else(|| ghost.as_ref().map(|(o, t)| (*o, t.as_str()))),
+        ghost: ghost.is_some(),
         whitespace: settings.show_whitespace.then_some(settings.whitespace_mode),
     };
     let folds = od.cached_folds();
@@ -1078,7 +1090,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         }
         // Carets (the primary one after the IME pre-edit; box carets in virtual space).
         let preedit_x = r.ll.virtuals.iter().find(|v| v.what == Virtual::Preedit).map(|v| {
-            let cursor = preedit.as_ref().map_or(v.galley.len(), |(_, c)| (*c).min(v.galley.len()));
+            // The caret stays before ghost text (an inline proposal).
+            let cursor =
+                if ghost.is_some() { 0 } else { preedit.as_ref().map_or(v.galley.len(), |(_, c)| (*c).min(v.galley.len())) };
             text_x0 - scroll_x + r.gx(v.galley.start + cursor)
         });
         for sel in editor.selections.ranges() {

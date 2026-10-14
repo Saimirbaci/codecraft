@@ -113,53 +113,72 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
     let frame =
         Frame::new().fill(st.theme.panel_bg).inner_margin(Margin::same(6)).stroke(Stroke::new(1.0, st.theme.border));
+    // Sizes set by commands (Stretch, layouts) apply through a new panel id; a maximized tool
+    // window fills the window (Window › Active Tool Window › Maximize Tool Window).
+    let rev = s.ws.layout.size_rev;
+    let maximized = s.ws.layout.maximized;
     if let Some(tw) = s.ws.layout.bottom {
         let size = s.ws.layout.size_of(tw, s.ws.layout.bottom_height);
-        let resp = egui::Panel::bottom(format!("tw-bottom-{}", tw.key()))
+        let mut panel = egui::Panel::bottom(format!("tw-bottom-{}-{rev}", tw.key()))
             .resizable(true)
             .default_size(size)
             .size_range(80.0..=1200.0)
-            .frame(frame)
-            .show(ui, |ui| {
-                if header(ui, st, tw.title()) {
-                    s.ws.layout.hide(tw);
-                }
-                tool_window(ui, s, st, tw);
-            });
-        s.ws.layout.bottom_height = resp.response.rect.height();
-        s.ws.layout.remember_size(tw, s.ws.layout.bottom_height);
+            .frame(frame);
+        if maximized == Some(tw) {
+            panel = panel.resizable(false).exact_size((ui.available_height() - 60.0).max(80.0));
+        }
+        let resp = panel.show(ui, |ui| {
+            if header(ui, st, tw.title()) {
+                s.ws.layout.hide(tw);
+            }
+            tool_window(ui, s, st, tw);
+        });
+        if maximized != Some(tw) {
+            s.ws.layout.bottom_height = resp.response.rect.height();
+            s.ws.layout.remember_size(tw, s.ws.layout.bottom_height);
+        }
     }
     if let Some(tw) = s.ws.layout.left {
         let size = s.ws.layout.size_of(tw, s.ws.layout.left_width);
-        let resp = egui::Panel::left(format!("tw-left-{}", tw.key()))
+        let mut panel = egui::Panel::left(format!("tw-left-{}-{rev}", tw.key()))
             .resizable(true)
             .default_size(size)
             .size_range(140.0..=900.0)
-            .frame(frame)
-            .show(ui, |ui| {
-                if header(ui, st, tw.title()) {
-                    s.ws.layout.hide(tw);
-                }
-                tool_window(ui, s, st, tw);
-            });
-        s.ws.layout.left_width = resp.response.rect.width();
-        s.ws.layout.remember_size(tw, s.ws.layout.left_width);
+            .frame(frame);
+        if maximized == Some(tw) {
+            panel = panel.resizable(false).exact_size((ui.available_width() - 60.0).max(140.0));
+        }
+        let resp = panel.show(ui, |ui| {
+            if header(ui, st, tw.title()) {
+                s.ws.layout.hide(tw);
+            }
+            tool_window(ui, s, st, tw);
+        });
+        if maximized != Some(tw) {
+            s.ws.layout.left_width = resp.response.rect.width();
+            s.ws.layout.remember_size(tw, s.ws.layout.left_width);
+        }
     }
     if let Some(tw) = s.ws.layout.right {
         let size = s.ws.layout.size_of(tw, s.ws.layout.right_width);
-        let resp = egui::Panel::right(format!("tw-right-{}", tw.key()))
+        let mut panel = egui::Panel::right(format!("tw-right-{}-{rev}", tw.key()))
             .resizable(true)
             .default_size(size)
             .size_range(160.0..=900.0)
-            .frame(frame)
-            .show(ui, |ui| {
-                if header(ui, st, tw.title()) {
-                    s.ws.layout.hide(tw);
-                }
-                tool_window(ui, s, st, tw);
-            });
-        s.ws.layout.right_width = resp.response.rect.width();
-        s.ws.layout.remember_size(tw, s.ws.layout.right_width);
+            .frame(frame);
+        if maximized == Some(tw) {
+            panel = panel.resizable(false).exact_size((ui.available_width() - 60.0).max(160.0));
+        }
+        let resp = panel.show(ui, |ui| {
+            if header(ui, st, tw.title()) {
+                s.ws.layout.hide(tw);
+            }
+            tool_window(ui, s, st, tw);
+        });
+        if maximized != Some(tw) {
+            s.ws.layout.right_width = resp.response.rect.width();
+            s.ws.layout.remember_size(tw, s.ws.layout.right_width);
+        }
     }
 }
 
@@ -456,7 +475,34 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
     let active = s.ws.active_run.filter(|a| tabs.iter().any(|(id, _, _)| id == a)).or_else(|| tabs.last().map(|t| t.0));
     let mut select = None;
     let mut close = None;
+    // Window › Active Tool Window › Group Tabs: the tabs as one list.
+    if s.ws.layout.group_tabs {
+        ui.horizontal(|ui| {
+            let current = tabs.iter().find(|(id, ..)| Some(*id) == active).map(|(_, t, _)| t.clone()).unwrap_or_default();
+            egui::ComboBox::from_id_salt(("run-tabs", build)).selected_text(format!("{current}  ({} tabs)", tabs.len())).show_ui(ui, |ui| {
+                for (id, title, status) in &tabs {
+                    let mark = match status {
+                        RunStatus::Running => "●",
+                        RunStatus::Succeeded => "✓",
+                        RunStatus::Failed(_) => "✖",
+                        RunStatus::Stopped => "■",
+                    };
+                    if ui.selectable_label(Some(*id) == active, format!("{mark} {title}")).clicked() {
+                        select = Some(*id);
+                    }
+                }
+            });
+            if let Some(a) = active
+                && ui.add(egui::Button::new(RichText::new("×").color(theme.text_muted)).frame(false)).clicked()
+            {
+                close = Some(a);
+            }
+        });
+    }
     ui.horizontal(|ui| {
+        if s.ws.layout.group_tabs {
+            return;
+        }
         for (id, title, status) in &tabs {
             let (mark, color) = match status {
                 RunStatus::Running => ("●", theme.success),

@@ -26,6 +26,12 @@ pub fn args(clippy: bool) -> Vec<String> {
     vec![sub.into(), "--message-format=json".into(), "--all-targets".into()]
 }
 
+/// A rustc or Clippy lint name (`unused_variables`, `clippy::unwrap_used`) safe to pass to `-W`.
+pub fn is_lint_name(s: &str) -> bool {
+    let bare = s.strip_prefix("clippy::").unwrap_or(s);
+    !bare.is_empty() && bare.len() <= 80 && bare.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 /// Whether a failed `cargo clippy` means Clippy is not installed (rather than a build error).
 pub fn clippy_missing(stderr: &[String]) -> bool {
     stderr.iter().any(|l| {
@@ -48,7 +54,11 @@ pub(crate) fn run(
     let mut clippy = spec.use_clippy && !spec.tools.as_ref().is_some_and(|t| t == &[Tool::CargoCheck]);
     let mut note = String::new();
     loop {
-        let args = args(clippy);
+        let mut args = args(clippy);
+        // Run Inspection by Name turns the lint on (allow-by-default Clippy lints included).
+        if clippy && let Some(lint) = spec.only.as_deref().filter(|l| is_lint_name(l)) {
+            args.extend(["--".to_string(), "-W".to_string(), lint.to_string()]);
+        }
         let command_line = format!("cargo {}", args.join(" "));
         progress(&format!("Running {command_line}…"));
         let out = run_process(&program, &args, cargo_root, cancel, progress)?;
