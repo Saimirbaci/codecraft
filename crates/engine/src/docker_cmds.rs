@@ -796,13 +796,13 @@ esac
         assert!(
             s.execute("tools.services.dockerRegistry", &json!({ "login": true, "registry": "--password=x" })).is_err()
         );
+        // Both terminals start asynchronously, in either order.
         let start = Instant::now();
-        while !calls(&dir).contains("login ghcr.io") {
+        while !(calls(&dir).contains("login ghcr.io") && calls(&dir).contains("exec -it c1 sh -c")) {
             assert!(start.elapsed() < Duration::from_secs(20), "{}", calls(&dir));
             s.pump();
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(calls(&dir).contains("exec -it c1 sh -c"));
         s.shutdown();
     }
 

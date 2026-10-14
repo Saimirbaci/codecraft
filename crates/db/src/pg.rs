@@ -235,6 +235,39 @@ impl Connection for PgConn {
         Ok(pager.finish(columns, affected))
     }
 
+    fn transaction_status(&mut self) -> crate::tx::TxStatus {
+        use crate::tx::TxStatus;
+        if self.client.is_closed() {
+            return TxStatus::Unknown;
+        }
+        // The simple protocol runs the probe as one statement: outside a transaction block its
+        // implicit transaction starts with the statement, so the two timestamps are equal;
+        // inside a block now() is the block's start. A failed block refuses every query.
+        match self.client.simple_query("SELECT now() <> statement_timestamp()") {
+            Ok(msgs) => {
+                let v = msgs.iter().find_map(|m| match m {
+                    postgres::SimpleQueryMessage::Row(r) => r.get(0).map(str::to_string),
+                    _ => None,
+                });
+                match v.as_deref() {
+                    Some("t") => TxStatus::Active,
+                    Some("f") => TxStatus::Idle,
+                    _ => TxStatus::Unknown,
+                }
+            }
+            Err(e) if e.code() == Some(&SqlState::IN_FAILED_SQL_TRANSACTION) => TxStatus::Failed,
+            Err(_) => TxStatus::Unknown,
+        }
+    }
+
+    fn is_broken(&mut self) -> bool {
+        self.client.is_closed()
+    }
+
+    fn ping(&mut self) -> DbResult<()> {
+        self.client.simple_query("SELECT 1").map(|_| ()).map_err(err)
+    }
+
     fn database_info(&mut self) -> DbResult<DatabaseInfo> {
         let databases = self
             .rows(

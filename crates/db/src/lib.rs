@@ -18,7 +18,9 @@
     clippy::unreachable
 )]
 
+pub mod compare;
 mod config;
+pub mod dump;
 pub mod edit;
 pub mod explain;
 pub mod export;
@@ -31,6 +33,7 @@ pub mod secrets;
 pub mod split;
 pub mod sql;
 mod sqlite;
+pub mod tx;
 pub mod value;
 
 use std::sync::Arc;
@@ -272,6 +275,24 @@ pub trait Connection: Send {
     /// Whether a transaction is open, when the driver can tell (SQLite); `None` otherwise.
     fn in_transaction(&mut self) -> Option<bool> {
         None
+    }
+    /// The transaction status as the server sees it (see [`tx::TxStatus`]); may run a short
+    /// query. `Unknown` when the driver cannot tell.
+    fn transaction_status(&mut self) -> tx::TxStatus {
+        match self.in_transaction() {
+            Some(true) => tx::TxStatus::Active,
+            Some(false) => tx::TxStatus::Idle,
+            None => tx::TxStatus::Unknown,
+        }
+    }
+    /// The connection to the server is gone (a dropped socket, a killed backend): it must be
+    /// reopened, and whatever transaction it had was rolled back by the server.
+    fn is_broken(&mut self) -> bool {
+        false
+    }
+    /// A cheap round trip (keep-alive, liveness check).
+    fn ping(&mut self) -> DbResult<()> {
+        self.execute("SELECT 1", 1, &mut tx::Discard).map(|_| ())
     }
 }
 

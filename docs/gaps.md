@@ -453,3 +453,19 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `params`, keep logs in memory (last 20) and have no "run from caret"; no schema selector for
     SQLite; Go to Database Object has no menu item (RustRover has none); rename covers table
     aliases and CTEs, not column aliases.
+40. Database transactions and data tools (track DB): the grid submits inside an open transaction
+    with a savepoint (it used to commit the user's transaction), COMMIT of a failed PostgreSQL
+    transaction reports the rollback, the transaction state comes from the server, grid submit
+    errors name the failing row; Auto/Manual mode and isolation per console or data source, a
+    transaction indicator, and a Commit/Rollback/Cancel guard on disconnect, closing a console or
+    the project, and quit; query timeout and real cancel; keep-alive and safe reconnect (reads
+    retried once, writes and transactions never); Compare Data with a sync script; pg_dump /
+    mysqldump / SQLite dump and restore; streamed export; full-text search. Remaining: closing a
+    secondary project window isn't guarded (its transactions roll back at shutdown, logged), nor
+    is opening another project in the same window; editing only a data source's name still asks;
+    MySQL transaction state is tracked from statements and MySQL is untested here (no server);
+    the timeout covers the time to the first rows (client side, no server `statement_timeout`);
+    no savepoint commands; Compare Data keeps 5,000 differences per kind and needs keys that sort
+    alike on both sides; no live progress for psql/pg_restore input; tool paths only per data
+    source; full-text search is LIKE/ILIKE without full-text indexes or paging; Data Tools forms
+    have no schema/table pickers; exported INSERTs can't target another dialect.

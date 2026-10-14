@@ -15,6 +15,7 @@ mod approvals_ui;
 mod bookmarks_panel;
 mod chrome;
 mod data_grid;
+mod database_data_ui;
 mod database_dialogs;
 mod database_editor_ui;
 mod database_panel;
@@ -571,6 +572,7 @@ impl App {
         http_ui::windows(ui, s, st);
         database_editor_ui::windows(ui, s, st);
         appearance_ui::windows(ui, s, st);
+        database_data_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         windows::capture(ui.ctx(), st);
@@ -632,6 +634,12 @@ impl eframe::App for App {
             self.fonts_installed = true;
         }
         Self::window_logic(ctx, &mut self.session, &mut self.ui);
+        // Quitting with open database transactions asks Commit / Rollback / Cancel first.
+        if ctx.input(|i| i.viewport().close_requested())
+            && codecraft_engine::database::tx::quit_blocked(&mut self.session)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
         self.autosave_state();
         // The native menu shows the focused window's enabled states.
         let focused = self.windows.focused(ctx).and_then(|i| self.windows.session(i));

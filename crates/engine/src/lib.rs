@@ -338,6 +338,10 @@ impl Session {
             return Err(CommandError::Unknown(id.to_string()));
         };
         (spec.enabled)(self).map_err(CommandError::Disabled)?;
+        // Closing connections with an open transaction asks Commit / Rollback / Cancel first.
+        if let Some(r) = database::tx::intercept(self, spec.id, params) {
+            return r;
+        }
         let run = spec.run;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self, params)));
         // Other views of an edited document follow the edit (split editors).

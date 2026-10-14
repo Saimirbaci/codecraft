@@ -8,7 +8,9 @@
 //! Shift+click and Shift+arrows extend the selection to a block of cells (or rows); the status
 //! line then shows count/sum/avg/min/max of the block, and Copy As offers several formats.
 
-use egui::{Align2, CornerRadius, CursorIcon, Event, FontId, Id, Key, Rect, ScrollArea, Sense, Stroke, pos2, vec2};
+use egui::{
+    Align2, CornerRadius, CursorIcon, Event, FontId, Id, Key, Rect, ScrollArea, Sense, Stroke, StrokeKind, pos2, vec2,
+};
 
 use codecraft_engine::database::{CellView, GridEdits, RowState};
 use codecraft_engine::db::{Cell, Column};
@@ -346,6 +348,15 @@ pub fn show(ui: &mut egui::Ui, id: Id, state: &mut GridState, data: &GridData<'_
                 painter.rect_filled(rect, CornerRadius::ZERO, theme.diff_removed_bg);
             } else if r % 2 == 1 {
                 painter.rect_filled(rect, CornerRadius::ZERO, theme.caret_row);
+            }
+            // The row whose change failed in the last submit.
+            if data.edits.is_some_and(|e| e.failed_row == Some(r)) {
+                painter.rect_stroke(
+                    rect.shrink(0.5),
+                    CornerRadius::ZERO,
+                    Stroke::new(1.5, theme.error),
+                    StrokeKind::Inside,
+                );
             }
             // Row number.
             let num_rect = Rect::from_min_size(rect.min, vec2(num_w, ROW_H));

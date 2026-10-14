@@ -24,6 +24,28 @@ pub(crate) struct MyConn {
     opts: Opts,
     kind: DbKind,
     default_db: Option<String>,
+    /// The connection failed at the transport level (it must be reopened).
+    broken: std::cell::Cell<bool>,
+    /// The server rolled the transaction back (deadlock) since the last status check.
+    rolled_back: std::cell::Cell<bool>,
+}
+
+/// ER_LOCK_DEADLOCK: InnoDB rolled back the whole transaction.
+const LOCK_DEADLOCK: u16 = 1213;
+
+/// Map an error, noting a lost connection or a transaction the server rolled back.
+fn tracked(broken: &std::cell::Cell<bool>, rolled_back: &std::cell::Cell<bool>, e: mysql::Error) -> DbError {
+    match &e {
+        mysql::Error::IoError(_) | mysql::Error::CodecError(_) => broken.set(true),
+        mysql::Error::DriverError(
+            mysql::DriverError::PacketOutOfSync | mysql::DriverError::UnexpectedPacket | mysql::DriverError::Timeout,
+        ) => broken.set(true),
+        // ER_SERVER_SHUTDOWN, ER_CONNECTION_KILLED (MariaDB).
+        mysql::Error::MySqlError(m) if m.code == 1053 || m.code == 1927 => broken.set(true),
+        mysql::Error::MySqlError(m) if m.code == LOCK_DEADLOCK => rolled_back.set(true),
+        _ => {}
+    }
+    err(e)
 }
 
 struct MyCancel {
@@ -138,14 +160,22 @@ impl MyConn {
             conn.query_drop("SET SESSION TRANSACTION READ ONLY")
                 .map_err(|e| DbError::Connect(format!("cannot make the session read-only: {e}")))?;
         }
-        Ok(Self { conn, opts, kind: cfg.kind, default_db: db })
+        Ok(Self {
+            conn,
+            opts,
+            kind: cfg.kind,
+            default_db: db,
+            broken: std::cell::Cell::new(false),
+            rolled_back: std::cell::Cell::new(false),
+        })
     }
 
     fn strings(&mut self, sql: &str, params: Vec<Value>) -> DbResult<Vec<Vec<Option<String>>>> {
+        let (broken, rb) = (&self.broken, &self.rolled_back);
         let rows: Vec<mysql::Row> = if params.is_empty() {
-            self.conn.query(sql).map_err(err)?
+            self.conn.query(sql).map_err(|e| tracked(broken, rb, e))?
         } else {
-            self.conn.exec(sql, mysql::Params::Positional(params)).map_err(err)?
+            self.conn.exec(sql, mysql::Params::Positional(params)).map_err(|e| tracked(broken, rb, e))?
         };
         Ok(rows.iter().map(|r| (0..r.len()).map(|i| r.as_ref(i).and_then(value_string)).collect()).collect())
     }
@@ -178,7 +208,8 @@ impl Connection for MyConn {
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary> {
         let started = Instant::now();
         let id = self.conn.connection_id();
-        let mut result = self.conn.query_iter(sql).map_err(err)?;
+        let (broken, rb) = (&self.broken, &self.rolled_back);
+        let mut result = self.conn.query_iter(sql).map_err(|e| tracked(broken, rb, e))?;
         let meta: Vec<(ColumnType, u16)> =
             result.columns().as_ref().iter().map(|c| (c.column_type(), c.character_set())).collect();
         let columns: Vec<Column> = result
@@ -191,7 +222,7 @@ impl Connection for MyConn {
         let mut pager = Pager::new(sink, page_size, started);
         let mut abandoned = false;
         for row in result.by_ref() {
-            let row = row.map_err(err)?;
+            let row = row.map_err(|e| tracked(broken, rb, e))?;
             let cells = meta.iter().enumerate().map(|(i, (ty, cs))| cell(row.as_ref(i), *ty, *cs)).collect();
             if !pager.push(cells) {
                 abandoned = true;
@@ -205,6 +236,36 @@ impl Connection for MyConn {
         let affected = columns.is_empty().then(|| result.affected_rows());
         drop(result);
         Ok(pager.finish(columns, affected))
+    }
+
+    fn transaction_status(&mut self) -> crate::tx::TxStatus {
+        use crate::tx::TxStatus;
+        if self.broken.get() {
+            return TxStatus::Unknown;
+        }
+        if self.rolled_back.replace(false) {
+            return TxStatus::Idle;
+        }
+        if self.kind == DbKind::Mariadb {
+            // MariaDB reports it; MySQL has no such variable (the statements tell).
+            if let Ok(rows) = self.strings("SELECT @@in_transaction", Vec::new()) {
+                match rows.first().map(|r| col(r, 0)).as_deref() {
+                    Some("1") => return TxStatus::Active,
+                    Some("0") => return TxStatus::Idle,
+                    _ => {}
+                }
+            }
+        }
+        TxStatus::Unknown
+    }
+
+    fn is_broken(&mut self) -> bool {
+        self.broken.get()
+    }
+
+    fn ping(&mut self) -> DbResult<()> {
+        let (broken, rb) = (&self.broken, &self.rolled_back);
+        self.conn.query_drop("SELECT 1").map_err(|e| tracked(broken, rb, e))
     }
 
     fn database_info(&mut self) -> DbResult<DatabaseInfo> {
@@ -318,5 +379,22 @@ mod tests {
         assert_eq!(cell(None, ColumnType::MYSQL_TYPE_LONG, 33), Cell::Null);
         assert_eq!(type_name(ColumnType::MYSQL_TYPE_VARCHAR), "varchar");
         assert_eq!(value_string(&Value::Time(true, 1, 2, 3, 4, 0)).unwrap(), "-26:03:04");
+    }
+
+    #[test]
+    fn errors_note_lost_connections_and_server_rollbacks() {
+        let (broken, rb) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+        let my = |code: u16| {
+            mysql::Error::MySqlError(mysql::MySqlError { state: "40001".into(), message: "x".into(), code })
+        };
+        let e = tracked(&broken, &rb, my(LOCK_DEADLOCK));
+        assert!(matches!(e, DbError::Query(_)) && rb.get() && !broken.get());
+        assert_eq!(tracked(&broken, &rb, my(QUERY_INTERRUPTED)), DbError::Cancelled);
+        let io = mysql::Error::IoError(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "gone"));
+        tracked(&broken, &rb, io);
+        assert!(broken.get());
+        let (broken, rb) = (std::cell::Cell::new(false), std::cell::Cell::new(false));
+        tracked(&broken, &rb, my(1927));
+        assert!(broken.get());
     }
 }
