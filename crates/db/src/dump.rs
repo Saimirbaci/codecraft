@@ -177,6 +177,9 @@ pub fn dump_command(
             Ok(ToolCommand { program, args, env: my_env(password), stdin: None })
         }
         DbKind::Sqlite => Err(DbError::Unsupported("SQLite dumps are written natively (no tool)".into())),
+        DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+            Err(DbError::Unsupported(format!("Dump is not available for {} yet", cfg.kind.label())))
+        }
     }
 }
 
@@ -192,7 +195,7 @@ pub fn restore_tool(kind: DbKind, file: &Path) -> Option<&'static str> {
         DbKind::Postgres if is_pg_archive(file) => Some("pg_restore"),
         DbKind::Postgres => Some("psql"),
         DbKind::Mysql | DbKind::Mariadb => Some("mysql"),
-        DbKind::Sqlite => None,
+        DbKind::Sqlite | DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => None,
     }
 }
 
@@ -242,6 +245,9 @@ pub fn restore_command(
             Ok(ToolCommand { program, args, env: my_env(password), stdin: Some(file.to_path_buf()) })
         }
         DbKind::Sqlite => Err(DbError::Unsupported("SQLite restores run natively (no tool)".into())),
+        DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+            Err(DbError::Unsupported(format!("Restore is not available for {} yet", cfg.kind.label())))
+        }
     }
 }
 

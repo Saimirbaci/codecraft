@@ -315,6 +315,11 @@ impl TunnelPlan {
             std::thread::sleep(Duration::from_millis(100));
         }
         self.tunnels.lock().open.entry(self.source.clone()).or_default().push(child);
+        // TLS through the tunnel still checks the server's own name (SQL Server, Redis,
+        // ClickHouse over HTTPS).
+        if !cfg.host.trim().is_empty() && !cfg.options.contains_key("tls_server_name") {
+            cfg.options.insert("tls_server_name".into(), cfg.host.trim().to_string());
+        }
         cfg.host = "127.0.0.1".into();
         cfg.port = Some(port);
         Ok(cfg)
@@ -560,6 +565,7 @@ mod tests {
         let cfg = plan.open_on(pg(Some("bastion")), port).unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, Some(port));
+        assert_eq!(cfg.options.get("tls_server_name").map(String::as_str), Some("db.internal"));
         assert_eq!(t.open_count(), 1);
         // The port was ready at once (the test listens), so the script may still be starting.
         let start = Instant::now();

@@ -1,7 +1,7 @@
 # Roadmap
 
-Status as of 2026-10-13: **M0–M11 have landed** (M4 delivered M3b and M6–M9 in parallel
-tracks, see `docs/m4-plan.md`). Menu parity (after capturing the lazily filled submenus): 192/192 core and 347/407 in-scope items
+Status as of 2026-10-14: **M0–M12 have landed** (M4 delivered M3b and M6–M9 in parallel
+tracks, see `docs/m4-plan.md`). Menu parity (after capturing the lazily filled submenus): 192/192 core and 401/407 in-scope items
 live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gaps.md`.
 
 | Milestone | Scope | Status |
@@ -17,7 +17,7 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 | M9 Native macOS menus, packaging | NSMenu global menu bar, signed .app/.dmg, Linux and Windows packages, project windows | ✅ (2026-10-13) |
 | M10 Daily-use depth | Session restore, snippet placeholders and completion resolve, in-place rename, whitespace/wrap rendering, inspections (Clippy) with quick-fixes, remaining cheap menu items, RustRover's lazily filled submenus. Plan: `docs/m10-plan.md` | ✅ (2026-10-13) |
 | M11 From the suite + remote | CLion debugger views (memory, disassembly, registers, watchpoints), profiler; DataGrip query history, explain plan, grid extras, SQL in Rust strings; HTTP Client; PyCharm interpreters, packages and console; Docker in Services, SSH deployment, remote run targets and Remote Development. Plan: `docs/m11-plan.md` | ✅ (2026-10-13) |
-| M12 Replace DataGrip + agent sessions | Schema tools (create/modify table, DDL, ER diagram, schema compare), robust transactions, compare data, dump/restore, SQL navigation and inspections, script runs; agent sessions saved per project and resumable; more data sources; Rust/editor/CLion/PyCharm depth. Plan: `docs/m12-plan.md` | 🚧 |
+| M12 Replace DataGrip + agent sessions | Schema tools (create/modify table, DDL, ER diagram, schema compare), robust transactions, compare data, dump/restore, SQL navigation and inspections, script runs; agent sessions saved per project and resumable; more data sources; Rust/editor/CLion/PyCharm depth. Plan: `docs/m12-plan.md` | ✅ (2026-10-14) |
 
 ## Current focus
 

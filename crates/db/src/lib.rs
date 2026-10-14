@@ -1,4 +1,5 @@
-//! CodeCraft Database drivers, introspection and query execution (SQLite, PostgreSQL, MySQL) (L0, no workspace deps).
+//! CodeCraft Database drivers, introspection and query execution (SQLite, PostgreSQL, MySQL,
+//! SQL Server, ClickHouse, Redis, DuckDB) (L0, no workspace deps).
 //!
 //! Everything here is synchronous and meant to run on worker threads: [`connect`] opens a
 //! [`Connection`]; its [`Connection::execute`] streams result pages to a sink so the caller can
@@ -19,18 +20,22 @@
 )]
 
 pub mod catalog;
+pub mod clickhouse;
 pub mod compare;
 mod config;
 pub mod ddl;
+pub mod duckdb;
 pub mod dump;
 pub mod edit;
 pub mod explain;
 pub mod export;
 pub mod import;
 mod lex;
+pub mod mssql;
 mod my;
 pub mod params;
 mod pg;
+pub mod redis;
 pub mod schema_diff;
 pub mod secrets;
 pub mod split;
@@ -306,6 +311,10 @@ pub fn connect(cfg: &DataSourceConfig, password: Option<&str>) -> DbResult<Box<d
         DbKind::Sqlite => Ok(Box::new(sqlite::SqliteConn::open(cfg)?)),
         DbKind::Postgres => Ok(Box::new(pg::PgConn::open(cfg, password)?)),
         DbKind::Mysql | DbKind::Mariadb => Ok(Box::new(my::MyConn::open(cfg, password)?)),
+        DbKind::SqlServer => Ok(Box::new(mssql::MssqlConn::open(cfg, password)?)),
+        DbKind::ClickHouse => Ok(Box::new(clickhouse::ChConn::open(cfg, password)?)),
+        DbKind::Redis => Ok(Box::new(redis::RedisConn::open(cfg, password)?)),
+        DbKind::DuckDb => Ok(Box::new(duckdb::DuckConn::open(cfg)?)),
     }
 }
 

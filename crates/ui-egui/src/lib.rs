@@ -46,6 +46,7 @@ mod popups;
 mod profiler_ui;
 mod project_windows;
 mod python_ui;
+mod redis_ui;
 mod refactor_ui;
 mod remote_ui;
 mod rust_ui;
@@ -631,6 +632,7 @@ impl App {
         appearance_ui::windows(ui, s, st);
         database_data_ui::windows(ui, s, st);
         ed_ui::windows(ui, s, st);
+        redis_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         windows::capture(ui.ctx(), st);

@@ -457,6 +457,9 @@ impl DbState {
             DbKind::Postgres => Some("pg_dump"),
             DbKind::Mysql | DbKind::Mariadb => Some("mysqldump"),
             DbKind::Sqlite => None,
+            DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+                return Err(format!("Dump is not available for {} yet", kind.label()));
+            }
         };
         let program = match tool_name {
             Some(name) => Some(self.find_tool(source, name, tool.as_deref())?),
@@ -732,9 +735,28 @@ pub fn search_sql(
                 }
                 (DbKind::Sqlite, false) => format!("{col} LIKE {pattern} ESCAPE '!'"),
                 (DbKind::Sqlite, true) => format!("instr(CAST({col} AS TEXT), {plain}) > 0"),
+                (DbKind::SqlServer, false) => format!("CAST({col} AS nvarchar(max)) LIKE {pattern} ESCAPE '!'"),
+                (DbKind::SqlServer, true) => {
+                    format!("CAST({col} AS nvarchar(max)) COLLATE Latin1_General_100_CS_AS LIKE {pattern} ESCAPE '!'")
+                }
+                (DbKind::DuckDb, false) => format!("CAST({col} AS VARCHAR) ILIKE {pattern} ESCAPE '!'"),
+                (DbKind::DuckDb, true) => format!("CAST({col} AS VARCHAR) LIKE {pattern} ESCAPE '!'"),
+                (DbKind::ClickHouse, false) => format!("positionCaseInsensitiveUTF8(toString({col}), {plain}) > 0"),
+                (DbKind::ClickHouse, true) => format!("position(toString({col}), {plain}) > 0"),
+                (DbKind::Redis, _) => String::new(),
             }
         })
         .collect();
+    if kind == DbKind::Redis {
+        return Err("Redis has no tables to search; use the key browser".into());
+    }
+    if kind == DbKind::SqlServer {
+        return Ok(format!(
+            "SELECT TOP ({limit}) * FROM {} WHERE {}",
+            qualified(kind, schema, table),
+            conds.join(" OR ")
+        ));
+    }
     Ok(format!("SELECT * FROM {} WHERE {} LIMIT {limit}", qualified(kind, schema, table), conds.join(" OR ")))
 }
 

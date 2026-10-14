@@ -244,8 +244,13 @@ impl NavState {
         }
         let sql = match kind {
             DbKind::Postgres => format!("SET search_path TO {}", codecraft_db::sql::quote_ident(kind, &schema)),
-            DbKind::Mysql | DbKind::Mariadb => format!("USE {}", codecraft_db::sql::quote_ident(kind, &schema)),
-            DbKind::Sqlite => return None,
+            DbKind::Mysql | DbKind::Mariadb | DbKind::ClickHouse => {
+                format!("USE {}", codecraft_db::sql::quote_ident(kind, &schema))
+            }
+            // Redis "schemas" are the numbered databases.
+            DbKind::Redis => format!("SELECT {}", schema.strip_prefix("db")?.parse::<u32>().ok()?),
+            // T-SQL has no session schema; DuckDB runs each statement in its own process.
+            DbKind::Sqlite | DbKind::SqlServer | DbKind::DuckDb => return None,
         };
         self.worker_schema.insert(worker.to_string(), schema);
         Some(sql)

@@ -1,6 +1,6 @@
 [package]
 name = "codecraft-db"
-description = "CodeCraft Database drivers, introspection and query execution (SQLite, PostgreSQL, MySQL)"
+description = "CodeCraft Database drivers, introspection and query execution (SQLite, PostgreSQL, MySQL, SQL Server, ClickHouse, Redis, DuckDB)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,6 +17,14 @@ postgres = { version = "0.19.14", default-features = false }
 postgres-protocol = { version = "0.6.12", default-features = false }
 mysql = { version = "28.0.3", default-features = false, features = ["minimal-rust"] }
 keyring = { version = "3.6.3", features = ["apple-native"] }
+# Microsoft SQL Server (TDS): tiberius on a current-thread tokio runtime owned by the connection's
+# thread (tokio, tokio-util and futures-util are already in the lockfile).
+tiberius = { version = "0.13.0", default-features = false, features = ["tds80", "native-tls"] }
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "net", "time"] }
+tokio-util = { version = "0.7.20", default-features = false, features = ["compat"] }
+futures-util = { version = "0.3.34", default-features = false }
+# ClickHouse over HTTP: the same ureq as crates/http (no new crates).
+ureq = { version = "2", default-features = false, features = ["native-tls", "gzip", "json"] }
 
 # PostgreSQL TLS through the platform TLS stack (Security.framework / SChannel); no OpenSSL.
 [target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]

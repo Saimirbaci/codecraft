@@ -1,6 +1,6 @@
 # M12: replace DataGrip, persistent agent sessions, and the rest of the suite
 
-Status: in progress (2026-10-14). Goal: a user can drop DataGrip and do their daily database
+Status: done (2026-10-14; all nine tracks landed; remaining depth is in `docs/gaps.md` items 38–46). Goal: a user can drop DataGrip and do their daily database
 work in CodeCraft, reliably (every transaction ends committed or rolled back, never half-done);
 agent chats survive restarts and can be resumed; and the remaining RustRover menus plus the
 headline CLion/PyCharm features land. Same rules as M4/M10/M11: read `AGENTS.md` and

@@ -536,3 +536,18 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     dependency tree or updates, no vcpkg classic mode; Reset Frame via `thread return` doesn't
     undo side effects; Attach to an Unstarted Process has no run configuration or recent names;
     Manage Targets can't add or edit targets and has no WSL.
+46. More data sources (track DD): Microsoft SQL Server (tiberius; SQL auth, TLS, GO batches,
+    `sys.*` introspection, `@@TRANCOUNT` transaction state, attention-signal cancel, estimated
+    plans), ClickHouse (HTTP; streamed rows, sessions, KILL QUERY cancel, `readonly=2`, no
+    transactions), Redis (own RESP client; key browser with SCAN MATCH/TYPE, namespaces, values
+    per type with paging, TTL, rename, delete, new keys, production confirmation; command
+    consoles) and DuckDB (the CLI). Only Redis was tested against a real server (one the tests
+    start); SQL Server, ClickHouse and DuckDB against fakes. Remaining: no MongoDB (the driver is
+    too heavy); SQL Server has no Windows/Kerberos/Azure AD auth, named instances need their
+    port, only the first result set of a batch is shown, no actual plans, no Create/Modify
+    Table; ClickHouse has no transactions or grid edits, `ssl=true` needs port 8443 set by hand,
+    cancel needs the KILL QUERY privilege, sessions expire after 600 s idle; Redis TLS only on
+    macOS/Windows, no Cluster/Sentinel/SUBSCRIBE/MONITOR, binary strings read-only, no consumer
+    groups, at most 100,000 keys in the browser, Redis consoles still get SQL completion; DuckDB
+    needs its CLI, runs each statement in its own process (no transactions or session state),
+    may lose HUGEINT/DECIMAL precision, no Explain Plan; no Dump for the four new kinds.

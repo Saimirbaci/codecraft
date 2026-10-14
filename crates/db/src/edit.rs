@@ -34,7 +34,7 @@ pub fn literal(kind: DbKind, value: &Cell) -> DbResult<String> {
     Ok(match value {
         Cell::Null => "NULL".into(),
         Cell::Bool(b) => match kind {
-            DbKind::Sqlite => if *b { "1" } else { "0" }.into(),
+            DbKind::Sqlite | DbKind::SqlServer => if *b { "1" } else { "0" }.into(),
             _ => if *b { "TRUE" } else { "FALSE" }.into(),
         },
         Cell::Int(i) => i.to_string(),
@@ -59,6 +59,9 @@ pub fn literal(kind: DbKind, value: &Cell) -> DbResult<String> {
         Cell::Text(s) | Cell::Other(s) => text_literal(kind, s)?,
         Cell::Bytes(b) => match kind {
             DbKind::Postgres => format!("decode('{}', 'hex')", hex(b)),
+            DbKind::SqlServer => format!("0x{}", hex(b)),
+            DbKind::ClickHouse => format!("unhex('{}')", hex(b)),
+            DbKind::DuckDb => format!("from_hex('{}')", hex(b)),
             _ => format!("X'{}'", hex(b)),
         },
     })
@@ -102,6 +105,16 @@ fn text_literal(kind: DbKind, s: &str) -> DbResult<String> {
                 quoted()
             }
         }
+        // N'' keeps Unicode whatever the column's collation.
+        DbKind::SqlServer => format!("N{}", quoted()),
+        DbKind::ClickHouse => crate::clickhouse::literal(s),
+        DbKind::DuckDb => {
+            if s.contains('\0') {
+                return Err(DbError::Unsupported("DuckDB text cannot contain NUL characters".into()));
+            }
+            quoted()
+        }
+        DbKind::Redis => return Err(DbError::Unsupported("Redis has no SQL literals".into())),
     })
 }
 
@@ -161,7 +174,8 @@ pub fn statements(kind: DbKind, schema: &str, table: &str, changes: &[RowChange]
 pub fn begin_statement(kind: DbKind) -> &'static str {
     match kind {
         DbKind::Mysql | DbKind::Mariadb => "START TRANSACTION",
-        DbKind::Sqlite | DbKind::Postgres => "BEGIN",
+        DbKind::Sqlite | DbKind::Postgres | DbKind::DuckDb | DbKind::ClickHouse | DbKind::Redis => "BEGIN",
+        DbKind::SqlServer => "BEGIN TRANSACTION",
     }
 }
 
@@ -250,6 +264,10 @@ pub fn apply_changes(
     }
     if sqls.is_empty() {
         return Ok(ApplyReport::default());
+    }
+    if !kind.supports_transactions() {
+        // All-or-nothing needs a transaction.
+        return Err(fail(None, None, format!("cannot edit data in the grid: {}", tx::no_transactions(kind)), true));
     }
     let outer = match conn.transaction_status() {
         TxStatus::Failed => {

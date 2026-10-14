@@ -5,6 +5,9 @@
 //! - SQLite: `EXPLAIN QUERY PLAN` rows `(id, parent, notused, detail)`; there is no analyze.
 //! - MySQL: `EXPLAIN FORMAT=JSON`; `EXPLAIN ANALYZE` prints a text tree. MariaDB analyzes with
 //!   `ANALYZE FORMAT=JSON` (`r_rows`, `r_total_time_ms`).
+//! - SQL Server: the estimated plan from `SET SHOWPLAN_XML ON` (the `RelOp` tree).
+//! - ClickHouse: `EXPLAIN indexes = 1`, an indented text tree.
+//! - DuckDB and Redis: not here (DuckDB's `EXPLAIN` runs in the console as text).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,15 +100,48 @@ pub fn explain_statement(kind: DbKind, sql: &str, analyze: bool) -> (String, boo
         (DbKind::Mysql, false) | (DbKind::Mariadb, false) => (format!("EXPLAIN FORMAT=JSON {sql}"), false),
         (DbKind::Mysql, true) => (format!("EXPLAIN ANALYZE {sql}"), true),
         (DbKind::Mariadb, true) => (format!("ANALYZE FORMAT=JSON {sql}"), true),
+        // Runs between SET SHOWPLAN_XML ON and OFF (see [`explain`]).
+        (DbKind::SqlServer, _) => (sql.to_string(), false),
+        (DbKind::ClickHouse, _) => (format!("EXPLAIN indexes = 1 {sql}"), false),
+        (DbKind::DuckDb, _) | (DbKind::Redis, _) => (format!("EXPLAIN {sql}"), false),
     }
+}
+
+/// SQL Server: the statement under `SET SHOWPLAN_XML ON` returns its plan instead of running.
+fn explain_mssql(conn: &mut dyn Connection, sql: &str) -> DbResult<Plan> {
+    crate::tx::run(conn, "SET SHOWPLAN_XML ON")?;
+    let result = query_all(conn, sql.trim().trim_end_matches(';').trim_end());
+    let off = crate::tx::run(conn, "SET SHOWPLAN_XML OFF");
+    let (_, rows, _) = result?;
+    off?;
+    parse_showplan_xml(&first_text(&rows)?)
 }
 
 /// Explain `sql` on `conn` (with `analyze`, where supported, the statement runs).
 pub fn explain(conn: &mut dyn Connection, sql: &str, analyze: bool) -> DbResult<Plan> {
     let kind = conn.kind();
+    if matches!(kind, DbKind::DuckDb | DbKind::Redis) {
+        return Err(DbError::Unsupported(format!(
+            "Explain Plan is not available for {}; run EXPLAIN in the console",
+            kind.label()
+        )));
+    }
     let (statement, analyzed) = explain_statement(kind, sql, analyze);
-    let (_, rows, _) = query_all(conn, &statement)?;
-    let mut plan = match kind {
+    let mut plan = if kind == DbKind::SqlServer {
+        explain_mssql(conn, &statement)?
+    } else {
+        let (_, rows, _) = query_all(conn, &statement)?;
+        explain_rows(kind, &rows, analyzed)?
+    };
+    plan.analyzed = analyzed;
+    if analyze && !analyzed {
+        plan.note = Some(format!("{} cannot analyze a query; showing the estimated plan", kind.label()));
+    }
+    Ok(plan)
+}
+
+fn explain_rows(kind: DbKind, rows: &[Vec<Cell>], analyzed: bool) -> DbResult<Plan> {
+    Ok(match kind {
         DbKind::Sqlite => {
             let eqp: Vec<(i64, i64, String)> = rows
                 .iter()
@@ -114,18 +150,224 @@ pub fn explain(conn: &mut dyn Connection, sql: &str, analyze: bool) -> DbResult<
             let raw = eqp.iter().map(|(id, p, d)| format!("{id}|{p}|{d}")).collect::<Vec<_>>().join("\n");
             Plan { roots: parse_sqlite(&eqp), raw, ..Plan::default() }
         }
-        DbKind::Postgres => parse_postgres(&first_text(&rows)?)?,
+        DbKind::Postgres => parse_postgres(&first_text(rows)?)?,
         DbKind::Mysql if analyzed => {
             let text = rows.iter().filter_map(|r| r.first().map(Cell::to_plain)).collect::<Vec<_>>().join("\n");
             parse_mysql_tree(&text)
         }
-        DbKind::Mysql | DbKind::Mariadb => parse_mysql_json(&first_text(&rows)?)?,
-    };
-    plan.analyzed = analyzed;
-    if analyze && !analyzed {
-        plan.note = Some(format!("{} cannot analyze a query; showing the estimated plan", kind.label()));
+        DbKind::Mysql | DbKind::Mariadb => parse_mysql_json(&first_text(rows)?)?,
+        DbKind::ClickHouse => {
+            let text = rows.iter().filter_map(|r| r.first().map(Cell::to_plain)).collect::<Vec<_>>().join("\n");
+            parse_indented(&text)
+        }
+        DbKind::SqlServer => parse_showplan_xml(&first_text(rows)?)?,
+        DbKind::DuckDb | DbKind::Redis => {
+            return Err(DbError::Unsupported("Explain Plan is not available for this data source".into()));
+        }
+    })
+}
+
+/// An indented text plan (ClickHouse `EXPLAIN`): each level two more spaces.
+pub fn parse_indented(text: &str) -> Plan {
+    let mut roots: Vec<PlanNode> = Vec::new();
+    // (indent, node) of the open ancestors.
+    let mut stack: Vec<(usize, PlanNode)> = Vec::new();
+    fn attach(stack: &mut [(usize, PlanNode)], roots: &mut Vec<PlanNode>, node: PlanNode) {
+        match stack.last_mut() {
+            Some((_, parent)) => parent.children.push(node),
+            None => roots.push(node),
+        }
+    }
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        // A detail line of the node above (`Condition: …`, `Keys: …`) is indented under it.
+        let is_detail = !trimmed.contains('(') && trimmed.contains(':') && !stack.is_empty();
+        if is_detail && stack.last().is_some_and(|(i, _)| indent > *i) {
+            if let Some((_, n)) = stack.last_mut() {
+                let (k, v) = trimmed.split_once(':').unwrap_or((trimmed, ""));
+                n.add_detail(k.trim(), v.trim());
+            }
+            continue;
+        }
+        while stack.last().is_some_and(|(i, _)| *i >= indent) {
+            if let Some((_, done)) = stack.pop() {
+                attach(&mut stack, &mut roots, done);
+            }
+        }
+        if stack.len() >= MAX_DEPTH {
+            continue;
+        }
+        let (op, rest) = match trimmed.find(" (") {
+            Some(i) => (trimmed.get(..i).unwrap_or(trimmed), trimmed.get(i + 1..).unwrap_or("")),
+            None => (trimmed, ""),
+        };
+        let mut node = PlanNode::new(op.trim());
+        node.add_detail("", rest.trim().trim_start_matches('(').trim_end_matches(')'));
+        stack.push((indent, node));
+    }
+    while let Some((_, done)) = stack.pop() {
+        attach(&mut stack, &mut roots, done);
+    }
+    Plan { roots, raw: text.to_string(), ..Plan::default() }
+}
+
+/// XML attribute values with the five predefined entities decoded.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+}
+
+/// `name="value"` pairs of a tag's text.
+fn xml_attrs(tag: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let chars: Vec<char> = tag.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+            i += 1;
+        }
+        let start = i;
+        while chars.get(i).is_some_and(|c| !c.is_whitespace() && *c != '=') {
+            i += 1;
+        }
+        let name: String = chars.get(start..i).unwrap_or(&[]).iter().collect();
+        if chars.get(i) != Some(&'=') {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let Some(&quote) = chars.get(i).filter(|c| **c == '"' || **c == '\'') else { continue };
+        i += 1;
+        let vstart = i;
+        while chars.get(i).is_some_and(|c| *c != quote) {
+            i += 1;
+        }
+        let value: String = chars.get(vstart..i).unwrap_or(&[]).iter().collect();
+        i += 1;
+        out.push((name, xml_unescape(&value)));
+    }
+    out
+}
+
+/// SQL Server's showplan XML: the nested `RelOp` elements as a tree (estimated rows and cost,
+/// the object each reads).
+pub fn parse_showplan_xml(xml: &str) -> DbResult<Plan> {
+    let mut roots: Vec<PlanNode> = Vec::new();
+    let mut open: Vec<PlanNode> = Vec::new();
+    let mut statement: Option<String> = None;
+    let mut rest = xml;
+    let mut seen_relop = false;
+    while let Some(lt) = rest.find('<') {
+        let after = rest.get(lt + 1..).unwrap_or("");
+        // The tag runs to the next `>` outside quotes.
+        let mut end = None;
+        let mut quote: Option<char> = None;
+        for (i, c) in after.char_indices() {
+            match (quote, c) {
+                (Some(q), c) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'') => quote = Some(c),
+                (None, '>') => {
+                    end = Some(i);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        let tag = after.get(..end).unwrap_or("");
+        rest = after.get(end + 1..).unwrap_or("");
+        if tag.starts_with('?') || tag.starts_with('!') {
+            continue;
+        }
+        if let Some(name) = tag.strip_prefix('/') {
+            if local_name(name.trim()) == "RelOp"
+                && let Some(done) = open.pop()
+            {
+                match open.last_mut() {
+                    Some(parent) => parent.children.push(done),
+                    None => roots.push(done),
+                }
+            }
+            continue;
+        }
+        let self_closing = tag.ends_with('/');
+        let body = tag.trim_end_matches('/');
+        let name = local_name(body.split_whitespace().next().unwrap_or(""));
+        let attrs = || xml_attrs(body.split_once(char::is_whitespace).map(|(_, a)| a).unwrap_or(""));
+        let get = |a: &[(String, String)], k: &str| a.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        match name {
+            "StmtSimple" if statement.is_none() => statement = get(&attrs(), "StatementText"),
+            "RelOp" => {
+                seen_relop = true;
+                let a = attrs();
+                let physical = get(&a, "PhysicalOp").unwrap_or_else(|| "?".into());
+                let mut node = PlanNode::new(physical.clone());
+                if let Some(logical) = get(&a, "LogicalOp").filter(|l| *l != physical) {
+                    node.add_detail("Logical", &logical);
+                }
+                node.rows = get(&a, "EstimateRows").and_then(|v| v.parse().ok());
+                node.total_cost = get(&a, "EstimatedTotalSubtreeCost").and_then(|v| v.parse().ok());
+                if self_closing {
+                    match open.last_mut() {
+                        Some(parent) => parent.children.push(node),
+                        None => roots.push(node),
+                    }
+                } else if open.len() < MAX_DEPTH {
+                    open.push(node);
+                } else {
+                    return Err(DbError::Query("the plan is nested too deeply".into()));
+                }
+            }
+            "Object" => {
+                if let Some(node) = open.last_mut()
+                    && node.relation.is_none()
+                {
+                    let a = attrs();
+                    let unq = |v: Option<String>| v.map(|s| s.trim_matches(['[', ']']).to_string());
+                    let table = unq(get(&a, "Table"));
+                    if let Some(t) = table {
+                        let schema = unq(get(&a, "Schema"));
+                        node.relation = Some(match schema {
+                            Some(s) if !s.is_empty() => format!("{s}.{t}"),
+                            _ => t,
+                        });
+                        if let Some(i) = unq(get(&a, "Index")) {
+                            node.add_detail("Index", &i);
+                        }
+                    }
+                }
+            }
+            "Predicate" | "SeekPredicates" => {
+                if let Some(node) = open.last_mut() {
+                    node.add_detail(name, "yes");
+                }
+            }
+            _ => {}
+        }
+    }
+    while let Some(done) = open.pop() {
+        match open.last_mut() {
+            Some(parent) => parent.children.push(done),
+            None => roots.push(done),
+        }
+    }
+    if !seen_relop {
+        return Err(DbError::Query("SQL Server returned no plan for this statement".into()));
+    }
+    let mut plan = Plan { roots, raw: xml.to_string(), ..Plan::default() };
+    if let Some(s) = statement {
+        plan.note = Some(format!("Estimated plan of: {}", s.chars().take(200).collect::<String>()));
     }
     Ok(plan)
+}
+
+/// `p:RelOp` → `RelOp`.
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
 }
 
 fn int(c: Option<&Cell>) -> i64 {
@@ -488,6 +730,44 @@ fn mysql_step(step: &str) -> PlanNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_server_showplan_xml() {
+        let xml = r#"<?xml version="1.0" encoding="utf-16"?><ShowPlanXML xmlns="http://schemas.microsoft.com/sqlserver/2004/07/showplan"><BatchSequence><Batch><Statements><StmtSimple StatementText="SELECT * FROM t WHERE a &gt; 1"><QueryPlan><RelOp NodeId="0" PhysicalOp="Nested Loops" LogicalOp="Inner Join" EstimateRows="10" EstimatedTotalSubtreeCost="0.5"><NestedLoops><RelOp NodeId="1" PhysicalOp="Clustered Index Scan" LogicalOp="Clustered Index Scan" EstimateRows="100" EstimatedTotalSubtreeCost="0.2"><IndexScan><Object Database="[app]" Schema="[dbo]" Table="[t]" Index="[PK_t]" /><Predicate /></IndexScan></RelOp><RelOp NodeId="2" PhysicalOp="Index Seek" LogicalOp="Index Seek" EstimateRows="1" EstimatedTotalSubtreeCost="0.1"><IndexScan><Object Schema="[dbo]" Table="[u]" /></IndexScan></RelOp></NestedLoops></RelOp></QueryPlan></StmtSimple></Statements></Batch></BatchSequence></ShowPlanXML>"#;
+        let plan = parse_showplan_xml(xml).unwrap();
+        assert_eq!(plan.roots.len(), 1);
+        let root = &plan.roots[0];
+        assert_eq!(root.operation, "Nested Loops");
+        assert_eq!(root.detail, "Logical: Inner Join");
+        assert_eq!(root.rows, Some(10.0));
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].relation.as_deref(), Some("dbo.t"));
+        assert!(root.children[0].detail.contains("Index: PK_t"));
+        assert_eq!(root.children[1].relation.as_deref(), Some("dbo.u"));
+        assert!(plan.note.unwrap().contains("a > 1"));
+        assert!(parse_showplan_xml("<ShowPlanXML/>").is_err());
+        for bad in ["", "<", "<RelOp", "<RelOp PhysicalOp=\"x>", "</RelOp></RelOp>", "<RelOp><RelOp>", "<a b='>'>"] {
+            let _ = parse_showplan_xml(bad);
+        }
+        let deep = "<RelOp PhysicalOp=\"x\">".repeat(MAX_DEPTH + 5);
+        assert!(parse_showplan_xml(&deep).is_err());
+    }
+
+    #[test]
+    fn clickhouse_indented_plans() {
+        let text = "Expression ((Projection + Before ORDER BY))\n  Limit (preliminary LIMIT)\n    ReadFromMergeTree (default.hits)\n    Indexes:\n      PrimaryKey\n        Keys:\n          id\n  Filter";
+        let plan = parse_indented(text);
+        assert_eq!(plan.roots.len(), 1);
+        let root = &plan.roots[0];
+        assert_eq!(root.operation, "Expression");
+        assert_eq!(root.children.len(), 2);
+        assert_eq!(root.children[0].operation, "Limit");
+        assert_eq!(root.children[0].children[0].operation, "ReadFromMergeTree");
+        assert_eq!(root.children[1].operation, "Filter");
+        let _ = parse_indented("");
+        let _ = parse_indented(&" x\n".repeat(5));
+        let _ = parse_indented(&(0..500).map(|i| format!("{}n", " ".repeat(i))).collect::<Vec<_>>().join("\n"));
+    }
 
     #[test]
     fn statements_per_database() {

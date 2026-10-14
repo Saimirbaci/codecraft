@@ -395,6 +395,65 @@ pub fn type_suggestions(kind: DbKind) -> &'static [&'static str] {
         DbKind::Sqlite => {
             &["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", "BOOLEAN", "DATE", "DATETIME", "VARCHAR(255)"]
         }
+        DbKind::SqlServer => &[
+            "int",
+            "bigint",
+            "smallint",
+            "tinyint",
+            "bit",
+            "decimal(10, 2)",
+            "money",
+            "float",
+            "real",
+            "nvarchar(255)",
+            "nvarchar(max)",
+            "varchar(255)",
+            "nchar(1)",
+            "date",
+            "time",
+            "datetime2",
+            "datetimeoffset",
+            "uniqueidentifier",
+            "varbinary(max)",
+            "xml",
+        ],
+        DbKind::DuckDb => &[
+            "INTEGER",
+            "BIGINT",
+            "SMALLINT",
+            "DOUBLE",
+            "DECIMAL(10, 2)",
+            "BOOLEAN",
+            "VARCHAR",
+            "DATE",
+            "TIMESTAMP",
+            "TIMESTAMPTZ",
+            "INTERVAL",
+            "UUID",
+            "BLOB",
+            "JSON",
+            "INTEGER[]",
+            "VARCHAR[]",
+        ],
+        DbKind::ClickHouse => &[
+            "UInt64",
+            "Int64",
+            "UInt32",
+            "Int32",
+            "Float64",
+            "Decimal(18, 2)",
+            "Bool",
+            "String",
+            "LowCardinality(String)",
+            "Date",
+            "DateTime",
+            "DateTime64(3)",
+            "UUID",
+            "Nullable(String)",
+            "Array(String)",
+            "Map(String, String)",
+        ],
+        DbKind::Redis => &[],
     }
 }
 
@@ -605,6 +664,9 @@ fn is_inline_sqlite_autoinc(kind: DbKind, t: &TableDef) -> Option<&str> {
 pub fn column_sql(kind: DbKind, c: &ColumnDef) -> DbResult<String> {
     check_name("a column", &c.name)?;
     check_type(c)?;
+    if matches!(kind, DbKind::ClickHouse | DbKind::Redis) {
+        return unsupported(kind, "define tables in the table dialog (use the console)");
+    }
     let mut s = format!("{} {}", q(kind, &c.name), c.data_type.trim());
     let default = c.default.trim();
     if !default.is_empty() {
@@ -634,6 +696,27 @@ pub fn column_sql(kind: DbKind, c: &ColumnDef) -> DbResult<String> {
                 s.push_str(&format!(" COMMENT {}", text(kind, &c.comment)?));
             }
         }
+        DbKind::SqlServer => {
+            if c.auto_increment {
+                s.push_str(" IDENTITY(1,1)");
+            }
+            s.push_str(if c.nullable { " NULL" } else { " NOT NULL" });
+            if !default.is_empty() {
+                s.push_str(&format!(" DEFAULT {default}"));
+            }
+        }
+        DbKind::DuckDb => {
+            if c.auto_increment {
+                return unsupported(kind, "auto-increment a column (use a sequence default)");
+            }
+            if !default.is_empty() {
+                s.push_str(&format!(" DEFAULT {default}"));
+            }
+            if !c.nullable {
+                s.push_str(" NOT NULL");
+            }
+        }
+        DbKind::ClickHouse | DbKind::Redis => {}
         DbKind::Sqlite => {
             if c.auto_increment {
                 s.push_str(" PRIMARY KEY AUTOINCREMENT");
@@ -943,6 +1026,9 @@ pub fn alter_table(kind: DbKind, old: &TableDef, new: &TableDef) -> DbResult<Ddl
         DbKind::Postgres => alter_pg(old, &ch)?,
         DbKind::Mysql | DbKind::Mariadb => alter_my(kind, old, &ch)?,
         DbKind::Sqlite => alter_sqlite(old, &ch)?,
+        DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+            return unsupported(kind, "be modified with this dialog yet (use ALTER TABLE in the console)");
+        }
     };
     pg_name_warnings(kind, &ch.new, &mut script.warnings);
     Ok(script)
@@ -1441,6 +1527,9 @@ pub fn drop_object(kind: DbKind, o: &ObjectRef, cascade: bool) -> DbResult<DdlSc
             DbKind::Postgres => format!("DROP SCHEMA {}{pg_cascade}", q(kind, &o.name)),
             DbKind::Mysql | DbKind::Mariadb => format!("DROP DATABASE {}", q(kind, &o.name)),
             DbKind::Sqlite => return unsupported(kind, "drop a schema (detach the database instead)"),
+            DbKind::SqlServer | DbKind::DuckDb => format!("DROP SCHEMA {}", q(kind, &o.name)),
+            DbKind::ClickHouse => format!("DROP DATABASE {}", q(kind, &o.name)),
+            DbKind::Redis => return unsupported(kind, "drop a schema"),
         },
         ObjectKind::Table => format!("DROP TABLE {}{pg_cascade}", qualified(kind, &o.schema, &o.name)),
         ObjectKind::View => format!("DROP VIEW {}{pg_cascade}", qualified(kind, &o.schema, &o.name)),
@@ -1450,7 +1539,10 @@ pub fn drop_object(kind: DbKind, o: &ObjectRef, cascade: bool) -> DbResult<DdlSc
         },
         ObjectKind::Column => format!("ALTER TABLE {table} DROP COLUMN {}{pg_cascade}", q(kind, &o.name)),
         ObjectKind::Index => match kind {
-            DbKind::Mysql | DbKind::Mariadb => format!("DROP INDEX {} ON {table}", q(kind, &o.name)),
+            DbKind::Mysql | DbKind::Mariadb | DbKind::SqlServer => {
+                format!("DROP INDEX {} ON {table}", q(kind, &o.name))
+            }
+            DbKind::ClickHouse => format!("ALTER TABLE {table} DROP INDEX {}", q(kind, &o.name)),
             _ => format!("DROP INDEX {}{pg_cascade}", qualified(kind, &o.schema, &o.name)),
         },
         ObjectKind::ForeignKey => match kind {
@@ -1462,6 +1554,8 @@ pub fn drop_object(kind: DbKind, o: &ObjectRef, cascade: bool) -> DbResult<DdlSc
                         .into(),
                 ));
             }
+            DbKind::SqlServer => format!("ALTER TABLE {table} DROP CONSTRAINT {}", q(kind, &o.name)),
+            DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => return unsupported(kind, "drop a foreign key"),
         },
     };
     Ok(single(kind, sql))
@@ -1475,11 +1569,17 @@ pub fn rename_object(kind: DbKind, o: &ObjectRef, new_name: &str) -> DbResult<Dd
     let to = q(kind, new_name);
     let table = qualified(kind, &o.schema, &o.table);
     let my = matches!(kind, DbKind::Mysql | DbKind::Mariadb);
+    if kind == DbKind::SqlServer {
+        return rename_mssql(o, new_name);
+    }
     let sql = match o.kind {
         ObjectKind::Schema => match kind {
             DbKind::Postgres => format!("ALTER SCHEMA {} RENAME TO {to}", q(kind, &o.name)),
             _ => return unsupported(kind, "rename a schema"),
         },
+        ObjectKind::Table | ObjectKind::View if kind == DbKind::ClickHouse => {
+            format!("RENAME TABLE {} TO {}", qualified(kind, &o.schema, &o.name), qualified(kind, &o.schema, new_name))
+        }
         ObjectKind::Table | ObjectKind::View if my => {
             format!("RENAME TABLE {} TO {}", qualified(kind, &o.schema, &o.name), qualified(kind, &o.schema, new_name))
         }
@@ -1498,12 +1598,38 @@ pub fn rename_object(kind: DbKind, o: &ObjectRef, new_name: &str) -> DbResult<Dd
         ObjectKind::Index => match kind {
             DbKind::Postgres => format!("ALTER INDEX {} RENAME TO {to}", qualified(kind, &o.schema, &o.name)),
             DbKind::Mysql | DbKind::Mariadb => format!("ALTER TABLE {table} RENAME INDEX {} TO {to}", q(kind, &o.name)),
-            DbKind::Sqlite => return unsupported(kind, "rename an index (drop it and create it again)"),
+            DbKind::Sqlite | DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+                return unsupported(kind, "rename an index (drop it and create it again)");
+            }
         },
         ObjectKind::ForeignKey => match kind {
             DbKind::Postgres => format!("ALTER TABLE {table} RENAME CONSTRAINT {} TO {to}", q(kind, &o.name)),
             _ => return unsupported(kind, "rename a foreign key (drop it and add it again)"),
         },
+    };
+    Ok(single(kind, sql))
+}
+
+/// SQL Server renames with `sp_rename` (the object as a qualified string, the new bare name).
+fn rename_mssql(o: &ObjectRef, new_name: &str) -> DbResult<DdlScript> {
+    let kind = DbKind::SqlServer;
+    let lit = |s: &str| format!("N'{}'", s.replace('\'', "''"));
+    let obj = |parts: &[&str]| parts.iter().filter(|p| !p.is_empty()).map(|p| q(kind, p)).collect::<Vec<_>>().join(".");
+    let sql = match o.kind {
+        ObjectKind::Schema => return unsupported(kind, "rename a schema"),
+        ObjectKind::MaterializedView => return unsupported(kind, "have materialized views"),
+        ObjectKind::Table | ObjectKind::View => {
+            format!("EXEC sp_rename {}, {}", lit(&obj(&[&o.schema, &o.name])), lit(new_name))
+        }
+        ObjectKind::Column => {
+            format!("EXEC sp_rename {}, {}, 'COLUMN'", lit(&obj(&[&o.schema, &o.table, &o.name])), lit(new_name))
+        }
+        ObjectKind::Index => {
+            format!("EXEC sp_rename {}, {}, 'INDEX'", lit(&obj(&[&o.schema, &o.table, &o.name])), lit(new_name))
+        }
+        ObjectKind::ForeignKey => {
+            format!("EXEC sp_rename {}, {}, 'OBJECT'", lit(&obj(&[&o.schema, &o.name])), lit(new_name))
+        }
     };
     Ok(single(kind, sql))
 }

@@ -2,11 +2,14 @@
 
 use crate::DbKind;
 
-/// Quote an identifier for the given database (`"a""b"`, `` `a``b` ``).
+/// Quote an identifier for the given database (`"a""b"`, `` `a``b` ``, `[a]]b]`).
 pub fn quote_ident(kind: DbKind, name: &str) -> String {
     match kind {
-        DbKind::Mysql | DbKind::Mariadb => format!("`{}`", name.replace('`', "``")),
-        DbKind::Sqlite | DbKind::Postgres => format!("\"{}\"", name.replace('"', "\"\"")),
+        DbKind::Mysql | DbKind::Mariadb | DbKind::ClickHouse => format!("`{}`", name.replace('`', "``")),
+        DbKind::SqlServer => format!("[{}]", name.replace(']', "]]")),
+        DbKind::Sqlite | DbKind::Postgres | DbKind::DuckDb | DbKind::Redis => {
+            format!("\"{}\"", name.replace('"', "\"\""))
+        }
     }
 }
 
@@ -27,11 +30,16 @@ pub fn select_table(
     order: Option<(&str, bool)>,
     limit: Option<usize>,
 ) -> String {
-    let mut sql = format!("SELECT * FROM {}", qualified(kind, schema, table));
+    // SQL Server has TOP instead of LIMIT.
+    let top = match (kind, limit) {
+        (DbKind::SqlServer, Some(n)) => format!("TOP ({n}) "),
+        _ => String::new(),
+    };
+    let mut sql = format!("SELECT {top}* FROM {}", qualified(kind, schema, table));
     if let Some((col, desc)) = order {
         sql.push_str(&format!(" ORDER BY {}{}", quote_ident(kind, col), if desc { " DESC" } else { "" }));
     }
-    if let Some(n) = limit {
+    if let Some(n) = limit.filter(|_| kind != DbKind::SqlServer) {
         sql.push_str(&format!(" LIMIT {n}"));
     }
     sql
@@ -93,6 +101,9 @@ mod tests {
         assert_eq!(quote_ident(DbKind::Mysql, "a`b"), "`a``b`");
         assert_eq!(qualified(DbKind::Sqlite, "main", "t"), "\"main\".\"t\"");
         assert_eq!(qualified(DbKind::Sqlite, "", "t"), "\"t\"");
+        assert_eq!(qualified(DbKind::SqlServer, "dbo", "a]b"), "[dbo].[a]]b]");
+        assert_eq!(quote_ident(DbKind::ClickHouse, "x"), "`x`");
+        assert_eq!(select_table(DbKind::SqlServer, "dbo", "t", None, Some(5)), "SELECT TOP (5) * FROM [dbo].[t]");
     }
 
     #[test]

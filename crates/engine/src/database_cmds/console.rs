@@ -236,6 +236,9 @@ fn set_transaction_mode(s: &mut Session, p: &Value) -> CmdResult {
         Some(m) => m,
         None => !s.db.source(&id).is_some_and(|d| d.config.manual_commit),
     };
+    if let Some(kind) = s.db.source(&id).map(|d| d.config.kind).filter(|k| manual && !k.supports_transactions()) {
+        return Err(CommandError::Disabled(codecraft_db::tx::no_transactions(kind)));
+    }
     if let Some(ds) = s.db.source_mut(&id) {
         ds.config.manual_commit = manual;
     }

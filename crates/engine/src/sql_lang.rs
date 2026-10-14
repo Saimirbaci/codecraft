@@ -82,8 +82,9 @@ impl SqlDialect {
     fn from_kind(kind: DbKind) -> Self {
         match kind {
             DbKind::Sqlite => Self::Sqlite,
-            DbKind::Postgres => Self::Postgres,
-            DbKind::Mysql | DbKind::Mariadb => Self::Mysql,
+            DbKind::Postgres | DbKind::DuckDb => Self::Postgres,
+            DbKind::Mysql | DbKind::Mariadb | DbKind::ClickHouse => Self::Mysql,
+            DbKind::SqlServer | DbKind::Redis => Self::Generic,
         }
     }
 }
