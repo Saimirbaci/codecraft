@@ -547,6 +547,7 @@ pub fn suppress_change(f: &Finding, text: &str) -> Result<TextChange, String> {
             Ok(at(f.start.line, l.chars().count(), format!("  // NOLINT({code})")))
         }
         Tool::ZigFmt => Err("zig fmt problems cannot be suppressed".into()),
+        Tool::CargoAudit | Tool::CargoDeny => Err("advisories are ignored in the tool's own configuration (audit.toml / deny.toml)".into()),
         Tool::Mypy | Tool::Pyright => {
             let l = line_text(f.start.line)?;
             if l.contains("# type: ignore") || l.contains("# pyright: ignore") {

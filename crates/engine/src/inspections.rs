@@ -59,6 +59,10 @@ pub enum Tool {
     Mypy,
     /// pyright or basedpyright (M11 track Y).
     Pyright,
+    /// `cargo audit` security advisories (M12 track RS).
+    CargoAudit,
+    /// `cargo deny` advisories, licenses, bans and sources (M12 track RS).
+    CargoDeny,
 }
 
 impl Tool {
@@ -72,6 +76,8 @@ impl Tool {
             Self::ZigFmt => "zig fmt",
             Self::Mypy => "mypy",
             Self::Pyright => "Pyright",
+            Self::CargoAudit => "cargo audit",
+            Self::CargoDeny => "cargo deny",
         }
     }
 
@@ -85,6 +91,8 @@ impl Tool {
             "zig_fmt" | "zig" => Some(Self::ZigFmt),
             "mypy" => Some(Self::Mypy),
             "pyright" | "basedpyright" => Some(Self::Pyright),
+            "cargo_audit" | "audit" => Some(Self::CargoAudit),
+            "cargo_deny" | "deny" => Some(Self::CargoDeny),
             _ => None,
         }
     }
@@ -612,6 +620,7 @@ fn finish(s: &mut Session, out: JobOutput) {
     }
     s.inspections.selected = results.open().next().map(|f| f.id);
     s.inspections.results = Some(results);
+    crate::cargo_audit::after_inspection(s);
     if kind == JobKind::Cleanup {
         if rewrites.is_empty() {
             s.notify(NotificationLevel::Info, "Code Cleanup", "nothing to clean up");
@@ -731,6 +740,7 @@ pub(crate) fn find_program(spec: &JobSpec, tool: Tool) -> Option<PathBuf> {
         }),
         Tool::ZigFmt => codecraft_lsp::which("zig"),
         Tool::Mypy | Tool::Pyright => crate::python_lint::find(&spec.root, tool),
+        Tool::CargoAudit | Tool::CargoDeny => crate::cargo_audit::find(tool),
     }
 }
 
@@ -787,6 +797,14 @@ fn run_job(spec: &JobSpec, cancel: &AtomicBool, tx: &Sender<Msg>) -> JobOutput {
                 outcome: format!("failed: {e}"),
                 ok: false,
             }),
+        }
+    }
+    // Security advisories: cargo audit / cargo deny when installed (M12 track RS).
+    if !cancelled {
+        match crate::cargo_audit::run(spec, cancel, &progress, &mut tools, &mut findings) {
+            Ok(()) => {}
+            Err(e) if e == CANCELLED => cancelled = true,
+            Err(e) => log::warn!("advisory tools: {e}"),
         }
     }
     let linters: [(Tool, &[&str]); 6] = [
@@ -947,6 +965,9 @@ pub fn docs_url(tool: Tool, code: &str, severity: Severity) -> Option<String> {
         Tool::ZigFmt => None,
         Tool::Mypy => Some(format!("https://mypy.readthedocs.io/en/stable/error_code_list.html#code-{code}")),
         Tool::Pyright => Some(format!("https://microsoft.github.io/pyright/#/configuration?id={code}")),
+        Tool::CargoAudit | Tool::CargoDeny => {
+            code.starts_with("RUSTSEC-").then(|| format!("https://rustsec.org/advisories/{code}.html"))
+        }
     }
 }
 
@@ -961,6 +982,7 @@ pub fn suppress_label(f: &Finding) -> String {
         Tool::ZigFmt => "Suppress".to_string(),
         Tool::Mypy => format!("Suppress with # type: ignore[{code}]"),
         Tool::Pyright => format!("Suppress with # pyright: ignore[{code}]"),
+        Tool::CargoAudit | Tool::CargoDeny => format!("Ignore {code} in the tool's configuration"),
     }
 }
 

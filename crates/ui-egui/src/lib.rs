@@ -44,6 +44,7 @@ mod project_windows;
 mod python_ui;
 mod refactor_ui;
 mod remote_ui;
+mod rust_ui;
 mod services_panel;
 mod settings_ui;
 mod state;
@@ -217,6 +218,9 @@ impl App {
         let mut session = Session::new();
         session.session_store.enable();
         session.run_store.generate.auto = true;
+        // Cargo.toml completion and the newer-version inspection ask crates.io (M12 track RS).
+        session.rust.deps.online = true;
+        session.rust.deps.auto = true;
         Self::build(open, PersistedState::load(), true, true, session)
     }
 
@@ -573,6 +577,7 @@ impl App {
         profiler_ui::windows(ui, s, st);
         http_ui::windows(ui, s, st);
         database_editor_ui::windows(ui, s, st);
+        rust_ui::windows(ui, s, st);
         appearance_ui::windows(ui, s, st);
         database_data_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);

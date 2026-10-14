@@ -21,6 +21,8 @@ pub mod agents;
 pub mod app_cmds;
 pub mod approvals;
 pub mod catalog;
+pub mod cargo_audit;
+pub mod cargo_deps;
 mod code_cmds;
 pub mod commands;
 pub mod completion;
@@ -55,6 +57,7 @@ mod jobs;
 pub mod keymaps;
 mod lang_cmds;
 pub mod local_history;
+pub mod macro_expand;
 mod local_history_cmds;
 mod lsp;
 pub mod misc;
@@ -83,6 +86,9 @@ mod run_config_cmds;
 pub mod run_config_store;
 pub mod run_configs;
 mod runs;
+mod rust_cmds;
+pub mod rust_repl;
+pub mod rust_tools;
 pub mod scratch;
 pub mod services;
 pub mod session_store;
@@ -252,6 +258,8 @@ pub struct Session {
     pub sql_lang: sql_lang::SqlLangState,
     /// The Services tool window's selected section.
     pub services: services::ServicesState,
+    /// Macro expansion, Cargo.toml dependencies, the Rust REPL, advisories (M12 track RS).
+    pub rust: rust_tools::RustState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -319,6 +327,7 @@ impl Session {
             profiler: profiler::ProfilerState::default(),
             sql_lang: sql_lang::SqlLangState::default(),
             services: services::ServicesState::default(),
+            rust: rust_tools::RustState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -380,6 +389,7 @@ impl Session {
         self.db.history.set_dir(dir.join("database").join("history"));
         self.remote.home_override = Some(dir.to_path_buf());
         self.remote.ssh_config_override = Some(dir.join("ssh_config"));
+        self.rust.deps.cache_dir_override = Some(dir.join("cache").join("crates-index"));
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
@@ -413,6 +423,7 @@ impl Session {
         changed |= profiler::pump(self);
         changed |= sql_lang::pump(self);
         changed |= run_config_gen::pump(self);
+        changed |= rust_tools::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -436,6 +447,7 @@ impl Session {
             || self.python.busy()
             || self.profiler.busy()
             || self.sql_lang.busy()
+            || self.rust.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -462,6 +474,7 @@ impl Session {
         docker::shutdown(self);
         python::shutdown(self);
         profiler::shutdown(self);
+        rust_tools::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);

@@ -28,6 +28,7 @@ mod client;
 mod discover;
 mod init;
 mod refactor;
+mod rust_ext;
 mod servers;
 mod transport;
 mod uri;
@@ -38,6 +39,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use lsp_types;
+pub use rust_ext::{ExpandedMacro, decode_expanded_macro};
 pub use servers::{ServerCommand, ServerKind, extra_bin_dirs, find_server, which};
 
 use crossbeam_channel::Receiver;

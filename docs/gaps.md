@@ -483,3 +483,13 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     strings; the ER diagram has no saved layouts, view nodes, cross-schema edges or notations,
     and PNG export needs the window (SVG works headless); the table dialog doesn't load the
     columns of a foreign key's target until that table is expanded.
+42. Rust depth (track RS): Show Recursive Macro Expansion (rust-analyzer `expandMacro`, rustfmt),
+    Cargo.toml crate/version completion and "newer version" inspection from crates.io (cached,
+    quiet offline, only on in the desktop app), update fixes and Update All Dependencies, a Rust
+    REPL on evcxr, cargo audit / cargo deny in Inspect Code; rust-analyzer's postfix completion
+    verified. Remaining: no single-step expansion (rust-analyzer only expands recursively); the
+    installed rust-analyzer returns nothing for built-in derives; offline crate-name completion
+    only knows crates seen before (no `~/.cargo/registry` scan); no Settings page for lookups
+    (`rust.cargo.setCratesIoLookups`); multi-line inline tables aren't recognised; the REPL has no
+    interrupt and no variables view, and `rust.repl.sendSelection` has no shortcut; advisories
+    can't be suppressed from the IDE (use audit.toml / deny.toml).
