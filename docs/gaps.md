@@ -439,3 +439,17 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     wasn't checked against a real CLI; sessions are per project root (feedback jobs on CodeCraft's
     own source appear only when that folder is open); opening/renaming reads the file
     synchronously (≤ 2 MB); no search, filter or export in History.
+39. SQL editor and explorer (track DC): Go to Declaration, Quick Documentation, Find Usages,
+    Rename and quick-fixes in SQL (files, consoles, Rust strings); inspections (UPDATE/DELETE
+    without WHERE, INSERT count mismatch, SELECT * in views, unused alias/CTE, ambiguous column,
+    unresolved names) with `-- noinspection`; `.sql` files attached to a data source and schema,
+    run whole with stop/continue/ask and an execution log; Go to Database Object (⌥⇧⌘O);
+    explorer filter, schemas to introspect, counts, routines, node refresh; pinned result tabs;
+    SQL live templates. Remaining: analysis is lexical (subqueries flattened; the ambiguity check
+    is single-level; unqualified usages may over-match; no SQL in Python/TypeScript strings);
+    PostgreSQL/MySQL DDL is generated (no checks, sequences, triggers, partitions, grants) and
+    DDL tabs are temp files never cleaned; routines come from information_schema without
+    parameter lists; no metadata cache across disconnects; scripts take parameters only via
+    `params`, keep logs in memory (last 20) and have no "run from caret"; no schema selector for
+    SQLite; Go to Database Object has no menu item (RustRover has none); rename covers table
+    aliases and CTEs, not column aliases.
