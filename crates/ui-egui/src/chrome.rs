@@ -192,6 +192,7 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 }
                 crate::python_ui::status_widget(ui, s, st);
                 crate::database_data_ui::status_widget(ui, s, st);
+                crate::ed_ui::status_widget(ui, s, st);
                 let info = s.ws.active().map(|(e, d)| {
                     let unit = d.doc.detect_indent_unit();
                     let indent =

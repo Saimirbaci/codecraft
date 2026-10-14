@@ -506,3 +506,17 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     after save writes the file twice; the formatter setting is free text; templates have no
     automatic completion popup, `{% url %}`/`{% static %}` or variable resolution, and Django
     Template is missing from Associate with File Type.
+44. Editor and IDE (track ED): Search/Replace Structurally (token templates with `$var$`,
+    constraints, saved templates), Edit › Macros, Run Inspection by Name, Silent Code Cleanup,
+    Configure Current File Analysis, Locate Duplicates, Data Flow to/from Here, offline
+    inspection results, Save File as Template / New from Template, Update Copyright, Window ›
+    Layouts and Active Tool Window actions, local Tasks & Contexts with time tracking, Markdown
+    export to HTML, Presentation Assistant, inline completion from the configured AI provider.
+    Remaining: structural search works on tokens (no operator precedence, type or reference
+    constraints, no variables inside strings); data flow is lexical (misses shadowing, closures,
+    trait dispatch, most pattern bindings); Locate Duplicates compares within one language and
+    caps each hash bucket at 64; file analysis levels aren't persisted; tasks have no
+    issue-tracker servers or changelists (a branch per task instead); macro shortcuts bypass the
+    keymap editor; inline completion only on request, multi-line proposals shown as one line;
+    Markdown export is HTML only; no Zig / TypeScript tool windows; the "Edit 'Default task'"
+    menu label isn't dynamic yet (`tasks_contexts::edit_label`).

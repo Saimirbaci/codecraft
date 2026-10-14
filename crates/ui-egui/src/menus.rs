@@ -50,6 +50,8 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("Edit › Bookmarks", "edit.bookmarks.toggleWithMnemonic"),
     ("Edit › Bookmarks", "edit.bookmarks.editDescription"),
     ("File", "file.scratches"),
+    // File › New › From Template… (the templates saved with File › Save File as Template…).
+    ("File › New", "file.newFromTemplate"),
 ];
 
 pub(crate) fn visible(item: &CatalogItem) -> bool {

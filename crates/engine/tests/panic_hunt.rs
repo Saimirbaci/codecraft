@@ -54,6 +54,11 @@ fn skip(id: &str, params: &Value) -> bool {
     if id == "runConfig.generate" && params.get("agent").is_some() {
         return true;
     }
+    // Call Inline Completion sends the code to the configured AI provider (paid API usage; the
+    // inline_completion tests use a 127.0.0.1 fake server).
+    if id == "code.codeCompletion.callInlineCompletion" {
+        return true;
+    }
     // Manage Accounts runs the real `gh`/`glab auth status` (misc_cmds tests use a fake one).
     if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
         return true;

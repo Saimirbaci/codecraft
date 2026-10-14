@@ -198,6 +198,18 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::python_output::specs());
         specs.extend(crate::python_format::specs());
         specs.extend(crate::templates_django::specs());
+        specs.extend(crate::ssr_cmds::specs());
+        specs.extend(crate::macros::specs());
+        specs.extend(crate::presentation::specs());
+        specs.extend(crate::analysis::specs());
+        specs.extend(crate::duplicates::specs());
+        specs.extend(crate::data_flow::specs());
+        specs.extend(crate::layouts::specs());
+        specs.extend(crate::file_templates::specs());
+        specs.extend(crate::copyright::specs());
+        specs.extend(crate::tasks_contexts::specs());
+        specs.extend(crate::markdown_export::specs());
+        specs.extend(crate::inline_completion::specs());
         // Routes come last so they wrap every registered command. SQL files and SQL in strings:
         // navigation commands handle SQL (track DC).
         crate::database_cmds::sql_editor::route(&mut specs);

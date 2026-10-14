@@ -401,6 +401,8 @@ fn sanitize_layout(l: &Layout) -> Layout {
             .collect(),
         all_hidden: l.all_hidden,
         last_active: l.last_active,
+        group_tabs: l.group_tabs,
+        ..Layout::default()
     }
 }
 

@@ -197,6 +197,15 @@ pub struct Layout {
     /// The tool window shown last (Window › Active Tool Window acts on it).
     #[serde(default)]
     pub last_active: Option<ToolWindowId>,
+    /// Window › Active Tool Window › Maximize Tool Window: this one fills the window.
+    #[serde(default)]
+    pub maximized: Option<ToolWindowId>,
+    /// Window › Active Tool Window › Group Tabs: tool windows show their tabs as one list.
+    #[serde(default)]
+    pub group_tabs: bool,
+    /// Bumped when sizes change outside a drag (stretch, layout restore) so panels re-read them.
+    #[serde(default)]
+    pub size_rev: u64,
 }
 
 impl Default for Layout {
@@ -211,6 +220,9 @@ impl Default for Layout {
             tool_sizes: BTreeMap::new(),
             all_hidden: false,
             last_active: None,
+            maximized: None,
+            group_tabs: false,
+            size_rev: 0,
         }
     }
 }
@@ -282,6 +294,34 @@ impl Layout {
         if *slot == Some(tw) {
             *slot = None;
         }
+        if self.maximized == Some(tw) {
+            self.maximized = None;
+        }
+    }
+
+    /// The size a side's open tool window has (its remembered size, else the side's size).
+    pub fn current_size(&self, tw: ToolWindowId) -> f32 {
+        let fallback = match tw.side() {
+            Side::Left => self.left_width,
+            Side::Bottom => self.bottom_height,
+            Side::Right => self.right_width,
+        };
+        self.size_of(tw, fallback)
+    }
+
+    /// Set a tool window's size (clamped to 80..=2000) and make the panels pick it up.
+    pub fn set_size(&mut self, tw: ToolWindowId, size: f32) {
+        if !size.is_finite() {
+            return;
+        }
+        let size = size.clamp(80.0, 2000.0);
+        match tw.side() {
+            Side::Left => self.left_width = size,
+            Side::Bottom => self.bottom_height = size,
+            Side::Right => self.right_width = size,
+        }
+        self.remember_size(tw, size);
+        self.size_rev = self.size_rev.wrapping_add(1);
     }
 }
 

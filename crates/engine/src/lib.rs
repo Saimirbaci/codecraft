@@ -106,6 +106,20 @@ pub mod paste;
 mod split_cmds;
 pub mod sql_lang;
 mod sql_lang_cmds;
+pub mod analysis;
+pub mod copyright;
+pub mod data_flow;
+pub mod duplicates;
+pub mod file_templates;
+pub mod inline_completion;
+pub mod layouts;
+pub mod macros;
+pub mod markdown_export;
+pub mod tasks_contexts;
+pub mod presentation;
+pub mod ssr;
+pub mod ssr_cmds;
+pub mod user_store;
 pub mod ssh_target;
 pub mod ssh_tunnel;
 pub mod structure;
@@ -175,6 +189,9 @@ pub enum Effect {
     SwitchProjectWindow(i32),
     /// Enter (true) or leave (false) full screen (View › Appearance).
     SetFullScreen(bool),
+    /// Ask for a file to open (or, with `save`, a file to write), then run `command` with the
+    /// chosen path as param `param`. `extensions` filter the dialog (`["json"]`).
+    PickFile { title: String, command: String, param: String, save: bool, extensions: Vec<String>, default_name: Option<String> },
 }
 
 /// State of the language server connection, for the status bar.
@@ -272,6 +289,28 @@ pub struct Session {
     pub jupyter: jupyter::JupyterState,
     /// Ruff/Black/isort runs for Python files (M12 track PY).
     pub py_format: python_format::FormatState,
+    /// Edit › Find › Search/Replace Structurally (M12 track ED).
+    pub ssr: ssr_cmds::SsrState,
+    /// Edit › Macros (M12 track ED).
+    pub macros: macros::MacroState,
+    /// View › Appearance › Presentation Assistant (M12 track ED).
+    pub presentation: presentation::PresentationState,
+    /// Code › Analyze Code popups (M12 track ED).
+    pub analysis: analysis::AnalysisState,
+    /// Code › Analyze Code › Locate Duplicates (M12 track ED).
+    pub duplicates: duplicates::DuplicatesState,
+    /// Code › Analyze Code › Data Flow to/from Here (M12 track ED).
+    pub data_flow: data_flow::DataFlowState,
+    /// Window › Layouts (M12 track ED).
+    pub layouts: layouts::LayoutsState,
+    /// File › Save File as Template / New from Template (M12 track ED).
+    pub file_templates: file_templates::FileTemplatesState,
+    /// Code › Update Copyright (M12 track ED).
+    pub copyright: copyright::CopyrightState,
+    /// Tools › Tasks & Contexts (M12 track ED).
+    pub tasks: tasks_contexts::TasksState,
+    /// Code › Code Completion › Call Inline Completion (M12 track ED).
+    pub inline: inline_completion::InlineState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -342,6 +381,17 @@ impl Session {
             rust: rust_tools::RustState::default(),
             jupyter: jupyter::JupyterState::default(),
             py_format: python_format::FormatState::default(),
+            ssr: ssr_cmds::SsrState::default(),
+            macros: macros::MacroState::default(),
+            presentation: presentation::PresentationState::default(),
+            analysis: analysis::AnalysisState::default(),
+            duplicates: duplicates::DuplicatesState::default(),
+            data_flow: data_flow::DataFlowState::default(),
+            layouts: layouts::LayoutsState::default(),
+            file_templates: file_templates::FileTemplatesState::default(),
+            copyright: copyright::CopyrightState::default(),
+            tasks: tasks_contexts::TasksState::default(),
+            inline: inline_completion::InlineState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -366,11 +416,22 @@ impl Session {
             return r;
         }
         let run = spec.run;
+        // Only top-level commands are recorded in macros and announced (not the steps of a
+        // command that runs others).
+        let top_level = self.macros.depth == 0;
+        self.macros.depth = self.macros.depth.saturating_add(1);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(self, params)));
+        self.macros.depth = self.macros.depth.saturating_sub(1);
         // Other views of an edited document follow the edit (split editors).
         self.ws.sync_views();
         match result {
-            Ok(r) => r,
+            Ok(r) => {
+                if top_level && r.is_ok() {
+                    macros::record(self, spec.id, params);
+                    presentation::note(self, spec.id);
+                }
+                r
+            }
             Err(payload) => {
                 let msg = payload
                     .downcast_ref::<&str>()
@@ -404,6 +465,11 @@ impl Session {
         self.remote.home_override = Some(dir.to_path_buf());
         self.remote.ssh_config_override = Some(dir.join("ssh_config"));
         self.rust.deps.cache_dir_override = Some(dir.join("cache").join("crates-index"));
+        self.ssr.set_home(dir.to_path_buf());
+        self.macros.set_home(dir.to_path_buf());
+        self.layouts.set_home(dir.to_path_buf());
+        self.file_templates.set_home(dir.to_path_buf());
+        self.copyright.set_home(dir.to_path_buf());
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
@@ -440,6 +506,11 @@ impl Session {
         changed |= sql_lang::pump(self);
         changed |= run_config_gen::pump(self);
         changed |= rust_tools::pump(self);
+        changed |= ssr_cmds::pump(self);
+        changed |= duplicates::pump(self);
+        changed |= data_flow::pump(self);
+        changed |= tasks_contexts::pump(self);
+        changed |= inline_completion::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -466,6 +537,10 @@ impl Session {
             || self.profiler.busy()
             || self.sql_lang.busy()
             || self.rust.busy()
+            || self.ssr.busy()
+            || self.duplicates.busy()
+            || self.data_flow.busy()
+            || self.inline.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -476,6 +551,9 @@ impl Session {
             || self.debug.settling()
             || self.inspections.busy()
             || self.run_store.generate.busy()
+            || self.ssr.busy()
+            || self.duplicates.busy()
+            || self.data_flow.busy()
     }
 
     /// Stop the language server and running processes (window closing).
@@ -494,6 +572,9 @@ impl Session {
         jupyter::shutdown(self);
         profiler::shutdown(self);
         rust_tools::shutdown(self);
+        ssr_cmds::shutdown(self);
+        duplicates::shutdown(self);
+        data_flow::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);

@@ -25,6 +25,7 @@ mod debug_panel;
 mod debug_views_ui;
 mod diff_view;
 mod docker_ui;
+mod ed_ui;
 mod editor;
 mod er_diagram;
 mod feedback;
@@ -383,7 +384,13 @@ impl App {
             || appearance_ui::wants_keyboard(s)
             || python_ui::wants_keyboard(s)
             || database_editor_ui::wants_keyboard(s)
+            || ed_ui::wants_keyboard(s)
         {
+            return;
+        }
+
+        // A shortcut bound to a saved macro plays it.
+        if !text_field_focused && ed_ui::macro_shortcut(ctx, s, st) {
             return;
         }
 
@@ -414,6 +421,25 @@ impl App {
                 ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Tab));
                 run_command(s, st, "editor.completion.accept", &Value::Null);
                 continue;
+            }
+            // An inline proposal (ghost text): Tab, Alt+Right and Cmd+Right insert it, Escape
+            // dismisses it.
+            if editor_focused
+                && !completion_open
+                && s.ws.active_editor().and_then(|id| codecraft_engine::inline_completion::visible(s, id)).is_some()
+            {
+                let inline = match key {
+                    Key::Tab if modifiers.is_none() => Some("code.codeCompletion.insertInlineProposal"),
+                    Key::ArrowRight if modifiers.alt && !modifiers.shift => Some("code.codeCompletion.insertInlineProposalsWord"),
+                    Key::ArrowRight if modifiers.command && !modifiers.shift => Some("code.codeCompletion.insertInlineProposalsLine"),
+                    Key::Escape => Some("editor.inlineCompletion.dismiss"),
+                    _ => None,
+                };
+                if let Some(id) = inline {
+                    ctx.input_mut(|i| i.consume_key(*modifiers, *key));
+                    run_command(s, st, id, &Value::Null);
+                    continue;
+                }
             }
             let found = st
                 .bindings
@@ -489,6 +515,24 @@ impl App {
                 Effect::OpenProjectWindow(p) => st.window_requests.push(project_windows::Request::Open(p)),
                 Effect::SwitchProjectWindow(d) => st.window_requests.push(project_windows::Request::Switch(d)),
                 Effect::SetFullScreen(on) => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on)),
+                Effect::PickFile { title, command, param, save, extensions, default_name } => {
+                    let mut dialog = rfd::FileDialog::new().set_title(title);
+                    if let Some(dir) = s.project_root() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if !extensions.is_empty() {
+                        dialog = dialog.add_filter(extensions.join(", "), &extensions);
+                    }
+                    if let Some(name) = default_name {
+                        dialog = dialog.set_file_name(name);
+                    }
+                    let picked = if save { dialog.save_file() } else { dialog.pick_file() };
+                    if let Some(p) = picked {
+                        let mut params = serde_json::Map::new();
+                        params.insert(param, json!(p));
+                        run_command(s, st, &command, &Value::Object(params));
+                    }
+                }
             }
         }
     }
@@ -583,6 +627,7 @@ impl App {
         rust_ui::windows(ui, s, st);
         appearance_ui::windows(ui, s, st);
         database_data_ui::windows(ui, s, st);
+        ed_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         windows::capture(ui.ctx(), st);

@@ -557,6 +557,7 @@ mod tests {
             editions: Vec::new(),
             programs: std::collections::HashMap::new(),
             format: false,
+            only: None,
         }
     }
 
