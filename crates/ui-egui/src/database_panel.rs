@@ -109,6 +109,8 @@ enum Kind {
     Column,
     Folder,
     Leaf,
+    /// A function or procedure (track DC).
+    Routine,
     Message,
 }
 
@@ -255,23 +257,77 @@ fn push_schemas(
     let t = &st.theme;
     let id = ds.config.id.as_str();
     let default = ds.tree.info.as_ref().and_then(|i| i.default_schema.clone());
+    // The explorer filter (track DC): matching objects, and the schemas that hold them.
+    let nav = &s.db.nav;
+    let filtering = !nav.explorer_filter.trim().is_empty();
     for (schema, node) in &ds.tree.schemas {
+        let routines = nav.routines_of(id, schema).and_then(|r| r.items.as_ref());
+        let schema_hit = nav.filter_matches(schema);
+        if filtering
+            && !schema_hit
+            && !node.tables.iter().flatten().any(|t| nav.filter_matches(&t.info.name))
+            && !routines.is_some_and(|rs| rs.iter().any(|r| nav.filter_matches(&r.name)))
+        {
+            continue;
+        }
         let key = node_key(id, Some(schema), None);
-        let expanded = s.db.expanded.contains(&key);
-        let mut r = Row::new(depth, Kind::Schema, key, id);
+        let expanded = s.db.expanded.contains(&key) || filtering && node.tables.is_some() && !schema_hit;
+        let mut r = Row::new(depth, Kind::Schema, key.clone(), id);
         r.expandable = true;
         r.expanded = expanded;
         r.icon = "⊞";
         r.icon_color = t.type_;
         r.label = schema.clone();
         r.label_color = t.text;
+        let mut counts = Vec::new();
         if default.as_deref() == Some(schema.as_str()) {
-            r.detail = "default".into();
+            counts.push("default".to_string());
         }
+        // Object counts once the schema is loaded.
+        if let Some(tables) = &node.tables {
+            let views =
+                tables.iter().filter(|t| t.info.kind != TableKind::Table && t.info.kind != TableKind::Foreign).count();
+            counts.push(format!("{} tables", tables.len() - views));
+            if views > 0 {
+                counts.push(format!("{views} views"));
+            }
+        }
+        if let Some(rs) = routines.filter(|rs| !rs.is_empty()) {
+            counts.push(format!("{} routines", rs.len()));
+        }
+        r.detail = counts.join(" · ");
         r.schema = Some(schema.clone());
         rows.push(r);
         if !expanded {
             continue;
+        }
+        if let Some(rs) = routines.filter(|rs| !rs.is_empty()) {
+            let fkey = format!("{key}\u{1f}#routines");
+            let shown: Vec<_> = rs.iter().filter(|r| !filtering || schema_hit || nav.filter_matches(&r.name)).collect();
+            let fexp = s.db.expanded.contains(&fkey) || filtering && !schema_hit;
+            let mut f = Row::new(depth + 1, Kind::Folder, fkey, id);
+            f.expandable = true;
+            f.expanded = fexp;
+            f.icon = "🗀";
+            f.icon_color = t.text_muted;
+            f.label = "routines".into();
+            f.label_color = t.text_muted;
+            f.detail = shown.len().to_string();
+            rows.push(f);
+            if fexp {
+                for rt in shown {
+                    let mut r = Row::new(depth + 2, Kind::Routine, String::new(), id);
+                    r.icon = "ƒ";
+                    r.icon_color = t.keyword;
+                    r.label = rt.name.clone();
+                    r.label_color = t.text;
+                    r.detail =
+                        if rt.returns.is_empty() { rt.kind.clone() } else { format!("{} → {}", rt.kind, rt.returns) };
+                    r.schema = Some(schema.clone());
+                    r.table = Some(rt.name.clone());
+                    rows.push(r);
+                }
+            }
         }
         if node.loading {
             rows.push(message(depth + 1, id, "Loading…", t.text_muted));
@@ -284,6 +340,9 @@ fn push_schemas(
             rows.push(message(depth + 1, id, "No tables", t.text_muted));
         }
         for table in tables {
+            if filtering && !schema_hit && !nav.filter_matches(&table.info.name) {
+                continue;
+            }
             let tkey = node_key(id, Some(schema), Some(&table.info.name));
             let texp = s.db.expanded.contains(&tkey);
             let mut r = Row::new(depth + 1, Kind::Table, tkey.clone(), id);
@@ -427,7 +486,26 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         if small_button(ui, "🔌", "Disconnect", connected, st.theme.error, st) {
             actions.push(TreeAction::Cmd("db.disconnect", Value::Null));
         }
+        if small_button(ui, "🔍", "Database Object… (⌥⇧⌘O)", connected, st.theme.text, st) {
+            actions.push(TreeAction::Cmd("db.gotoObject", Value::Null));
+        }
     });
+    // Filter (track DC): edits the engine's filter in place, like the dialogs' fields.
+    if !s.db.sources.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut s.db.nav.explorer_filter)
+                    .id(egui::Id::new("db-explorer-filter"))
+                    .hint_text("Filter tables, views, routines…")
+                    .desired_width(ui.available_width() - 24.0),
+            );
+            if !s.db.nav.explorer_filter.is_empty()
+                && ui.add(egui::Button::new(RichText::new("×").color(st.theme.text_muted)).frame(false)).clicked()
+            {
+                actions.push(TreeAction::Cmd("db.explorer.filter", json!({ "text": "" })));
+            }
+        });
+    }
     ui.add(egui::Separator::default().spacing(4.0));
     if s.db.sources.is_empty() {
         ui.add_space(12.0);
@@ -518,6 +596,10 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                             "db.openTable",
                             json!({ "dataSource": row.source, "schema": row.schema, "table": row.table }),
                         )),
+                        Kind::Routine => actions.push(TreeAction::Cmd(
+                            "sql.openDdl",
+                            json!({ "dataSource": row.source, "schema": row.schema, "name": row.table, "routine": true }),
+                        )),
                         _ if row.expandable => actions.push(toggle(row)),
                         _ => {}
                     }
@@ -574,16 +656,42 @@ fn context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
             item(ui, "Query History", "db.showHistory", ds.clone());
             ui.separator();
             item(ui, "Test Connection", "db.testConnection", ds.clone());
+            item(ui, "Schemas to Introspect…", "db.introspectSchemas", ds.clone());
             item(ui, "Properties…", "db.editDataSource", ds.clone());
             item(ui, "Remove", "db.removeDataSource", ds);
         }
-        Kind::Schema | Kind::Database => {
+        Kind::Schema => {
+            item(ui, "Refresh", "db.refreshNode", json!({ "dataSource": row.source, "schema": row.schema }));
+            item(ui, "Open Query Console", "db.newConsole", ds);
+        }
+        Kind::Database => {
             item(ui, "Refresh", "db.refresh", ds.clone());
             item(ui, "Open Query Console", "db.newConsole", ds);
+        }
+        Kind::Routine => {
+            let r = json!({ "dataSource": row.source, "schema": row.schema, "name": row.table, "routine": true });
+            item(ui, "Go to DDL", "sql.openDdl", r);
+            if ui.button("Copy Name").clicked() {
+                ui.ctx().copy_text(row.label.clone());
+                ui.close();
+            }
         }
         Kind::Table => {
             let t = json!({ "dataSource": row.source, "schema": row.schema, "table": row.table });
             item(ui, "Open Data", "db.openTable", t.clone());
+            item(
+                ui,
+                "Go to DDL",
+                "sql.openDdl",
+                json!({ "dataSource": row.source, "schema": row.schema, "name": row.table }),
+            );
+            item(
+                ui,
+                "Find Usages in Project SQL",
+                "sql.findUsages",
+                json!({ "schema": row.schema, "table": row.table }),
+            );
+            item(ui, "Refresh", "db.refreshNode", t.clone());
             item(ui, "Count Rows", "db.rowCount", t.clone());
             if ui.button("Import Data from File…").clicked() {
                 ui.close();
@@ -950,6 +1058,12 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                         cmd = Some(("db.setDataSource", json!({ "dataSource": id, "path": path })));
                     }
                 }
+                // Schema, Run 'file.sql' and its error mode (track DC).
+                if let Some(c) =
+                    crate::database_editor_ui::file_toolbar(ui, s, st, path.as_deref(), source.as_deref(), is_console)
+                {
+                    cmd = Some(c);
+                }
                 if let Some(ConnStatus::Failed(e)) = current.map(|d| &d.status) {
                     ui.label(RichText::new("connection failed").color(st.theme.error)).on_hover_text(e);
                 }
@@ -995,9 +1109,23 @@ pub fn services(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     // Tabs.
     ScrollArea::horizontal().id_salt("db-result-tabs").max_height(28.0).show(ui, |ui| {
         ui.horizontal(|ui| {
-            let out_sel = s.db.active_result.is_none();
+            let script = s.db.scripts.shown.and_then(|id| s.db.scripts.get(id));
+            let out_sel = s.db.active_result.is_none() && script.is_none();
             if ui.selectable_label(out_sel, "Output").clicked() {
                 cmd.push(("db.selectResult", Value::Null));
+                cmd.push(("db.showScriptLog", json!({ "script": null })));
+            }
+            // The latest script run's execution log (track DC).
+            if let Some(r) = s.db.scripts.runs.last() {
+                let sel = s.db.active_result.is_none() && script.is_some_and(|x| x.id == r.id);
+                let color = if r.failed() > 0 { st.theme.error } else { st.theme.text };
+                if ui
+                    .selectable_label(sel, RichText::new(format!("▤ {}", r.title)).color(color))
+                    .on_hover_text(format!("Execution log: {}", r.summary()))
+                    .clicked()
+                {
+                    cmd.push(("db.showScriptLog", json!({ "script": r.id })));
+                }
             }
             for r in &s.db.results {
                 let sel = s.db.active_result == Some(r.id);
@@ -1028,6 +1156,17 @@ pub fn services(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if ui.selectable_label(sel, job).on_hover_text(&r.sql).clicked() {
                     cmd.push(("db.selectResult", json!({ "result": r.id })));
                 }
+                // Pinned tabs stay when the console runs again (track DC).
+                let pinned = s.db.nav.pinned.contains(&r.id);
+                let pin_color = if pinned { st.theme.accent } else { st.theme.text_muted };
+                if (pinned || sel)
+                    && ui
+                        .add(egui::Button::new(RichText::new("📌").size(11.0).color(pin_color)).frame(false))
+                        .on_hover_text(if pinned { "Unpin tab" } else { "Pin tab (the next run opens a new tab)" })
+                        .clicked()
+                {
+                    cmd.push(("db.results.pin", json!({ "result": r.id })));
+                }
                 if ui
                     .add(egui::Button::new(RichText::new("×").color(st.theme.text_muted)).frame(false))
                     .on_hover_text("Close")
@@ -1040,7 +1179,11 @@ pub fn services(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     });
     ui.add(egui::Separator::default().spacing(2.0));
     match s.db.active().cloned() {
-        None => output(ui, s, st),
+        None => {
+            if !crate::database_editor_ui::script_log(ui, s, st, &mut cmd) {
+                output(ui, s, st);
+            }
+        }
         Some(r) => result_view(ui, s, st, &r, &mut cmd),
     }
     for (id, p) in cmd {

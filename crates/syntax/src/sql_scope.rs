@@ -22,6 +22,8 @@ pub struct TableRef {
     /// Char range of the table name.
     pub start: usize,
     pub end: usize,
+    /// Char range of the alias (where it is defined).
+    pub alias_span: Option<(usize, usize)>,
 }
 
 /// A column reference (`name` or `qualifier.name`).
@@ -45,6 +47,8 @@ pub struct Statement {
     pub columns: Vec<ColumnRef>,
     /// Names defined by `WITH name AS (…)`.
     pub ctes: Vec<String>,
+    /// Char ranges of the CTE names where they are defined (parallel to `ctes`).
+    pub cte_spans: Vec<(usize, usize)>,
     /// Column aliases (`AS name`, `expr name`).
     pub aliases: Vec<String>,
     /// Aliases of subqueries and table functions in FROM (their columns are unknown).
@@ -365,6 +369,93 @@ pub fn analyze(sql: &str) -> Vec<Statement> {
     t.statements().into_iter().map(|(a, b)| Analyzer::new(&t, &ends, a, b).run()).collect()
 }
 
+/// What an [`SqlToken`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum SqlTokenKind {
+    /// A keyword or a built-in type name.
+    Keyword,
+    /// An identifier (table, column, alias, …).
+    Name,
+    /// An identifier used as a function name.
+    Function,
+    /// A quoted identifier (`"x"`, `` `x` ``), quotes included in the text.
+    QuotedName,
+    /// One punctuation or operator char.
+    Symbol(char),
+    /// A string or number literal.
+    Literal,
+    /// Parameters and anything else.
+    Other,
+}
+
+/// A significant (non-comment) token of SQL text, for analyses outside this module
+/// (inspections, navigation, rename). Offsets are char offsets.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SqlToken {
+    pub start: usize,
+    pub end: usize,
+    pub kind: SqlTokenKind,
+    pub text: String,
+}
+
+impl SqlToken {
+    /// A keyword or name equal to `w` (case-insensitively).
+    pub fn is_word(&self, w: &str) -> bool {
+        matches!(self.kind, SqlTokenKind::Keyword | SqlTokenKind::Name | SqlTokenKind::Function)
+            && self.text.eq_ignore_ascii_case(w)
+    }
+
+    pub fn is_sym(&self, c: char) -> bool {
+        self.kind == SqlTokenKind::Symbol(c)
+    }
+
+    /// The identifier this token names (unquoted); keywords too with `keywords` (`name`,
+    /// `user`, `status` are keywords to the highlighter but common column names).
+    pub fn name(&self, keywords: bool) -> Option<String> {
+        match self.kind {
+            SqlTokenKind::Name | SqlTokenKind::Function => Some(self.text.clone()),
+            SqlTokenKind::Keyword if keywords => Some(self.text.clone()),
+            SqlTokenKind::QuotedName => {
+                let q = self.text.chars().next().filter(|c| matches!(c, '"' | '`'))?;
+                let inner = self.text.strip_prefix(q)?.strip_suffix(q)?;
+                let doubled: String = [q, q].iter().collect();
+                Some(inner.replace(&doubled, &q.to_string()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The significant tokens of `sql` (comments left out).
+pub fn tokens(sql: &str) -> Vec<SqlToken> {
+    let t = Toks::new(sql);
+    t.toks
+        .iter()
+        .map(|tok| {
+            let kind = match tok.tt {
+                Tt::Word => match tok.kind {
+                    K::Keyword | K::Type | K::Boolean => SqlTokenKind::Keyword,
+                    K::Function => SqlTokenKind::Function,
+                    _ => SqlTokenKind::Name,
+                },
+                Tt::Sym(c) => SqlTokenKind::Symbol(c),
+                Tt::Lit => SqlTokenKind::Literal,
+                Tt::Other if tok.kind == K::Ident => SqlTokenKind::QuotedName,
+                _ if tok.kind == K::Number || tok.kind == K::String => SqlTokenKind::Literal,
+                _ => SqlTokenKind::Other,
+            };
+            SqlToken { start: tok.start, end: tok.end, kind, text: t.doc.string(tok.start, tok.end) }
+        })
+        .collect()
+}
+
+/// The comments of `sql`: (start, end, text) in chars.
+pub fn comments(sql: &str) -> Vec<(usize, usize, String)> {
+    let doc = Doc::new(sql);
+    let (all, _) = sql::tokens(&doc);
+    all.into_iter().filter(|t| t.is_comment()).map(|t| (t.start, t.end, doc.string(t.start, t.end))).collect()
+}
+
 struct Analyzer<'a> {
     t: &'a Toks,
     ends: &'a [Option<usize>],
@@ -419,6 +510,7 @@ impl<'a> Analyzer<'a> {
             if t.is_word(p + 1, "as") && t.is_sym(p + 2, '(') && !self.is_consumed(p) {
                 if let Some(n) = t.name(p, false) {
                     self.st.ctes.push(n);
+                    self.st.cte_spans.push(t.range(p));
                     self.consume(p);
                 }
             } else if t.is_sym(p + 1, '(')
@@ -430,6 +522,7 @@ impl<'a> Analyzer<'a> {
                 && let Some(n) = t.name(p, false)
             {
                 self.st.ctes.push(n);
+                self.st.cte_spans.push(t.range(p));
                 self.consume(p);
             }
             // Item lists are recorded here; the scan still walks through them (subqueries in
@@ -515,6 +608,7 @@ impl<'a> Analyzer<'a> {
                 self.st.tables.push(TableRef {
                     schema: n.checked_sub(2).and_then(|i| parts.get(i)).cloned(),
                     name: parts.last().cloned().unwrap_or_default(),
+                    alias_span: alias.as_ref().map(|(_, at)| t.range(*at)),
                     alias: alias.map(|(a, _)| a),
                     start,
                     end,
@@ -538,6 +632,7 @@ impl<'a> Analyzer<'a> {
         self.st.tables.push(TableRef {
             schema: n.checked_sub(2).and_then(|i| parts.get(i)).cloned(),
             name: parts.last().cloned().unwrap_or_default(),
+            alias_span: alias.as_ref().map(|(_, at)| t.range(*at)),
             alias: alias.map(|(a, _)| a),
             start,
             end,
@@ -890,6 +985,7 @@ pub fn complete(sql: &str, caret: usize, schema: Option<&dyn SqlSchema>) -> SqlC
                     alias: None,
                     start: 0,
                     end: 0,
+                    alias_span: None,
                 });
                 add_columns(&mut out.items, schema, &tr, 0);
             }
@@ -1159,6 +1255,30 @@ mod tests {
         // Without a schema: keywords only.
         let c = complete("SELECT * FROM u", 15, None);
         assert!(c.items.iter().all(|i| i.kind == SqlItemKind::Keyword));
+    }
+
+    #[test]
+    fn tokens_comments_and_definition_spans() {
+        let sql = "WITH r AS (SELECT 1) -- note\nSELECT u.\"Odd\" FROM users AS u, r";
+        let toks = tokens(sql);
+        let at = |s: usize, e: usize| sql.chars().skip(s).take(e - s).collect::<String>();
+        assert!(toks.iter().all(|t| at(t.start, t.end) == t.text));
+        assert!(toks[0].is_word("with") && toks[0].kind == SqlTokenKind::Keyword);
+        let q = toks.iter().find(|t| t.kind == SqlTokenKind::QuotedName).unwrap();
+        assert_eq!(q.name(false).as_deref(), Some("Odd"));
+        assert!(toks.iter().any(|t| t.is_sym('(')));
+        let c = comments(sql);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].2, "-- note");
+        let st = &analyze(sql)[0];
+        assert_eq!(st.cte_spans.iter().map(|&(s, e)| at(s, e)).collect::<Vec<_>>(), ["r"]);
+        let users = st.tables.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(users.alias_span.map(|(s, e)| at(s, e)).as_deref(), Some("u"));
+        assert_eq!(st.tables.iter().find(|t| t.name == "r").unwrap().alias_span, None);
+        for junk in ["", "\"", "`", "'", "$$", "/*", "--", "é\"ü"] {
+            let _ = tokens(junk);
+            let _ = comments(junk);
+        }
     }
 
     #[test]

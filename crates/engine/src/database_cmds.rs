@@ -24,12 +24,14 @@ mod console;
 mod edit;
 mod grid;
 mod import;
+pub(crate) mod sql_editor;
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     let mut v = edit::specs();
     v.extend(console::specs());
     v.extend(grid::specs());
     v.extend(import::specs());
+    v.extend(sql_editor::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);
@@ -685,6 +687,9 @@ fn expand(s: &mut Session, p: &Value) -> CmdResult {
             let node = ds.tree.schemas.get(sc);
             if node.is_none_or(|n| n.tables.is_none() && !n.loading) {
                 s.db.meta(&id, MetaReq::Tables(sc.to_string())).map_err(failed)?;
+            }
+            if connected {
+                crate::database::sql_nav::request_routines(&mut s.db, &id, sc, false);
             }
         }
         (Some(sc), Some(t)) => {
@@ -1377,7 +1382,10 @@ fn complete(s: &mut Session, p: &Value) -> CmdResult {
     let refs = table_refs(&stmt);
 
     let Some(ds) = s.db.source(&source) else { return ok() };
-    let default_schema = ds.tree.info.as_ref().and_then(|i| i.default_schema.clone());
+    // An attached file completes in its schema (track DC).
+    let file_schema =
+        d.path.as_deref().and_then(|p| s.db.nav.schema_for_path(p)).filter(|sc| ds.tree.schemas.contains_key(sc));
+    let default_schema = file_schema.or_else(|| ds.tree.info.as_ref().and_then(|i| i.default_schema.clone()));
     let find_table = |schema: Option<&str>, name: &str| -> Option<(String, String)> {
         let schemas: Vec<&String> = match schema {
             Some(sc) => ds.tree.schemas.keys().filter(|k| k.eq_ignore_ascii_case(sc)).collect(),

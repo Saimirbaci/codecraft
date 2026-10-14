@@ -32,12 +32,16 @@ mod edit;
 pub mod exec;
 pub mod history;
 pub mod import;
+pub mod script;
+pub mod sql_nav;
 
 pub use codecraft_db::explain::{Plan, PlanNode};
 pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
 pub use exec::{ConfirmPrompt, ExecAction, ParamField, ParamPrompt};
 pub use history::{HistoryEntry, HistoryPopup, HistoryStore, SavedQuery};
 pub use import::{ImportDialog, ImportState};
+pub use script::{ScriptMode, ScriptPhase, ScriptRun, ScriptState, StmtStatus};
+pub use sql_nav::{DbObject, DbObjectKind, GotoObjectPopup, NavState};
 
 /// Data sources, relative to the project root.
 pub const DATASOURCES_FILE: &str = ".codecraft/datasources.json";
@@ -405,6 +409,9 @@ pub(crate) enum MetaReq {
     Tables(String),
     Details(String, String),
     Count(String, String),
+    /// A catalog query for the SQL editor (`key`, `sql`): routines, comments, definitions
+    /// ([`sql_nav`]).
+    Query(String, String),
 }
 
 enum MetaResult {
@@ -412,6 +419,7 @@ enum MetaResult {
     Tables(Vec<TableInfo>),
     Details(TableDetails),
     Count(u64),
+    Rows(Vec<Vec<Cell>>),
 }
 
 enum Req {
@@ -420,6 +428,8 @@ enum Req {
         run: u64,
         statements: Vec<String>,
         manual: bool,
+        /// Run the remaining statements after one fails (script mode "continue").
+        keep_going: bool,
     },
     /// Explain one statement (`analyze` runs it).
     Explain {
@@ -545,6 +555,8 @@ pub(crate) struct RunSpec {
     pub manual: bool,
     /// Explain the (single) statement instead of running it; `true` analyzes.
     pub explain: Option<bool>,
+    /// Keep running the statements after one fails (Run file in "continue" mode).
+    pub keep_going: bool,
 }
 
 struct RunInfo {
@@ -606,6 +618,10 @@ pub struct DbState {
     next_id: u64,
     /// SSH tunnels of data sources with `ssh_tunnel` (track S, `ssh_tunnel.rs`).
     pub(crate) tunnels: crate::ssh_tunnel::Tunnels,
+    /// SQL editor navigation, explorer filter, pinned results, routines (track DC).
+    pub nav: sql_nav::NavState,
+    /// Run SQL file: script runs and their execution logs (track DC).
+    pub scripts: script::ScriptState,
 }
 
 impl Default for DbState {
@@ -638,6 +654,8 @@ impl Default for DbState {
             runs: HashMap::new(),
             next_id: 0,
             tunnels: Default::default(),
+            nav: sql_nav::NavState::default(),
+            scripts: script::ScriptState::default(),
         }
     }
 }
@@ -760,6 +778,9 @@ impl DbState {
             if let Some(id) = self.bindings.get(p).filter(|id| self.source(id).is_some()) {
                 return Some(id.clone());
             }
+            if let Some(id) = self.nav.ddl_source(p).filter(|id| self.source(id).is_some()) {
+                return Some(id.to_string());
+            }
         }
         match self.sources.as_slice() {
             [only] => Some(only.config.id.clone()),
@@ -862,6 +883,7 @@ impl DbState {
                     t.counting = true;
                 }
             }
+            MetaReq::Query(..) => {}
         }
         self.send(&key, Req::Meta(req))
     }
@@ -899,16 +921,27 @@ impl DbState {
             filter,
             manual,
             explain,
+            keep_going,
         } = spec;
         if statements.is_empty() {
             return Err("nothing to execute".into());
         }
+        if !self.workers.contains_key(&worker) {
+            // A new connection starts in the default schema.
+            self.nav.forget_worker(&worker);
+        }
         self.ensure_worker(&worker, &source)?;
         self.close_cursors(&worker, &source);
-        // A new run replaces the owner's earlier tabs (re-sorting replaces just its own tab).
+        self.switch_schema(&worker, &source);
+        // A new run replaces the owner's earlier tabs (re-sorting replaces just its own tab);
+        // pinned tabs stay.
         if replace.is_none() {
-            let stale: Vec<u64> =
-                self.results.iter().filter(|r| r.owner == owner && !r.is_running()).map(|r| r.id).collect();
+            let stale: Vec<u64> = self
+                .results
+                .iter()
+                .filter(|r| r.owner == owner && !r.is_running() && !self.nav.pinned.contains(&r.id))
+                .map(|r| r.id)
+                .collect();
             self.results.retain(|r| !stale.contains(&r.id));
             if self.active_result.is_some_and(|a| stale.contains(&a)) {
                 self.active_result = None;
@@ -940,13 +973,45 @@ impl DbState {
             Some(analyze) => {
                 Req::Explain { run, sql: statements.into_iter().next().unwrap_or_default(), analyze, manual }
             }
-            None => Req::Exec { run, statements, manual },
+            None => Req::Exec { run, statements, manual, keep_going },
         };
         if let Err(e) = self.send(&worker, req) {
             self.runs.remove(&run);
             return Err(e);
         }
         Ok(run)
+    }
+
+    /// Before a run on a console or attached file with a chosen schema: switch the connection
+    /// to that schema (`SET search_path` / `USE`) once, as a run of its own (no result tab).
+    fn switch_schema(&mut self, worker: &str, source: &str) {
+        let kind = self.source(source).map(|d| d.config.kind).unwrap_or_default();
+        let Some(sql) = self.nav.schema_switch(worker, kind) else { return };
+        let run = self.next();
+        self.log(OutputLevel::Sql, source, sql.clone());
+        self.runs.insert(
+            run,
+            RunInfo {
+                worker: worker.to_string(),
+                source: source.to_string(),
+                owner: format!("schema:{worker}"),
+                title: String::new(),
+                statements: vec![sql.clone()],
+                replace: None,
+                table: None,
+                sort: None,
+                base_sql: None,
+                filter: ResultFilter::default(),
+                started: Instant::now(),
+                cancel_requested: false,
+                waiting: false,
+            },
+        );
+        let req = Req::Exec { run, statements: vec![sql], manual: false, keep_going: false };
+        if self.send(worker, req).is_err() {
+            self.runs.remove(&run);
+            self.nav.forget_worker(worker);
+        }
     }
 
     /// Fetch the next page of a result whose cursor is open.
@@ -1043,6 +1108,7 @@ impl DbState {
         }
         let prefix = source.map(|s| node_key(s, Some(""), None));
         self.table_keys.retain(|k, _| prefix.as_ref().is_some_and(|p| !k.starts_with(p.as_str())));
+        self.nav.forget_source(source);
         for r in self.results.iter_mut().filter(|r| source.is_none_or(|s| r.source == s)) {
             r.edits.submitting = false;
         }
@@ -1164,6 +1230,8 @@ impl DbState {
         self.param_values.clear();
         self.history.set_project(root.clone());
         self.passwords.clear();
+        self.nav.load(root.as_deref());
+        self.scripts = script::ScriptState::default();
         self.root = root.clone();
         self.loaded = true;
         let Some(root) = root else { return };
@@ -1334,6 +1402,9 @@ fn worker_main(
                     MetaReq::Tables(schema) => conn.tables(schema).map(MetaResult::Tables),
                     MetaReq::Details(schema, table) => conn.table_details(schema, table).map(MetaResult::Details),
                     MetaReq::Count(schema, table) => conn.row_count(schema, table).map(MetaResult::Count),
+                    MetaReq::Query(_, sql) => {
+                        codecraft_db::query_all(conn.as_mut(), sql).map(|(_, rows, _)| MetaResult::Rows(rows))
+                    }
                 }
                 .map_err(|e| e.to_string());
                 let _ = events.send(Event::Meta { worker: key.clone(), req: m, result });
@@ -1361,7 +1432,7 @@ fn worker_main(
                 let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
                 let _ = events.send(Event::RunDone { run });
             }
-            Req::Exec { run, statements, manual } => {
+            Req::Exec { run, statements, manual, keep_going } => {
                 if let Err(e) = open_transaction(conn.as_mut(), manual, &mut in_tx) {
                     let _ = events.send(Event::StmtFailed { run, stmt: 0, error: DbError::Query(e) });
                     let _ = events.send(Event::RunDone { run });
@@ -1388,7 +1459,7 @@ fn worker_main(
                     if let Some(open) = conn.in_transaction() {
                         in_tx = open;
                     }
-                    let stop = r.is_err();
+                    let stop = r.is_err() && !keep_going;
                     let _ = events.send(match r {
                         Ok(summary) => Event::StmtDone { run, stmt: i, summary },
                         Err(error) => Event::StmtFailed { run, stmt: i, error },
@@ -1425,6 +1496,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
         handle(s, ev);
     }
+    changed |= sql_nav::pump(s);
     s.db.history.flush();
     changed
 }
@@ -1485,7 +1557,14 @@ fn handle(s: &mut Session, ev: Event) {
             let Some(info) = db.runs.get(&run) else { return };
             let sql = info.statements.get(stmt).cloned().unwrap_or_default();
             let multi = info.statements.len() > 1;
-            let title = if multi { format!("{} [{}]", info.title, stmt + 1) } else { info.title.clone() };
+            // Query tabs are named after what the statement reads (`users`); table views keep
+            // the table's name.
+            let derived = if info.table.is_none() { sql_nav::result_title(&sql) } else { None };
+            let title = match derived {
+                Some(t) => t,
+                None if multi => format!("{} [{}]", info.title, stmt + 1),
+                None => info.title.clone(),
+            };
             let (source, owner, worker, table, sort, replace, filter) = (
                 info.source.clone(),
                 info.owner.clone(),
@@ -1577,6 +1656,7 @@ fn handle(s: &mut Session, ev: Event) {
                 }
             }
             db.log(OutputLevel::Info, &source, line.clone());
+            script::on_statement(db, run, stmt, Ok(&summary));
             s.status = line;
         }
         Event::StmtFailed { run, stmt, error } => {
@@ -1596,6 +1676,7 @@ fn handle(s: &mut Session, ev: Event) {
                 }
             }
             db.log(if cancelled { OutputLevel::Info } else { OutputLevel::Error }, &source, msg.clone());
+            script::on_statement(db, run, stmt, Err(&msg));
             if !has_tab {
                 db.active_result = None;
                 crate::services::show(s, crate::services::ServicesSection::Database);
@@ -1604,6 +1685,7 @@ fn handle(s: &mut Session, ev: Event) {
         }
         Event::RunDone { run } => {
             db.runs.remove(&run);
+            script::on_run_done(s, run);
         }
         Event::Meta { worker, req, result } => {
             let Some(source) = worker.strip_prefix("meta:").map(str::to_string) else { return };
@@ -1651,6 +1733,20 @@ fn handle(s: &mut Session, ev: Event) {
 }
 
 fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResult, String>) {
+    if let MetaReq::Query(key, _) = &req {
+        let rows = match result {
+            Ok(MetaResult::Rows(rows)) => Ok(rows),
+            Ok(_) => Err("unexpected reply".to_string()),
+            Err(e) => Err(e),
+        };
+        sql_nav::on_query(db, source, key, rows);
+        return;
+    }
+    // Only the schemas chosen for introspection are listed (all by default).
+    let wanted = match (&req, &result) {
+        (MetaReq::Info, Ok(MetaResult::Info(info))) => db.nav.introspected(source, &info.schemas),
+        _ => Vec::new(),
+    };
     if let MetaReq::Details(schema, table) = &req {
         let k = node_key(source, Some(schema), Some(table));
         if db.table_keys.contains_key(&k) {
@@ -1672,7 +1768,7 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
         (MetaReq::Info, Ok(MetaResult::Info(info))) => {
             ds.tree.loading = false;
             let old = std::mem::take(&mut ds.tree.schemas);
-            for name in &info.schemas {
+            for name in &wanted {
                 let node = old.get(name).cloned().unwrap_or_default();
                 ds.tree.schemas.insert(name.clone(), node);
             }
@@ -1680,8 +1776,8 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
             let default = info
                 .default_schema
                 .clone()
-                .filter(|d| info.schemas.contains(d))
-                .or_else(|| (info.schemas.len() == 1).then(|| info.schemas.first().cloned()).flatten());
+                .filter(|d| wanted.contains(d))
+                .or_else(|| (wanted.len() == 1).then(|| wanted.first().cloned()).flatten());
             if let Some(d) = default {
                 if ds.tree.schemas.get(&d).is_none_or(|n| n.tables.is_none()) {
                     follow_up.push(MetaReq::Tables(d.clone()));
@@ -1723,6 +1819,8 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
                 }
             }
         }
+        // Handled above (`sql_nav::on_query`).
+        (MetaReq::Query(..), _) => {}
     }
     if let Some(e) = err {
         db.log(OutputLevel::Error, source, e);

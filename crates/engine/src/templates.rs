@@ -275,6 +275,7 @@ const TS_JS: &[&str] = &["typescript", "javascript"];
 const C_CPP: &[&str] = &["c", "cpp"];
 const CPP: &[&str] = &["cpp"];
 const ZIG: &[&str] = &["zig"];
+const SQL: &[&str] = &["sql"];
 
 /// CodeCraft's built-in templates.
 pub fn builtins() -> Vec<Template> {
@@ -388,6 +389,18 @@ pub fn builtins() -> Vec<Template> {
         t("st", "struct", "const $NAME$ = struct {\n\t$END$\n};", ZIG),
         t("sif", "if", "if ($COND$) {\n\t$SELECTION$\n}$END$", ZIG),
         t("sblock", "{ } block", "{\n\t$SELECTION$\n}$END$", ZIG),
+        // SQL (track DC)
+        t("sel", "SELECT … FROM", "SELECT $COLUMNS$\nFROM $TABLE$$END$;", SQL).with_default("COLUMNS", "*"),
+        t("selw", "SELECT … FROM … WHERE", "SELECT $COLUMNS$\nFROM $TABLE$\nWHERE $CONDITION$$END$;", SQL)
+            .with_default("COLUMNS", "*"),
+        t("ins", "INSERT INTO … VALUES", "INSERT INTO $TABLE$ ($COLUMNS$)\nVALUES ($VALUES$)$END$;", SQL),
+        t("upd", "UPDATE … SET … WHERE", "UPDATE $TABLE$\nSET $COLUMN$ = $VALUE$\nWHERE $CONDITION$$END$;", SQL),
+        t("del", "DELETE FROM … WHERE", "DELETE\nFROM $TABLE$\nWHERE $CONDITION$$END$;", SQL),
+        t("j", "JOIN … ON", "JOIN $TABLE$ $ALIAS$ ON $CONDITION$$END$", SQL),
+        t("lj", "LEFT JOIN … ON", "LEFT JOIN $TABLE$ $ALIAS$ ON $CONDITION$$END$", SQL),
+        t("cte", "WITH … AS (…)", "WITH $NAME$ AS (\n\t$QUERY$\n)\nSELECT *\nFROM $NAME$$END$;", SQL)
+            .with_default("NAME", "cte"),
+        t("sgb", "SELECT … GROUP BY", "SELECT $COLUMN$, count(*)\nFROM $TABLE$\nGROUP BY $COLUMN$$END$;", SQL),
     ]
 }
 
@@ -555,7 +568,8 @@ mod tests {
     fn builtins_are_well_formed() {
         let all = builtins();
         assert!(all.len() > 60);
-        for lang in [Language::Rust, Language::Python, Language::TypeScript, Language::C, Language::Zig] {
+        let langs = [Language::Rust, Language::Python, Language::TypeScript, Language::C, Language::Zig, Language::Sql];
+        for lang in langs {
             let mut seen = std::collections::HashSet::new();
             for t in all.iter().filter(|t| t.applies_to(lang)) {
                 assert!(seen.insert(t.abbreviation.clone()), "duplicate {} for {lang:?}", t.abbreviation);
