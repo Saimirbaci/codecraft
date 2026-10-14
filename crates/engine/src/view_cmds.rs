@@ -9,7 +9,7 @@ use crate::lsp::GotoKind;
 use crate::{Popup, Session};
 
 /// Tool windows CodeCraft implements (the others stay disabled in the menu until they exist).
-pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 27] = [
+pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 28] = [
     ToolWindowId::Project,
     ToolWindowId::Find,
     ToolWindowId::Run,
@@ -37,6 +37,7 @@ pub const IMPLEMENTED_TOOL_WINDOWS: [ToolWindowId; 27] = [
     ToolWindowId::FileTransfer,
     ToolWindowId::RemoteHost,
     ToolWindowId::RustRepl,
+    ToolWindowId::PythonProcessOutput,
 ];
 
 macro_rules! tool_window {

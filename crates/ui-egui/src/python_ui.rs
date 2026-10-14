@@ -73,10 +73,18 @@ pub fn show_console(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             egui::Grid::new("python-console-vars-grid").num_columns(2).striped(true).show(ui, |ui| {
                 for v in &s.python.console.vars {
                     ui.label(RichText::new(&v.name).monospace()).on_hover_text(&v.type_name);
-                    ui.label(
-                        RichText::new(format!("{{{}}} {}", v.type_name, v.value)).monospace().color(theme.text_muted),
-                    )
-                    .on_hover_text(&v.value);
+                    ui.horizontal(|ui| {
+                        if v.viewable && ui.small_button("⊞ View").on_hover_text("View as DataFrame / Array").clicked() {
+                            cmds.push(("python.dataframe.view", json!({ "expression": v.name, "source": "console" })));
+                        }
+                        let shape = v.shape.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
+                        ui.label(
+                            RichText::new(format!("{{{}{shape}}} {}", v.type_name, v.value))
+                                .monospace()
+                                .color(theme.text_muted),
+                        )
+                        .on_hover_text(&v.value);
+                    });
                     ui.end_row();
                 }
             });
@@ -467,6 +475,52 @@ pub fn windows(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 }
 
 /// Whether a Python dialog reads the keyboard.
+/// View › Tool Windows › Python Process Output: the running Python processes and their log.
+pub fn show_process_output(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    use codecraft_engine::python_output::{self, LineKind};
+    let theme = st.theme.clone();
+    let mut cmds: Cmds = Vec::new();
+    let procs = python_output::processes(s);
+    ui.horizontal_wrapped(|ui| {
+        if procs.is_empty() {
+            ui.label(RichText::new("No Python processes are running").color(theme.text_muted).small());
+        }
+        for p in &procs {
+            let pid = p.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            ui.label(RichText::new(format!("● {}{pid}: {}", p.name, p.status)).small().color(theme.success))
+                .on_hover_text(p.interpreter.clone().unwrap_or_default());
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.small_button("Clear").clicked() {
+                cmds.push(("python.processOutput.clear", Value::Null));
+            }
+        });
+    });
+    ui.separator();
+    let lines = &s.python.process_output.lines;
+    let row_h = 16.0;
+    ScrollArea::both()
+        .id_salt("python-process-output")
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show_rows(ui, row_h, lines.len(), |ui, range| {
+            for l in lines.range(range) {
+                let color = match l.kind {
+                    LineKind::Info => theme.console_system,
+                    LineKind::Command => theme.accent,
+                    LineKind::Stdout => theme.text_editor,
+                    LineKind::Stderr => theme.console_stderr,
+                };
+                ui.add(
+                    egui::Label::new(RichText::new(format!("[{}] {}", l.source, l.text)).monospace().color(color))
+                        .selectable(true)
+                        .extend(),
+                );
+            }
+        });
+    run_all(s, st, cmds);
+}
+
 pub fn wants_keyboard(s: &Session) -> bool {
     s.python.confirm_uninstall.is_some() || s.python.create_venv.is_some() || s.python.setup_task.is_some()
 }

@@ -194,9 +194,16 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::profiler_cmds::specs());
         specs.extend(crate::sql_lang_cmds::specs());
         specs.extend(crate::rust_cmds::specs());
-        // SQL files and SQL in strings: navigation commands handle SQL (track DC). Last, so it
-        // wraps every registered command.
+        specs.extend(crate::notebook_cmds::specs());
+        specs.extend(crate::python_output::specs());
+        specs.extend(crate::python_format::specs());
+        specs.extend(crate::templates_django::specs());
+        // Routes come last so they wrap every registered command. SQL files and SQL in strings:
+        // navigation commands handle SQL (track DC).
         crate::database_cmds::sql_editor::route(&mut specs);
+        // Python files format with Ruff/Black; templates navigate and complete (track PY).
+        crate::python_format::route(&mut specs);
+        crate::templates_django::route(&mut specs);
         let mut by_id = HashMap::new();
         for (i, s) in specs.iter().enumerate() {
             if by_id.insert(s.id, i).is_some() {

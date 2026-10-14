@@ -180,6 +180,12 @@ pub struct Settings {
     pub status_bar_widgets: BTreeMap<String, bool>,
     /// Edit › Find Usages › Find Usages Settings….
     pub find_usages: FindUsagesOptions,
+    /// Code › Reformat Code for Python: `auto` (Ruff, else Black), `ruff`, `black` or `none`.
+    pub python_formatter: String,
+    /// Reformat Python files with that formatter when they are saved.
+    pub python_reformat_on_save: bool,
+    /// Optimize imports (Ruff's isort rules, or isort) of Python files when they are saved.
+    pub python_optimize_imports_on_save: bool,
 }
 
 /// Where View › Appearance › Navigation Bar shows the path of the active file.
@@ -293,6 +299,9 @@ impl Default for Settings {
             show_status_bar: true,
             status_bar_widgets: BTreeMap::new(),
             find_usages: FindUsagesOptions::default(),
+            python_formatter: "auto".into(),
+            python_reformat_on_save: false,
+            python_optimize_imports_on_save: false,
         }
     }
 }

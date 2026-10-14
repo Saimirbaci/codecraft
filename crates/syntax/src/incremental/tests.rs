@@ -1,7 +1,7 @@
 use super::*;
 use crate::highlight;
 
-const ALL: [Language; 16] = [
+const ALL: [Language; 17] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
@@ -18,6 +18,7 @@ const ALL: [Language; 16] = [
     Language::Dockerfile,
     Language::Http,
     Language::PlainText,
+    Language::DjangoTemplate,
 ];
 
 const RUST: &str = r####"#![allow(dead_code)]
@@ -87,6 +88,8 @@ const DOCKERFILE: &str = "# syntax=docker/dockerfile:1\nFROM rust:1 AS build\nWO
 
 const HTTP: &str = "@host = localhost\n### Users\n# @name list\nGET http://{{host}}/users HTTP/1.1\nAccept: application/json\n\n###\nPOST /x\nContent-Type: application/json\n\n{\"a\": \"{{$uuid}}\"}\n\n> {%\n  client.log(1);\n%}\n";
 
+const DJANGO: &str = "{% extends \"base.html\" %}\n{% block content %}\n<div class=\"a {{ cls }}\">\n  {# note #}\n  {% for x in xs|sort %}<p>{{ x.name|title }}</p>{% endfor %}\n</div>\n<!-- c -->\n{% endblock %}\n";
+
 const PLAIN: &str = "just some text\nwith lines\n\nand more\n";
 
 fn sample(language: Language) -> &'static str {
@@ -107,6 +110,7 @@ fn sample(language: Language) -> &'static str {
         Language::Dockerfile => DOCKERFILE,
         Language::Http => HTTP,
         Language::PlainText => PLAIN,
+        Language::DjangoTemplate => DJANGO,
     }
 }
 

@@ -41,6 +41,7 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::FileTransfer => "🔃",
         ToolWindowId::RemoteHost => "🖥",
         ToolWindowId::RustRepl => "🦀",
+        ToolWindowId::PythonProcessOutput => "🐍",
     }
 }
 
@@ -193,6 +194,7 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::FileTransfer => crate::remote_ui::show_file_transfer(ui, s, st),
         ToolWindowId::RemoteHost => crate::remote_ui::show_remote_host(ui, s, st),
         ToolWindowId::RustRepl => crate::rust_ui::show_repl(ui, s, st),
+        ToolWindowId::PythonProcessOutput => crate::python_ui::show_process_output(ui, s, st),
     }
 }
 

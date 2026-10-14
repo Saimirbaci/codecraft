@@ -119,7 +119,7 @@ def _vars():
     for k, v in list(_ns.items()):
         if k.startswith("_") or type(v).__name__ == "module":
             continue
-        out.append({"name": k, "type": type(v).__name__, "value": _short(v)})
+        out.append(_cc_var(k, v))
         if len(out) >= 500:
             break
     return out
@@ -151,6 +151,7 @@ def _handle(m):
         _send({"ev": "done", "id": m.get("id"), "status": "incomplete"})
         return
     status = _exec(src)
+    _cc_cache.clear()
     _send({"ev": "done", "id": m.get("id"), "status": status, "vars": _vars()})
 _send({"ev": "ready", "version": "%d.%d.%d" % sys.version_info[:3], "executable": sys.executable})
 while True:
@@ -160,12 +161,20 @@ while True:
             _handle(m)
         elif m.get("op") == "vars":
             _send({"ev": "done", "id": m.get("id"), "status": "ok", "vars": _vars()})
+        elif m.get("op") == "frame":
+            _send(_cc_frame(m, _ns))
     except KeyboardInterrupt:
         sys.stderr.write("KeyboardInterrupt\n")
         _send({"ev": "done", "id": None, "status": "error", "vars": _vars()})
     except SystemExit:
         break
 "#;
+
+/// The full console driver: the shared inspection helpers ([`crate::dataframe::INSPECT_PY`],
+/// View as DataFrame) and [`DRIVER`].
+pub fn driver() -> String {
+    format!("{}\n{}", crate::dataframe::INSPECT_PY, DRIVER)
+}
 
 /// Who wrote a transcript chunk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,6 +195,12 @@ pub struct ConsoleVar {
     #[serde(rename = "type")]
     pub type_name: String,
     pub value: String,
+    /// A DataFrame, Series, 1-D/2-D array or list of rows: View as DataFrame/Array works (M12).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub viewable: bool,
+    /// Its shape (`(100, 3)`) when viewable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<String>,
 }
 
 /// What the reader threads report.
@@ -256,6 +271,8 @@ pub struct Console {
     next_id: u64,
     /// The last exit message (process ended).
     pub exited: Option<String>,
+    /// `frame` answers (View as DataFrame) not taken yet.
+    pub frames: Vec<Value>,
 }
 
 impl Console {
@@ -267,7 +284,7 @@ impl Console {
     pub fn start(&mut self, python: &Path, cwd: Option<&Path>) -> Result<(), String> {
         self.stop();
         let mut cmd = Command::new(python);
-        cmd.args(["-u", "-c", DRIVER])
+        cmd.args(["-u", "-c", &driver()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -355,6 +372,12 @@ impl Console {
         p.stdin.send(msg).map_err(|_| "the Python Console has exited".to_string())?;
         self.running = Some(id);
         Ok(id)
+    }
+
+    /// Send another request to the driver (a View as DataFrame `frame` page).
+    pub fn send_op(&self, msg: &Value) -> Result<(), String> {
+        let Some(p) = &self.process else { return Err("the Python Console is not running".into()) };
+        p.stdin.send(msg.to_string()).map_err(|_| "the Python Console has exited".to_string())
     }
 
     /// Answer an `input()` call.
@@ -512,6 +535,12 @@ impl Console {
             }
             Some("out") => self.push(ConsoleKind::Output, &text()),
             Some("err") => self.push(ConsoleKind::Error, &text()),
+            Some("frame") => {
+                if self.frames.len() >= 64 {
+                    self.frames.remove(0);
+                }
+                self.frames.push(v.clone());
+            }
             Some("input") => {
                 self.awaiting_input = Some(v.get("prompt").and_then(Value::as_str).unwrap_or("").to_string());
             }
@@ -581,7 +610,7 @@ pub fn ends_block(draft: &str) -> bool {
 }
 
 /// `KeyboardInterrupt` in the console process.
-fn interrupt_pid(pid: u32) -> Result<(), String> {
+pub(crate) fn interrupt_pid(pid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
         let status = Command::new("kill")

@@ -371,7 +371,13 @@ fn install_missing(s: &mut Session, p: &Value) -> CmdResult {
 fn start_console(s: &mut Session) -> Result<(), CommandError> {
     let python = s.python.python_program();
     let cwd = s.project_root();
-    s.python.console.start(&python, cwd.as_deref()).map_err(CommandError::Failed)
+    let r = s.python.console.start(&python, cwd.as_deref());
+    let (kind, line) = match &r {
+        Ok(()) => (crate::python_output::LineKind::Command, format!("{} -u -c <console driver>", python.display())),
+        Err(e) => (crate::python_output::LineKind::Stderr, e.clone()),
+    };
+    s.python.process_output.push("Python Console", kind, &line);
+    r.map_err(CommandError::Failed)
 }
 
 fn ensure_console(s: &mut Session) -> Result<(), CommandError> {

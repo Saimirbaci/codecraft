@@ -33,6 +33,8 @@ pub enum ToolWindowId {
     RemoteHost,
     /// Tools › Rust › Rust REPL (evcxr).
     RustRepl,
+    /// Background Python processes (console, kernels, formatters) for diagnosis (M12 track PY).
+    PythonProcessOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,7 +45,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 27] = [
+    pub const ALL: [ToolWindowId; 28] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -71,6 +73,7 @@ impl ToolWindowId {
         Self::FileTransfer,
         Self::RemoteHost,
         Self::RustRepl,
+        Self::PythonProcessOutput,
     ];
 
     pub fn title(self) -> &'static str {
@@ -102,6 +105,7 @@ impl ToolWindowId {
             Self::FileTransfer => "File Transfer",
             Self::RemoteHost => "Remote Host",
             Self::RustRepl => "Rust REPL",
+            Self::PythonProcessOutput => "Python Process Output",
         }
     }
 
@@ -167,6 +171,7 @@ impl ToolWindowId {
             Self::FileTransfer => "fileTransfer",
             Self::RemoteHost => "remoteHost",
             Self::RustRepl => "rustRepl",
+            Self::PythonProcessOutput => "pythonProcessOutput",
         }
     }
 

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use codecraft_syntax::{FoldRange, Highlights, Language, folding_ranges, highlight, matching_bracket, outline};
 
-const LANGUAGES: [Language; 16] = [
+const LANGUAGES: [Language; 17] = [
     Language::Rust,
     Language::Toml,
     Language::Markdown,
@@ -25,6 +25,7 @@ const LANGUAGES: [Language; 16] = [
     Language::Dockerfile,
     Language::Http,
     Language::PlainText,
+    Language::DjangoTemplate,
 ];
 
 /// xorshift64*: tiny, deterministic, good enough for fuzzing.

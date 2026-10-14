@@ -493,3 +493,16 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     (`rust.cargo.setCratesIoLookups`); multi-line inline tables aren't recognised; the REPL has no
     interrupt and no variables view, and `rust.repl.sendSelection` has no shortcut; advisories
     can't be suppressed from the IDE (use audit.toml / deny.toml).
+43. PyCharm (track PY): `.ipynb` notebooks in a notebook editor on a built-in kernel driver for
+    the project's interpreter (streams, rich reprs, matplotlib PNGs, `input()`, `!cmd`, interrupt,
+    restart; byte-exact round trip), View as DataFrame/Array from the console and notebook
+    Variables (paged, sorted, filtered in the process), Ruff/Black/isort for Reformat Code and
+    Optimize Imports (also on save), Django/Jinja template highlighting, navigation and tag/filter
+    completion, and Python Process Output. Remaining: no Jupyter/ipykernel or remote kernels,
+    no cell magics, other kernel languages still run Python; no notebook-level undo, cell drag,
+    split/merge or collapsed outputs; HTML output shown as text, no widgets; every cell is laid
+    out each frame (slow for very long notebooks); no language-server features inside cells; no
+    DataFrame view from the debugger; DataFrame filter is substring-only, no export; formatting
+    after save writes the file twice; the formatter setting is free text; templates have no
+    automatic completion popup, `{% url %}`/`{% static %}` or variable resolution, and Django
+    Template is missing from Associate with File Type.
