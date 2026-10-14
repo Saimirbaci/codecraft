@@ -469,3 +469,17 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     alike on both sides; no live progress for psql/pg_restore input; tool paths only per data
     source; full-text search is LIKE/ILIKE without full-text indexes or paging; Data Tools forms
     have no schema/table pickers; exported INSERTs can't target another dialect.
+41. Database schema tools (track DA): Create/Modify Table with a live SQL preview (PostgreSQL and
+    SQLite in one transaction, SQLite via a rebuild that keeps views, triggers and foreign keys;
+    MySQL statement by statement with exact reporting), Drop/Rename/Truncate with preview, SQL
+    Generator and Copy DDL, an ER diagram (layout, zoom, pan, drag, PNG/SVG), Compare Schemas
+    with a migration script, and column renames that update the project's `.sql` files.
+    Remaining: MySQL/MariaDB DDL is checked by unit tests only (no server here) and functional
+    indexes there are left out of the editable definition; SQLite can't rename views/indexes or
+    drop a foreign key in place, and generated columns aren't kept by a rebuild; trigger/view
+    rewrites after a column rename are token-level, and nested PostgreSQL views still block type
+    changes; Compare skips routines, sequences, triggers, grants and partitions (cross-dialect
+    views copied with a warning); the `.sql` rename is a heuristic and skips SQL in Rust
+    strings; the ER diagram has no saved layouts, view nodes, cross-schema edges or notations,
+    and PNG export needs the window (SVG works headless); the table dialog doesn't load the
+    columns of a foreign key's target until that table is expanded.

@@ -26,6 +26,7 @@ mod edit;
 mod grid;
 mod import;
 pub(crate) mod sql_editor;
+mod schema;
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     let mut v = edit::specs();
@@ -34,6 +35,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     v.extend(import::specs());
     v.extend(sql_editor::specs());
     v.extend(data::specs());
+    v.extend(schema::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);

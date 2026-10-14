@@ -18,8 +18,10 @@
     clippy::unreachable
 )]
 
+pub mod catalog;
 pub mod compare;
 mod config;
+pub mod ddl;
 pub mod dump;
 pub mod edit;
 pub mod explain;
@@ -29,6 +31,7 @@ mod lex;
 mod my;
 pub mod params;
 mod pg;
+pub mod schema_diff;
 pub mod secrets;
 pub mod split;
 pub mod sql;

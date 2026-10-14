@@ -36,6 +36,7 @@ pub mod import;
 pub mod script;
 pub mod sql_nav;
 pub mod tx;
+pub mod schema_tools;
 
 pub use codecraft_db::explain::{Plan, PlanNode};
 pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
@@ -629,6 +630,8 @@ pub struct DbState {
     pub txs: tx::TxBook,
     /// Compare Data, Dump/Restore, Export to File and Full-text Search jobs.
     pub data: data_tools::DataTools,
+    /// Create/Modify Table, Drop/Rename/Truncate, SQL Generator, ER diagram, Compare (track DA).
+    pub schema: schema_tools::SchemaTools,
 }
 
 impl Default for DbState {
@@ -665,6 +668,7 @@ impl Default for DbState {
             scripts: script::ScriptState::default(),
             txs: tx::TxBook::default(),
             data: data_tools::DataTools::default(),
+            schema: Default::default(),
         }
     }
 }
@@ -724,6 +728,7 @@ impl DbState {
             || self.import.as_ref().is_some_and(ImportDialog::is_busy)
             || self.data.busy()
             || self.txs.guard.is_some()
+            || self.schema.busy()
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -1241,6 +1246,7 @@ impl DbState {
         self.param_prompt = None;
         self.confirm = None;
         self.import = None;
+        self.schema = Default::default();
         self.param_values.clear();
         self.history.set_project(root.clone());
         self.passwords.clear();
@@ -1513,6 +1519,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         handle(s, ev);
     }
     changed |= sql_nav::pump(s);
+    changed |= schema_tools::pump(s);
     s.db.history.flush();
     changed
 }
