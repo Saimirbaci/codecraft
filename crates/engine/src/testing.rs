@@ -7,6 +7,7 @@
 //! locations on a worker thread, records the run in `<project>/.codecraft/test-history.json` and
 //! loads the coverage report of a "Run with Coverage" run.
 
+pub mod cpp;
 mod junit;
 mod lcov;
 mod locate;
@@ -55,6 +56,11 @@ pub enum Framework {
     Pytest,
     CTest,
     Zig,
+    /// C++ (track CL): `CODECRAFT_TEST_FRAMEWORK` or the arguments say which (`testing/cpp.rs`).
+    GoogleTest,
+    Catch2,
+    Doctest,
+    BoostTest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,6 +720,9 @@ fn basename(program: &str) -> &str {
 
 /// The test framework a process runs, if any.
 pub(crate) fn process_framework(cmd: &ProcessCommand) -> Option<Framework> {
+    if let Some(fw) = cpp::framework_of(cmd) {
+        return Some(fw);
+    }
     let program = basename(&cmd.program);
     let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
     if program == "sh" || program == "bash" || program == "zsh" {
@@ -751,6 +760,10 @@ pub(crate) fn process_framework(cmd: &ProcessCommand) -> Option<Framework> {
 /// Before a process starts: pytest gets `-v` (live results) and a JUnit report in a temp file
 /// (durations, output per test). Returns the command to run and the report path.
 pub(crate) fn instrument_process(cmd: &ProcessCommand) -> (ProcessCommand, Option<PathBuf>) {
+    // C++ test binaries write their framework's report (GoogleTest JSON, Catch2/doctest/Boost XML).
+    if let Some(fw) = cpp::framework_of(cmd) {
+        return cpp::instrument(cmd, fw);
+    }
     let program = basename(&cmd.program);
     let direct = !matches!(program, "sh" | "bash" | "zsh");
     if !direct || process_framework(cmd) != Some(Framework::Pytest) {
@@ -832,6 +845,12 @@ pub(crate) fn pump(s: &mut Session) -> bool {
 }
 
 fn on_finished(s: &mut Session, tab: RunTabId) {
+    // A C++ framework's report replaces the live tree.
+    if let Some(run) = s.testing.run_mut(tab).filter(|r| r.framework.is_cpp())
+        && let Some(path) = run.junit.take()
+    {
+        cpp::merge_report(run, &path);
+    }
     // pytest's JUnit report.
     if let Some(run) = s.testing.run_mut(tab)
         && let Some(path) = run.junit.take()
@@ -879,6 +898,7 @@ fn start_locate(s: &mut Session, tab: RunTabId) {
                     suite: si,
                     test: ti,
                     name: t.name.clone(),
+                    suite_name: suite.name.clone(),
                     suite_kind: suite.kind,
                     suite_source: suite.source.clone(),
                     crate_name: suite.crate_name.clone(),
@@ -1279,6 +1299,7 @@ pub fn rerun_failed_origin(run: &TestRun) -> Result<TestOrigin, String> {
             }
             Ok(TestOrigin::Process(cmd))
         }
+        (fw, TestOrigin::Process(cmd)) if fw.is_cpp() => cpp::rerun_failed(fw, cmd, &failed).map(TestOrigin::Process),
         (Framework::Zig, TestOrigin::Process(cmd))
             if basename(&cmd.program) == "zig" && cmd.args.first().is_some_and(|a| a == "test") =>
         {

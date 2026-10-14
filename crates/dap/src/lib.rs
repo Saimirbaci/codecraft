@@ -399,6 +399,12 @@ impl DapClient {
         self.request("pause", json!({ "threadId": thread_id }))
     }
 
+    /// Restart a stack frame (when [`Capabilities::supports_restart_frame`]): execution goes back
+    /// to the frame's start and a `stopped` event (reason `restart`) follows.
+    pub fn restart_frame(&self, frame_id: i64) -> Result<RequestId> {
+        self.request("restartFrame", json!({ "frameId": frame_id }))
+    }
+
     /// `disconnect` as a plain request (see [`DapClient::terminate`] for ending a session).
     pub fn disconnect(&self, terminate_debuggee: bool) -> Result<RequestId> {
         self.request("disconnect", json!({ "restart": false, "terminateDebuggee": terminate_debuggee }))

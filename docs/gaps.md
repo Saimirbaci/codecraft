@@ -520,3 +520,19 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     keymap editor; inline completion only on request, multi-line proposals shown as one line;
     Markdown export is HTML only; no Zig / TypeScript tool windows; the "Edit 'Default task'"
     menu label isn't dynamic yet (`tasks_contexts::edit_label`).
+45. CLion (track CL): GoogleTest, Catch2, doctest and Boost.Test in the test runner (gutter runs,
+    report files, rerun failed with each framework's filter); CMake presets and profiles driving
+    the build directory and a CMake tool window on the File API (reload log, targets, cache,
+    CTest, dependencies); Valgrind Memcheck (Linux) with a results tree and XML import;
+    ASan/LSan/TSan/UBSan/MSan/HWASan reports structured in the Run tab and a sanitizer option for
+    C/C++ configurations; Conan/vcpkg install with the toolchain passed to CMake; Attach to an
+    Unstarted Process, Reset Frame, Manage Targets (run targets: local, SSH, Docker). Remaining:
+    Catch2/doctest/Boost trees fill when the run ends (no live progress), no Catch2 JSON
+    reporter, no gutter Debug for tests or "all tests in file"; framework detection relies on
+    includes in a target's sources; CTest names only list and back up unconfigured projects;
+    no CMake run configuration kind, cache edits need a reload, multi-config generators use the
+    first configuration, build presets only for Build, no profile editor, sanitizer flags only
+    in Debug/Release; Valgrind is Linux-only Memcheck without suppressions; no Conan/vcpkg
+    dependency tree or updates, no vcpkg classic mode; Reset Frame via `thread return` doesn't
+    undo side effects; Attach to an Unstarted Process has no run configuration or recent names;
+    Manage Targets can't add or edit targets and has no WSL.

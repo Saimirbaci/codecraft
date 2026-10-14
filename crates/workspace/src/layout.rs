@@ -35,6 +35,8 @@ pub enum ToolWindowId {
     RustRepl,
     /// Background Python processes (console, kernels, formatters) for diagnosis (M12 track PY).
     PythonProcessOutput,
+    /// CLion's CMake tool window (M12 track CL).
+    CMake,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -45,7 +47,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 28] = [
+    pub const ALL: [ToolWindowId; 29] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -74,6 +76,7 @@ impl ToolWindowId {
         Self::RemoteHost,
         Self::RustRepl,
         Self::PythonProcessOutput,
+        Self::CMake,
     ];
 
     pub fn title(self) -> &'static str {
@@ -106,6 +109,7 @@ impl ToolWindowId {
             Self::RemoteHost => "Remote Host",
             Self::RustRepl => "Rust REPL",
             Self::PythonProcessOutput => "Python Process Output",
+            Self::CMake => "CMake",
         }
     }
 
@@ -172,6 +176,7 @@ impl ToolWindowId {
             Self::RemoteHost => "remoteHost",
             Self::RustRepl => "rustRepl",
             Self::PythonProcessOutput => "pythonProcessOutput",
+            Self::CMake => "cmake",
         }
     }
 

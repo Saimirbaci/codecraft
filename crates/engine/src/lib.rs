@@ -28,6 +28,7 @@ pub mod commands;
 pub mod completion;
 pub mod commit_ai;
 mod convert;
+pub mod cpp;
 pub mod database;
 mod database_cmds;
 pub mod debug;
@@ -311,6 +312,8 @@ pub struct Session {
     pub tasks: tasks_contexts::TasksState,
     /// Code › Code Completion › Call Inline Completion (M12 track ED).
     pub inline: inline_completion::InlineState,
+    /// CLion features: CMake, C++ tests, Valgrind, sanitizers, Conan/vcpkg (M12 track CL).
+    pub cpp: cpp::CppState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -392,6 +395,7 @@ impl Session {
             copyright: copyright::CopyrightState::default(),
             tasks: tasks_contexts::TasksState::default(),
             inline: inline_completion::InlineState::default(),
+            cpp: cpp::CppState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -470,6 +474,8 @@ impl Session {
         self.layouts.set_home(dir.to_path_buf());
         self.file_templates.set_home(dir.to_path_buf());
         self.copyright.set_home(dir.to_path_buf());
+        // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
+        self.cpp.isolated = true;
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
@@ -511,6 +517,7 @@ impl Session {
         changed |= data_flow::pump(self);
         changed |= tasks_contexts::pump(self);
         changed |= inline_completion::pump(self);
+        changed |= cpp::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -541,6 +548,7 @@ impl Session {
             || self.duplicates.busy()
             || self.data_flow.busy()
             || self.inline.busy()
+            || self.cpp.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -554,6 +562,7 @@ impl Session {
             || self.ssr.busy()
             || self.duplicates.busy()
             || self.data_flow.busy()
+            || self.cpp.busy()
     }
 
     /// Stop the language server and running processes (window closing).
@@ -575,6 +584,7 @@ impl Session {
         ssr_cmds::shutdown(self);
         duplicates::shutdown(self);
         data_flow::shutdown(self);
+        cpp::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);

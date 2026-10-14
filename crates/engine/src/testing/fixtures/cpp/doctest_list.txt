@@ -1,0 +1,10 @@
+[doctest] doctest version is "2.4.11"
+[doctest] run with "--help" for options
+===============================================================================
+[doctest] listing all test case names
+===============================================================================
+adds
+fails
+in suite
+===============================================================================
+[doctest] unskipped test cases passing the current filters: 3

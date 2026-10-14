@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<MatchingTests>
+  <TestCase>
+    <Name>Adds numbers</Name>
+    <ClassName/>
+    <Tags>[math]</Tags>
+    <SourceInfo>
+      <File>/proj/tests/catch_test.cpp</File>
+      <Line>5</Line>
+    </SourceInfo>
+  </TestCase>
+  <TestCase>
+    <Name>Fails</Name>
+    <ClassName/>
+    <Tags>[math]</Tags>
+    <SourceInfo>
+      <File>/proj/tests/catch_test.cpp</File>
+      <Line>10</Line>
+    </SourceInfo>
+  </TestCase>
+</MatchingTests>

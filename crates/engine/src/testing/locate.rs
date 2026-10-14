@@ -29,6 +29,8 @@ pub(crate) struct Request {
     pub suite: usize,
     pub test: usize,
     pub name: String,
+    /// The suite's name in the tree (GoogleTest suite, Boost.Test suite, …).
+    pub suite_name: String,
     pub suite_kind: SuiteKind,
     pub suite_source: Option<PathBuf>,
     pub crate_name: Option<String>,
@@ -53,12 +55,22 @@ pub(crate) type Located = (usize, usize, String, Option<TestLocation>, Option<Te
 pub(crate) fn run(job: Job) -> Vec<Located> {
     let mut files = Files::default();
     let mut out = Vec::with_capacity(job.requests.len());
+    // C++ tests: the project's sources (the project root is the last base), listed once.
+    let cpp_sources = match job.bases.last() {
+        Some(root) if job.framework.is_cpp() => super::cpp::source_files(root),
+        _ => Vec::new(),
+    };
     for r in &job.requests {
         let def = match job.framework {
             Framework::Cargo => locate_rust(&job, r, &mut files),
             Framework::Pytest => locate_pytest(&job, r, &mut files),
             Framework::Zig => locate_zig(&job, r, &mut files),
             Framework::CTest => None,
+            Framework::GoogleTest | Framework::Catch2 | Framework::Doctest | Framework::BoostTest => {
+                super::cpp::locate(job.framework, &cpp_sources, &r.suite_name, &r.name, &mut |p| {
+                    files.get(p).map(str::to_string)
+                })
+            }
         };
         let failure = r.failure.as_ref().and_then(|f| {
             let path = resolve(&job.bases, &f.path, r, &job.targets)?;
@@ -287,6 +299,7 @@ mod tests {
             suite: 0,
             test: 0,
             name: name.into(),
+            suite_name: String::new(),
             suite_kind: kind,
             suite_source: Some(PathBuf::from(source)),
             crate_name: Some(krate.into()),

@@ -188,6 +188,14 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
             actions.push(Action::Command(id, Value::Null));
         }
     }
+    // Reset Frame (track CL): drop the selected frame and return to its caller.
+    let reset = "run.debuggingActions.resetFrame";
+    let resp = ui
+        .add_enabled(enabled(reset), egui::Button::new(RichText::new("⤺").color(theme.text)).frame(false))
+        .on_hover_text(shortcut_tip("Reset Frame", reset));
+    if resp.clicked() {
+        actions.push(Action::Command(reset, Value::Null));
+    }
 }
 
 fn status_label(ui: &mut Ui, debug: &DebugState, theme: &Theme) {

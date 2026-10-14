@@ -27,6 +27,8 @@ pub(crate) struct Parser {
     capture: Option<(usize, usize)>,
     /// pytest: inside `=== FAILURES ===` / `=== ERRORS ===`.
     in_failures: bool,
+    /// GoogleTest's console (track CL).
+    gtest: super::cpp::gtest::Console,
 }
 
 impl Parser {
@@ -37,6 +39,9 @@ impl Parser {
             Framework::Pytest => self.feed_pytest(suites, line),
             Framework::CTest => self.feed_ctest(suites, line),
             Framework::Zig => self.feed_zig(suites, line),
+            Framework::GoogleTest => super::cpp::gtest::feed(&mut self.gtest, suites, line),
+            // Catch2, doctest and Boost.Test results come from their XML report at the end.
+            Framework::Catch2 | Framework::Doctest | Framework::BoostTest => {}
         }
     }
 

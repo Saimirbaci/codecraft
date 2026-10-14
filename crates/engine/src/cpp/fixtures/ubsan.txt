@@ -1,0 +1,8 @@
+starting
+/proj/main.cpp:7:12: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior /proj/main.cpp:7:12 in
+result: -2147483648
+main.cpp:12:14: runtime error: division by zero
+    #0 0x100003f3c in divide(int, int) main.cpp:12
+    #1 0x100003f80 in main main.cpp:16
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior main.cpp:12:14 in

@@ -1,0 +1,14 @@
+
+=================================================================
+==1234==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 7 byte(s) in 1 object(s) allocated from:
+    #0 0x4af01b in malloc (/proj/build/leak+0x4af01b)
+    #1 0x4da26a in make /proj/dep.c:4:7
+    #2 0x4da2a0 in main /proj/leak.c:10:3
+
+Indirect leak of 3 byte(s) in 1 object(s) allocated from:
+    #0 0x4af01b in malloc (/proj/build/leak+0x4af01b)
+    #1 0x4da26a in main /proj/leak.c:11:3
+
+SUMMARY: AddressSanitizer: 10 byte(s) leaked in 2 allocation(s).

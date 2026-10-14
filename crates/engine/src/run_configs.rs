@@ -102,24 +102,26 @@ pub fn derive_polyglot(root: &Path) -> Vec<RunConfig> {
     let mut out = Vec::new();
     let read = |name: &str| std::fs::read_to_string(root.join(name)).ok();
 
-    // CMake (CLion conventions).
+    // CMake (CLion conventions): the selected CMake profile's build directory (track CL).
     if let Some(cmake) = read("CMakeLists.txt") {
-        let configure =
-            format!("cmake -S . -B {CMAKE_BUILD_DIR} -DCMAKE_BUILD_TYPE=Debug -DCMAKE_EXPORT_COMPILE_COMMANDS=ON");
-        let mut build = ProcessCommand::shell(format!("{configure} && cmake --build {CMAKE_BUILD_DIR}"), root);
+        let (dir, configure) = crate::cpp::cmake::configure_script(root);
+        let qdir = codecraft_cargo::shell_quote(&dir);
+        let mut build = ProcessCommand::shell(format!("{configure} && cmake --build {qdir}"), root);
         build.build = true;
         out.push(RunConfig::process("CMake: Build", build));
         for exe in cmake_executables(&cmake) {
+            let bin = if Path::new(&dir).is_absolute() { format!("{dir}/{exe}") } else { format!("./{dir}/{exe}") };
             let script =
-                format!("{configure} && cmake --build {CMAKE_BUILD_DIR} --target {exe} && ./{CMAKE_BUILD_DIR}/{exe}");
+                format!("{configure} && cmake --build {qdir} --target {exe} && {}", codecraft_cargo::shell_quote(&bin));
             out.push(RunConfig::process(format!("Run {exe}"), ProcessCommand::shell(script, root)));
         }
         if cmake.to_ascii_lowercase().contains("enable_testing") {
-            let script = format!(
-                "{configure} && cmake --build {CMAKE_BUILD_DIR} && ctest --test-dir {CMAKE_BUILD_DIR} --output-on-failure"
-            );
+            let script =
+                format!("{configure} && cmake --build {qdir} && ctest --test-dir {qdir} --output-on-failure");
             out.push(RunConfig::process("CTest", ProcessCommand::shell(script, root)));
         }
+        // Test executables of the configured project: "All in <target>" in the test runner.
+        out.extend(crate::cpp::cmake::test_target_configs(root));
     }
 
     // Make.
@@ -244,6 +246,8 @@ pub fn gutter_run_lines(path: &Path, text: &str) -> Vec<usize> {
     let mut out = Vec::new();
     match language {
         Language::C | Language::Cpp => {
+            // GoogleTest / Catch2 / doctest / Boost.Test tests and suites (track CL).
+            out.extend(crate::testing::cpp::gutter_lines(text));
             for (i, l) in text.lines().enumerate() {
                 // A definition at file level: `int main(…) {`, `int main(void)` with the brace below.
                 let t = l.trim_end();
@@ -294,6 +298,8 @@ pub fn gutter_run_lines(path: &Path, text: &str) -> Vec<usize> {
         Language::Http => out = codecraft_http::parse::request_lines(text),
         _ => {}
     }
+    out.sort_unstable();
+    out.dedup();
     out
 }
 
@@ -438,6 +444,10 @@ pub fn context_config(root: &Path, path: &Path, text: &str, line: usize) -> Opti
             }
         }
         Language::C | Language::Cpp => {
+            // A C++ test (or suite) at the caret runs in the test runner (track CL).
+            if let Some(m) = crate::testing::cpp::macro_at(text, line) {
+                return Some(crate::cpp::cmake::test_config(root, path, &m));
+            }
             if !text.contains("main(") {
                 return None;
             }

@@ -108,6 +108,7 @@ pub fn detect(text: &str) -> TraceLanguage {
         || text.contains("LeakSanitizer")
         || text.contains("runtime error:")
         || text.contains("UndefinedBehaviorSanitizer")
+        || text.contains("MemorySanitizer")
     {
         TraceLanguage::Sanitizer
     } else if text.contains("panicked at") || text.contains("stack backtrace:") || text.contains(".rs:") {

@@ -1,0 +1,19 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=9337)
+  Write of size 4 at 0x000102f2c000 by thread T1:
+    #0 increment race.cc:4 (race+0x100003e10)
+    #1 Thread1(void*) race.cc:10 (race+0x100003e5c)
+
+  Previous write of size 4 at 0x000102f2c000 by main thread:
+    #0 increment race.cc:4 (race+0x100003e10)
+    #1 main race.cc:16 (race+0x100003ec4)
+
+  Location is global 'Global' of size 4 at 0x000102f2c000 (race+0x100008000)
+
+  Thread T1 (tid=9339, running) created by main thread at:
+    #0 pthread_create <null> (libclang_rt.tsan_osx_dynamic.dylib:x86_64h+0x2c35f)
+    #1 main race.cc:15 (race+0x100003eb8)
+
+SUMMARY: ThreadSanitizer: data race race.cc:4 in increment
+==================
+ThreadSanitizer: reported 1 warnings

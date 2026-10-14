@@ -1,0 +1,113 @@
+{
+  "tests": 6,
+  "failures": 2,
+  "disabled": 1,
+  "errors": 0,
+  "timestamp": "2026-10-14T10:00:00Z",
+  "time": "0.004s",
+  "name": "AllTests",
+  "testsuites": [
+    {
+      "name": "MathTest",
+      "tests": 3,
+      "failures": 1,
+      "disabled": 1,
+      "errors": 0,
+      "timestamp": "2026-10-14T10:00:00Z",
+      "time": "0.003s",
+      "testsuite": [
+        {
+          "name": "Adds",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 5,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-10-14T10:00:00Z",
+          "time": "0s",
+          "classname": "MathTest"
+        },
+        {
+          "name": "Fails",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 9,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "timestamp": "2026-10-14T10:00:00Z",
+          "time": "0.001s",
+          "classname": "MathTest",
+          "failures": [
+            {
+              "failure": "/proj/tests/math_test.cpp:12\nExpected equality of these values:\n  add(1, 2)\n    Which is: 3\n  4\n",
+              "type": ""
+            }
+          ]
+        },
+        {
+          "name": "DISABLED_Slow",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 14,
+          "status": "NOTRUN",
+          "result": "SUPPRESSED",
+          "timestamp": "2026-10-14T10:00:00Z",
+          "time": "0s",
+          "classname": "MathTest"
+        }
+      ]
+    },
+    {
+      "name": "Inst/ParamTest",
+      "tests": 2,
+      "failures": 1,
+      "disabled": 0,
+      "errors": 0,
+      "time": "0s",
+      "testsuite": [
+        {
+          "name": "Even/0",
+          "value_param": "2",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 18,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "time": "0s",
+          "classname": "Inst/ParamTest"
+        },
+        {
+          "name": "Even/1",
+          "value_param": "3",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 18,
+          "status": "RUN",
+          "result": "COMPLETED",
+          "time": "0s",
+          "classname": "Inst/ParamTest",
+          "failures": [
+            {
+              "failure": "/proj/tests/math_test.cpp:20\nValue of: GetParam() % 2 == 0\n  Actual: false\nExpected: true\n",
+              "type": ""
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "SkipTest",
+      "tests": 1,
+      "failures": 0,
+      "disabled": 0,
+      "errors": 0,
+      "time": "0s",
+      "testsuite": [
+        {
+          "name": "Later",
+          "file": "/proj/tests/math_test.cpp",
+          "line": 24,
+          "status": "RUN",
+          "result": "SKIPPED",
+          "time": "0s",
+          "classname": "SkipTest"
+        }
+      ]
+    }
+  ]
+}

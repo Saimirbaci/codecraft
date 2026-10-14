@@ -1,0 +1,19 @@
+=================================================================
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014 at pc 0x0001000f3e8c bp 0x7ff7bfeff6f0 sp 0x7ff7bfeff6e8
+WRITE of size 4 at 0x602000000014 thread T0
+    #0 0x1000f3e8b in main main.cpp:5:7
+    #1 0x7ff80b1f441e in start+0x76e (dyld:x86_64+0xfffffffffff6e41e)
+
+0x602000000014 is located 0 bytes after 4-byte region [0x602000000010,0x602000000014)
+allocated by thread T0 here:
+    #0 0x10014b8ad in wrap_malloc+0x9d (libclang_rt.asan_osx_dynamic.dylib:x86_64h+0x4f8ad)
+    #1 0x1000f3e4a in main main.cpp:4:15
+    #2 0x7ff80b1f441e in start+0x76e (dyld:x86_64+0xfffffffffff6e41e)
+
+SUMMARY: AddressSanitizer: heap-buffer-overflow /proj/main.cpp:5:7 in main
+Shadow bytes around the buggy address:
+  0x601ffffffd80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x602000000000: fa fa[04]fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+==12345==ABORTING
