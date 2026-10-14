@@ -535,8 +535,11 @@ fn manual_commit_transactions() {
     s.execute("editor.type", &json!({ "text": ";\nbegin" })).unwrap();
     s.execute("db.execute", &Value::Null).unwrap();
     pump_until(&mut s, "typed begin", |s| !s.db.busy() && s.db.transaction_open(&worker));
-    s.execute("db.disconnect", &json!({ "dataSource": id })).unwrap();
-    assert!(s.db.output.iter().any(|l| l.text.contains("rolled back (disconnected)")));
+    // Disconnecting with an open transaction asks first (track DB); answer up front.
+    assert_eq!(s.execute("db.disconnect", &json!({ "dataSource": id })).unwrap()["ask"], true);
+    s.execute("db.tx.resolve", &json!({ "choice": "rollback" })).unwrap();
+    pump_until(&mut s, "disconnected", |s| s.db.txs.guard.is_none() && s.db.open_transactions(None).is_empty());
+    assert!(s.db.output.iter().any(|l| l.text == "Transaction rolled back"));
     s.shutdown();
 }
 

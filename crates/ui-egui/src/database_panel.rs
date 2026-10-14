@@ -46,6 +46,8 @@ pub struct DbUi {
     transposed: Option<TransposedCache>,
     /// The name typed in the history popup's Save field.
     pub save_name: String,
+    /// The Data Tools window (track DB).
+    pub data: crate::database_data_ui::DataUi,
 }
 
 type TransposedCache = ((u64, usize, usize), Vec<Column>, Vec<Vec<Cell>>);
@@ -611,6 +613,19 @@ fn context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
             }
         }
     }
+    // Data tools (track DB): export, compare, dump, restore, full-text search.
+    let kind = match row.kind {
+        Kind::Source => Some("source"),
+        Kind::Schema | Kind::Database => Some("schema"),
+        Kind::Table => Some("table"),
+        _ => None,
+    };
+    if let Some(kind) = kind
+        && let Some((id, p)) =
+            crate::database_data_ui::tree_items(ui, kind, &row.source, row.schema.as_deref(), row.table.as_deref())
+    {
+        actions.push(TreeAction::Cmd(id, p));
+    }
 }
 
 // ---------------------------------------------------------------- data source dialog
@@ -860,7 +875,6 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     };
     let running = s.enabled("db.cancel").is_ok() && s.db.running();
     let worker = console_worker(path.as_deref(), d.id.0);
-    let tx_open = s.db.transaction_open(&worker);
     let mut cmd: Option<(&'static str, Value)> = None;
     let frame = Frame::new()
         .fill(st.theme.header_bg)
@@ -901,27 +915,10 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     cmd = Some(("db.showHistory", Value::Null));
                 }
                 ui.separator();
-                if let Some(ds) = source.as_ref().and_then(|id| s.db.source(id)) {
-                    let manual = ds.config.manual_commit;
-                    let mut chosen = manual;
-                    egui::ComboBox::from_id_salt("db-tx-mode")
-                        .selected_text(if manual { "Tx: Manual" } else { "Tx: Auto" })
-                        .width(92.0)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut chosen, false, "Auto-commit");
-                            ui.selectable_value(&mut chosen, true, "Manual commit");
-                        });
-                    if chosen != manual {
-                        cmd = Some(("db.setTransactionMode", json!({ "manual": chosen, "dataSource": ds.config.id })));
-                    }
-                    if small_button(ui, "✔", "Commit", tx_open, st.theme.success, st) {
-                        cmd = Some(("db.commit", json!({ "connection": worker })));
-                    }
-                    if small_button(ui, "↶", "Rollback", tx_open, st.theme.error, st) {
-                        cmd = Some(("db.rollback", json!({ "connection": worker })));
-                    }
-                    if tx_open {
-                        ui.label(RichText::new("● pending transaction").size(12.0).color(st.theme.warning));
+                // Transaction mode, isolation, Commit/Rollback and the indicator (track DB).
+                if let Some(src) = source.as_ref().filter(|id| s.db.source(id).is_some()) {
+                    if let Some(c) = crate::database_data_ui::console_tx(ui, s, st, &worker, src) {
+                        cmd = Some(c);
                     }
                     ui.separator();
                 }

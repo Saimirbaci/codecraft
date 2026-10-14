@@ -21,6 +21,7 @@ use crate::popup::{CompletionItem, CompletionPopup};
 use crate::{CommandError, Popup, Session};
 
 mod console;
+mod data;
 mod edit;
 mod grid;
 mod import;
@@ -30,6 +31,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     v.extend(console::specs());
     v.extend(grid::specs());
     v.extend(import::specs());
+    v.extend(data::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);

@@ -54,6 +54,8 @@ pub struct GridEdits {
     pub submitting: bool,
     /// Why the last submit failed (the changes stay pending).
     pub error: Option<String>,
+    /// The grid row whose change failed in the last submit.
+    pub failed_row: Option<usize>,
 }
 
 /// Same value as far as the user can tell (an edit back to the original is no edit).
@@ -182,6 +184,14 @@ impl GridEdits {
             self.deleted.remove(r);
         }
         self.error = None;
+    }
+
+    /// The grid row of each change [`GridEdits::changes`] returns, in the same order.
+    pub fn change_rows(&self, fetched: usize) -> Vec<usize> {
+        let mut out: Vec<usize> = self.deleted.iter().copied().collect();
+        out.extend(self.updated.keys().filter(|r| !self.deleted.contains(r)).copied());
+        out.extend((0..self.inserted.len()).map(|i| fetched.saturating_add(i)));
+        out
     }
 
     /// The changes to submit: deletes, then updates, then inserts. `keys` are the primary key
@@ -318,6 +328,7 @@ impl DbState {
         if let Some(r) = self.edits_mut(result) {
             r.edits.submitting = true;
             r.edits.error = None;
+            r.edits.failed_row = None;
         }
         if self.edit_preview.as_ref().is_some_and(|p| p.result == result) {
             self.edit_preview = None;

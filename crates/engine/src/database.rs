@@ -28,10 +28,12 @@ use codecraft_workspace::NotificationLevel;
 
 use crate::Session;
 
+pub mod data_tools;
 mod edit;
 pub mod exec;
 pub mod history;
 pub mod import;
+pub mod tx;
 
 pub use codecraft_db::explain::{Plan, PlanNode};
 pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
@@ -319,12 +321,7 @@ impl DataSourceForm {
             confirm_writes: cfg.confirm_writes,
             manual_commit: cfg.manual_commit,
             ssh_tunnel: cfg.ssh_tunnel.clone().unwrap_or_default(),
-            ssh_host: cfg
-                .ssh
-                .as_ref()
-                .map(|t| t.host.clone())
-                .or_else(|| cfg.ssh_tunnel.clone())
-                .unwrap_or_default(),
+            ssh_host: cfg.ssh.as_ref().map(|t| t.host.clone()).or_else(|| cfg.ssh_tunnel.clone()).unwrap_or_default(),
             ssh_port: cfg.ssh.as_ref().and_then(|t| t.port).map(|p| p.to_string()).unwrap_or_default(),
             ssh_user: cfg.ssh.as_ref().map(|t| t.user.clone()).unwrap_or_default(),
             ssh_auth: cfg.ssh.as_ref().map(|t| t.auth).unwrap_or_default(),
@@ -444,6 +441,8 @@ enum Req {
         table: String,
         changes: Vec<codecraft_db::edit::RowChange>,
     },
+    /// Connection settings (isolation level, query timeout).
+    Link(tx::LinkReq),
     Close,
 }
 
@@ -494,7 +493,7 @@ enum Event {
     Applied {
         worker: String,
         result: u64,
-        outcome: Result<u64, String>,
+        outcome: Result<codecraft_db::edit::ApplyReport, codecraft_db::edit::ApplyFailure>,
     },
     SecretFailed(String),
     Plan {
@@ -512,6 +511,10 @@ enum Event {
         result: Result<(), String>,
     },
     Import(import::ImportEvent),
+    /// Transactions and connection state (`tx`).
+    Tx(tx::TxEvent),
+    /// Data tools jobs (`data_tools`).
+    Data(data_tools::DataEvent),
 }
 
 struct Worker {
@@ -606,6 +609,10 @@ pub struct DbState {
     next_id: u64,
     /// SSH tunnels of data sources with `ssh_tunnel` (track S, `ssh_tunnel.rs`).
     pub(crate) tunnels: crate::ssh_tunnel::Tunnels,
+    /// Open transactions, console transaction settings and the pending-transaction guard.
+    pub txs: tx::TxBook,
+    /// Compare Data, Dump/Restore, Export to File and Full-text Search jobs.
+    pub data: data_tools::DataTools,
 }
 
 impl Default for DbState {
@@ -638,6 +645,8 @@ impl Default for DbState {
             runs: HashMap::new(),
             next_id: 0,
             tunnels: Default::default(),
+            txs: tx::TxBook::default(),
+            data: data_tools::DataTools::default(),
         }
     }
 }
@@ -695,6 +704,8 @@ impl DbState {
             || self.runs.values().any(|r| !r.waiting)
             || self.dialog.as_ref().is_some_and(|d| d.test == TestState::Running)
             || self.import.as_ref().is_some_and(ImportDialog::is_busy)
+            || self.data.busy()
+            || self.txs.guard.is_some()
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -800,6 +811,8 @@ impl DbState {
         let ds = self.source(source).ok_or_else(|| format!("no data source `{source}`"))?;
         let cfg = self.resolved(&ds.config);
         let tunnel = self.plan_tunnel(&cfg)?;
+        let opts = self.link_opts(key, &cfg);
+        let reroute = tx::reroute(self, &cfg);
         let password = self.worker_password(source);
         let secrets = self.secrets.clone();
         let events = self.tx.clone();
@@ -808,7 +821,7 @@ impl DbState {
         std::thread::Builder::new()
             .name(format!("db-{}", key.chars().take(40).collect::<String>()))
             .spawn(move || match crate::ssh_tunnel::route(tunnel, cfg) {
-                Ok(cfg) => worker_main(name, cfg, password, secrets, rx, events),
+                Ok(cfg) => worker_main(name, cfg, password, secrets, rx, events, (opts, reroute)),
                 Err(error) => {
                     let _ = events.send(Event::ConnectFailed { worker: name, error });
                 }
@@ -1031,6 +1044,7 @@ impl DbState {
                 let _ = w.tx.send(Req::Close);
             }
             self.runs.retain(|_, r| r.worker != k);
+            self.txs.conns.remove(&k);
             for r in self.results.iter_mut().filter(|r| r.worker == k) {
                 if r.has_more {
                     r.has_more = false;
@@ -1293,6 +1307,7 @@ fn worker_main(
     secrets: Arc<dyn SecretStore>,
     rx: Receiver<Req>,
     events: Sender<Event>,
+    (opts, reroute): (tx::LinkOpts, Option<tx::Reroute>),
 ) {
     let password = match password {
         Some(p) => Some(p),
@@ -1305,65 +1320,85 @@ fn worker_main(
         },
         None => None,
     };
-    let mut conn = match codecraft_db::connect(&cfg, password.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = events.send(Event::ConnectFailed { worker: key, error: e.to_string() });
+    let mut link = tx::Link::new(key.clone(), cfg, password, reroute, opts, events.clone());
+    let version = match link.open() {
+        Ok(v) => v,
+        Err(error) => {
+            let _ = events.send(Event::ConnectFailed { worker: key, error });
             return;
         }
     };
-    let version = conn.server_version().unwrap_or_else(|_| cfg.kind.label().to_string());
-    let _ = events.send(Event::Connected { worker: key.clone(), version, canceller: conn.canceller() });
-    let dialect = cfg.kind.dialect();
-    let mut in_tx = false;
+    if let Some(canceller) = link.canceller() {
+        let _ = events.send(Event::Connected { worker: key.clone(), version, canceller });
+    }
+    let dialect = link.kind().dialect();
     let mut deferred: Option<Req> = None;
     loop {
         let req = match deferred.take() {
             Some(r) => r,
-            None => match rx.recv() {
-                Ok(r) => r,
-                Err(_) => break,
+            None => match link.recv(&rx) {
+                Some(r) => r,
+                None => break,
             },
         };
         match req {
             Req::Close => break,
             Req::More { .. } | Req::StopFetch => {}
+            Req::Link(r) => link.handle(r),
             Req::Meta(m) => {
-                let result = match &m {
+                let result = link.read(|conn| match &m {
                     MetaReq::Info => conn.database_info().map(MetaResult::Info),
                     MetaReq::Tables(schema) => conn.tables(schema).map(MetaResult::Tables),
                     MetaReq::Details(schema, table) => conn.table_details(schema, table).map(MetaResult::Details),
                     MetaReq::Count(schema, table) => conn.row_count(schema, table).map(MetaResult::Count),
-                }
-                .map_err(|e| e.to_string());
+                });
                 let _ = events.send(Event::Meta { worker: key.clone(), req: m, result });
             }
             Req::Apply { result, schema, table, changes } => {
-                let outcome =
-                    codecraft_db::edit::apply(conn.as_mut(), &schema, &table, &changes).map_err(|e| e.to_string());
+                let in_tx = link.in_tx;
+                let outcome = link.ready().map_err(|e| codecraft_db::edit::ApplyFailure {
+                    index: None,
+                    statement: None,
+                    error: e,
+                    rolled_back: true,
+                });
+                let outcome = outcome.and_then(|()| match link.conn() {
+                    Ok(conn) => codecraft_db::edit::apply_changes(conn, &schema, &table, &changes, in_tx),
+                    Err(e) => Err(codecraft_db::edit::ApplyFailure {
+                        index: None,
+                        statement: None,
+                        error: e,
+                        rolled_back: true,
+                    }),
+                });
+                if let Ok(r) = &outcome
+                    && r.in_transaction
+                {
+                    link.statements += changes.len();
+                }
+                link.check_broken();
+                link.refresh();
                 let _ = events.send(Event::Applied { worker: key.clone(), result, outcome });
             }
             Req::Tx { commit } => {
-                let sql = if commit { "COMMIT" } else { "ROLLBACK" };
-                let result = codecraft_db::query_all(conn.as_mut(), sql).map(|_| ()).map_err(|e| e.to_string());
-                in_tx = conn.in_transaction().unwrap_or(false);
+                let result = link.end(commit);
                 let _ = events.send(Event::TxDone { worker: key.clone(), commit, result });
-                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
+                link.refresh();
             }
             Req::Explain { run, sql, analyze, manual } => {
-                let result = open_transaction(conn.as_mut(), manual, &mut in_tx).and_then(|()| {
-                    codecraft_db::explain::explain(conn.as_mut(), &sql, analyze).map_err(|e| e.to_string())
+                let result = link.ready().and_then(|()| link.begin_if_manual(manual)).and_then(|()| {
+                    let conn = link.conn()?;
+                    codecraft_db::explain::explain(conn, &sql, analyze).map_err(|e| e.to_string())
                 });
-                if let Some(open) = conn.in_transaction() {
-                    in_tx = open;
-                }
+                link.check_broken();
+                link.refresh();
                 let _ = events.send(Event::Plan { run, result });
-                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
                 let _ = events.send(Event::RunDone { run });
             }
             Req::Exec { run, statements, manual } => {
-                if let Err(e) = open_transaction(conn.as_mut(), manual, &mut in_tx) {
+                if let Err(e) = link.ready().and_then(|()| link.begin_if_manual(manual)) {
                     let _ = events.send(Event::StmtFailed { run, stmt: 0, error: DbError::Query(e) });
+                    link.refresh();
                     let _ = events.send(Event::RunDone { run });
                     continue;
                 }
@@ -1377,17 +1412,11 @@ fn worker_main(
                         events: &events,
                         deferred: &mut deferred,
                     };
-                    let r = conn.execute(sql, codecraft_db::PAGE_SIZE, &mut sink);
-                    if r.is_ok() {
-                        match codecraft_db::transaction_effect(sql, dialect) {
-                            codecraft_db::TxEffect::Begin => in_tx = true,
-                            codecraft_db::TxEffect::End => in_tx = false,
-                            codecraft_db::TxEffect::None => {}
-                        }
-                    }
-                    if let Some(open) = conn.in_transaction() {
-                        in_tx = open;
-                    }
+                    let read = !codecraft_db::is_modifying(sql, dialect)
+                        && codecraft_db::transaction_effect(sql, dialect) == codecraft_db::TxEffect::None;
+                    let retry = read && !link.in_tx;
+                    let r = link.execute(sql, codecraft_db::PAGE_SIZE, &mut sink, retry);
+                    link.track(sql, r.is_ok());
                     let stop = r.is_err();
                     let _ = events.send(match r {
                         Ok(summary) => Event::StmtDone { run, stmt: i, summary },
@@ -1397,22 +1426,11 @@ fn worker_main(
                         break;
                     }
                 }
-                let _ = events.send(Event::TxState { worker: key.clone(), open: in_tx });
+                link.refresh();
                 let _ = events.send(Event::RunDone { run });
             }
         }
     }
-}
-
-/// In manual-commit mode, open a transaction unless one is open.
-fn open_transaction(conn: &mut dyn codecraft_db::Connection, manual: bool, in_tx: &mut bool) -> Result<(), String> {
-    if !manual || *in_tx {
-        return Ok(());
-    }
-    let begin = codecraft_db::edit::begin_statement(conn.kind());
-    codecraft_db::query_all(conn, begin).map_err(|e| format!("cannot start a transaction: {e}"))?;
-    *in_tx = true;
-    Ok(())
 }
 
 // ---------------------------------------------------------------- pump
@@ -1632,6 +1650,7 @@ fn handle(s: &mut Session, ev: Event) {
             }
         }
         Event::TxDone { worker, commit, result } => {
+            let result_copy = result.clone();
             let source = db.workers.get(&worker).map(|w| w.source.clone()).unwrap_or_default();
             let msg = match result {
                 Ok(()) if commit => "Transaction committed".to_string(),
@@ -1641,8 +1660,11 @@ fn handle(s: &mut Session, ev: Event) {
             let level = if msg.contains("failed") { OutputLevel::Error } else { OutputLevel::Info };
             db.log(level, &source, msg.clone());
             s.status = msg;
+            tx::on_tx_done(s, &worker, &result_copy);
         }
         Event::Import(ev) => import::on_event(s, ev),
+        Event::Tx(ev) => tx::on_event(s, ev),
+        Event::Data(ev) => data_tools::on_event(s, ev),
         Event::SecretFailed(e) => {
             db.log(OutputLevel::Error, "", e.clone());
             s.status = e;
@@ -1790,16 +1812,26 @@ fn on_plan(s: &mut Session, run: u64, result: Result<Plan, String>) {
     }
 }
 
-/// A submit finished: reload the table on success, keep the changes and say why on failure.
-fn on_applied(s: &mut Session, worker: &str, result: u64, outcome: Result<u64, String>) {
+/// A submit finished: reload the table on success, keep the changes and say exactly what failed
+/// otherwise (the failing row is marked in the grid).
+fn on_applied(
+    s: &mut Session,
+    worker: &str,
+    result: u64,
+    outcome: Result<codecraft_db::edit::ApplyReport, codecraft_db::edit::ApplyFailure>,
+) {
     let db = &mut s.db;
     let Some(r) = db.results.iter_mut().find(|r| r.id == result) else { return };
     r.edits.submitting = false;
     match outcome {
-        Ok(n) => {
+        Ok(report) => {
+            let n = report.affected;
             r.edits = GridEdits::default();
             let r = r.clone();
-            let msg = format!("Changes submitted: {n} row{} affected", if n == 1 { "" } else { "s" });
+            let mut msg = format!("Changes submitted: {n} row{} affected", if n == 1 { "" } else { "s" });
+            if report.in_transaction {
+                msg.push_str(" (in the open transaction: Commit to save them)");
+            }
             db.log(OutputLevel::Info, &r.source, msg.clone());
             s.status = msg;
             let reload = RunSpec {
@@ -1819,7 +1851,13 @@ fn on_applied(s: &mut Session, worker: &str, result: u64, outcome: Result<u64, S
                 s.db.log(OutputLevel::Error, &r.source, format!("Cannot reload the table: {e}"));
             }
         }
-        Err(e) => {
+        Err(f) => {
+            let fetched = r.rows.len();
+            r.edits.failed_row = f.index.and_then(|i| r.edits.change_rows(fetched).get(i).copied());
+            let mut e = f.to_string();
+            if let Some(row) = r.edits.failed_row {
+                e = format!("Row {}: {e}", row + 1);
+            }
             r.edits.error = Some(e.clone());
             let source = r.source.clone();
             db.log(OutputLevel::Error, &source, e.clone());

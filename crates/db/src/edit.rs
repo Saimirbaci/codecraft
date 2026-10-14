@@ -9,7 +9,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::sql::{qualified, quote_ident};
-use crate::{Cell, Connection, DbError, DbKind, DbResult, ResultSink};
+use crate::tx::{self, Discard, TxStatus};
+use crate::{Cell, Connection, DbError, DbKind, DbResult};
 
 /// One pending change to a table row. Keys identify the row by its primary key columns.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -164,13 +165,56 @@ pub fn begin_statement(kind: DbKind) -> &'static str {
     }
 }
 
-/// A sink that ignores rows (DML returns none).
-struct Discard;
+/// Why a submit failed. Unless `rolled_back` is false, nothing was saved and the pending changes
+/// can be fixed and submitted again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyFailure {
+    /// The change that failed (index into the changes), when one did.
+    pub index: Option<usize>,
+    /// Its statement.
+    pub statement: Option<String>,
+    /// The server's error (or why nothing ran).
+    pub error: String,
+    /// Everything was rolled back. False only when the outcome is unknown (the connection was
+    /// lost during COMMIT, or rolling back failed).
+    pub rolled_back: bool,
+}
 
-impl ResultSink for Discard {
-    fn columns(&mut self, _: &[crate::Column]) {}
-    fn page(&mut self, _: crate::Page) -> bool {
-        true
+impl std::fmt::Display for ApplyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(i) = self.index {
+            write!(f, "change {} failed: ", i + 1)?;
+        }
+        f.write_str(&self.error)?;
+        if let Some(sql) = &self.statement {
+            write!(f, "\n  {sql}")?;
+        }
+        if self.rolled_back {
+            f.write_str("\nNothing was saved: the changes were rolled back and are still pending.")?;
+        }
+        Ok(())
+    }
+}
+
+/// A successful submit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyReport {
+    /// Rows changed.
+    pub affected: u64,
+    /// The changes joined a transaction that was already open: its Commit saves them.
+    pub in_transaction: bool,
+}
+
+/// The savepoint that makes a submit inside an open transaction all-or-nothing.
+const SUBMIT_SAVEPOINT: &str = "codecraft_submit";
+
+fn lost(conn: &mut dyn Connection, e: &DbError) -> String {
+    if conn.is_broken() {
+        format!("the connection was lost ({e}); the server rolled back the transaction")
+    } else {
+        e.to_string()
     }
 }
 
@@ -178,15 +222,56 @@ impl ResultSink for Discard {
 /// exactly one row (changed or deleted meanwhile) rolls everything back. Returns the rows
 /// affected.
 pub fn apply(conn: &mut dyn Connection, schema: &str, table: &str, changes: &[RowChange]) -> DbResult<u64> {
+    apply_changes(conn, schema, table, changes, false).map(|r| r.affected).map_err(|f| DbError::Query(f.to_string()))
+}
+
+/// [`apply`] with the details: which change failed and whether everything was rolled back.
+/// `in_tx`: the caller knows a transaction is open on the connection (used when the driver
+/// cannot tell). Inside an open transaction the changes run under a savepoint, so a failure
+/// undoes just them and success leaves them for the transaction's Commit; otherwise they run
+/// in their own transaction.
+pub fn apply_changes(
+    conn: &mut dyn Connection,
+    schema: &str,
+    table: &str,
+    changes: &[RowChange],
+    in_tx: bool,
+) -> Result<ApplyReport, ApplyFailure> {
     let kind = conn.kind();
-    let sqls = statements(kind, schema, table, changes)?;
-    if sqls.is_empty() {
-        return Ok(0);
+    let fail = |index: Option<usize>, statement: Option<String>, error: String, rolled_back: bool| ApplyFailure {
+        index,
+        statement,
+        error,
+        rolled_back,
+    };
+    let mut sqls = Vec::with_capacity(changes.len());
+    for (i, c) in changes.iter().enumerate() {
+        sqls.push(statement(kind, schema, table, c).map_err(|e| fail(Some(i), None, e.to_string(), true))?);
     }
-    conn.execute(begin_statement(kind), 1, &mut Discard)?;
+    if sqls.is_empty() {
+        return Ok(ApplyReport::default());
+    }
+    let outer = match conn.transaction_status() {
+        TxStatus::Failed => {
+            return Err(fail(
+                None,
+                None,
+                "the connection's transaction has failed; roll it back before submitting".into(),
+                true,
+            ));
+        }
+        TxStatus::Active => true,
+        TxStatus::Idle => false,
+        TxStatus::Unknown => in_tx,
+    };
+    let started = if outer { tx::savepoint(conn, SUBMIT_SAVEPOINT) } else { tx::begin(conn, None) };
+    if let Err(e) = started {
+        let error = format!("cannot start a transaction: {}", lost(conn, &e));
+        return Err(fail(None, None, error, true));
+    }
     let mut total = 0u64;
-    let mut failure = None;
-    for (sql, change) in sqls.iter().zip(changes) {
+    let mut failure: Option<(usize, String, String)> = None;
+    for (i, (sql, change)) in sqls.iter().zip(changes).enumerate() {
         match conn.execute(sql, 1, &mut Discard) {
             Ok(summary) => {
                 let n = summary.rows_affected.unwrap_or(0);
@@ -196,32 +281,51 @@ pub fn apply(conn: &mut dyn Connection, schema: &str, table: &str, changes: &[Ro
                     matches!(kind, DbKind::Mysql | DbKind::Mariadb) && matches!(change, RowChange::Update { .. });
                 let keyed = !matches!(change, RowChange::Insert { .. });
                 if keyed && (n > 1 || n == 0 && !mysql_update) {
-                    failure = Some(DbError::Query(if n == 0 {
-                        format!("the row was changed or deleted by someone else; nothing was saved\n  {sql}")
+                    let why = if n == 0 {
+                        "the row was changed or deleted by someone else".to_string()
                     } else {
-                        format!("{n} rows matched one row's key; nothing was saved\n  {sql}")
-                    }));
+                        format!("{n} rows matched one row's key")
+                    };
+                    failure = Some((i, sql.clone(), why));
                     break;
                 }
             }
             Err(e) => {
-                failure = Some(match e {
-                    DbError::Query(m) => DbError::Query(format!("{m}\n  {sql}")),
-                    other => other,
-                });
+                let why = lost(conn, &e);
+                failure = Some((i, sql.clone(), why));
                 break;
             }
         }
     }
-    if let Some(e) = failure {
-        let _ = conn.execute("ROLLBACK", 1, &mut Discard);
-        return Err(e);
+    if let Some((i, sql, why)) = failure {
+        let undo = if conn.is_broken() {
+            Ok(())
+        } else if outer {
+            tx::rollback_to(conn, SUBMIT_SAVEPOINT).and_then(|()| tx::release(conn, SUBMIT_SAVEPOINT))
+        } else {
+            tx::run(conn, "ROLLBACK")
+        };
+        return Err(match undo {
+            Ok(()) => fail(Some(i), Some(sql), why, true),
+            Err(e) => fail(Some(i), Some(sql), format!("{why}; rolling back failed too: {e}"), false),
+        });
     }
-    if let Err(e) = conn.execute("COMMIT", 1, &mut Discard) {
-        let _ = conn.execute("ROLLBACK", 1, &mut Discard);
-        return Err(e);
+    if outer {
+        return match tx::release(conn, SUBMIT_SAVEPOINT) {
+            Ok(()) => Ok(ApplyReport { affected: total, in_transaction: true }),
+            Err(e) => {
+                let rb = tx::rollback_to(conn, SUBMIT_SAVEPOINT).is_ok();
+                Err(fail(None, None, format!("cannot release the savepoint: {}", lost(conn, &e)), rb))
+            }
+        };
     }
-    Ok(total)
+    match tx::end(conn, true) {
+        Ok(_) => Ok(ApplyReport { affected: total, in_transaction: false }),
+        Err(e) => {
+            let unknown = conn.is_broken();
+            Err(fail(None, Some("COMMIT".into()), e.to_string(), !unknown))
+        }
+    }
 }
 
 #[cfg(test)]

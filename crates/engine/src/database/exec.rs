@@ -152,7 +152,7 @@ pub(crate) fn submit(
         title: run.title.clone(),
         statements,
         // Manual commit applies to consoles (agents' `sql` runs on the query connection commit).
-        manual: cfg.manual_commit && run.worker.starts_with("console:"),
+        manual: run.worker.starts_with("console:") && s.db.manual_commit(&run.worker, &run.source),
         explain,
         ..RunSpec::default()
     })?;
