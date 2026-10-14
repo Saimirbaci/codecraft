@@ -631,6 +631,10 @@ fn char_triggers(typed: char, prev: Option<char>, run_start: Option<char>) -> bo
 
 /// After a typed char: re-request an incomplete list, or schedule the auto-popup.
 pub(crate) fn after_typed(s: &mut Session, typed: char) {
+    // Cargo.toml: crate names and versions from crates.io (M12 track RS).
+    if crate::cargo_deps::after_typed(s, typed) {
+        return;
+    }
     if let Some(Popup::Completion(c)) = &s.popup {
         if c.incomplete && is_ident_char(typed) && c.items.iter().any(|i| i.lsp.is_some()) {
             let (anchor, mode) = (c.anchor, if c.type_matching { Mode::TypeMatching } else { Mode::Basic });

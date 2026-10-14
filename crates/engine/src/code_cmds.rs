@@ -26,7 +26,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             None,
             "",
             Context::Editor,
-            |s| crate::http_client::or_http_editor(s, |s| crate::sql_lang::or_in_injection(s, has_lsp_editor)),
+            |s| {
+                crate::cargo_deps::or_cargo_toml(s, |s| {
+                    crate::http_client::or_http_editor(s, |s| crate::sql_lang::or_in_injection(s, has_lsp_editor))
+                })
+            },
             basic_completion,
         ),
         spec("code.reformatCode", "Reformat Code", None, "", Context::Editor, has_editor, reformat),
@@ -65,8 +69,12 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Some("Alt+Enter"),
             "",
             Context::Editor,
-            has_lsp_editor,
+            |s| crate::cargo_deps::or_cargo_toml(s, has_lsp_editor),
             |s, _| {
+                // Cargo.toml has no language server: dependency updates and advisories (M12 RS).
+                if crate::cargo_deps::is_cargo_toml_editor(s) {
+                    return crate::cargo_deps::show_context_actions(s);
+                }
                 s.lsp_code_actions()?;
                 ok()
             },
@@ -122,6 +130,9 @@ fn move_lines(s: &mut Session, up: bool) -> CmdResult {
 }
 
 fn basic_completion(s: &mut Session, _: &Value) -> CmdResult {
+    if crate::cargo_deps::is_cargo_toml_editor(s) {
+        return crate::cargo_deps::complete(s, false);
+    }
     if crate::http_client::is_http_editor(s) {
         return crate::http_client::complete(s, false);
     }

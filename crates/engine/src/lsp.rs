@@ -52,6 +52,8 @@ pub(crate) enum Pending {
     Lookup(crate::completion::LookupPending),
     /// Show Usages and Find/Highlight Usages in File (M10 G); errors are routed too.
     Usages(crate::usages::UsagesPending),
+    /// Macro expansion (M12 RS); errors are routed too.
+    Rust(crate::rust_tools::RustPending),
 }
 
 /// One running language server.
@@ -810,6 +812,7 @@ impl Session {
             Pending::Refactor(p) => return crate::refactor::on_response(self, p, result),
             Pending::Lookup(p) => return crate::completion::on_response(self, p, result),
             Pending::Usages(p) => return crate::usages::on_response(self, p, result),
+            Pending::Rust(p) => return crate::rust_tools::on_response(self, p, result),
             _ => {}
         }
         let value = match result {
@@ -880,7 +883,8 @@ impl Session {
             | Pending::InlayHints { .. }
             | Pending::Refactor(_)
             | Pending::Lookup(_)
-            | Pending::Usages(_) => {}
+            | Pending::Usages(_)
+            | Pending::Rust(_) => {}
         }
     }
 
@@ -1136,6 +1140,8 @@ impl Session {
         let items: Vec<ActionItem> = crate::python::install_actions(self).into_iter().chain(items).collect();
         // SQL in a Rust string: Reformat SQL, Choose SQL Data Source….
         let items: Vec<ActionItem> = items.into_iter().chain(crate::sql_lang::context_actions(self)).collect();
+        // Rust: Show recursive macro expansion on a macro call (M12 RS).
+        let items: Vec<ActionItem> = crate::macro_expand::context_actions(self).into_iter().chain(items).collect();
         if let Some(Popup::Actions { items: target, pending, .. }) = &mut self.popup {
             if items.is_empty() {
                 self.popup = None;
