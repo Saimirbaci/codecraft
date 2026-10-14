@@ -46,6 +46,10 @@ fn skip(id: &str, params: &Value) -> bool {
     {
         return true;
     }
+    // Generate with `agent` starts a coding agent too.
+    if id == "runConfig.generate" && params.get("agent").is_some() {
+        return true;
+    }
     // Manage Accounts runs the real `gh`/`glab auth status` (misc_cmds tests use a fake one).
     if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
         return true;

@@ -745,6 +745,24 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let mut open = true;
     let mut cmds: Cmds = Vec::new();
     let mut form = st.prefs.run_form.clone();
+    let generated = s.run_store.generate.view.clone();
+    let agents: Vec<(&'static str, &'static str, Option<&'static str>, Option<String>)> = s
+        .agents
+        .backends()
+        .iter()
+        .map(|b| {
+            // Ask mode when the agent has it (anything beyond reading needs approval), else Auto.
+            let mode = if b.ask_unavailable().is_none() {
+                Some("ask")
+            } else if b.installed() {
+                Some("auto")
+            } else {
+                None
+            };
+            let why = mode.is_none().then(|| b.ask_unavailable().unwrap_or_default());
+            (b.backend.id(), b.backend.label(), mode, why)
+        })
+        .collect();
     crate::windows::resizable(
         egui::Window::new("Run/Debug Configurations").default_size([820.0, 480.0]),
         st,
@@ -801,6 +819,31 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 {
                     cmds.push(("runConfig.delete", json!({ "index": i })));
                 }
+                ui.menu_button("Generate", |ui| {
+                    if ui
+                        .button("Detect from Project")
+                        .on_hover_text("Propose configurations for the project's entry points")
+                        .clicked()
+                    {
+                        cmds.push(("runConfig.generate", Value::Null));
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Ask an agent").color(theme.text_muted));
+                    for (id, label, mode, why) in &agents {
+                        let text = if *mode == Some("auto") { format!("{label} (Auto)") } else { label.to_string() };
+                        let hover = match (mode, why) {
+                            (Some("ask"), _) => format!("{label} reads the project and proposes configurations; anything else needs your approval"),
+                            (Some(_), _) => format!("{label} has no Ask mode here, so it runs without approvals; it is told to only read the project"),
+                            (None, why) => why.clone().unwrap_or_default(),
+                        };
+                        let button = ui.add_enabled(mode.is_some(), egui::Button::new(text));
+                        if button.on_hover_text(hover).clicked() {
+                            cmds.push(("runConfig.generate", json!({ "agent": id, "mode": mode })));
+                            ui.close();
+                        }
+                    }
+                });
             });
             ui.separator();
             ScrollArea::vertical().id_salt("run-configs-scroll").show(ui, |ui| {
@@ -830,6 +873,10 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             });
         });
         ui.add_space(4.0);
+        if let Some(view) = &generated {
+            generate_view(ui, &theme, view, &mut cmds);
+            return;
+        }
         match (dialog.selected, form.as_mut()) {
             (Some(Selection { derived: false, .. }), Some(f)) => {
                 run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref());
@@ -851,7 +898,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             }
             _ => {
                 ui.label(
-                    RichText::new("Add a configuration with + Add (Cargo, Command, Python, C/C++, Zig, Npm), or copy one from the project.")
+                    RichText::new("Add a configuration with + Add (Cargo, Command, Python, C/C++, Zig, Npm), copy one from the project, or let Generate propose them.")
                         .color(theme.text_muted),
                 );
             }
@@ -881,6 +928,98 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     for (id, p) in cmds {
         run_command(s, st, id, &p);
     }
+}
+
+/// Edit Configurations › Generate: the proposed configurations, grouped by ecosystem, with a
+/// tick box each.
+fn generate_view(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    view: &codecraft_engine::run_config_gen::GenView,
+    cmds: &mut Cmds,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Generated configurations").strong().size(15.0));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.button("Close").clicked() {
+                cmds.push(("runConfig.generate.cancel", Value::Null));
+            }
+            let fresh = view.proposals.iter().any(|p| !p.exists);
+            if ui.add_enabled(fresh, egui::Button::new("None")).clicked() {
+                cmds.push(("runConfig.generate.select", json!({ "all": false })));
+            }
+            if ui.add_enabled(fresh, egui::Button::new("All")).clicked() {
+                cmds.push(("runConfig.generate.select", json!({ "all": true })));
+            }
+        });
+    });
+    if let Some(busy) = &view.busy {
+        ui.horizontal(|ui| {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(RichText::new(busy).color(theme.text_muted));
+            if let Some(job) = view.agent_job {
+                ui.label(RichText::new(format!("(agent job {job}; its progress is in the Agents tool window)")).color(theme.text_disabled));
+            }
+        });
+    }
+    if let Some(e) = &view.error {
+        ui.label(RichText::new(e).color(theme.error));
+    }
+    ui.add_space(4.0);
+    let picked = view.proposals.iter().filter(|p| p.selected && !p.exists).count();
+    egui::Panel::bottom("run-configs-generate-buttons").resizable(false).show(ui, |ui| {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let label = if picked == 1 { "Add 1 Configuration".to_string() } else { format!("Add {picked} Configurations") };
+            if ui.add_enabled(picked > 0, egui::Button::new(label)).clicked() {
+                cmds.push(("runConfig.generate.add", Value::Null));
+            }
+            ui.label(RichText::new("Added ones are saved with Apply or OK.").color(theme.text_muted));
+        });
+    });
+    ScrollArea::vertical().id_salt("run-configs-generated").show(ui, |ui| {
+        if view.proposals.is_empty() && view.busy.is_none() {
+            ui.label(RichText::new("No entry points found. Add a configuration with + Add.").color(theme.text_muted));
+        }
+        let mut group = "";
+        for (i, p) in view.proposals.iter().enumerate() {
+            if p.group != group {
+                group = &p.group;
+                ui.add_space(6.0);
+                ui.label(RichText::new(group).color(theme.text_muted).strong());
+            }
+            ui.horizontal(|ui| {
+                let mut on = p.selected && !p.exists;
+                let name = RichText::new(&p.config.name);
+                let changed = ui.add_enabled(!p.exists, egui::Checkbox::new(&mut on, name)).changed();
+                if changed {
+                    cmds.push(("runConfig.generate.select", json!({ "index": i, "selected": on })));
+                }
+                if p.exists {
+                    ui.label(RichText::new("already configured").color(theme.text_disabled));
+                }
+            });
+            ui.indent(("generated", i), |ui| {
+                let dir = if p.config.working_dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("   in {}", p.config.working_dir)
+                };
+                ui.label(RichText::new(format!("{}: {}{dir}", p.config.kind.label(), p.config.command)).monospace().size(12.0));
+                if !p.reason.is_empty() {
+                    ui.label(RichText::new(&p.reason).color(theme.text_muted).size(12.0));
+                }
+            });
+        }
+        if !view.notes.is_empty() {
+            ui.add_space(8.0);
+            ui.collapsing(format!("Skipped from the agent's reply ({})", view.notes.len()), |ui| {
+                for n in &view.notes {
+                    ui.label(RichText::new(n).color(theme.text_muted).size(12.0));
+                }
+            });
+        }
+    });
 }
 
 /// "Run on:" Local / Docker (M11 track D; track S adds SSH here) and the target's fields.

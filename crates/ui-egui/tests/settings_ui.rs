@@ -195,3 +195,48 @@ fn edit_configurations_creates_and_saves() {
     assert!(saved.contains("\"python\"") && saved.contains("main.py"), "{saved}");
     assert_eq!(h.state().session.run_configs.first().map(|c| c.name.as_str()), Some("Python"));
 }
+
+#[test]
+fn edit_configurations_generates_from_the_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = project(dir.path());
+    std::fs::write(root.join("app.py"), "from flask import Flask\napp = Flask(__name__)\n").unwrap();
+    std::fs::write(root.join("requirements.txt"), "flask\n").unwrap();
+    std::fs::write(root.join("helpers.py"), "if __name__ == '__main__':\n    pass\n").unwrap();
+    let mut h = harness(Some(root.clone()));
+    let wait = |h: &mut Harness<'static, App>, what: &str, cond: &dyn Fn(&App) -> bool| {
+        let start = std::time::Instant::now();
+        while !cond(h.state()) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(60), "timed out waiting for {what}");
+            h.run_steps(1);
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+    };
+    wait(&mut h, "the project", &|a| a.session.run_store.root().is_some() && !a.session.jobs_running());
+    assert!(h.state().session.run_store.user.is_empty(), "tests never generate on open");
+    h.state_mut().session.execute("run.editConfigurations", &Value::Null).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Generate").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("Ask an agent").is_some());
+    h.get_by_label("Detect from Project").click();
+    h.run_steps(2);
+    wait(&mut h, "the proposals", &|a| {
+        a.session.run_store.generate.view.as_ref().is_some_and(|v| v.busy.is_none() && !v.proposals.is_empty())
+    });
+    h.run_steps(2);
+    assert!(h.query_by_label_contains("Generated configurations").is_some());
+    assert!(h.query_by_label("Flask app:app").is_some());
+    assert!(h.query_by_label("make").is_some());
+    assert!(h.query_by_label_contains("helpers").is_none(), "not every Python file");
+    snapshot(&mut h, "generate-configurations");
+    h.get_by_label("make").click();
+    h.run_steps(2);
+    h.get_by_label("Add 1 Configuration").click();
+    h.run_steps(2);
+    assert!(h.state().session.run_store.generate.view.is_none());
+    h.get_by_label("OK").click();
+    h.run_steps(2);
+    let names: Vec<String> = h.state().session.run_store.user.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, vec!["Flask app:app"]);
+}

@@ -6,7 +6,7 @@
 use serde_json::{Value, json};
 
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_project, ok, simple, spec};
-use crate::params::{bool_or, opt_usize, req_usize};
+use crate::params::{bool_or, opt_str, opt_usize, req_usize};
 use crate::run_config_store::{
     self, RunConfigDialog, RunKind, Selection, UserRunConfig, check_unique, env_text, parse_env, unique_name,
 };
@@ -70,17 +70,152 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 ok()
             },
         ),
+        spec(
+            "runConfig.generate",
+            "Generate Run Configurations",
+            None,
+            "{agent?: \"claude\"|\"codex\"|\"grok\"|\"gemini\", mode?: \"ask\"|\"auto\" (default ask)} — open Edit \
+             Configurations and propose configurations for the project's entry points (Cargo binaries, \
+             Django/FastAPI/Flask/Streamlit apps, `__main__` packages, CMake/Meson/Zig executables, sources with \
+             main(), npm scripts, tests). With `agent`, that coding agent reviews the detected list and the \
+             project and proposes the final one (read-only; in Ask mode anything else needs approval). \
+             Poll runConfig.generate.list; add with runConfig.generate.add.",
+            Context::Global,
+            has_project,
+            generate,
+        ),
+        simple("runConfig.generate.list", "List Generated Run Configurations", has_project, |s, _| {
+            Ok(serde_json::to_value(&s.run_store.generate.view).unwrap_or(Value::Null))
+        }),
+        spec(
+            "runConfig.generate.select",
+            "Select Generated Run Configuration",
+            None,
+            "{index: int, selected: bool} or {all: bool} — tick proposals to add",
+            Context::Global,
+            has_generate_view,
+            generate_select,
+        ),
+        spec(
+            "runConfig.generate.add",
+            "Add Generated Run Configurations",
+            None,
+            "{indices?: [int]} — add the ticked (or the given) proposals as configurations (to the dialog's \
+             draft when it is open; Apply/OK saves) → {added: [name]}",
+            Context::Global,
+            has_generate_view,
+            generate_add,
+        ),
+        simple("runConfig.generate.cancel", "Close Generated Run Configurations", always, |s, _| {
+            crate::run_config_gen::cancel(s);
+            ok()
+        }),
         simple("runConfig.apply", "Run Configurations: Apply", has_dialog, |s, _| apply(s).map(|_| Value::Null)),
         simple("runConfig.ok", "Run Configurations: OK", has_dialog, |s, _| {
             apply(s)?;
             s.run_store.dialog = None;
+            crate::run_config_gen::cancel(s);
             ok()
         }),
         simple("runConfig.cancel", "Run Configurations: Cancel", always, |s, _| {
             s.run_store.dialog = None;
+            crate::run_config_gen::cancel(s);
             ok()
         }),
     ]
+}
+
+fn has_generate_view(s: &Session) -> Result<(), String> {
+    s.run_store.generate.view.as_ref().map(|_| ()).ok_or_else(|| "no generated run configurations are shown".into())
+}
+
+fn generate(s: &mut Session, p: &Value) -> CmdResult {
+    let root = project(s)?;
+    let agent = match opt_str(p, "agent").filter(|a| !a.trim().is_empty()) {
+        None => None,
+        Some(id) => {
+            let backend = codecraft_agent::Backend::from_id(id).ok_or_else(|| {
+                CommandError::BadParams(format!("unknown agent `{id}` (claude, codex, grok, gemini)"))
+            })?;
+            let mode = match opt_str(p, "mode").unwrap_or("ask") {
+                "ask" => crate::approvals::AgentMode::Ask,
+                "auto" => crate::approvals::AgentMode::Auto,
+                other => return Err(CommandError::BadParams(format!("unknown mode `{other}` (ask or auto)"))),
+            };
+            Some((backend, mode))
+        }
+    };
+    if s.run_store.dialog.is_none() {
+        open(s, &Value::Null)?;
+    }
+    crate::run_config_gen::start(s, root, agent)?;
+    ok()
+}
+
+fn generate_select(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(view) = &mut s.run_store.generate.view else { return ok() };
+    if let Some(all) = p.get("all").and_then(Value::as_bool) {
+        for pr in view.proposals.iter_mut().filter(|pr| !pr.exists) {
+            pr.selected = all;
+        }
+        return ok();
+    }
+    let index = req_usize(p, "index")?;
+    let pr = view
+        .proposals
+        .get_mut(index)
+        .ok_or_else(|| CommandError::BadParams(format!("no generated configuration {index}")))?;
+    pr.selected = bool_or(p, "selected", !pr.selected);
+    ok()
+}
+
+fn generate_add(s: &mut Session, p: &Value) -> CmdResult {
+    let Some(view) = &s.run_store.generate.view else { return Ok(json!({ "added": [] })) };
+    let picked: Vec<UserRunConfig> = match p.get("indices") {
+        None | Some(Value::Null) => {
+            view.proposals.iter().filter(|pr| pr.selected && !pr.exists).map(|pr| pr.config.clone()).collect()
+        }
+        Some(Value::Array(items)) => {
+            let mut out = Vec::new();
+            for v in items {
+                let i = v
+                    .as_u64()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .ok_or_else(|| CommandError::BadParams("`indices` must be numbers".into()))?;
+                let pr = view
+                    .proposals
+                    .get(i)
+                    .ok_or_else(|| CommandError::BadParams(format!("no generated configuration {i}")))?;
+                if !pr.exists {
+                    out.push(pr.config.clone());
+                }
+            }
+            out
+        }
+        Some(_) => return Err(CommandError::BadParams("`indices` must be an array".into())),
+    };
+    let added = edit(s, |list| {
+        let mut names = Vec::new();
+        for mut c in picked {
+            if list.len() >= 500 {
+                return Err("too many run configurations".into());
+            }
+            if list.iter().any(|o| crate::run_config_gen::same_run(o, &c)) {
+                continue;
+            }
+            c.name = unique_name(&c.name, list);
+            names.push(c.name.clone());
+            list.push(c);
+        }
+        Ok(names)
+    })?;
+    crate::run_config_gen::cancel(s);
+    if let (Some(first), Some(d)) = (added.first(), &mut s.run_store.dialog)
+        && let Some(i) = d.draft.iter().position(|c| &c.name == first)
+    {
+        d.selected = Some(Selection { derived: false, index: i });
+    }
+    Ok(json!({ "added": added }))
 }
 
 fn has_dialog(s: &Session) -> Result<(), String> {

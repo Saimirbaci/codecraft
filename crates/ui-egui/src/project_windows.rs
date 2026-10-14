@@ -86,6 +86,7 @@ impl ProjectWindows {
         persisted.apply(&mut session);
         session.ws.settings = main.ws.settings.clone();
         session.lsp_enabled = main.lsp_enabled;
+        session.run_store.generate.auto = main.run_store.generate.auto;
         // Save and restore the window's project session like the main window does.
         session.session_store.autosave = main.session_store.autosave;
         session.session_store.restore_on_open = main.session_store.restore_on_open;

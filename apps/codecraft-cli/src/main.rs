@@ -9,6 +9,9 @@
 //!                                              manage the project's run configurations
 //!   flags: --name N  --kind cargo|command|python|cpp|zig|npm  --command "…"
 //!          --env A=1 (repeatable)  --env-file .env  --cwd dir
+//! codecraft-cli configs <project> generate [--add] [--agent claude|codex|grok|gemini [--mode ask|auto]]
+//!                                              propose configurations for the entry points
+//!                                              (`--add` saves the new ones)
 //! ```
 
 use std::path::PathBuf;
@@ -162,7 +165,11 @@ fn run(path: Option<&String>, id: Option<&String>, params: Option<&String>) -> R
 
 /// `configs <project> <action> …`: `runConfig.*` with command-line flags instead of JSON.
 fn configs(path: Option<&String>, rest: &[String]) -> Result<ExitCode, String> {
-    let action = rest.first().map(String::as_str).ok_or("missing action (list, add, update, copy, delete, run)")?;
+    let action =
+        rest.first().map(String::as_str).ok_or("missing action (list, add, update, copy, delete, run, generate)")?;
+    if action == "generate" {
+        return generate(path, rest.get(1..).unwrap_or_default());
+    }
     let (index, flags) = match action {
         "update" | "copy" | "delete" | "run" => (rest.get(1), rest.get(2..).unwrap_or_default()),
         _ => (None, rest.get(1..).unwrap_or_default()),
@@ -197,7 +204,7 @@ fn configs(path: Option<&String>, rest: &[String]) -> Result<ExitCode, String> {
             };
             s.execute("run.run", &json!({ "config": i }))
         }
-        other => return Err(format!("unknown action `{other}` (list, add, update, copy, delete, run)")),
+        other => return Err(format!("unknown action `{other}` (list, add, update, copy, delete, run, generate)")),
     }
     .map_err(|e| e.to_string())?;
     pump_until(&mut s, Duration::from_secs(1800), |s| !s.jobs_running());
@@ -209,6 +216,46 @@ fn configs(path: Option<&String>, rest: &[String]) -> Result<ExitCode, String> {
             }
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `configs <project> generate [--add] [--agent A [--mode M]]`: print the proposed configurations
+/// (and save the new ones with `--add`).
+fn generate(path: Option<&String>, flags: &[String]) -> Result<ExitCode, String> {
+    let mut params = serde_json::Map::new();
+    let mut add = false;
+    let mut it = flags.iter();
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("`{flag}` needs a value"));
+        match flag.as_str() {
+            "--add" => add = true,
+            "--agent" => {
+                params.insert("agent".into(), json!(value()?));
+            }
+            "--mode" => {
+                params.insert("mode".into(), json!(value()?));
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+    }
+    let mut s = open_project(path)?;
+    s.execute("runConfig.generate", &Value::Object(params)).map_err(|e| e.to_string())?;
+    // Detection takes moments; an agent can take minutes.
+    pump_until(&mut s, Duration::from_secs(1800), |s| {
+        !s.jobs_running() && s.run_store.generate.view.as_ref().is_none_or(|v| v.busy.is_none())
+    });
+    let view = s.execute("runConfig.generate.list", &Value::Null).map_err(|e| e.to_string())?;
+    if let Some(e) = view.get("error").and_then(Value::as_str) {
+        eprintln!("{e}");
+    }
+    let result = if add {
+        let added = s.execute("runConfig.generate.add", &Value::Null).map_err(|e| e.to_string())?;
+        s.execute("runConfig.ok", &Value::Null).map_err(|e| e.to_string())?;
+        added
+    } else {
+        view
+    };
+    println!("{}", serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?);
     Ok(ExitCode::SUCCESS)
 }
 

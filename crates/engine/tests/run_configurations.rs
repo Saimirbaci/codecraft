@@ -311,3 +311,169 @@ fn cpp_configuration_compiles_and_runs_with_the_env_file() {
     assert!(lines.iter().any(|l| l == "hello world"), "{lines:?}");
     s.shutdown();
 }
+
+// ---------------------------------------------------------------- generated configurations
+
+/// A Rust + Python project: a binary, a Flask app in `web/`, plus files that are not entry points.
+fn polyglot(dir: &Path) -> std::path::PathBuf {
+    let root = dir.join("poly");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::create_dir_all(root.join("web/pkg")).unwrap();
+    std::fs::write(root.join("Makefile"), "all:\n\techo hi\nrun:\n\techo run\nlint:\n\ttrue\n").unwrap();
+    std::fs::write(root.join("web/requirements.txt"), "flask\n").unwrap();
+    std::fs::write(root.join("web/app.py"), "from flask import Flask\napp = Flask(__name__)\n").unwrap();
+    std::fs::write(root.join("web/pkg/helpers.py"), "if __name__ == '__main__':\n    pass\n").unwrap();
+    std::fs::write(root.join("web/seed.py"), "if __name__ == '__main__':\n    pass\n").unwrap();
+    // The web sub-project's own virtualenv.
+    std::fs::create_dir_all(root.join("web/.venv/bin")).unwrap();
+    std::fs::write(root.join("web/.venv/pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    std::fs::write(root.join("web/.venv/bin/python"), "").unwrap();
+    root
+}
+
+fn open_auto(root: &Path, auto: bool) -> Session {
+    let mut s = Session::new();
+    s.lsp_enabled = false;
+    s.run_store.generate.auto = auto;
+    s.execute("file.open", &json!({ "path": root })).unwrap();
+    wait_idle(&mut s);
+    s
+}
+
+fn user_names(s: &Session) -> Vec<String> {
+    s.run_store.user.iter().map(|c| c.name.clone()).collect()
+}
+
+#[test]
+fn configurations_are_generated_once_when_a_project_opens() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = polyglot(tmp.path());
+    let file = root.join(".codecraft/run-configurations.json");
+
+    // Off (the engine default; tests, the CLI): nothing is written.
+    let s = open_auto(&root, false);
+    assert!(s.run_store.user.is_empty() && !file.exists());
+    drop(s);
+
+    let mut s = open_auto(&root, true);
+    let names = user_names(&s);
+    assert_eq!(names, vec!["web: Flask app:app", "make", "make run"], "entry points only");
+    assert!(file.exists());
+    assert!(s.ws.notifications.iter().any(|n| n.message.contains("Created 3 run configurations")));
+    // The derived `make` / `make run` are not listed twice in the run widget.
+    let listed: Vec<String> = s.run_configs.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(listed.iter().filter(|n| *n == "make").count(), 1, "{listed:?}");
+    assert!(listed.contains(&"make lint".to_string()), "other derived ones stay: {listed:?}");
+
+    // The user deletes everything: reopening does not bring them back.
+    for _ in 0..3 {
+        s.execute("runConfig.delete", &json!({ "index": 0 })).unwrap();
+    }
+    drop(s);
+    let s = open_auto(&root, true);
+    assert!(s.run_store.user.is_empty(), "{:?}", user_names(&s));
+
+    // The setting turns it off.
+    let tmp2 = tempfile::tempdir().unwrap();
+    let root2 = polyglot(tmp2.path());
+    let mut s = Session::new();
+    s.lsp_enabled = false;
+    s.run_store.generate.auto = true;
+    s.execute("settings.set", &json!({ "key": "generate_run_configs", "value": false })).unwrap();
+    s.execute("file.open", &json!({ "path": root2 })).unwrap();
+    wait_idle(&mut s);
+    assert!(s.run_store.user.is_empty() && !root2.join(".codecraft/run-configurations.json").exists());
+}
+
+#[test]
+fn generate_proposes_and_adds_through_the_dialog() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = polyglot(tmp.path());
+    let mut s = open(&root);
+    s.execute("runConfig.create", &json!({ "name": "My make", "kind": "command", "command": "make" })).unwrap();
+
+    s.execute("runConfig.generate", &Value::Null).unwrap();
+    assert!(s.run_store.dialog.is_some(), "Generate opens Edit Configurations");
+    wait_idle(&mut s);
+    let view = s.execute("runConfig.generate.list", &Value::Null).unwrap();
+    assert!(view["busy"].is_null(), "{view}");
+    let proposals = view["proposals"].as_array().unwrap();
+    let by_name = |n: &str| proposals.iter().find(|p| p["config"]["name"] == n).unwrap_or_else(|| panic!("{n}: {view}"));
+    // An existing configuration with the same command is recognised (and keeps its name).
+    assert_eq!(by_name("My make")["exists"], true);
+    assert_eq!(by_name("My make")["selected"], false);
+    assert_eq!(by_name("web: Flask app:app")["config"]["kind"], "flask");
+    assert_eq!(by_name("web: Flask app:app")["config"]["working_dir"], "web");
+    assert_eq!(by_name("web: Flask app:app")["group"], "Python");
+
+    // Untick `make run`, add the rest; they go to the draft until OK.
+    let i = proposals.iter().position(|p| p["config"]["name"] == "make run").unwrap();
+    s.execute("runConfig.generate.select", &json!({ "index": i, "selected": false })).unwrap();
+    let r = s.execute("runConfig.generate.add", &Value::Null).unwrap();
+    assert_eq!(r["added"], json!(["web: Flask app:app"]));
+    assert!(s.run_store.generate.view.is_none(), "adding closes the Generate view");
+    assert_eq!(user_names(&s), vec!["My make"], "not saved before OK");
+    s.execute("runConfig.ok", &Value::Null).unwrap();
+    assert_eq!(user_names(&s), vec!["My make", "web: Flask app:app"]);
+    let flask = s.run_configs.iter().find(|c| c.name == "web: Flask app:app").unwrap();
+    let cmd = flask.command.as_ref().unwrap();
+    assert!(cmd.args.windows(2).any(|w| w == ["-m", "flask"]), "{:?}", cmd.args);
+    assert!(cmd.cwd.ends_with("web"));
+    assert!(cmd.program.ends_with("web/.venv/bin/python"), "the sub-project's interpreter: {}", cmd.program);
+
+    // Generating again: everything already there is marked, nothing new is ticked.
+    s.execute("runConfig.generate", &Value::Null).unwrap();
+    wait_idle(&mut s);
+    let view = s.execute("runConfig.generate.list", &Value::Null).unwrap();
+    let ticked: Vec<&Value> = view["proposals"].as_array().unwrap().iter().filter(|p| p["selected"] == true).collect();
+    assert_eq!(ticked.len(), 1, "only `make run` is new: {view}");
+    s.execute("runConfig.cancel", &Value::Null).unwrap();
+    assert!(s.run_store.generate.view.is_none());
+
+    // Bad params are errors, not panics.
+    assert!(s.execute("runConfig.generate", &json!({ "agent": "vim" })).is_err());
+    assert!(s.execute("runConfig.generate", &json!({ "agent": "claude", "mode": "review" })).is_err());
+    assert!(matches!(s.execute("runConfig.generate.add", &Value::Null), Err(CommandError::Disabled(_))));
+}
+
+fn have(tool: &str) -> bool {
+    std::process::Command::new(tool).arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+#[test]
+fn an_agent_refines_the_generated_configurations() {
+    if !have("python3") {
+        eprintln!("skipping: python3 not found");
+        return;
+    }
+    let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake_runconfig_agent.py");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = polyglot(tmp.path());
+    let mut s = open(&root);
+    s.execute("agent.settings", &json!({ "acp": { "gemini": ["python3", fake] } })).unwrap();
+
+    s.execute("runConfig.generate", &json!({ "agent": "gemini" })).unwrap();
+    let start = Instant::now();
+    loop {
+        s.pump();
+        let v = s.run_store.generate.view.clone().unwrap();
+        if v.busy.is_none() && v.agent_job.is_some() {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "timed out: {v:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let view = s.execute("runConfig.generate.list", &Value::Null).unwrap();
+    assert!(view["error"].is_null(), "{view}");
+    let names: Vec<&str> =
+        view["proposals"].as_array().unwrap().iter().map(|p| p["config"]["name"].as_str().unwrap()).collect();
+    // The agent kept the first detected one, added a worker and its nonsense entry was dropped.
+    assert_eq!(names, vec!["web: Flask app:app", "Worker"], "{view}");
+    assert_eq!(view["proposals"][1]["source"], "agent");
+    assert_eq!(view["proposals"][1]["config"]["env"], json!([["QUEUE", "default"]]));
+    assert_eq!(view["notes"].as_array().unwrap().len(), 1, "{view}");
+    s.execute("runConfig.generate.add", &Value::Null).unwrap();
+    s.execute("runConfig.ok", &Value::Null).unwrap();
+    assert_eq!(user_names(&s), vec!["web: Flask app:app", "Worker"]);
+    s.shutdown();
+}

@@ -140,6 +140,9 @@ pub struct Settings {
     pub rename_in_place: bool,
     /// Reopen the last project(s) and their editors on startup (System Settings).
     pub reopen_last_project: bool,
+    /// Generate run configurations for the project's entry points when a project without saved
+    /// configurations opens.
+    pub generate_run_configs: bool,
     /// File › Power Save Mode: no completion auto-popup, inlay/semantic requests, check on save
     /// or live TODO scanning.
     pub power_save_mode: bool,
@@ -272,6 +275,7 @@ impl Default for Settings {
             completion_argument_placeholders: false,
             rename_in_place: true,
             reopen_last_project: true,
+            generate_run_configs: true,
             power_save_mode: false,
             file_type_associations: BTreeMap::new(),
             right_margin: 100,

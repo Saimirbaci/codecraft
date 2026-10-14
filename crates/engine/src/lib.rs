@@ -77,6 +77,7 @@ pub mod python_env;
 mod python_lint;
 pub mod python_project;
 mod run_cmds;
+pub mod run_config_gen;
 mod run_config_cmds;
 pub mod run_config_store;
 pub mod run_configs;
@@ -404,6 +405,7 @@ impl Session {
         changed |= python::pump(self);
         changed |= profiler::pump(self);
         changed |= sql_lang::pump(self);
+        changed |= run_config_gen::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -436,6 +438,7 @@ impl Session {
             || self.db.busy()
             || self.debug.settling()
             || self.inspections.busy()
+            || self.run_store.generate.busy()
     }
 
     /// Stop the language server and running processes (window closing).

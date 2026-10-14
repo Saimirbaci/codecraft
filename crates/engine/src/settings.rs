@@ -65,6 +65,7 @@ pub const PAGE_FONT: &str = "Editor › Font";
 pub const PAGE_COLOR_SCHEME: &str = "Editor › Color Scheme";
 pub const PAGE_CODE_STYLE: &str = "Editor › Code Style";
 pub const PAGE_LIVE_TEMPLATES: &str = "Editor › Live Templates";
+pub const PAGE_RUN_CONFIGS: &str = "Build, Execution, Deployment › Run Configurations";
 pub const PAGE_RUST: &str = "Languages & Frameworks › Rust";
 pub const PAGE_VCS: &str = "Version Control › Commit Message Generation";
 pub const PAGE_TOOLS: &str = "Tools › AI Agents";
@@ -82,6 +83,7 @@ pub const PAGES: &[&str] = &[
     PAGE_COLOR_SCHEME,
     PAGE_CODE_STYLE,
     PAGE_LIVE_TEMPLATES,
+    PAGE_RUN_CONFIGS,
     PAGE_RUST,
     PAGE_VCS,
     PAGE_TOOLS,
@@ -221,6 +223,13 @@ pub const SETTINGS: &[SettingDef] = &[
         Kind::Bool,
     ),
     def("show_status_bar", "Show the status bar", PAGE_APPEARANCE, "View › Appearance › Status Bar", Kind::Bool),
+    def(
+        "generate_run_configs",
+        "Generate run configurations for new projects",
+        PAGE_RUN_CONFIGS,
+        "When a project without saved run configurations opens, create them for its entry points (Cargo binaries, Django/FastAPI/Flask apps, CMake/Zig executables, …)",
+        Kind::Bool,
+    ),
     def(
         "reopen_last_project",
         "Reopen projects on startup",

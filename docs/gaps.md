@@ -405,3 +405,23 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     snapshots, query history and SSH state under `dir`; the panic-hunting test uses it (an early
     M11 run had written HTTP scratch files and a profiler list into `~/.codecraft`). New
     per-user files must be added there.
+
+## Generated run configurations (2026-10-14)
+
+37. Run › Edit Configurations › Generate proposes editable configurations for the project's
+    entry points, per ecosystem and per sub-project (`backend/`, `web/`, …): Cargo binaries and
+    tests; Django, FastAPI, Flask and Streamlit apps, `__main__` packages, `[project.scripts]`,
+    `if __name__ == "__main__"` scripts with an entry-point name (`main.py`, `app.py`, `run.py`,
+    `cli.py`, `server.py`) and pytest, never one per Python file; CMake/Meson executables, CTest,
+    `make`/`make run`/`make test`, or the sources that define `main()`; `build.zig` steps or `zig
+    run src/main.zig`; npm `dev`/`start`/`test`/`build`; Go `package main`; compose/Dockerfile.
+    Proposals are ticked in a list (already configured ones are marked) and added to the draft.
+    "Ask an agent" sends the detected list to Claude Code/Codex/Grok/Gemini (Ask mode when
+    available, so anything beyond reading needs approval) and shows its JSON reply as proposals,
+    after validation. The desktop app generates once when a project without
+    `.codecraft/run-configurations.json` opens (Settings › Build, Execution, Deployment › Run
+    Configurations). Remaining: detection is heuristic (three directory levels, file heads, no
+    Python import graph); CMake binaries are assumed under `cmake-build-debug/<subdir>/` (no
+    `RUNTIME_OUTPUT_DIRECTORY`); an agent in Auto mode (backends without Ask) is only told not
+    to change files. Python and npm configurations that run in a sub-project use its own
+    virtualenv and lockfile unless the project has a selected interpreter.

@@ -512,7 +512,7 @@ impl UserRunConfig {
                 if args.is_empty() {
                     return Err(format!("`{name}`: the command is empty"));
                 }
-                process(crate::run_configs::python_for(project), args)
+                process(crate::run_configs::python_in(project, &self.cwd(project, project)), args)
             }
             RunKind::Zig => {
                 let args = words()?;
@@ -526,7 +526,7 @@ impl UserRunConfig {
                 if args.is_empty() {
                     return Err(format!("`{name}`: the command is empty"));
                 }
-                process(crate::run_configs::package_manager(project).into(), args)
+                process(crate::run_configs::package_manager_in(project, &self.cwd(project, project)).into(), args)
             }
             RunKind::Django | RunKind::FastApi | RunKind::Flask => {
                 let args = words()?;
@@ -534,7 +534,11 @@ impl UserRunConfig {
                     return Err(format!("`{name}`: the command is empty"));
                 }
                 let (program, args) =
-                    crate::python_project::framework_command(self.kind, crate::run_configs::python_for(project), args);
+                    crate::python_project::framework_command(
+                    self.kind,
+                    crate::run_configs::python_in(project, &self.cwd(project, project)),
+                    args,
+                );
                 process(program, args)
             }
             RunKind::Dockerfile => {
@@ -678,6 +682,8 @@ pub struct RunConfigStore {
     pub error: Option<String>,
     corrupt: bool,
     pub dialog: Option<RunConfigDialog>,
+    /// Generated configurations (Edit Configurations › Generate, and on project open).
+    pub generate: crate::run_config_gen::GenState,
 }
 
 impl RunConfigStore {
@@ -737,7 +743,10 @@ impl RunConfigStore {
     }
 
     fn clear(&mut self) {
+        // Whether generation on open is enabled outlives the project.
+        let auto = self.generate.auto;
         *self = Self::default();
+        self.generate.auto = auto;
     }
 }
 
@@ -754,6 +763,7 @@ pub(crate) fn project_loaded(s: &mut Session, root: &Path) {
         s.notify(codecraft_workspace::NotificationLevel::Warning, "Run Configurations", e);
     }
     rebuild(s);
+    crate::run_config_gen::project_loaded(s, root);
 }
 
 pub(crate) fn project_closed(s: &mut Session) {
@@ -768,7 +778,16 @@ pub(crate) fn rebuild(s: &mut Session) {
     let cargo = cargo_root(s).unwrap_or_else(|| project.clone());
     let mut list: Vec<RunConfig> =
         s.run_store.user.iter().filter_map(|u| u.to_run_config(&project, &cargo).ok()).collect();
-    list.extend(s.run_store.derived.iter().cloned());
+    // A derived configuration that a user one already covers (same name or same command line,
+    // as after Generate) is not listed twice.
+    let derived: Vec<RunConfig> = s
+        .run_store
+        .derived
+        .iter()
+        .filter(|d| !list.iter().any(|u| u.name == d.name || u.command_line() == d.command_line()))
+        .cloned()
+        .collect();
+    list.extend(derived);
     s.run_configs = list;
     s.selected_run_config = selected.and_then(|n| s.run_configs.iter().position(|c| c.name == n)).unwrap_or(0);
 }

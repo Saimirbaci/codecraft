@@ -212,6 +212,7 @@ impl App {
     pub fn new(open: Option<PathBuf>) -> Self {
         let mut session = Session::new();
         session.session_store.enable();
+        session.run_store.generate.auto = true;
         Self::build(open, PersistedState::load(), true, true, session)
     }
 
@@ -715,6 +716,7 @@ pub fn launch(launch: Launch) -> eframe::Result {
         Box::new(move |_cc| {
             let mut session = Session::new();
             session.session_store.autosave = true;
+            session.run_store.generate.auto = true;
             session.session_store.restore_on_open = !no_restore;
             let mut app = App::build(open, persisted, true, !no_restore, session);
             app.native_menu.allowed = true;

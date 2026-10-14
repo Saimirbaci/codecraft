@@ -18,6 +18,27 @@ pub fn python_for(root: &Path) -> String {
     crate::python_env::project_python(root).map(|p| p.display().to_string()).unwrap_or_else(|| "python3".into())
 }
 
+/// The interpreter for a configuration that runs in `cwd`: the project's selected interpreter,
+/// else the virtualenv of the sub-project it runs in (`backend/.venv`), else the project's.
+pub fn python_in(project: &Path, cwd: &Path) -> String {
+    crate::python_env::selected_interpreter(project)
+        .or_else(|| (cwd != project && cwd.starts_with(project)).then(|| crate::python_env::project_venv(cwd)).flatten())
+        .or_else(|| crate::python_env::project_venv(project))
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "python3".into())
+}
+
+/// The package manager for a configuration that runs in `cwd`: from the sub-project's lockfile
+/// when it has one, else the project's.
+pub(crate) fn package_manager_in(project: &Path, cwd: &Path) -> &'static str {
+    let locks = ["bun.lockb", "bun.lock", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
+    if cwd != project && locks.iter().any(|l| cwd.join(l).is_file()) {
+        package_manager(cwd)
+    } else {
+        package_manager(project)
+    }
+}
+
 /// The JavaScript package manager from the lockfile.
 pub(crate) fn package_manager(root: &Path) -> &'static str {
     if root.join("bun.lockb").is_file() || root.join("bun.lock").is_file() {
