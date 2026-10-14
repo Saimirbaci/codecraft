@@ -1,0 +1,10 @@
+All available test cases:
+  Adds numbers
+      [math]
+  Fails
+      [math][!mayfail]
+  A very long test case name that wraps onto the
+    next line
+      [long]
+3 test cases
+

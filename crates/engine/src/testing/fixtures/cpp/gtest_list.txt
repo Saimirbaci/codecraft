@@ -1,0 +1,7 @@
+MathTest.
+  Adds
+  Fails
+  DISABLED_Slow
+Inst/ParamTest.  # TypeParam =
+  Even/0  # GetParam() = 2
+  Even/1  # GetParam() = 3

@@ -193,6 +193,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::python_cmds::specs());
         specs.extend(crate::profiler_cmds::specs());
         specs.extend(crate::sql_lang_cmds::specs());
+        specs.extend(crate::cpp::specs());
         // SQL files and SQL in strings: navigation commands handle SQL (track DC).
         crate::database_cmds::sql_editor::route(&mut specs);
         let mut by_id = HashMap::new();

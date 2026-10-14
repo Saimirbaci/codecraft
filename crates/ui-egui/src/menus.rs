@@ -53,7 +53,9 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn visible(item: &CatalogItem) -> bool {
-    !matches!(item.scope, Scope::Out | Scope::Os)
+    // CLion's Valgrind import is implemented (track CL) although the observed install lists it
+    // as a third-party plugin item.
+    !matches!(item.scope, Scope::Out | Scope::Os) || item.id == "run.importValgrindXmlResults"
 }
 
 fn children<'a>(path: &'a [&'a str]) -> impl Iterator<Item = &'static CatalogItem> + 'a {

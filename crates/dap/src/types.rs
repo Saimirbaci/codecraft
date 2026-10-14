@@ -40,6 +40,8 @@ pub struct Capabilities {
     pub supports_disassemble_request: bool,
     pub supports_data_breakpoints: bool,
     pub supports_instruction_breakpoints: bool,
+    /// `restartFrame` (Run › Debugging Actions › Reset Frame).
+    pub supports_restart_frame: bool,
     pub exception_breakpoint_filters: Vec<ExceptionBreakpointsFilter>,
 }
 

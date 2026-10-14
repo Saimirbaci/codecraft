@@ -390,6 +390,11 @@ pub enum DebugTarget {
         #[serde(default)]
         program: Option<PathBuf>,
     },
+    /// Run › Attach to an Unstarted Process…: wait for a process with this name (or this
+    /// executable's name) to start, then attach (lldb `process attach --name X --waitfor`).
+    /// Stopping detaches.
+    #[serde(rename_all = "camelCase")]
+    AttachWait { name: String, process: String },
 }
 
 fn yes() -> bool {
@@ -407,7 +412,8 @@ impl DebugTarget {
             | Self::Node { name, .. }
             | Self::Attach { name, .. }
             | Self::CoreDump { name, .. }
-            | Self::Remote { name, .. } => name,
+            | Self::Remote { name, .. }
+            | Self::AttachWait { name, .. } => name,
         }
     }
 }
@@ -720,6 +726,7 @@ enum RunSpec {
     Attach { pid: u32, process: ProcessKind },
     Core { core: PathBuf, program: Option<PathBuf> },
     Remote { address: String, program: Option<PathBuf> },
+    AttachWait { process: String },
 }
 
 struct Prepared {
@@ -767,6 +774,8 @@ enum Pending {
     /// A console command that resumes (`thread step-inst`): an error in its output means we are
     /// still stopped.
     ResumeCommand,
+    /// Reset Frame through the LLDB console (`thread return`): the stack is read again after.
+    ResetFrame,
     /// Memory, Disassembly, Registers and watchpoint requests (see `debug_views`).
     View {
         epoch: u64,
@@ -788,6 +797,7 @@ impl Pending {
                 | Self::ResumeCommand
                 | Self::View { .. }
                 | Self::SetBreakpoints { .. }
+                | Self::ResetFrame
         )
     }
 }
@@ -862,7 +872,10 @@ impl Runtime {
     /// Attached to a process we did not start (or a core dump, or a remote program whose pid
     /// means nothing here): stopping detaches and never kills it.
     fn attached(&self) -> bool {
-        matches!(self.plan.run, RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. })
+        matches!(
+            self.plan.run,
+            RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. } | RunSpec::AttachWait { .. }
+        )
     }
 
     /// End the session with `disconnect`: detach from an attached process, else terminate.
@@ -1063,6 +1076,19 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                 env: Vec::new(),
             })
         }
+        DebugTarget::AttachWait { name, process } => {
+            if !dap::launch::valid_wait_name(process) {
+                return Err(format!("`{process}` is not a process name"));
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::AttachWait { process: process.trim().to_owned() },
+                args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+            })
+        }
         DebugTarget::Node { name, program, args, cwd } => Ok(LaunchPlan {
             name: name.clone(),
             build: None,
@@ -1231,6 +1257,12 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
             let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
             let init = rust_init_commands(adapter.kind);
             let args = dap::launch::native_core(adapter.kind, &plan.name, program.as_deref(), core, &init);
+            (adapter, args)
+        }
+        RunSpec::AttachWait { process } => {
+            let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
+            let init = rust_init_commands(adapter.kind);
+            let args = dap::launch::native_attach_wait(adapter.kind, &plan.name, process, &init);
             (adapter, args)
         }
         RunSpec::Remote { address, program } => {
@@ -1731,6 +1763,26 @@ fn on_response(s: &mut Session, response: dap::Response) {
             }
         }
         Pending::Evaluate { epoch, purpose } => on_evaluate(s, epoch == epoch_now, purpose, response.result),
+        Pending::ResetFrame => {
+            let result = response.result.and_then(|body| {
+                let b = dap::types::parse::<dap::EvaluateBody>(&body).unwrap_or_default();
+                match dap::lldb::error_of(&b.result) {
+                    Some(e) => Err(e),
+                    None => Ok(b.result),
+                }
+            });
+            match result {
+                Ok(text) => {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        s.debug.push_console(DebugConsoleKind::Result, text.to_owned());
+                    }
+                    s.status = "Frame reset".into();
+                }
+                Err(e) => s.debug.error(format!("Reset Frame: {e}")),
+            }
+            refresh_stack(s);
+        }
         Pending::View { epoch, request } => {
             crate::debug_views::on_response(s, epoch == epoch_now, request, response.result);
         }
@@ -2277,6 +2329,63 @@ fn step_with(s: &mut Session, step: Step, by_instruction: bool) -> Result<(), Co
     s.debug.views.on_resume();
     s.status = "Running".into();
     Ok(())
+}
+
+/// Run › Debugging Actions › Reset Frame: drop the selected frame and return to its caller.
+/// Adapters with `restartFrame` restart it; LLDB adapters without it pop it with `thread
+/// return` (side effects are not undone). Returns how it was done.
+pub(crate) fn reset_frame(s: &mut Session) -> Result<&'static str, CommandError> {
+    if !s.debug.is_stopped() {
+        return Err(CommandError::Disabled("the program is not paused".into()));
+    }
+    let (frame, index, count) = {
+        let session = s.debug.session.as_ref().ok_or_else(|| CommandError::Disabled("not debugging".into()))?;
+        let frame = session.selected_frame().map(|f| f.id).ok_or_else(|| CommandError::Failed("no frame is selected".into()))?;
+        (frame, session.frame, session.frames.len())
+    };
+    if index + 1 >= count {
+        return Err(CommandError::Failed("the outermost frame cannot be reset".into()));
+    }
+    let previous = s.debug.session.as_ref().and_then(|x| x.status.clone());
+    let Some(rt) = s.debug.rt.as_mut() else { return Err(CommandError::Disabled("not debugging".into())) };
+    if rt.capabilities.supports_restart_frame {
+        if !rt.request(Pending::Resume, |c| c.restart_frame(frame)) {
+            return Err(CommandError::Failed("the debugger is not responding".into()));
+        }
+        rt.last_stop = previous;
+        rt.epoch += 1;
+        if let Some(session) = &mut s.debug.session {
+            session.status = Some(DebugStatus::Running);
+            session.clear_stop();
+        }
+        s.debug.views.on_resume();
+        return Ok("restartFrame");
+    }
+    if matches!(rt.kind, AdapterKind::LldbDap | AdapterKind::CodeLldb) {
+        if !rt.request(Pending::ResetFrame, |c| c.evaluate("thread return", Some(frame), "repl")) {
+            return Err(CommandError::Failed("the debugger is not responding".into()));
+        }
+        s.debug.push_console(DebugConsoleKind::Input, "> thread return".to_owned());
+        return Ok("thread return");
+    }
+    Err(CommandError::Failed(format!("{} cannot reset frames (it has no restartFrame request)", adapter_id(rt.kind))))
+}
+
+/// Read the threads and the current thread's stack again (the stop is unchanged).
+fn refresh_stack(s: &mut Session) {
+    let thread = current_thread(s);
+    let Some(rt) = s.debug.rt.as_mut() else { return };
+    rt.epoch += 1;
+    let epoch = rt.epoch;
+    rt.ref_paths.clear();
+    if let Some(session) = s.debug.session.as_mut() {
+        session.clear_stop();
+    }
+    s.debug.views.on_stop();
+    rt.request(Pending::Threads, DapClient::threads);
+    if let Some(thread) = thread {
+        rt.request(Pending::StackTrace { epoch, reveal: true }, |c| c.stack_trace(thread, 0, MAX_FRAMES));
+    }
 }
 
 pub(crate) fn pause(s: &mut Session) -> Result<(), CommandError> {

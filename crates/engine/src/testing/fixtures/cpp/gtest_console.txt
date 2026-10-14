@@ -1,0 +1,46 @@
+Running main() from /deps/googletest/src/gtest_main.cc
+[==========] Running 5 tests from 3 test suites.
+[----------] Global test environment set-up.
+[----------] 2 tests from MathTest
+[ RUN      ] MathTest.Adds
+[       OK ] MathTest.Adds (0 ms)
+[ RUN      ] MathTest.Fails
+/proj/tests/math_test.cpp:12: Failure
+Expected equality of these values:
+  add(1, 2)
+    Which is: 3
+  4
+[  FAILED  ] MathTest.Fails (1 ms)
+[----------] 2 tests from MathTest (3 ms total)
+
+[----------] 2 tests from Inst/ParamTest
+[ RUN      ] Inst/ParamTest.Even/0
+[       OK ] Inst/ParamTest.Even/0 (0 ms)
+[ RUN      ] Inst/ParamTest.Even/1
+/proj/tests/math_test.cpp:20: Failure
+Value of: GetParam() % 2 == 0
+  Actual: false
+Expected: true
+[  FAILED  ] Inst/ParamTest.Even/1, where GetParam() = 3 (0 ms)
+[----------] 2 tests from Inst/ParamTest (0 ms total)
+
+[----------] 1 test from SkipTest
+[ RUN      ] SkipTest.Later
+/proj/tests/math_test.cpp:25: Skipped
+not ready
+
+[  SKIPPED ] SkipTest.Later (0 ms)
+[----------] 1 test from SkipTest (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 5 tests from 3 test suites ran. (4 ms total)
+[  PASSED  ] 2 tests.
+[  SKIPPED ] 1 test, listed below:
+[  SKIPPED ] SkipTest.Later
+[  FAILED  ] 2 tests, listed below:
+[  FAILED  ] MathTest.Fails
+[  FAILED  ] Inst/ParamTest.Even/1, where GetParam() = 3
+
+ 2 FAILED TESTS
+  YOU HAVE 1 DISABLED TEST
+

@@ -26,6 +26,7 @@ pub mod commands;
 pub mod completion;
 pub mod commit_ai;
 mod convert;
+pub mod cpp;
 pub mod database;
 mod database_cmds;
 pub mod debug;
@@ -252,6 +253,8 @@ pub struct Session {
     pub sql_lang: sql_lang::SqlLangState,
     /// The Services tool window's selected section.
     pub services: services::ServicesState,
+    /// CLion features: CMake, C++ tests, Valgrind, sanitizers, Conan/vcpkg (M12 track CL).
+    pub cpp: cpp::CppState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -319,6 +322,7 @@ impl Session {
             profiler: profiler::ProfilerState::default(),
             sql_lang: sql_lang::SqlLangState::default(),
             services: services::ServicesState::default(),
+            cpp: cpp::CppState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -376,6 +380,8 @@ impl Session {
         self.db.history.set_dir(dir.join("database").join("history"));
         self.remote.home_override = Some(dir.to_path_buf());
         self.remote.ssh_config_override = Some(dir.join("ssh_config"));
+        // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
+        self.cpp.isolated = true;
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
@@ -409,6 +415,7 @@ impl Session {
         changed |= profiler::pump(self);
         changed |= sql_lang::pump(self);
         changed |= run_config_gen::pump(self);
+        changed |= cpp::pump(self);
         session_store::autosave(self);
         self.ws.sync_views();
         changed
@@ -432,6 +439,7 @@ impl Session {
             || self.python.busy()
             || self.profiler.busy()
             || self.sql_lang.busy()
+            || self.cpp.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -442,6 +450,7 @@ impl Session {
             || self.debug.settling()
             || self.inspections.busy()
             || self.run_store.generate.busy()
+            || self.cpp.busy()
     }
 
     /// Stop the language server and running processes (window closing).
@@ -458,6 +467,7 @@ impl Session {
         docker::shutdown(self);
         python::shutdown(self);
         profiler::shutdown(self);
+        cpp::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
         runs::stop_all(self);

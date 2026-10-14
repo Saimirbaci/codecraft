@@ -40,6 +40,7 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::PythonPackages => "📦",
         ToolWindowId::FileTransfer => "🔃",
         ToolWindowId::RemoteHost => "🖥",
+        ToolWindowId::CMake => "△",
     }
 }
 
@@ -76,6 +77,10 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                 for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().rev().filter(|t| t.side() == Side::Bottom) {
                     stripe_button(ui, s, st, tw);
+                }
+                // CMake projects get the CMake tool window (track CL).
+                if s.cpp.cmake.is_cmake {
+                    stripe_button(ui, s, st, ToolWindowId::CMake);
                 }
             });
         });
@@ -191,6 +196,7 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::PythonPackages => crate::python_ui::show_packages(ui, s, st),
         ToolWindowId::FileTransfer => crate::remote_ui::show_file_transfer(ui, s, st),
         ToolWindowId::RemoteHost => crate::remote_ui::show_remote_host(ui, s, st),
+        ToolWindowId::CMake => crate::cmake_ui::show(ui, s, st),
     }
 }
 
@@ -515,6 +521,10 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
         .collect();
     // Test runs: the test tree (and the selected test's output) beside the console.
     if is_test_run && !crate::testing_panel::show_test_run(ui, s, st, tab.id) {
+        return;
+    }
+    // Valgrind Memcheck and sanitizer reports of this run (track CL).
+    if crate::valgrind_ui::show_run_extras(ui, s, st, tab.id) {
         return;
     }
     if !failed.is_empty() && !is_test_run {

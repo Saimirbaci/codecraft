@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Catch2TestRun name="catch_tests" rng-seed="1234567" xml-format-version="3" catch2-version="3.5.2">
+  <TestCase name="Adds numbers" tags="[math]" filename="/proj/tests/catch_test.cpp" line="5">
+    <OverallResult success="true" skips="0" durationInSeconds="0.000012"/>
+  </TestCase>
+  <TestCase name="Fails" tags="[math]" filename="/proj/tests/catch_test.cpp" line="10">
+    <Expression success="false" type="REQUIRE" filename="/proj/tests/catch_test.cpp" line="12">
+      <Original>
+        add(1, 2) == 4
+      </Original>
+      <Expanded>
+        3 == 4
+      </Expanded>
+    </Expression>
+    <OverallResult success="false" skips="0" durationInSeconds="0.0021">
+      <StdOut>
+printed by the test
+      </StdOut>
+    </OverallResult>
+  </TestCase>
+  <TestCase name="Sections" filename="/proj/tests/catch_test.cpp" line="15">
+    <Section name="first" filename="/proj/tests/catch_test.cpp" line="16">
+      <OverallResults successes="1" failures="0" expectedFailures="0" skipped="false" durationInSeconds="0.00001"/>
+    </Section>
+    <Section name="second" filename="/proj/tests/catch_test.cpp" line="19">
+      <Expression success="false" type="CHECK" filename="/proj/tests/catch_test.cpp" line="20">
+        <Original>
+          v.size() == 0
+        </Original>
+        <Expanded>
+          3 == 0
+        </Expanded>
+      </Expression>
+      <OverallResults successes="0" failures="1" expectedFailures="0" skipped="false" durationInSeconds="0.00002"/>
+    </Section>
+    <OverallResult success="false" skips="0" durationInSeconds="0.0001"/>
+  </TestCase>
+  <TestCase name="Throws" filename="/proj/tests/catch_test.cpp" line="24">
+    <Exception filename="/proj/tests/catch_test.cpp" line="24">
+      boom &amp; bust
+    </Exception>
+    <OverallResult success="false" skips="0" durationInSeconds="0.00005"/>
+  </TestCase>
+  <TestCase name="Not yet" filename="/proj/tests/catch_test.cpp" line="28">
+    <Skip filename="/proj/tests/catch_test.cpp" line="29">
+      not ready
+    </Skip>
+    <OverallResult success="true" skips="1" durationInSeconds="0.00001"/>
+  </TestCase>
+  <OverallResults successes="1" failures="3" expectedFailures="0" skips="1"/>
+  <OverallResultsCases successes="1" failures="3" expectedFailures="0" skips="1"/>
+</Catch2TestRun>

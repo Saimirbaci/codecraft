@@ -162,6 +162,53 @@ pub fn native_attach(kind: AdapterKind, name: &str, pid: u32, init_commands: &[S
     }
 }
 
+/// `attach` arguments that wait for a process to start (Run › Attach to an Unstarted Process…).
+/// `program` is an executable path (the adapter creates the target from it and waits for a
+/// process with its name) or a bare process name, which lldb-dap attaches to with the LLDB
+/// command `process attach --name <name> --waitfor`.
+pub fn native_attach_wait(kind: AdapterKind, name: &str, program: &str, init_commands: &[String]) -> Value {
+    let path = std::path::Path::new(program);
+    match kind {
+        AdapterKind::CodeLldb => json!({
+            "name": name,
+            "type": "lldb",
+            "request": "attach",
+            "program": program,
+            "waitFor": true,
+            "initCommands": init_commands,
+        }),
+        _ if path.is_absolute() && path.is_file() => json!({
+            "name": name,
+            "type": "lldb-dap",
+            "request": "attach",
+            "program": program,
+            "waitFor": true,
+            "initCommands": init_commands,
+        }),
+        _ => {
+            let process = path.file_name().and_then(|n| n.to_str()).unwrap_or(program);
+            json!({
+                "name": name,
+                "type": "lldb-dap",
+                "request": "attach",
+                "attachCommands": [format!("process attach --name {} --waitfor", lldb_quoted(process))],
+                "initCommands": init_commands,
+            })
+        }
+    }
+}
+
+/// A process name for an LLDB command line.
+fn lldb_quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// A process name (or path) Attach to an Unstarted Process can wait for.
+pub fn valid_wait_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && n.len() <= 4096 && !n.contains(['\n', '\r', '\0'])
+}
+
 fn quoted(path: &std::path::Path) -> String {
     format!("\"{}\"", path.display().to_string().replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -303,6 +350,27 @@ mod tests {
         assert!(valid_remote_address("[::1]:9"));
         for bad in ["", "host", "host:", ":12", "host:0", "host:99999", "a b:1", "h;x:1"] {
             assert!(!valid_remote_address(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn attach_wait_arguments() {
+        let by_name = native_attach_wait(AdapterKind::LldbDap, "w", "my \"app\"", &[]);
+        assert_eq!(by_name["request"], json!("attach"));
+        assert_eq!(by_name["attachCommands"], json!(["process attach --name \"my \\\"app\\\"\" --waitfor"]));
+        assert!(by_name.get("waitFor").is_none());
+        let exe = std::env::current_exe().unwrap();
+        let by_path = native_attach_wait(AdapterKind::LldbDap, "w", &exe.display().to_string(), &[]);
+        assert_eq!(by_path["waitFor"], json!(true));
+        assert_eq!(by_path["program"], json!(exe.display().to_string()));
+        // A path that does not exist (yet) waits by its file name.
+        let missing = native_attach_wait(AdapterKind::LldbDap, "w", "/nowhere/server", &[]);
+        assert_eq!(missing["attachCommands"], json!(["process attach --name \"server\" --waitfor"]));
+        let code = native_attach_wait(AdapterKind::CodeLldb, "w", "server", &[]);
+        assert_eq!((code["type"].clone(), code["waitFor"].clone()), (json!("lldb"), json!(true)));
+        assert!(valid_wait_name("app"));
+        for bad in ["", "  ", "a\nb", "x\0"] {
+            assert!(!valid_wait_name(bad));
         }
     }
 

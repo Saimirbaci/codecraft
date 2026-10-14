@@ -157,6 +157,10 @@ pub struct UserRunConfig {
     pub working_dir: String,
     /// Where it runs (M11: Docker and SSH targets).
     pub target: crate::run_targets::RunTarget,
+    /// C/C++ only: sanitizers compiled in (`address,undefined`, `thread`; empty = none) — the
+    /// compile gets `-fsanitize=<list> -fno-omit-frame-pointer -g` (M12 track CL).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub sanitizers: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -568,6 +572,11 @@ impl UserRunConfig {
                 let exe = dir.join(build_file_name(&name));
                 let mut compile: Vec<String> = vec![(if cxx { "c++" } else { "cc" }).into()];
                 compile.extend(build.iter().cloned());
+                let sanitizers = self.sanitizers.trim();
+                if !sanitizers.is_empty() {
+                    compile.push(format!("-fsanitize={sanitizers}"));
+                    compile.extend(["-fno-omit-frame-pointer".into(), "-g".into()]);
+                }
                 compile.extend(["-o".into(), exe.display().to_string()]);
                 let mut run = vec![exe.display().to_string()];
                 run.extend(args.iter().cloned());
@@ -598,6 +607,7 @@ impl UserRunConfig {
                 env_file: String::new(),
                 working_dir: rel(&cmd.cwd),
                 target: c.target.clone(),
+                sanitizers: String::new(),
             };
         }
         let mut quiet = c.invocation.clone();
@@ -610,6 +620,7 @@ impl UserRunConfig {
             env_file: String::new(),
             working_dir: rel(&c.invocation.cwd),
             target: c.target.clone(),
+            sanitizers: String::new(),
         }
     }
 }
