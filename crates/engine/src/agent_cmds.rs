@@ -20,7 +20,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             None,
             "{backend: \"claude\"|\"codex\"|\"grok\"|\"gemini\", mode: \"auto\"|\"ask\"|\"review\", prompt: string, \
              attachments?: [path], cwd?: path, title?: string, includeActiveFile?: bool (default true), \
-             includeSelection?: bool (default true)} → {job}",
+             includeSelection?: bool (default true)} → {job, session} (`session`: the saved session's id, \
+             see agent.sessions.*)",
             Context::Global,
             always,
             start,
@@ -178,7 +179,8 @@ fn start(s: &mut Session, p: &Value) -> CmdResult {
         include_selection: bool_or(p, "includeSelection", true),
     };
     let id = agents::start(s, req)?;
-    Ok(json!({ "job": id.0 }))
+    let session = s.agents.job(id).and_then(|j| j.session_key.clone());
+    Ok(json!({ "job": id.0, "session": session }))
 }
 
 /// `one`: a single file (`path` param) or all pending ones.

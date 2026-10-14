@@ -1,6 +1,7 @@
 //! The Agent tool window: job launcher (backend, mode, prompt, context toggles), the job list,
-//! a live activity feed, follow-ups, and the review of worktree changes with per-file diffs.
-//! OWNED BY the agents track.
+//! the History of this project's saved sessions (reopen, resume, rename, delete), a live activity
+//! feed, follow-ups, and the review of worktree changes with per-file diffs.
+//! OWNED BY the agents track; History by the agent-sessions track (M12 AG).
 
 use std::path::{Path, PathBuf};
 
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 
 use codecraft_engine::Session;
 use codecraft_engine::agent::{Backend, BackendInfo, ChangeKind};
+use codecraft_engine::agent_sessions::{self, SessionSummary};
 use codecraft_engine::agents::{
     Activity, JobId, JobStatus, ReviewDecision, ReviewFile, ToolState, mode_id, mode_support,
 };
@@ -32,6 +34,12 @@ pub struct AgentUi {
     pub side_by_side: bool,
     pub show_logs: bool,
     pub approvals_collapsed: bool,
+    /// The History list is expanded.
+    pub history_open: bool,
+    /// A session being renamed: (session id, the new title).
+    pub renaming: Option<(String, String)>,
+    /// "Delete All" was clicked once; the second click deletes.
+    pub confirm_clear: bool,
 }
 
 impl Default for AgentUi {
@@ -48,6 +56,9 @@ impl Default for AgentUi {
             side_by_side: false,
             show_logs: false,
             approvals_collapsed: false,
+            history_open: true,
+            renaming: None,
+            confirm_clear: false,
         }
     }
 }
@@ -78,6 +89,7 @@ fn status_mark(theme: &Theme, status: JobStatus) -> (&'static str, egui::Color32
         JobStatus::Stopped => ("■", theme.text_muted),
         JobStatus::Reviewing => ("●", theme.warning),
         JobStatus::Done => ("✓", theme.text_muted),
+        JobStatus::Interrupted => ("⚠", theme.warning),
     }
 }
 
@@ -100,11 +112,19 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     new_job(ui, s, st, &theme, &backends);
     ui.add_space(4.0);
     ui.separator();
+    let has_history = !agent_sessions::history(s).is_empty() || s.agents.sessions.loading;
     if s.agents.jobs.is_empty() {
-        ui.label(RichText::new("No agent jobs yet.").color(theme.text_muted));
+        if has_history {
+            history(ui, s, st, &theme);
+        } else {
+            ui.label(RichText::new("No agent jobs yet.").color(theme.text_muted));
+        }
         return;
     }
     job_list(ui, s, st, &theme);
+    if has_history {
+        history(ui, s, st, &theme);
+    }
     let selected =
         st.agent.selected.filter(|id| s.agents.job(*id).is_some()).or_else(|| s.agents.jobs.last().map(|j| j.id));
     st.agent.selected = selected;
@@ -250,6 +270,155 @@ fn job_list(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme)
     });
 }
 
+// ------------------------------------------------------------------------- history
+
+/// Earlier sessions of this project (saved across restarts) that are not open as jobs.
+fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
+    let rows: Vec<SessionSummary> = agent_sessions::history(s).into_iter().cloned().collect();
+    let loading = s.agents.sessions.loading;
+    let warnings = s.agents.sessions.warnings.clone();
+    let mut cmd: Option<(&'static str, Value)> = None;
+    let mut select_session: Option<String> = None;
+    ui.horizontal(|ui| {
+        let arrow = if st.agent.history_open { "▼" } else { "▶" };
+        let header = RichText::new(format!("{arrow} History · {}", rows.len())).small().strong().color(theme.text_muted);
+        if ui
+            .add(egui::Label::new(header).sense(egui::Sense::click()))
+            .on_hover_text("Earlier agent sessions of this project")
+            .clicked()
+        {
+            st.agent.history_open = !st.agent.history_open;
+        }
+        if loading {
+            ui.add(egui::Spinner::new().size(10.0));
+        }
+        if !warnings.is_empty() {
+            ui.label(RichText::new(format!("⚠ {}", warnings.len())).small().color(theme.warning))
+                .on_hover_text(warnings.join("\n"));
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if rows.is_empty() || !st.agent.history_open {
+                return;
+            }
+            let label = if st.agent.confirm_clear { "Really delete all?" } else { "Delete All" };
+            let color = if st.agent.confirm_clear { theme.error } else { theme.text_muted };
+            let resp = ui
+                .add(egui::Button::new(RichText::new(label).small().color(color)).frame(false))
+                .on_hover_text("Delete every saved session of this project (running jobs are kept)");
+            if resp.clicked() {
+                if st.agent.confirm_clear {
+                    cmd = Some(("agent.sessions.clear", Value::Null));
+                    st.agent.confirm_clear = false;
+                } else {
+                    st.agent.confirm_clear = true;
+                }
+            }
+            if resp.hovered() {
+                return;
+            }
+            if st.agent.confirm_clear && ui.input(|i| i.pointer.any_click()) {
+                st.agent.confirm_clear = false;
+            }
+        });
+    });
+    if !st.agent.history_open {
+        return;
+    }
+    let now = agent_sessions::now_ms();
+    ScrollArea::vertical().id_salt("agent-history").max_height(140.0).auto_shrink([false, true]).show(ui, |ui| {
+        for row in &rows {
+            ui.horizontal(|ui| {
+                let (mark, color) = status_mark(theme, row.status);
+                ui.label(RichText::new(mark).color(color)).on_hover_text(row.status.label());
+                let renaming = st.agent.renaming.as_ref().is_some_and(|(k, _)| *k == row.id);
+                if renaming {
+                    rename_field(ui, st, &row.id, &mut cmd);
+                    return;
+                }
+                let meta = format!(
+                    "{} · {} · {}",
+                    row.backend.label(),
+                    mode_label(row.mode),
+                    agent_sessions::age_label(now, row.created_ms)
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(RichText::new(&meta).small().color(theme.text_muted));
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let title = if row.title.is_empty() { "(untitled)" } else { row.title.as_str() };
+                        let mut tip = format!("{meta} · {}", row.status.label());
+                        if let Some(c) = row.cost_usd {
+                            tip.push_str(&format!(" · ${c:.2}"));
+                        }
+                        if row.worktree.is_some() && !row.worktree_exists {
+                            tip.push_str("\nIts review worktree no longer exists.");
+                        }
+                        tip.push_str("\nClick to open; right-click for more.");
+                        let resp = ui
+                            .add(egui::Button::selectable(false, RichText::new(title).color(theme.text)).truncate())
+                            .on_hover_text(tip);
+                        if resp.clicked() {
+                            select_session = Some(row.id.clone());
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Open").clicked() {
+                                select_session = Some(row.id.clone());
+                                ui.close();
+                            }
+                            if ui.button("Rename…").clicked() {
+                                st.agent.renaming = Some((row.id.clone(), row.title.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Show Session File").clicked() {
+                                cmd = Some(("agent.sessions.reveal", json!({ "session": row.id })));
+                                ui.close();
+                            }
+                            if ui.button("Open Session File in Editor").clicked() {
+                                cmd = Some(("agent.sessions.reveal", json!({ "session": row.id, "inEditor": true })));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button(RichText::new("Delete").color(theme.error)).clicked() {
+                                cmd = Some(("agent.sessions.delete", json!({ "session": row.id })));
+                                ui.close();
+                            }
+                        });
+                    });
+                });
+            });
+        }
+    });
+    if let Some(key) = select_session {
+        match s.execute("agent.sessions.open", &json!({ "session": key })) {
+            Ok(v) => {
+                st.agent.selected = v.get("job").and_then(Value::as_u64).map(JobId);
+                st.agent.review_file = None;
+            }
+            Err(e) => s.status = e.to_string(),
+        }
+    }
+    if let Some((c, p)) = cmd {
+        run_command(s, st, c, &p);
+    }
+}
+
+/// The inline title editor of a session (Enter renames, Esc cancels).
+fn rename_field(ui: &mut egui::Ui, st: &mut UiState, key: &str, cmd: &mut Option<(&'static str, Value)>) {
+    let Some((_, text)) = st.agent.renaming.as_mut() else { return };
+    let id = Id::new(("agent-rename", key));
+    let resp = ui.add(TextEdit::singleline(text).id(id).desired_width(ui.available_width() - 8.0));
+    if !resp.has_focus() && !resp.lost_focus() {
+        resp.request_focus();
+    }
+    if ui.input(|i| i.key_pressed(Key::Escape)) {
+        st.agent.renaming = None;
+    } else if resp.lost_focus() {
+        if ui.input(|i| i.key_pressed(Key::Enter)) && !text.trim().is_empty() {
+            *cmd = Some(("agent.sessions.rename", json!({ "session": key, "title": text.trim() })));
+        }
+        st.agent.renaming = None;
+    }
+}
+
 // ------------------------------------------------------------------------- one job
 
 fn job_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, id: JobId) {
@@ -268,13 +437,32 @@ fn job_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme,
     }
     let branch = job.worktree.as_ref().map(|w| w.branch.clone());
     let title = job.title.clone();
+    let session_key = job.session_key.clone();
     let error = job.error.clone().filter(|_| job.status == JobStatus::Failed);
     let mut action: Option<&str> = None;
+    let mut rename_cmd: Option<(&'static str, Value)> = None;
     ui.horizontal(|ui| {
         ui.label(RichText::new(mark).color(color));
+        let renaming = session_key.as_ref().filter(|k| st.agent.renaming.as_ref().is_some_and(|(r, _)| r == *k));
+        if let Some(key) = renaming {
+            rename_field(ui, st, key, &mut rename_cmd);
+            return;
+        }
         ui.label(RichText::new(&title).strong().color(theme.text));
+        if let Some(key) = &session_key
+            && ui
+                .add(egui::Button::new(RichText::new("Rename").small().color(theme.text_muted)).frame(false))
+                .on_hover_text("Rename this session")
+                .clicked()
+        {
+            st.agent.renaming = Some((key.clone(), title.clone()));
+        }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("Discard").on_hover_text("Stop the job, remove its worktree and forget it").clicked() {
+            if ui
+                .small_button("Close")
+                .on_hover_text("Stop the job, remove its worktree and close it (the session stays in History)")
+                .clicked()
+            {
                 action = Some("agent.discard");
             }
             if running && ui.small_button("■ Stop").on_hover_text("Stop the agent").clicked() {
@@ -293,6 +481,9 @@ fn job_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme,
     });
     if let Some(e) = error {
         ui.label(RichText::new(e).small().color(theme.error));
+    }
+    if let Some((c, p)) = rename_cmd {
+        run_command(s, st, c, &p);
     }
     if let Some(cmd) = action {
         run_command(s, st, cmd, &json!({ "job": id.0 }));
@@ -325,6 +516,8 @@ fn follow_up_bar(
     can: Result<(), String>,
     running: bool,
 ) {
+    // Without a live agent the follow-up resumes the saved session.
+    let resume = s.agents.job(id).is_some_and(|j| !j.has_live_session());
     ui.add_space(2.0);
     if running {
         ui.horizontal(|ui| {
@@ -339,13 +532,19 @@ fn follow_up_bar(
     }
     let mut send = false;
     ui.horizontal(|ui| {
-        let w = ui.available_width() - 60.0;
-        let resp =
-            ui.add(TextEdit::singleline(&mut st.agent.follow_up).hint_text("Follow up…").desired_width(w.max(80.0)));
+        let w = ui.available_width() - if resume { 74.0 } else { 60.0 };
+        let hint = if resume { "Resume this session…" } else { "Follow up…" };
+        let resp = ui.add(TextEdit::singleline(&mut st.agent.follow_up).hint_text(hint).desired_width(w.max(80.0)));
         if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
             send = true;
         }
-        if ui.add_enabled(!st.agent.follow_up.trim().is_empty(), egui::Button::new("Send")).clicked() {
+        let (label, tip) = if resume {
+            ("Resume", "Continue the agent's session with this prompt")
+        } else {
+            ("Send", "Send a follow-up in this session")
+        };
+        if ui.add_enabled(!st.agent.follow_up.trim().is_empty(), egui::Button::new(label)).on_hover_text(tip).clicked()
+        {
             send = true;
         }
     });

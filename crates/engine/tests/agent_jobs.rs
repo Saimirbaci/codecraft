@@ -250,10 +250,14 @@ echo '{{"type":"turn.completed","usage":{{"input_tokens":1}}}}'
     assert_eq!(job.review.iter().find(|f| f.rel == "keep.txt").unwrap().decision, ReviewDecision::Rejected);
     assert!(job.worktree.is_none());
     assert_eq!(job.cwd, job.project, "after the review the job points back at the project");
-    assert!(s.execute("agent.followUp", &json!({ "job": id, "prompt": "more" })).is_err());
+    // A follow-up starts a new review round in a new worktree (the old one is being removed).
+    s.execute("agent.followUp", &json!({ "job": id, "prompt": "more" })).unwrap();
+    assert_eq!(status(&s, id), JobStatus::Preparing);
 
     // The worktree and its branch are cleaned up in the background.
     wait(&mut s, "cleanup", |s| !s.agents.any_active());
+    let again = s.agents.job(JobId(id)).and_then(|j| j.worktree.as_ref()).map(|w| w.path.clone());
+    assert!(again.is_some_and(|p| p != wt_path));
     assert!(!wt_path.exists());
     let branches = Command::new("git").arg("-C").arg(&repo).args(["branch", "--list", &branch]).output().unwrap();
     assert!(String::from_utf8_lossy(&branches.stdout).trim().is_empty(), "branch {branch} remains");

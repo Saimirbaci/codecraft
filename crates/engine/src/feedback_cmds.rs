@@ -102,7 +102,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "feedback.runIteration",
             "Build & Run the New Version",
             None,
-            "{job}: `cargo run -p codecraft` in the agent job's worktree",
+            "{job} or {session}: `cargo run -p codecraft` in the agent job's worktree (`session` reopens a \
+             saved agent session first, e.g. after a restart)",
             Context::Global,
             always,
             run_iteration,
@@ -316,6 +317,7 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
         context: s.feedback.context.clone(),
         attachments,
         job: None,
+        session: None,
     };
     write_record(&dir, &record)?;
 
@@ -339,6 +341,7 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
         Ok(v) => {
             let job = v.get("job").and_then(Value::as_u64);
             record.job = job;
+            record.session = v.get("session").and_then(Value::as_str).map(str::to_string);
             write_record(&dir, &record)?;
             s.feedback.last = Some(Submitted { id: id.clone(), dir: dir.clone(), job, backend: draft.backend.clone() });
             s.feedback.reset_draft();
@@ -347,7 +350,7 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
                 Some(j) => format!("Feedback sent to {} (job {j})", draft.backend),
                 None => format!("Feedback sent to {}", draft.backend),
             };
-            Ok(json!({ "id": id, "dir": dir, "job": job, "prompt": prompt }))
+            Ok(json!({ "id": id, "dir": dir, "job": job, "session": record.session, "prompt": prompt }))
         }
         Err(e) => {
             let reason = match e {
@@ -400,7 +403,17 @@ fn reopen(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn run_iteration(s: &mut Session, p: &Value) -> CmdResult {
-    let job = req_usize(p, "job")?;
+    // After a restart the job id is gone; the saved session reopens it.
+    let job = match p.get("session").and_then(Value::as_str) {
+        Some(session) if p.get("job").is_none_or(Value::is_null) => {
+            let v = s.execute("agent.sessions.open", &json!({ "session": session }))?;
+            v.get("job")
+                .and_then(Value::as_u64)
+                .and_then(|j| usize::try_from(j).ok())
+                .ok_or_else(|| CommandError::Failed(format!("cannot open agent session {session}")))?
+        }
+        _ => req_usize(p, "job")?,
+    };
     let info = match s.execute("agent.job", &json!({ "job": job })) {
         Ok(v) => v,
         Err(CommandError::Unknown(_)) => {

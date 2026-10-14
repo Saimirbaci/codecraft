@@ -46,6 +46,10 @@ fn skip(id: &str, params: &Value) -> bool {
     {
         return true;
     }
+    // Resuming a saved session starts the agent again.
+    if id == "agent.sessions.resume" && (params.get("session").is_some() || params.get("job").is_some()) {
+        return true;
+    }
     // Generate with `agent` starts a coding agent too.
     if id == "runConfig.generate" && params.get("agent").is_some() {
         return true;
