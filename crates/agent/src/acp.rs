@@ -2,7 +2,10 @@
 //! JSON-RPC 2.0, one message per line, over the agent's stdio.
 //!
 //! The client sends `initialize`, `session/new {cwd, mcpServers: []}`, then one `session/prompt`
-//! per turn (`session/cancel` to stop a turn). It turns `session/update` notifications (message
+//! per turn (`session/cancel` to stop a turn). To continue an earlier session ([`start_resumed`])
+//! it sends `session/load {sessionId, cwd, mcpServers: []}` instead when the agent advertises
+//! `agentCapabilities.loadSession` (the history the agent replays is dropped: the host has it),
+//! and otherwise starts a new session whose first prompt carries a transcript of the old one. It turns `session/update` notifications (message
 //! chunks, `tool_call`, `tool_call_update`, `plan`) into [`AgentEvent`]s and forwards the
 //! agent's requests (`session/request_permission`, `fs/read_text_file`, `fs/write_text_file`) to
 //! the host as [`HostRequest`]s; the host answers through the request's [`Responder`] whenever it
@@ -16,7 +19,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -131,6 +134,17 @@ impl Drop for Responder {
     }
 }
 
+/// How to continue an earlier session (see [`start_resumed`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resume {
+    /// The agent's id of the earlier session, loaded with `session/load` when the agent offers
+    /// `loadSession`.
+    pub session_id: Option<String>,
+    /// Put before the first prompt when the session is not loaded (a transcript of it), so the
+    /// agent still has the context.
+    pub fallback_preamble: Option<String>,
+}
+
 /// A request from the agent the host must answer.
 #[derive(Debug)]
 pub enum HostRequest {
@@ -220,6 +234,19 @@ pub fn start(
     events: Sender<AgentEvent>,
     host: Sender<HostRequest>,
 ) -> Result<AcpClient> {
+    start_resumed(cmd, cwd, prompt, Resume::default(), events, host)
+}
+
+/// [`start`], continuing an earlier session: `session/load` when the agent supports it, else a
+/// new session whose first prompt starts with `resume.fallback_preamble`.
+pub fn start_resumed(
+    cmd: Command,
+    cwd: &Path,
+    prompt: String,
+    resume: Resume,
+    events: Sender<AgentEvent>,
+    host: Sender<HostRequest>,
+) -> Result<AcpClient> {
     let sp = spawn(cmd, true, events.clone())?;
     let (out_tx, out_rx) = unbounded::<Value>();
     let pending: Pending = Arc::default();
@@ -244,7 +271,16 @@ pub fn start(
     let done = sp.done_tx;
     let reader_events = events.clone();
     let stdout = sp.stdout;
-    let reader = Reader { events: reader_events, host, out: out_tx, pending, tools: HashMap::new(), cwd: cwd.into() };
+    let replaying = Arc::new(AtomicBool::new(false));
+    let reader = Reader {
+        events: reader_events,
+        host,
+        out: out_tx,
+        pending,
+        tools: HashMap::new(),
+        cwd: cwd.into(),
+        replaying: Arc::clone(&replaying),
+    };
     std::thread::Builder::new()
         .name("codecraft-acp-reader".into())
         .spawn(move || {
@@ -265,7 +301,7 @@ pub fn start(
     std::thread::Builder::new()
         .name("codecraft-acp-driver".into())
         .spawn(move || {
-            if let Err(e) = drive(&rpc, &cwd, prompt, &ctl_rx, &events) {
+            if let Err(e) = drive(&rpc, &cwd, prompt, &resume, &replaying, &ctl_rx, &events) {
                 let _ = events.send(AgentEvent::Error { message: e });
                 let _ =
                     events.send(AgentEvent::Result { is_error: true, cost_usd: None, duration_ms: None, text: None });
@@ -314,11 +350,57 @@ fn rpc_message(e: &RpcError) -> String {
     format!("{} (code {})", e.message, e.code)
 }
 
+/// The outcome of `session/new` or `session/load`.
+enum Opened {
+    Done(Value),
+    Failed(String),
+    Shutdown,
+}
+
+/// Call `session/new` or `session/load`, signing in once with the agent's first auth method when
+/// it asks for authentication.
+fn open_session(
+    rpc: &Rpc,
+    ctl: &Receiver<Control>,
+    queued: &mut std::collections::VecDeque<String>,
+    method: &str,
+    params: &Value,
+    auth_methods: &[String],
+) -> std::result::Result<Opened, String> {
+    let mut stop_handshake = || {};
+    for attempt in 0..2 {
+        let rx = rpc.call(method, params.clone());
+        match wait(&rx, ctl, queued, Some(HANDSHAKE_TIMEOUT), &mut stop_handshake)? {
+            Wait::Shutdown => return Ok(Opened::Shutdown),
+            Wait::Done(Ok(v)) => return Ok(Opened::Done(v)),
+            Wait::Done(Err(e)) if e.code == AUTH_REQUIRED && attempt == 0 && !auth_methods.is_empty() => {
+                // Use the agent's stored login (the first method it offers), then retry once.
+                let method = auth_methods.first().cloned().unwrap_or_default();
+                let rx = rpc.call("authenticate", json!({ "methodId": method }));
+                match wait(&rx, ctl, queued, Some(HANDSHAKE_TIMEOUT), &mut stop_handshake)? {
+                    Wait::Shutdown => return Ok(Opened::Shutdown),
+                    Wait::Done(Ok(_)) => {}
+                    Wait::Done(Err(e)) => {
+                        return Err(format!(
+                            "the agent needs you to sign in (run it once in a terminal): {}",
+                            rpc_message(&e)
+                        ));
+                    }
+                }
+            }
+            Wait::Done(Err(e)) => return Ok(Opened::Failed(rpc_message(&e))),
+        }
+    }
+    Ok(Opened::Failed("the agent still asks for authentication".into()))
+}
+
 /// Handshake, then one `session/prompt` per queued prompt until shutdown.
 fn drive(
     rpc: &Rpc,
     cwd: &Path,
     first: String,
+    resume: &Resume,
+    replaying: &AtomicBool,
     ctl: &Receiver<Control>,
     events: &Sender<AgentEvent>,
 ) -> std::result::Result<(), String> {
@@ -345,32 +427,43 @@ fn drive(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string)).collect())
         .unwrap_or_default();
-    let new_params = json!({ "cwd": cwd, "mcpServers": [] });
+    let can_load = init.pointer("/agentCapabilities/loadSession").and_then(Value::as_bool).unwrap_or(false);
     let mut session = None;
-    for attempt in 0..2 {
-        let rx = rpc.call("session/new", new_params.clone());
-        match wait(&rx, ctl, &mut queued, Some(HANDSHAKE_TIMEOUT), &mut stop_handshake)? {
-            Wait::Shutdown => return Ok(()),
-            Wait::Done(Ok(v)) => {
-                session = v.get("sessionId").and_then(Value::as_str).map(str::to_string);
-                break;
-            }
-            Wait::Done(Err(e)) if e.code == AUTH_REQUIRED && attempt == 0 && !auth_methods.is_empty() => {
-                // Use the agent's stored login (the first method it offers), then retry once.
-                let method = auth_methods.first().cloned().unwrap_or_default();
-                let rx = rpc.call("authenticate", json!({ "methodId": method }));
-                match wait(&rx, ctl, &mut queued, Some(HANDSHAKE_TIMEOUT), &mut stop_handshake)? {
-                    Wait::Shutdown => return Ok(()),
-                    Wait::Done(Ok(_)) => {}
-                    Wait::Done(Err(e)) => {
-                        return Err(format!(
-                            "the agent needs you to sign in (run it once in a terminal): {}",
-                            rpc_message(&e)
-                        ));
-                    }
+    if let Some(old) = resume.session_id.as_deref().filter(|id| !id.is_empty()) {
+        if can_load {
+            let params = json!({ "sessionId": old, "cwd": cwd, "mcpServers": [] });
+            // The agent replays the conversation as updates before it answers; the host already
+            // has it, so those updates are dropped.
+            replaying.store(true, Ordering::SeqCst);
+            let opened = open_session(rpc, ctl, &mut queued, "session/load", &params, &auth_methods);
+            replaying.store(false, Ordering::SeqCst);
+            match opened? {
+                Opened::Shutdown => return Ok(()),
+                Opened::Done(_) => {
+                    session = Some(old.to_string());
+                    let _ = events.send(AgentEvent::Log { line: format!("Resumed the agent's session {old}") });
+                }
+                Opened::Failed(e) => {
+                    let _ = events.send(AgentEvent::Log {
+                        line: format!("Cannot load the earlier session ({e}); continuing in a new one"),
+                    });
                 }
             }
-            Wait::Done(Err(e)) => return Err(format!("session/new failed: {}", rpc_message(&e))),
+        } else {
+            let _ = events.send(AgentEvent::Log {
+                line: "The agent cannot load earlier sessions; continuing in a new one with a transcript".into(),
+            });
+        }
+    }
+    if session.is_none() {
+        if let (Some(pre), Some(first)) = (&resume.fallback_preamble, queued.front_mut()) {
+            *first = format!("{pre}{first}");
+        }
+        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        match open_session(rpc, ctl, &mut queued, "session/new", &params, &auth_methods)? {
+            Opened::Shutdown => return Ok(()),
+            Opened::Done(v) => session = v.get("sessionId").and_then(Value::as_str).map(str::to_string),
+            Opened::Failed(e) => return Err(format!("session/new failed: {e}")),
         }
     }
     let session = session.ok_or("session/new returned no sessionId")?;
@@ -482,6 +575,8 @@ struct Reader {
     pending: Pending,
     tools: HashMap<String, ToolState>,
     cwd: PathBuf,
+    /// `session/load` is replaying history the host already has: drop updates.
+    replaying: Arc<AtomicBool>,
 }
 
 impl Reader {
@@ -500,6 +595,7 @@ impl Reader {
             (Some(m), Some(id)) => self.request(m, id, msg.get("params").unwrap_or(&Value::Null)),
             (Some(m), None) => {
                 if m == "session/update"
+                    && !self.replaying.load(Ordering::SeqCst)
                     && let Some(update) = msg.pointer("/params/update")
                 {
                     for ev in self.update(update) {
@@ -691,6 +787,7 @@ mod tests {
             pending: Arc::default(),
             tools: HashMap::new(),
             cwd: "/p".into(),
+            replaying: Arc::default(),
         };
         (r, erx, hrx, orx)
     }

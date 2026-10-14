@@ -11,6 +11,8 @@
 //!   file is decided.
 //!
 //! Git and the agents run on worker threads; [`pump`] applies their results on the UI thread.
+//! Every job is saved per project and can be reopened and resumed after a restart
+//! ([`crate::agent_sessions`]).
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -57,6 +59,8 @@ pub enum JobStatus {
     Reviewing,
     /// Review finished (or there was nothing to review).
     Done,
+    /// A saved job that was still running when CodeCraft quit (or crashed).
+    Interrupted,
 }
 
 impl JobStatus {
@@ -69,6 +73,7 @@ impl JobStatus {
             Self::Stopped => "stopped",
             Self::Reviewing => "reviewing",
             Self::Done => "done",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -204,6 +209,19 @@ pub struct Job {
     pub error: Option<String>,
     /// When the current turn started.
     pub started: Instant,
+    /// The id of the job's saved session (`agent.sessions.*`); stable across restarts.
+    pub session_key: Option<String>,
+    /// When the job was created (Unix milliseconds).
+    pub created_ms: u64,
+    /// Save bookkeeping ([`crate::agent_sessions`]).
+    pub(crate) persist: crate::agent_sessions::Persist,
+    /// The worktree's path, kept after it is removed so a resumed review recreates it at the
+    /// same place (the CLIs key their sessions by directory).
+    pub(crate) worktree_path: Option<PathBuf>,
+    /// Decisions of a reopened review, applied once its changes are collected again.
+    pub(crate) restored_decisions: Vec<(String, ReviewDecision)>,
+    /// The pending prompt continues the agent's session (`--resume`) once the worktree exists.
+    pub(crate) pending_resume: bool,
     runner: Runner,
     events_tx: Sender<AgentEvent>,
     events: Receiver<AgentEvent>,
@@ -246,12 +264,7 @@ impl Job {
         if self.is_running() || self.review_pending {
             return Err("the agent is still working".into());
         }
-        if self.mode == AgentMode::Review && self.worktree.is_none() {
-            return Err("this review is finished and its worktree was removed; start a new job".into());
-        }
-        if self.mode == AgentMode::Ask && !self.has_live_session() {
-            return Err("the agent session ended; start a new job".into());
-        }
+        // Without a live session the follow-up resumes it (a review recreates its worktree).
         Ok(())
     }
 
@@ -284,6 +297,8 @@ impl Job {
             "worktree": self.worktree.as_ref().map(|w| &w.path),
             "branch": self.worktree.as_ref().map(|w| &w.branch),
             "sessionId": self.session_id,
+            "session": self.session_key,
+            "created": self.created_ms,
             "costUsd": self.cost_usd,
             "durationMs": self.duration_ms,
             "error": self.error,
@@ -335,6 +350,8 @@ pub struct AgentsState {
     work_rx: Receiver<(JobId, Work)>,
     /// Worktree removals still running.
     cleanups: usize,
+    /// Saved sessions of the open project, and the switches for saving them.
+    pub sessions: crate::agent_sessions::SessionsState,
 }
 
 impl Default for AgentsState {
@@ -348,6 +365,7 @@ impl Default for AgentsState {
             work_tx,
             work_rx,
             cleanups: 0,
+            sessions: crate::agent_sessions::SessionsState::default(),
         }
     }
 }
@@ -498,49 +516,15 @@ pub(crate) fn start(s: &mut Session, req: StartRequest) -> Result<JobId, Command
             "Review mode needs a git repository; use Auto or Ask, or run `git init` and commit first".into(),
         ));
     }
-    s.agents.next_id += 1;
-    let id = JobId(s.agents.next_id);
-    let (events_tx, events) = unbounded();
-    let (host_tx, host) = unbounded();
-    let mut job = Job {
-        id,
-        backend: req.backend,
-        mode: req.mode,
-        title: req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(&req.prompt)),
-        prompt: req.prompt.clone(),
-        attachments: req.attachments.clone(),
-        project: project.clone(),
-        cwd: project.clone(),
-        worktree: None,
-        status: JobStatus::Running,
-        activity: VecDeque::new(),
-        changed_files: Vec::new(),
-        review: Vec::new(),
-        cost_usd: None,
-        duration_ms: None,
-        session_id: None,
-        error: None,
-        started: Instant::now(),
-        runner: Runner::Idle,
-        events_tx,
-        events,
-        host_tx,
-        host,
-        pending_prompt: None,
-        stop_requested: false,
-        turn_error: false,
-        turn_reported_duration: false,
-        streaming_text: false,
-        sync_due: None,
-        last_sync: None,
-        permissions: Vec::new(),
-        review_pending: false,
-    };
+    let title = req.title.clone().filter(|t| !t.trim().is_empty()).unwrap_or_else(|| default_title(&req.prompt));
+    let mut job = new_job(s, req.backend, req.mode, title, req.prompt.clone(), project.clone());
+    let id = job.id;
+    job.attachments = req.attachments.clone();
     job.push(Activity::Prompt { text: req.prompt.clone() });
     match req.mode {
         AgentMode::Auto | AgentMode::Ask => {
             let prompt = compose_prompt(s, &req, &project, &project);
-            launch(s, &mut job, &info, prompt, false)?;
+            launch(s, &mut job, &info, prompt, false, None)?;
         }
         AgentMode::Review => {
             let base = s
@@ -574,8 +558,92 @@ fn unix_millis() -> u128 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
 }
 
+/// A new idle job with the next id and a fresh session key (not yet in the job list).
+pub(crate) fn new_job(
+    s: &mut Session,
+    backend: Backend,
+    mode: AgentMode,
+    title: String,
+    prompt: String,
+    project: PathBuf,
+) -> Job {
+    s.agents.next_id += 1;
+    let id = JobId(s.agents.next_id);
+    let (events_tx, events) = unbounded();
+    let (host_tx, host) = unbounded();
+    let created_ms = u64::try_from(unix_millis()).unwrap_or(u64::MAX);
+    Job {
+        id,
+        backend,
+        mode,
+        title,
+        prompt,
+        attachments: Vec::new(),
+        cwd: project.clone(),
+        project,
+        worktree: None,
+        status: JobStatus::Running,
+        activity: VecDeque::new(),
+        changed_files: Vec::new(),
+        review: Vec::new(),
+        cost_usd: None,
+        duration_ms: None,
+        session_id: None,
+        error: None,
+        started: Instant::now(),
+        session_key: Some(crate::agent_sessions::new_key(created_ms, id)),
+        created_ms,
+        persist: crate::agent_sessions::Persist::default(),
+        worktree_path: None,
+        restored_decisions: Vec::new(),
+        pending_resume: false,
+        runner: Runner::Idle,
+        events_tx,
+        events,
+        host_tx,
+        host,
+        pending_prompt: None,
+        stop_requested: false,
+        turn_error: false,
+        turn_reported_duration: false,
+        streaming_text: false,
+        sync_due: None,
+        last_sync: None,
+        permissions: Vec::new(),
+        review_pending: false,
+    }
+}
+
+/// Add a job reopened from its saved session. With `collect_review`, the changes in its
+/// worktree are listed again in the background (saved decisions are reapplied).
+pub(crate) fn insert_restored(s: &mut Session, mut job: Job, collect_review: bool) -> JobId {
+    let id = job.id;
+    if collect_review && let Some(wt) = job.worktree.clone() {
+        job.status = JobStatus::Reviewing;
+        job.review_pending = true;
+        let tx = s.agents.work_tx.clone();
+        let spawned = std::thread::Builder::new().name("codecraft-agent-review".into()).spawn(move || {
+            let r = git::changed_files(&wt).map_err(|e| e.to_string());
+            let _ = tx.send((id, Work::Review(r)));
+        });
+        if let Err(e) = spawned {
+            job.review_pending = false;
+            job.push(Activity::Error { message: format!("cannot start a thread: {e}") });
+        }
+    }
+    s.agents.jobs.push(job);
+    id
+}
+
 /// Start the agent process for a turn.
-fn launch(s: &Session, job: &mut Job, info: &BackendInfo, prompt: String, follow_up: bool) -> Result<(), CommandError> {
+fn launch(
+    s: &Session,
+    job: &mut Job,
+    info: &BackendInfo,
+    prompt: String,
+    follow_up: bool,
+    acp_resume: Option<acp::Resume>,
+) -> Result<(), CommandError> {
     let scrub = s.agents.settings.scrub_api_keys;
     job.started = Instant::now();
     job.turn_error = false;
@@ -587,7 +655,8 @@ fn launch(s: &Session, job: &mut Job, info: &BackendInfo, prompt: String, follow
             let launch =
                 info.acp.clone().ok_or_else(|| CommandError::Failed(info.ask_unavailable().unwrap_or_default()))?;
             let cmd = cli::acp_command(job.backend, &launch.program, &launch.args, &job.cwd, scrub);
-            let client = acp::start(cmd, &job.cwd, prompt, job.events_tx.clone(), job.host_tx.clone())
+            let resume = acp_resume.unwrap_or_default();
+            let client = acp::start_resumed(cmd, &job.cwd, prompt, resume, job.events_tx.clone(), job.host_tx.clone())
                 .map_err(|e| CommandError::Failed(e.to_string()))?;
             job.runner = Runner::Acp(client);
         }
@@ -653,10 +722,14 @@ pub(crate) fn follow_up(s: &mut Session, id: JobId, prompt: &str) -> Result<(), 
     allowed.map_err(CommandError::Failed)?;
     let Some(pos) = s.agents.jobs.iter().position(|j| j.id == id) else { return Err(no_job(id)) };
     let mut job = s.agents.jobs.remove(pos);
+    // What the agent saw so far, for agents that cannot reload their session.
+    let preamble = crate::agent_sessions::transcript_preamble(&job.activity);
     job.push(Activity::Prompt { text: prompt.to_string() });
     job.review.clear();
+    job.error = None;
+    let live_acp = matches!(&job.runner, Runner::Acp(c) if c.process().is_running());
     let result = match &job.runner {
-        Runner::Acp(c) => {
+        Runner::Acp(c) if live_acp => {
             if c.prompt(prompt) {
                 job.started = Instant::now();
                 job.turn_error = false;
@@ -667,13 +740,69 @@ pub(crate) fn follow_up(s: &mut Session, id: JobId, prompt: &str) -> Result<(), 
                 Err(CommandError::Failed("the agent session ended; start a new job".into()))
             }
         }
-        _ => launch(s, &mut job, &info, prompt.to_string(), true),
+        _ if job.mode == AgentMode::Ask => {
+            // A new agent process continuing the session (`session/load`, else the transcript).
+            job.push(Activity::Info { text: "Resuming the agent session…".into() });
+            let resume = acp::Resume { session_id: job.session_id.clone(), fallback_preamble: Some(preamble) };
+            launch(s, &mut job, &info, prompt.to_string(), false, Some(resume))
+        }
+        _ if job.mode == AgentMode::Review && job.worktree.is_none() => {
+            recreate_worktree(s, &mut job, prompt, preamble)
+        }
+        _ => {
+            let resumable = job.session_id.is_some() || job.backend == Backend::Grok;
+            if resumable {
+                launch(s, &mut job, &info, prompt.to_string(), true, None)
+            } else {
+                // No agent session to resume: start one that carries the transcript.
+                launch(s, &mut job, &info, format!("{preamble}{prompt}"), false, None)
+            }
+        }
     };
     if let Err(e) = &result {
         job.push(Activity::Error { message: e.to_string() });
     }
     s.agents.jobs.insert(pos.min(s.agents.jobs.len()), job);
     result
+}
+
+/// A follow-up on a review whose worktree is gone: create it again (at the same path when the
+/// job had one, so the agent finds its session there), then resume.
+fn recreate_worktree(s: &mut Session, job: &mut Job, prompt: &str, preamble: String) -> Result<(), CommandError> {
+    let base = s
+        .agents
+        .worktrees_dir()
+        .ok_or_else(|| CommandError::Failed("cannot find the home directory for worktrees".into()))?;
+    if !git::is_repo(&job.project) {
+        return Err(CommandError::Failed(format!("{} is no longer a git repository", job.project.display())));
+    }
+    // The old place, when it is free (not still being removed) and under the same base.
+    let old_id = job
+        .worktree_path
+        .as_deref()
+        .filter(|p| !p.exists() && s.agents.cleanups == 0)
+        .filter(|p| p.parent().and_then(Path::parent) == Some(base.as_path()))
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|w| !w.is_empty() && !w.starts_with('.'));
+    let same_place = old_id.is_some();
+    let wt_id = old_id.unwrap_or_else(|| format!("{}-{}", job.id.0, unix_millis()));
+    job.pending_resume = same_place && job.session_id.is_some();
+    job.pending_prompt =
+        Some(if job.pending_resume { prompt.to_string() } else { format!("{preamble}{prompt}") });
+    job.status = JobStatus::Preparing;
+    job.stop_requested = false;
+    job.turn_error = false;
+    job.push(Activity::Info { text: "Creating a git worktree…".into() });
+    let (id, proj, tx) = (job.id, job.project.clone(), s.agents.work_tx.clone());
+    std::thread::Builder::new()
+        .name("codecraft-agent-worktree".into())
+        .spawn(move || {
+            let r = git::create_worktree(&proj, &base, &wt_id).map_err(|e| e.to_string());
+            let _ = tx.send((id, Work::Worktree(r)));
+        })
+        .map_err(|e| CommandError::Failed(format!("cannot start a thread: {e}")))?;
+    Ok(())
 }
 
 fn no_job(id: JobId) -> CommandError {
@@ -699,8 +828,18 @@ pub(crate) fn discard(s: &mut Session, id: JobId) -> Result<(), CommandError> {
     if let Some(wt) = job.worktree.take() {
         cleanup_worktree(s, id, wt);
     }
+    if job.is_running() {
+        job.status = JobStatus::Stopped;
+    }
+    // The saved session stays (history); it no longer has a worktree.
+    crate::agent_sessions::save_detached(s, &mut job);
     s.status = format!("Agent job {} discarded", id.0);
     Ok(())
+}
+
+/// Remove a worktree and its branch in the background (a deleted saved session's).
+pub(crate) fn remove_worktree_later(s: &mut Session, wt: Worktree) {
+    cleanup_worktree(s, JobId(0), wt);
 }
 
 fn cleanup_worktree(s: &mut Session, id: JobId, wt: Worktree) {
@@ -860,6 +999,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     for id in ids {
         changed |= pump_job(s, id);
     }
+    changed |= crate::agent_sessions::pump(s);
     changed
 }
 
@@ -888,10 +1028,12 @@ fn apply_work(s: &mut Session, id: JobId, work: Work) {
                     job.push(Activity::Info {
                         text: format!("Working in {} on branch {}", wt.path.display(), wt.branch),
                     });
+                    job.worktree_path = Some(wt.path.clone());
                     job.worktree = Some(wt);
+                    let resume = std::mem::take(&mut job.pending_resume);
                     match job.pending_prompt.take() {
                         Some(prompt) if !job.stop_requested => {
-                            if let Err(e) = launch(s, &mut job, &info, prompt, false) {
+                            if let Err(e) = launch(s, &mut job, &info, prompt, resume, None) {
                                 job.status = JobStatus::Failed;
                                 job.error = Some(e.to_string());
                                 job.push(Activity::Error { message: e.to_string() });
@@ -922,6 +1064,11 @@ fn apply_work(s: &mut Session, id: JobId, work: Work) {
                     let Some(wt) = job.worktree.clone() else { return };
                     let project = job.project.clone();
                     job.review = files.into_iter().filter_map(|f| review_file(&wt, &project, f)).collect();
+                    for (rel, decision) in std::mem::take(&mut job.restored_decisions) {
+                        if let Some(f) = job.review.iter_mut().find(|f| f.rel == rel) {
+                            f.decision = decision;
+                        }
+                    }
                     if job.review.is_empty() {
                         job.push(Activity::Info { text: "The agent changed no files.".into() });
                     } else {
@@ -1322,12 +1469,16 @@ pub(crate) fn shutdown(s: &mut Session) {
         p.kill();
     }
     let base = s.agents.worktrees_dir();
+    // With saved sessions an interrupted review can be resumed in its worktree later.
+    let persisting = crate::agent_sessions::active(s);
     for job in &mut s.agents.jobs {
         for p in job.permissions.drain(..) {
             p.responder.permission(&p.options, PermissionChoice::Cancelled);
         }
         job.runner = Runner::Idle;
-        let keep = job.status == JobStatus::Reviewing && job.pending_review() > 0;
+        let keep = (job.status == JobStatus::Reviewing && (job.pending_review() > 0 || job.review_pending))
+            || (persisting && job.is_running());
+        let mut removed = false;
         if let (Some(wt), Some(base)) = (&job.worktree, &base) {
             if keep {
                 log::info!(
@@ -1337,9 +1488,17 @@ pub(crate) fn shutdown(s: &mut Session) {
                 );
             } else if let Err(e) = git::remove_worktree(wt, base) {
                 log::warn!("cannot remove agent worktree {}: {e}", wt.path.display());
+            } else {
+                removed = true;
             }
         }
+        if removed {
+            job.worktree = None;
+            job.cwd = job.project.clone();
+        }
     }
+    // Last save: jobs still running are saved as interrupted.
+    crate::agent_sessions::shutdown(s);
 }
 
 #[cfg(test)]

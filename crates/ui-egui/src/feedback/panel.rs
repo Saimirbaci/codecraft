@@ -297,10 +297,24 @@ pub(super) fn history(ctx: &egui::Context, s: &mut Session, st: &mut UiState, on
                         let title = if r.title.is_empty() { "(no description)" } else { r.title.as_str() };
                         ui.label(title).on_hover_text(&r.id);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(job) = r.job
-                                && ui.small_button("Build & run").on_hover_text(format!("Job {job}")).clicked()
+                            // The saved session outlives the job id (restarts).
+                            let target = match (&r.session, r.job) {
+                                (Some(session), _) => Some(json!({ "session": session })),
+                                (None, Some(job)) => Some(json!({ "job": job })),
+                                (None, None) => None,
+                            };
+                            if let Some(target) = target
+                                && ui.small_button("Build & run").on_hover_text("Build and run the agent's version").clicked()
                             {
-                                action = Some(("feedback.runIteration", json!({ "job": job })));
+                                action = Some(("feedback.runIteration", target));
+                            }
+                            if let Some(session) = &r.session
+                                && ui
+                                    .small_button("Session")
+                                    .on_hover_text("Open the agent session in the Agents tool window")
+                                    .clicked()
+                            {
+                                action = Some(("agent.sessions.open", json!({ "session": session })));
                             }
                             if ui.small_button("Revise").on_hover_text("Re-open as a revision").clicked() {
                                 action = Some(("feedback.reopen", json!({ "id": r.id })));

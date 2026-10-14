@@ -398,6 +398,10 @@ pub struct Record {
     pub attachments: Vec<String>,
     #[serde(default)]
     pub job: Option<u64>,
+    /// The saved agent session the job writes to (`agent.sessions.open`); unlike `job`, it
+    /// survives a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -418,6 +422,9 @@ pub struct Summary {
     pub parent: Option<String>,
     pub job: Option<u64>,
     pub shapes: usize,
+    /// The saved agent session of the job.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// The last successful submission (for "Build & run the new version").
@@ -576,6 +583,7 @@ pub fn list_records(dir: &Path) -> Vec<Summary> {
             target: r.target,
             parent: r.parent,
             job: r.job,
+            session: r.session,
         })
         .collect();
     out.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.id.cmp(&a.id)));

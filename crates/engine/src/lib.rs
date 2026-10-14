@@ -13,6 +13,7 @@
 )]
 
 mod agent_cmds;
+pub mod agent_sessions;
 pub mod appearance;
 mod bookmark_cmds;
 pub mod bookmarks;
@@ -364,9 +365,11 @@ impl Session {
     }
 
     /// Keep every per-user file under `dir` instead of `$CODECRAFT_HOME` (default `~/.codecraft`):
-    /// scratches, live templates, profiler snapshots, query history, SSH servers and remote
-    /// caches. For tests and embedders that must never touch the user's real files.
+    /// scratches, live templates, profiler snapshots, query history, SSH servers, remote caches
+    /// and saved agent sessions (which this also turns on). For tests and embedders that must
+    /// never touch the user's real files.
     pub fn isolate_home(&mut self, dir: &std::path::Path) {
+        self.agents.sessions.dir_override = Some(dir.join(agent_sessions::DIR_NAME));
         self.scratch.dir_override = Some(dir.join("scratches"));
         self.editing.templates.set_path(dir.join("templates.json"));
         self.profiler.dir_override = Some(dir.join("profiler"));

@@ -138,3 +138,83 @@ fn agent_that_is_not_acp_fails_cleanly() {
     assert!(saw_error, "the failed handshake is reported");
     assert_eq!(exit, Some(Some(3)));
 }
+
+/// Events of one turn without host requests (the "chat" prompt needs none).
+fn chat_turn(events: &Receiver<AgentEvent>) -> Vec<AgentEvent> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(Instant::now() < deadline, "turn did not end: {out:?}");
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(20)) {
+            let end = matches!(ev, AgentEvent::Result { .. } | AgentEvent::Exited { .. });
+            out.push(ev);
+            if end {
+                return out;
+            }
+        }
+    }
+}
+
+fn logged(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect()
+}
+
+#[test]
+fn resume_loads_the_session_when_offered() {
+    let Some(script) = fake() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let log = dir.join("calls.log");
+    let (etx, erx) = unbounded();
+    let (htx, _hrx) = unbounded();
+    let args = [script.display().to_string(), "--load".into(), "--log".into(), log.display().to_string()];
+    let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
+    let resume = acp::Resume { session_id: Some("old-1".into()), fallback_preamble: Some("TRANSCRIPT\n".into()) };
+    let client = acp::start_resumed(cmd, &dir, "chat again".into(), resume, etx, htx).unwrap();
+    let ev = chat_turn(&erx);
+    assert!(ev.contains(&AgentEvent::Session { id: "old-1".into() }), "{ev:?}");
+    assert!(ev.contains(&AgentEvent::TextDelta { text: "Chatting.".into() }));
+    assert!(
+        !ev.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("Replayed"))),
+        "replayed history is dropped: {ev:?}"
+    );
+    let calls = logged(&log);
+    assert!(calls.iter().any(|c| c["method"] == "session/load" && c["params"]["sessionId"] == "old-1"), "{calls:?}");
+    assert!(!calls.iter().any(|c| c["method"] == "session/new"));
+    let prompt = calls.iter().find(|c| c["method"] == "session/prompt").unwrap();
+    assert_eq!(prompt["text"], "chat again", "no transcript when the session is loaded");
+    assert_eq!(prompt["sessionId"], "old-1");
+    client.shutdown();
+}
+
+#[test]
+fn resume_falls_back_to_a_transcript() {
+    let Some(script) = fake() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let log = dir.join("calls.log");
+    let (etx, erx) = unbounded();
+    let (htx, _hrx) = unbounded();
+    let args = [script.display().to_string(), "--log".into(), log.display().to_string()];
+    let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
+    let resume = acp::Resume { session_id: Some("old-1".into()), fallback_preamble: Some("TRANSCRIPT\n".into()) };
+    let client = acp::start_resumed(cmd, &dir, "chat again".into(), resume, etx, htx).unwrap();
+    let ev = chat_turn(&erx);
+    assert!(ev.contains(&AgentEvent::Session { id: "fake-session".into() }), "{ev:?}");
+    let calls = logged(&log);
+    assert!(calls.iter().any(|c| c["method"] == "session/new"));
+    assert!(!calls.iter().any(|c| c["method"] == "session/load"));
+    let prompts: Vec<&serde_json::Value> = calls.iter().filter(|c| c["method"] == "session/prompt").collect();
+    assert_eq!(prompts[0]["text"], "TRANSCRIPT\nchat again");
+    // Only the first prompt carries the transcript.
+    assert!(client.prompt("chat once more"));
+    chat_turn(&erx);
+    let calls = logged(&log);
+    let prompts: Vec<&serde_json::Value> = calls.iter().filter(|c| c["method"] == "session/prompt").collect();
+    assert_eq!(prompts.get(1).map(|p| p["text"].clone()), Some(json!("chat once more")));
+    client.shutdown();
+}

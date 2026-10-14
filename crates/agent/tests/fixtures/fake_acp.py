@@ -3,7 +3,11 @@
 
 Each prompt: say something, read hello.txt through the client, propose an upper-cased version
 (tool_call with a diff), ask permission, and on approval write it through the client. A prompt
-containing "run" asks to execute a command instead. Never prints anything but JSON-RPC on stdout.
+containing "run" asks to execute a command instead; one containing "chat" only answers.
+Never prints anything but JSON-RPC on stdout.
+
+Options: `--load` advertises `loadSession` (session/load replays one message, then answers);
+`--log PATH` appends every handshake call and prompt to PATH as JSON lines.
 """
 import json
 import os
@@ -12,6 +16,18 @@ import sys
 next_id = 1000
 cwd = os.getcwd()
 session = "fake-session"
+can_load = "--load" in sys.argv[1:]
+log_path = None
+if "--log" in sys.argv[1:]:
+    i = sys.argv.index("--log")
+    if i + 1 < len(sys.argv):
+        log_path = sys.argv[i + 1]
+
+
+def log(entry):
+    if log_path:
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
 
 
 def send(msg):
@@ -52,14 +68,27 @@ def handle(msg):
     method = msg.get("method")
     mid = msg.get("id")
     params = msg.get("params") or {}
+    global cwd, session
+    if method in ("initialize", "session/new", "session/load"):
+        log({"method": method, "params": params})
     if method == "initialize":
-        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {"protocolVersion": 1,
+              "agentCapabilities": {"loadSession": can_load}, "authMethods": []}})
     elif method == "session/new":
-        global cwd
         cwd = params.get("cwd", cwd)
         send({"jsonrpc": "2.0", "id": mid, "result": {"sessionId": session}})
+    elif method == "session/load" and can_load:
+        cwd = params.get("cwd", cwd)
+        session = params.get("sessionId", session)
+        update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Replayed history."}})
+        send({"jsonrpc": "2.0", "id": mid, "result": {}})
     elif method == "session/prompt":
         text = "".join(b.get("text", "") for b in params.get("prompt", []))
+        log({"method": method, "sessionId": params.get("sessionId"), "text": text})
+        if "chat" in text:
+            update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Chatting."}})
+            send({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+            return
         update({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "Working on it."}})
         update({"sessionUpdate": "plan", "entries": [{"content": "Shout", "priority": "high", "status": "in_progress"}]})
         if "run" in text:
