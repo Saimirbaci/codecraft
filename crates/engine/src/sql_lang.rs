@@ -31,7 +31,7 @@ use codecraft_syntax::sql_inject::{self, SqlInjection};
 use codecraft_syntax::sql_scope::{self, SqlColumn, SqlItemKind, SqlSchema};
 use codecraft_syntax::{Highlights, Language};
 use codecraft_text::{Document, EditGroup};
-use codecraft_workspace::{DocId, Problem, ProblemSource, Severity};
+use codecraft_workspace::{DocId, Problem, ProblemSource};
 
 use crate::database::{ConnStatus, DataSource, MetaReq};
 use crate::popup::{ActionItem, CompletionItem, CompletionPopup};
@@ -477,21 +477,28 @@ fn source_for_doc(s: &Session, language: Language, path: Option<&Path>) -> Optio
     }
 }
 
-/// Unresolved names of a document as problems, and the schema levels to load.
+/// SQL problems of a document (the inspections of [`crate::database::sql_nav::inspect`]; names
+/// are checked when the data source is connected), and the schema levels to load.
 fn problems_of(s: &Session, doc: DocId, source: Option<&str>) -> (Vec<Problem>, Vec<MetaReq>) {
+    use crate::database::sql_nav::inspect;
     let Some(od) = s.ws.doc(doc) else { return (Vec::new(), Vec::new()) };
     let Some(path) = od.path.clone() else { return (Vec::new(), Vec::new()) };
-    let Some(ds) = source.and_then(|id| s.db.source(id)).filter(|d| connected(d)) else {
-        return (Vec::new(), Vec::new());
-    };
-    let schema = DbSchema::new(ds);
-    let problem = |d: &Document, start: usize, end: usize, message: String| Problem {
+    let ds = source.and_then(|id| s.db.source(id)).filter(|d| connected(d));
+    let mut schema = ds.map(DbSchema::new);
+    // An attached file's names resolve in its schema.
+    if let (Some(sc), Some(file_schema)) = (schema.as_mut(), s.db.nav.schema_for_path(&path))
+        && sc.ds.tree.schemas.contains_key(&file_schema)
+    {
+        sc.default = Some(file_schema);
+    }
+    let schema_ref = schema.as_ref().map(|x| x as &dyn SqlSchema);
+    let problem = |d: &Document, p: inspect::SqlProblem, (start, end): (usize, usize)| Problem {
         path: path.clone(),
         start: d.offset_to_position(start),
         end: d.offset_to_position(end.max(start)),
-        severity: Severity::Warning,
-        message,
-        code: Some("SqlResolve".into()),
+        severity: p.severity,
+        message: p.message,
+        code: Some(p.code.to_string()),
         source: ProblemSource::Inspection,
     };
     let mut out = Vec::new();
@@ -499,21 +506,22 @@ fn problems_of(s: &Session, doc: DocId, source: Option<&str>) -> (Vec<Problem>, 
         Language::Rust => {
             if let Some(injections) = s.sql_lang.injections_for(doc, od.doc.revision()) {
                 for inj in injections {
-                    for issue in sql_scope::check(&inj.sql, &schema) {
-                        let (a, b) = inj.to_rust_range(issue.start, issue.end);
-                        out.push(problem(&od.doc, a, b, issue.message));
+                    for issue in inspect::check(&inj.sql, schema_ref) {
+                        let range = inj.to_rust_range(issue.start, issue.end);
+                        out.push(problem(&od.doc, issue, range));
                     }
                 }
             }
         }
         Language::Sql if od.doc.len_chars() <= MAX_SCAN_CHARS => {
-            for issue in sql_scope::check(&od.doc.text(), &schema) {
-                out.push(problem(&od.doc, issue.start, issue.end, issue.message));
+            for issue in inspect::check(&od.doc.text(), schema_ref) {
+                let range = (issue.start, issue.end);
+                out.push(problem(&od.doc, issue, range));
             }
         }
         _ => {}
     }
-    (out, schema.wanted.into_inner())
+    (out, schema.map(|x| x.wanted.into_inner()).unwrap_or_default())
 }
 
 /// Check a visible document when it settled and its text or the schema changed (always with
@@ -529,8 +537,8 @@ fn diagnose(s: &mut Session, doc: DocId, force: bool) -> bool {
     // waiting for the text to settle.
     let has_sql = language == Language::Sql || s.sql_lang.injections_for(doc, revision).is_some_and(|i| !i.is_empty());
     let source = source_for_doc(s, language, Some(&path));
-    let live = source.as_deref().and_then(|id| s.db.source(id)).is_some_and(connected);
-    if (!has_sql || !live) && !s.sql_lang.published.contains(&path) {
+    // SQL is inspected without a data source too (names only with a connected one).
+    if !has_sql && !s.sql_lang.published.contains(&path) {
         s.sql_lang.checked.insert(doc, (revision, 0));
         return false;
     }
@@ -813,7 +821,11 @@ pub(crate) fn context_actions(s: &Session) -> Vec<ActionItem> {
         kind: Some("sql".into()),
         payload: json!({ "title": title, "codecraftCommand": command }),
     };
-    vec![action("Reformat SQL", "sql.reformatInjected"), action("Choose SQL Data Source…", "sql.chooseDataSource")]
+    // Quick-fixes of the SQL problems at the caret first (track DC).
+    let mut items = crate::database::sql_nav::context_actions(s);
+    items.push(action("Reformat SQL", "sql.reformatInjected"));
+    items.push(action("Choose SQL Data Source…", "sql.chooseDataSource"));
+    items
 }
 
 /// The data source chooser for injected SQL.

@@ -144,12 +144,12 @@ fn sqlite_through_commands() {
     let rows = &s.db.result(rid).unwrap().rows;
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[..], [vec![Cell::Text("Ann".into())], vec![Cell::Text("Bob".into())]]);
-    assert_eq!(s.db.result(rid).unwrap().title, "console");
+    assert_eq!(s.db.result(rid).unwrap().title, "authors");
     s.execute("db.executeAll", &Value::Null).unwrap();
     pump_until(&mut s, "all", |s| !s.db.busy());
     let titles: Vec<_> =
         s.db.results.iter().filter(|r| r.owner.starts_with("console:")).map(|r| r.title.clone()).collect();
-    assert_eq!(titles, ["console [1]", "console [3]"], "{:?}", s.db.output.iter().rev().take(6).collect::<Vec<_>>());
+    assert_eq!(titles, ["books", "authors"], "{:?}", s.db.output.iter().rev().take(6).collect::<Vec<_>>());
     assert!(s.db.output.iter().any(|l| l.text.starts_with("3 rows affected")), "{:?}", s.db.output);
 
     // Errors show up in the output.

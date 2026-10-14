@@ -16,6 +16,7 @@ mod bookmarks_panel;
 mod chrome;
 mod data_grid;
 mod database_dialogs;
+mod database_editor_ui;
 mod database_panel;
 mod debug_panel;
 mod debug_views_ui;
@@ -372,6 +373,7 @@ impl App {
             || remote_ui::wants_keyboard(s)
             || appearance_ui::wants_keyboard(s)
             || python_ui::wants_keyboard(s)
+            || database_editor_ui::wants_keyboard(s)
         {
             return;
         }
@@ -567,6 +569,7 @@ impl App {
         python_ui::windows(ui, s, st);
         profiler_ui::windows(ui, s, st);
         http_ui::windows(ui, s, st);
+        database_editor_ui::windows(ui, s, st);
         appearance_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
