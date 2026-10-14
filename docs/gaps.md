@@ -425,3 +425,17 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `RUNTIME_OUTPUT_DIRECTORY`); an agent in Auto mode (backends without Ask) is only told not
     to change files. Python and npm configurations that run in a sub-project use its own
     virtualenv and lockfile unless the project has a selected interpreter.
+
+## M12 (2026-10-14)
+
+38. Agent sessions (track AG): every agent job is saved per project under
+    `$CODECRAFT_HOME/agent-sessions/<project key>/` (prompt, feed, status, cost, the backend's
+    session id, review state), listed in the Agents tool window after a restart (running ones as
+    Interrupted) and resumable (`claude --resume`, `codex exec resume`, ACP `session/load`, else a
+    transcript seed). Remaining: two windows on one project don't see each other's live jobs (the
+    other's shows as interrupted); a failed `claude --resume` (its own store cleared) isn't
+    retried with the transcript; worktrees of interrupted reviews stay until resumed or deleted,
+    and pruning removes old session files but not their worktrees; Gemini's `--resume` argument
+    wasn't checked against a real CLI; sessions are per project root (feedback jobs on CodeCraft's
+    own source appear only when that folder is open); opening/renaming reads the file
+    synchronously (≤ 2 MB); no search, filter or export in History.
