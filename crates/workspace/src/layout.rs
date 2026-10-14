@@ -31,6 +31,8 @@ pub enum ToolWindowId {
     PythonPackages,
     FileTransfer,
     RemoteHost,
+    /// Background Python processes (console, kernels, formatters) for diagnosis (M12 track PY).
+    PythonProcessOutput,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -41,7 +43,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 26] = [
+    pub const ALL: [ToolWindowId; 27] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -68,6 +70,7 @@ impl ToolWindowId {
         Self::PythonPackages,
         Self::FileTransfer,
         Self::RemoteHost,
+        Self::PythonProcessOutput,
     ];
 
     pub fn title(self) -> &'static str {
@@ -98,6 +101,7 @@ impl ToolWindowId {
             Self::PythonPackages => "Python Packages",
             Self::FileTransfer => "File Transfer",
             Self::RemoteHost => "Remote Host",
+            Self::PythonProcessOutput => "Python Process Output",
         }
     }
 
@@ -162,6 +166,7 @@ impl ToolWindowId {
             Self::PythonPackages => "pythonPackages",
             Self::FileTransfer => "fileTransfer",
             Self::RemoteHost => "remoteHost",
+            Self::PythonProcessOutput => "pythonProcessOutput",
         }
     }
 

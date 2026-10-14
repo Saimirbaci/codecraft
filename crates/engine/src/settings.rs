@@ -67,6 +67,7 @@ pub const PAGE_CODE_STYLE: &str = "Editor › Code Style";
 pub const PAGE_LIVE_TEMPLATES: &str = "Editor › Live Templates";
 pub const PAGE_RUN_CONFIGS: &str = "Build, Execution, Deployment › Run Configurations";
 pub const PAGE_RUST: &str = "Languages & Frameworks › Rust";
+pub const PAGE_PYTHON: &str = "Languages & Frameworks › Python";
 pub const PAGE_VCS: &str = "Version Control › Commit Message Generation";
 pub const PAGE_TOOLS: &str = "Tools › AI Agents";
 pub const PAGE_OTHER: &str = "Other";
@@ -85,6 +86,7 @@ pub const PAGES: &[&str] = &[
     PAGE_LIVE_TEMPLATES,
     PAGE_RUN_CONFIGS,
     PAGE_RUST,
+    PAGE_PYTHON,
     PAGE_VCS,
     PAGE_TOOLS,
 ];
@@ -363,6 +365,27 @@ pub const SETTINGS: &[SettingDef] = &[
         "External linter: Clippy",
         PAGE_RUST,
         "Use Clippy instead of cargo check for diagnostics",
+        Kind::Bool,
+    ),
+    def(
+        "python_formatter",
+        "Formatter",
+        PAGE_PYTHON,
+        "Reformat Code for Python: auto (Ruff, else Black), ruff, black or none",
+        Kind::Text,
+    ),
+    def(
+        "python_reformat_on_save",
+        "Reformat code on save",
+        PAGE_PYTHON,
+        "Run the formatter on Python files when they are saved",
+        Kind::Bool,
+    ),
+    def(
+        "python_optimize_imports_on_save",
+        "Optimize imports on save",
+        PAGE_PYTHON,
+        "Sort imports (Ruff's isort rules, or isort) when Python files are saved",
         Kind::Bool,
     ),
     def("commit_ai_provider", "Provider", PAGE_VCS, "openrouter, ollama, claude or openai", Kind::Provider),

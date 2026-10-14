@@ -52,6 +52,7 @@ mod inspection_cmds;
 pub mod inspections;
 pub mod inline_rename;
 mod jobs;
+pub mod jupyter;
 pub mod keymaps;
 mod lang_cmds;
 pub mod local_history;
@@ -60,6 +61,10 @@ mod lsp;
 pub mod misc;
 mod misc_cmds;
 mod navigate_cmds;
+pub mod notebook;
+mod notebook_cmds;
+pub mod notebook_kernel;
+pub mod dataframe;
 mod params;
 pub mod refactor;
 mod refactor_cmds;
@@ -75,6 +80,8 @@ pub mod python;
 mod python_cmds;
 pub mod python_console;
 pub mod python_env;
+pub mod python_format;
+pub mod python_output;
 mod python_lint;
 pub mod python_project;
 mod run_cmds;
@@ -97,6 +104,7 @@ pub mod ssh_target;
 pub mod ssh_tunnel;
 pub mod structure;
 pub mod templates;
+pub mod templates_django;
 pub mod todo;
 pub mod terminal;
 mod terminal_cmds;
@@ -252,6 +260,10 @@ pub struct Session {
     pub sql_lang: sql_lang::SqlLangState,
     /// The Services tool window's selected section.
     pub services: services::ServicesState,
+    /// Jupyter notebooks, their kernels and View as DataFrame (M12 track PY).
+    pub jupyter: jupyter::JupyterState,
+    /// Ruff/Black/isort runs for Python files (M12 track PY).
+    pub py_format: python_format::FormatState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -319,6 +331,8 @@ impl Session {
             profiler: profiler::ProfilerState::default(),
             sql_lang: sql_lang::SqlLangState::default(),
             services: services::ServicesState::default(),
+            jupyter: jupyter::JupyterState::default(),
+            py_format: python_format::FormatState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -406,6 +420,8 @@ impl Session {
         changed |= remote::pump(self);
         changed |= http_client::pump(self);
         changed |= python::pump(self);
+        changed |= jupyter::pump(self);
+        changed |= python_format::pump(self);
         changed |= profiler::pump(self);
         changed |= sql_lang::pump(self);
         changed |= run_config_gen::pump(self);
@@ -430,6 +446,8 @@ impl Session {
             || self.remote.busy()
             || self.http.busy()
             || self.python.busy()
+            || self.jupyter.busy()
+            || self.py_format.busy()
             || self.profiler.busy()
             || self.sql_lang.busy()
     }
@@ -457,6 +475,7 @@ impl Session {
         remote::shutdown(self);
         docker::shutdown(self);
         python::shutdown(self);
+        jupyter::shutdown(self);
         profiler::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
@@ -619,6 +638,7 @@ impl Session {
         let mut saved = 0usize;
         let mut errors = Vec::new();
         let mut saved_paths = Vec::new();
+        jupyter::before_save(self);
         local_history::before_save(self);
         for od in self.ws.docs_mut() {
             let Some(path) = od.path.clone() else { continue };
@@ -640,6 +660,7 @@ impl Session {
         }
         local_history::after_save(self, &saved_paths);
         remote::after_save(self, &saved_paths);
+        python_format::after_save(self, &saved_paths);
         if !errors.is_empty() {
             let msg = errors.join("\n");
             self.notify(NotificationLevel::Error, "Cannot save files", msg.clone());

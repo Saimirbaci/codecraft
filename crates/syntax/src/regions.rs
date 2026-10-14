@@ -41,6 +41,7 @@ fn comment_prefixes(language: Language) -> &'static [&'static str] {
         Language::Http => &["#", "//"],
         Language::Sql => &["--"],
         Language::Markdown => &["<!--"],
+        Language::DjangoTemplate => &["{#", "<!--"],
         Language::PlainText => &["//", "#"],
     }
 }
@@ -74,7 +75,7 @@ fn fold_desc(attrs: &str) -> String {
 /// The marker in the text after a comment prefix, if any.
 fn marker_in_comment(body: &str) -> Option<Marker> {
     let body = body.trim_start();
-    let body = body.strip_suffix("-->").unwrap_or(body);
+    let body = body.strip_suffix("-->").or_else(|| body.trim_end().strip_suffix("#}")).unwrap_or(body);
     if let Some(rest) = keyword(body, "region").or_else(|| keyword(body, "#region")) {
         return Some(Marker::Start(clip_name(rest)));
     }

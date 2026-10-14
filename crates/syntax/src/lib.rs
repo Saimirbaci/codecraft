@@ -23,6 +23,7 @@
 
 mod c;
 mod common;
+pub mod django;
 mod dockerfile;
 mod http;
 mod incremental;
@@ -71,6 +72,8 @@ pub enum Language {
     Http,
     #[default]
     PlainText,
+    /// Django and Jinja2 templates (`.jinja`, `.j2`, `.html` under a `templates` directory).
+    DjangoTemplate,
 }
 
 impl Language {
@@ -96,6 +99,8 @@ impl Language {
             "sql" | "ddl" | "dml" | "psql" | "pgsql" => Self::Sql,
             "dockerfile" | "containerfile" => Self::Dockerfile,
             "http" | "rest" => Self::Http,
+            "jinja" | "jinja2" | "j2" | "djhtml" | "jhtml" => Self::DjangoTemplate,
+            "html" | "htm" if in_templates_dir(path) => Self::DjangoTemplate,
             _ => match path.file_name().and_then(|n| n.to_str()) {
                 Some("Cargo.lock") => Self::Toml,
                 Some("BUILD" | "WORKSPACE" | "SConstruct" | "SConscript") => Self::Python,
@@ -124,6 +129,7 @@ impl Language {
             Self::Dockerfile => "Dockerfile",
             Self::Http => "HTTP Request",
             Self::PlainText => "Plain text",
+            Self::DjangoTemplate => "Django Template",
         }
     }
 
@@ -146,6 +152,7 @@ impl Language {
             Self::Dockerfile => "dockerfile",
             Self::Http => "http",
             Self::PlainText => "plaintext",
+            Self::DjangoTemplate => "django-html",
         }
     }
 
@@ -156,7 +163,7 @@ impl Language {
             }
             Self::Toml | Self::Yaml | Self::Shell | Self::Python | Self::Dockerfile | Self::Http => Some("#"),
             Self::Sql => Some("--"),
-            Self::Markdown | Self::PlainText => None,
+            Self::Markdown | Self::PlainText | Self::DjangoTemplate => None,
         }
     }
 
@@ -164,9 +171,15 @@ impl Language {
         match self {
             Self::Rust | Self::C | Self::Cpp | Self::TypeScript | Self::JavaScript | Self::Sql => Some(("/*", "*/")),
             Self::Markdown => Some(("<!--", "-->")),
+            Self::DjangoTemplate => Some(("{#", "#}")),
             _ => None,
         }
     }
+}
+
+/// Whether a directory above `path` is called `templates` (Django/Flask template folders).
+fn in_templates_dir(path: &Path) -> bool {
+    path.parent().is_some_and(|p| p.components().any(|c| c.as_os_str() == "templates"))
 }
 
 /// Highlight classes. The UI maps each to a theme colour (RustRover's Dark scheme by default).
@@ -280,6 +293,7 @@ fn lexical_spans(language: Language, doc: &Doc) -> Vec<Span> {
         Language::Sql => sql::spans(doc),
         Language::Dockerfile => dockerfile::spans(doc),
         Language::Http => http::spans(doc),
+        Language::DjangoTemplate => django::spans(doc),
         Language::Rust | Language::PlainText => Vec::new(),
     }
 }
@@ -374,6 +388,7 @@ fn language_folds(language: Language, text: &str) -> Vec<FoldRange> {
         Language::Sql => sql::folding_ranges(&Doc::new(text)),
         Language::Dockerfile => dockerfile::folding_ranges(&Doc::new(text)),
         Language::Http => http::folding_ranges(&Doc::new(text)),
+        Language::DjangoTemplate => django::folding_ranges(&Doc::new(text)),
         Language::PlainText => Vec::new(),
     }
 }
@@ -434,6 +449,7 @@ pub fn outline(language: Language, text: &str) -> Vec<OutlineItem> {
         Language::Sql => sql::outline(&Doc::new(text)),
         Language::Dockerfile => dockerfile::outline(&Doc::new(text)),
         Language::Http => http::outline(&Doc::new(text)),
+        Language::DjangoTemplate => django::outline(&Doc::new(text)),
         Language::Json | Language::Yaml | Language::Shell | Language::PlainText => Vec::new(),
     }
 }
@@ -470,6 +486,10 @@ mod tests {
             ("api.dockerfile", Language::Dockerfile),
             ("api.http", Language::Http),
             ("users.REST", Language::Http),
+            ("app/templates/base.html", Language::DjangoTemplate),
+            ("page.jinja", Language::DjangoTemplate),
+            ("nginx.conf.j2", Language::DjangoTemplate),
+            ("site/index.html", Language::PlainText),
             ("LICENSE", Language::PlainText),
             ("", Language::PlainText),
         ];
@@ -525,7 +545,10 @@ mod tests {
             Language::TypeScript,
             Language::JavaScript,
             Language::Sql,
+            Language::Dockerfile,
+            Language::Http,
             Language::PlainText,
+            Language::DjangoTemplate,
         ] {
             assert_eq!(highlight(language, "").len_lines(), 1);
             assert_eq!(matching_bracket(language, "", 0), None);

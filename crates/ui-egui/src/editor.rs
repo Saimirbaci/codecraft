@@ -674,6 +674,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     // Presentation Mode enlarges the editor font without touching the setting.
     settings.editor_font_size = codecraft_engine::appearance::chrome(s).editor_font_size;
     let Some(editor) = s.ws.editor(eid).cloned() else { return };
+    // A Jupyter notebook that parsed shows as cells (M12 track PY).
+    if codecraft_engine::jupyter::shows_notebook(s, editor.doc) {
+        crate::notebook_ui::show(ui, s, st, eid, editor.doc);
+        return;
+    }
     let path = s.ws.doc(editor.doc).and_then(|d| d.path.clone());
     let problems: Vec<Problem> =
         path.as_deref().map(|p| s.ws.problems_for(p).into_iter().cloned().collect()).unwrap_or_default();

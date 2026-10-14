@@ -128,6 +128,8 @@ pub struct PythonState {
     pub console: Console,
     /// Detection and tool lookup (tests point it at fake directories).
     pub probe: Option<Probe>,
+    /// View › Tool Windows › Python Process Output (M12 track PY).
+    pub process_output: crate::python_output::ProcessOutput,
 }
 
 impl PythonState {
@@ -180,7 +182,9 @@ impl PythonState {
         if self.log.len() >= MAX_LOG_LINES {
             self.log.drain(..MAX_LOG_LINES / 4);
         }
-        self.log.push(line.into());
+        let line = line.into();
+        self.process_output.push("Packages", crate::python_output::LineKind::Stdout, &line);
+        self.log.push(line);
     }
 }
 
@@ -242,7 +246,14 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         }
     }
     // Console.
+    let was_alive = s.python.console.is_alive();
     let poll = s.python.console.poll();
+    if was_alive
+        && !s.python.console.is_alive()
+        && let Some(msg) = s.python.console.exited.clone()
+    {
+        s.python.process_output.push("Python Console", crate::python_output::LineKind::Info, &msg);
+    }
     changed |= poll.changed;
     if let Some(status) = poll.finished {
         changed = true;
