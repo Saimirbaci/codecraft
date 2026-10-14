@@ -130,6 +130,8 @@ struct Row {
     table: Option<String>,
     /// The data source colour, drawn as a bar at the row's left edge.
     stripe: Option<Color32>,
+    /// What the schema tools' menu sees: `table`, `view`, `column`, `index`, `foreignKey` (track DA).
+    object: &'static str,
 }
 
 impl Row {
@@ -150,6 +152,7 @@ impl Row {
             schema: None,
             table: None,
             stripe: None,
+            object: "",
         }
     }
 }
@@ -302,6 +305,11 @@ fn push_schemas(
             };
             r.schema = Some(schema.clone());
             r.table = Some(table.info.name.clone());
+            r.object = match table.info.kind {
+                TableKind::Table | TableKind::Foreign => "table",
+                TableKind::View => "view",
+                TableKind::MaterializedView => "materializedView",
+            };
             rows.push(r);
             if !texp {
                 continue;
@@ -328,6 +336,9 @@ fn push_schemas(
                     detail.push_str(&format!(" = {def}"));
                 }
                 r.detail = detail;
+                r.schema = Some(schema.clone());
+                r.table = Some(table.info.name.clone());
+                r.object = "column";
                 rows.push(r);
             }
             for (suffix, title, items) in [
@@ -384,6 +395,9 @@ fn push_schemas(
                         r.label = name;
                         r.label_color = t.text;
                         r.detail = detail;
+                        r.schema = Some(schema.clone());
+                        r.table = Some(table.info.name.clone());
+                        r.object = if suffix == "#fk" { "foreignKey" } else { "index" };
                         rows.push(r);
                     }
                 }
@@ -556,6 +570,26 @@ fn toggle(row: &Row) -> TreeAction {
 }
 
 fn context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
+    base_context_menu(ui, row, actions);
+    // Schema tools (track DA): New Table, Modify, SQL Generator, Diagram, Compare, Rename, Drop…
+    let kind = match row.kind {
+        Kind::Source => "source",
+        Kind::Schema => "schema",
+        _ => row.object,
+    };
+    let target = crate::database_schema_ui::NodeTarget {
+        kind,
+        source: &row.source,
+        schema: row.schema.as_deref(),
+        table: row.table.as_deref(),
+        name: &row.label,
+    };
+    let mut cmds = Vec::new();
+    crate::database_schema_ui::tree_menu(ui, &target, &mut cmds);
+    actions.extend(cmds.into_iter().map(|(id, p)| TreeAction::Cmd(id, p)));
+}
+
+fn base_context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>) {
     let ds = json!({ "dataSource": row.source });
     let mut item = |ui: &mut egui::Ui, label: &str, id: &'static str, params: Value| {
         if ui.button(label).clicked() {
@@ -847,6 +881,7 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
 pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     dialog(ui.ctx(), s, st);
     crate::database_dialogs::show(ui.ctx(), s, st);
+    crate::database_schema_ui::show(ui.ctx(), s, st);
     let Some((_, d)) = s.ws.active() else { return };
     if d.language != Language::Sql {
         return;

@@ -24,12 +24,14 @@ mod console;
 mod edit;
 mod grid;
 mod import;
+mod schema;
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     let mut v = edit::specs();
     v.extend(console::specs());
     v.extend(grid::specs());
     v.extend(import::specs());
+    v.extend(schema::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);

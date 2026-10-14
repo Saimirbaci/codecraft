@@ -32,6 +32,7 @@ mod edit;
 pub mod exec;
 pub mod history;
 pub mod import;
+pub mod schema_tools;
 
 pub use codecraft_db::explain::{Plan, PlanNode};
 pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
@@ -606,6 +607,8 @@ pub struct DbState {
     next_id: u64,
     /// SSH tunnels of data sources with `ssh_tunnel` (track S, `ssh_tunnel.rs`).
     pub(crate) tunnels: crate::ssh_tunnel::Tunnels,
+    /// Create/Modify Table, Drop/Rename/Truncate, SQL Generator, ER diagram, Compare (track DA).
+    pub schema: schema_tools::SchemaTools,
 }
 
 impl Default for DbState {
@@ -638,6 +641,7 @@ impl Default for DbState {
             runs: HashMap::new(),
             next_id: 0,
             tunnels: Default::default(),
+            schema: Default::default(),
         }
     }
 }
@@ -695,6 +699,7 @@ impl DbState {
             || self.runs.values().any(|r| !r.waiting)
             || self.dialog.as_ref().is_some_and(|d| d.test == TestState::Running)
             || self.import.as_ref().is_some_and(ImportDialog::is_busy)
+            || self.schema.busy()
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -1161,6 +1166,7 @@ impl DbState {
         self.param_prompt = None;
         self.confirm = None;
         self.import = None;
+        self.schema = Default::default();
         self.param_values.clear();
         self.history.set_project(root.clone());
         self.passwords.clear();
@@ -1425,6 +1431,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
         handle(s, ev);
     }
+    changed |= schema_tools::pump(s);
     s.db.history.flush();
     changed
 }
