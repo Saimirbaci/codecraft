@@ -164,7 +164,7 @@ impl Link {
                 None => return Err(e.to_string()),
             },
         };
-        if let Some(level) = self.opts.isolation
+        if let Some(level) = self.opts.isolation.filter(|_| self.cfg.kind.supports_transactions())
             && let Some(sql) = session_isolation_sql(self.cfg.kind, level).map_err(|e| e.to_string())?
         {
             codecraft_db::tx::run(conn.as_mut(), &sql).map_err(|e| format!("cannot set the isolation level: {e}"))?;
@@ -605,6 +605,10 @@ impl TxBook {
 impl DbState {
     /// Manual commit for a connection: the console's choice, else the data source's.
     pub fn manual_commit(&self, worker: &str, source: &str) -> bool {
+        // ClickHouse, Redis and DuckDB have no transactions: always auto-commit.
+        if self.source(source).is_some_and(|d| !d.config.kind.supports_transactions()) {
+            return false;
+        }
         self.txs.console(worker).manual.unwrap_or_else(|| self.source(source).is_some_and(|d| d.config.manual_commit))
     }
 
@@ -646,11 +650,7 @@ impl DbState {
         if let Some(d) = ds.tree.info.as_ref().and_then(|i| i.default_schema.clone()) {
             return Some(d);
         }
-        Some(match ds.config.kind {
-            DbKind::Sqlite => "main".into(),
-            DbKind::Postgres => "public".into(),
-            DbKind::Mysql | DbKind::Mariadb => ds.config.database.clone(),
-        })
+        Some(fallback_schema(&ds.config))
     }
 
     /// Open transactions (of one data source, or all), with what the guard shows.
@@ -674,6 +674,20 @@ impl DbState {
 }
 
 /// A worker event about transactions or the connection.
+/// Where unqualified names of a data source resolve before its schema tree is loaded.
+pub(crate) fn fallback_schema(cfg: &DataSourceConfig) -> String {
+    let db = cfg.database.trim();
+    match cfg.kind {
+        DbKind::Sqlite | DbKind::DuckDb => "main".into(),
+        DbKind::Postgres => "public".into(),
+        DbKind::Mysql | DbKind::Mariadb => cfg.database.clone(),
+        DbKind::SqlServer => "dbo".into(),
+        DbKind::ClickHouse if db.is_empty() => "default".into(),
+        DbKind::ClickHouse => db.to_string(),
+        DbKind::Redis => format!("db{}", db.trim_start_matches("db").parse::<u32>().unwrap_or(0)),
+    }
+}
+
 pub(crate) fn on_event(s: &mut Session, ev: TxEvent) {
     let db = &mut s.db;
     match ev {

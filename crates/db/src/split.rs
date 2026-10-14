@@ -10,6 +10,10 @@ pub enum Dialect {
     Sqlite,
     Postgres,
     Mysql,
+    /// Microsoft SQL Server: `[ident]`, nested comments, `GO` batch separators, BEGIN…END blocks.
+    TSql,
+    /// Redis consoles: one command per line (not SQL).
+    Redis,
 }
 
 /// One statement: `[start, end)` in chars, trimmed of surrounding whitespace, without the `;`.
@@ -24,6 +28,12 @@ pub struct Statement {
 
 /// Split a script into statements. Statements that hold only comments are dropped.
 pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<Statement> {
+    if dialect == Dialect::Redis {
+        return crate::redis::split_commands(sql);
+    }
+    let tsql = dialect == Dialect::TSql;
+    // T-SQL `CREATE PROCEDURE|FUNCTION|TRIGGER`: only GO ends the body.
+    let mut routine = false;
     let chars: Vec<char> = sql.chars().collect();
     let mut out = Vec::new();
     let mut seg_start = 0usize;
@@ -47,7 +57,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<Statement> {
                 continue;
             }
             '/' if next == Some('*') => {
-                i = skip_block_comment(&chars, i, dialect == Dialect::Postgres);
+                i = skip_block_comment(&chars, i, dialect == Dialect::Postgres || tsql);
                 continue;
             }
             '\'' => {
@@ -69,7 +79,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<Statement> {
                 i = skip_quoted(&chars, i, '`', false);
                 continue;
             }
-            '[' if dialect == Dialect::Sqlite => {
+            '[' if dialect == Dialect::Sqlite || tsql => {
                 has_code = true;
                 i = skip_quoted(&chars, i, ']', false);
                 continue;
@@ -85,7 +95,7 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<Statement> {
                 i += 1;
                 continue;
             }
-            ';' if block_depth == 0 => {
+            ';' if block_depth == 0 && !routine => {
                 if has_code {
                     out.push(make_statement(&chars, seg_start, i, i + 1));
                 }
@@ -96,14 +106,49 @@ pub fn split_statements(sql: &str, dialect: Dialect) -> Vec<Statement> {
                 continue;
             }
             c if is_ident_start(c) => {
+                let had_code = has_code;
                 has_code = true;
                 let start = i;
                 while at(i).is_some_and(is_ident_char) {
                     i += 1;
                 }
                 let word: String = chars.get(start..i).unwrap_or(&[]).iter().collect::<String>().to_ascii_uppercase();
+                if tsql
+                    && word == "GO"
+                    && let Some((line_end, count)) = go_line(&chars, start, i)
+                {
+                    if had_code {
+                        for _ in 0..count {
+                            out.push(make_statement(&chars, seg_start, start, line_end));
+                        }
+                    }
+                    seg_start = line_end;
+                    has_code = false;
+                    words.clear();
+                    block_depth = 0;
+                    routine = false;
+                    i = line_end;
+                    continue;
+                }
                 if words.len() < 4 {
                     words.push(word.clone());
+                }
+                if tsql {
+                    match word.as_str() {
+                        "BEGIN" => {
+                            let next = peek_word(&chars, i);
+                            if !matches!(
+                                next.as_deref(),
+                                Some("TRAN" | "TRANSACTION" | "DISTRIBUTED" | "DIALOG" | "CONVERSATION")
+                            ) {
+                                block_depth += 1;
+                            }
+                        }
+                        "CASE" => block_depth += 1,
+                        "END" => block_depth = block_depth.saturating_sub(1),
+                        _ => {}
+                    }
+                    routine |= words.len() <= 4 && is_tsql_routine(&words);
                 }
                 if is_trigger(&words) && matches!(dialect, Dialect::Sqlite | Dialect::Generic) {
                     match word.as_str() {
@@ -180,10 +225,17 @@ pub fn first_keyword(sql: &str) -> Option<String> {
 /// sources check this). Statements known to only read are allowed; anything else counts as a
 /// modification, so an unfamiliar command is guarded rather than let through.
 pub fn is_modifying(sql: &str, dialect: Dialect) -> bool {
+    if dialect == Dialect::Redis {
+        return crate::redis::is_write_command(sql);
+    }
     let words = crate::lex::words(sql, dialect);
     let Some(first) = words.first() else { return false };
     let has = |set: &[&str]| words.iter().skip(1).any(|w| set.contains(&w.as_str()));
+    let second = words.get(1).map(String::as_str);
     match first.as_str() {
+        // A T-SQL BEGIN … END block can hold anything.
+        "BEGIN" if dialect == Dialect::TSql => !matches!(second, Some("TRAN" | "TRANSACTION" | "DISTRIBUTED")),
+        "PRINT" | "WAITFOR" | "RAISERROR" | "THROW" | "SAVE" if dialect == Dialect::TSql => false,
         "SELECT" => has(&["INTO"]) && !has_mysql_variable_into(sql),
         "WITH" => has(&["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"]),
         "EXPLAIN" => {
@@ -216,8 +268,20 @@ pub enum TxEffect {
 /// `BEGIN`/`START TRANSACTION` open a transaction; `COMMIT`/`ROLLBACK`/`END` close it (not
 /// `ROLLBACK TO SAVEPOINT`). In MySQL, DDL commits implicitly.
 pub fn transaction_effect(sql: &str, dialect: Dialect) -> TxEffect {
+    if dialect == Dialect::Redis {
+        return TxEffect::None;
+    }
     let words = crate::lex::words(sql, dialect);
     let second = words.get(1).map(String::as_str);
+    if dialect == Dialect::TSql {
+        // `BEGIN` alone opens a block; `END` closes one. `ROLLBACK TRAN <savepoint>` is
+        // indistinguishable from a named transaction here; the server's @@TRANCOUNT decides.
+        return match words.first().map(String::as_str) {
+            Some("BEGIN") if matches!(second, Some("TRAN" | "TRANSACTION" | "DISTRIBUTED")) => TxEffect::Begin,
+            Some("COMMIT" | "ROLLBACK") => TxEffect::End,
+            _ => TxEffect::None,
+        };
+    }
     match words.first().map(String::as_str) {
         Some("BEGIN") if dialect != Dialect::Postgres || second != Some("ATOMIC") => TxEffect::Begin,
         Some("START") if second == Some("TRANSACTION") => TxEffect::Begin,
@@ -225,6 +289,73 @@ pub fn transaction_effect(sql: &str, dialect: Dialect) -> TxEffect {
         Some("ROLLBACK" | "ABORT") if !words.iter().any(|w| w == "TO") => TxEffect::End,
         Some("CREATE" | "ALTER" | "DROP" | "TRUNCATE" | "RENAME") if dialect == Dialect::Mysql => TxEffect::End,
         _ => TxEffect::None,
+    }
+}
+
+/// `CREATE [OR ALTER] PROC|PROCEDURE|FUNCTION|TRIGGER` and `ALTER …` of those (T-SQL).
+fn is_tsql_routine(words: &[String]) -> bool {
+    let w: Vec<&str> = words.iter().map(String::as_str).collect();
+    let routine = |k: &str| matches!(k, "PROC" | "PROCEDURE" | "FUNCTION" | "TRIGGER");
+    match w.as_slice() {
+        ["CREATE", "OR", "ALTER", k, ..] => routine(k),
+        ["CREATE" | "ALTER", k, ..] => routine(k),
+        _ => false,
+    }
+}
+
+/// A `GO [count]` line (T-SQL batch separator): `GO` alone on its line after whitespace,
+/// optionally a repeat count and a `--` comment. Returns the offset after the line and the count.
+fn go_line(chars: &[char], word_start: usize, word_end: usize) -> Option<(usize, usize)> {
+    let mut b = word_start;
+    while b > 0 {
+        match chars.get(b - 1) {
+            Some('\n') => break,
+            Some(c) if c.is_whitespace() => b -= 1,
+            _ => return None,
+        }
+    }
+    let mut i = word_end;
+    let skip_blanks = |i: &mut usize| {
+        while chars.get(*i).is_some_and(|c| *c == ' ' || *c == '\t' || *c == '\r') {
+            *i += 1;
+        }
+    };
+    skip_blanks(&mut i);
+    let digits_start = i;
+    while chars.get(i).is_some_and(char::is_ascii_digit) {
+        i += 1;
+    }
+    let count: usize = chars.get(digits_start..i).unwrap_or(&[]).iter().collect::<String>().parse().unwrap_or(1);
+    skip_blanks(&mut i);
+    if chars.get(i) == Some(&'-') && chars.get(i + 1) == Some(&'-') {
+        i = skip_line(chars, i);
+    }
+    match chars.get(i) {
+        None => Some((chars.len(), count.clamp(1, MAX_GO_REPEAT))),
+        Some('\n') => Some((i + 1, count.clamp(1, MAX_GO_REPEAT))),
+        Some(_) => None,
+    }
+}
+
+/// `GO n` repeats a batch at most this often.
+const MAX_GO_REPEAT: usize = 100;
+
+/// The next word after `i` (comments and whitespace skipped), upper-cased.
+fn peek_word(chars: &[char], mut i: usize) -> Option<String> {
+    loop {
+        match chars.get(i) {
+            Some(c) if c.is_whitespace() => i += 1,
+            Some('-') if chars.get(i + 1) == Some(&'-') => i = skip_line(chars, i),
+            Some('/') if chars.get(i + 1) == Some(&'*') => i = skip_block_comment(chars, i, true),
+            Some(c) if is_ident_start(*c) => {
+                let start = i;
+                while chars.get(i).is_some_and(|c| is_ident_char(*c)) {
+                    i += 1;
+                }
+                return Some(chars.get(start..i)?.iter().collect::<String>().to_ascii_uppercase());
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -484,6 +615,66 @@ mod tests {
         assert_eq!(at(23).as_deref(), Some("select 3"));
         assert_eq!(at(1000).as_deref(), Some("select 3"));
         assert_eq!(statement_at("  ", Dialect::Generic, 1), None);
+    }
+
+    #[test]
+    fn tsql_go_batches_and_blocks() {
+        let d = Dialect::TSql;
+        let sql = "SELECT 1\nGO\nCREATE PROCEDURE p AS\nBEGIN\n  SELECT 1;\n  SELECT 2;\nEND\ngo\nSELECT [a;b] FROM t; SELECT 'go'\n  GO 3 -- thrice\nPRINT 'x'";
+        let t = texts(sql, d);
+        assert_eq!(t[0], "SELECT 1");
+        assert!(t[1].starts_with("CREATE PROCEDURE p AS") && t[1].ends_with("END"), "{t:?}");
+        assert_eq!(t[2], "SELECT [a;b] FROM t");
+        assert_eq!(&t[3..6], ["SELECT 'go'", "SELECT 'go'", "SELECT 'go'"]);
+        assert_eq!(t[6], "PRINT 'x'");
+        assert_eq!(t.len(), 7);
+        // GO inside words, strings, comments or with trailing text is not a separator.
+        assert_eq!(texts("SELECT go FROM t\nSELECT 1 /* \nGO\n */", d).len(), 1);
+        assert_eq!(texts("SELECT 'a\nGO\nb'", d).len(), 1);
+        assert_eq!(texts("SELECT 1\nGO x\nSELECT 2", d).len(), 1);
+        // IF … BEGIN … END stays one statement; BEGIN TRAN does not open a block.
+        let t = texts("IF 1=1 BEGIN UPDATE t SET a=1; DELETE FROM t; END; BEGIN TRAN; UPDATE t SET a = 2; COMMIT", d);
+        assert_eq!(
+            t,
+            ["IF 1=1 BEGIN UPDATE t SET a=1; DELETE FROM t; END", "BEGIN TRAN", "UPDATE t SET a = 2", "COMMIT"]
+        );
+        assert_eq!(texts("SELECT CASE WHEN a=1 THEN 2 END; SELECT 3", d).len(), 2);
+        assert_eq!(texts("GO\nGO\n", d).len(), 0);
+        assert_eq!(texts("SELECT 1\nGO 999999999999999999999", d).len(), 1);
+        assert_eq!(texts("SELECT 1\nGO 500", d).len(), MAX_GO_REPEAT);
+        for hostile in [
+            "GO",
+            "G",
+            "\nGO 1",
+            "BEGIN BEGIN BEGIN",
+            "END END",
+            "[unterminated",
+            "/* /* */",
+            "CREATE PROC p AS SELECT 1; SELECT 2",
+        ] {
+            let _ = split_statements(hostile, d);
+            let _ = statement_at(hostile, d, 3);
+        }
+        assert_eq!(texts("CREATE OR ALTER PROC p AS SELECT 1; SELECT 2\nGO\nSELECT 3", d).len(), 2);
+    }
+
+    #[test]
+    fn tsql_classification() {
+        let d = Dialect::TSql;
+        assert!(is_modifying("BEGIN UPDATE t SET a = 1 END", d));
+        assert!(!is_modifying("BEGIN TRAN", d));
+        assert!(!is_modifying("PRINT 'x'", d));
+        assert!(is_modifying("EXEC sp_rename 'a', 'b'", d));
+        assert!(!is_modifying("SELECT * FROM [dbo].[t]", d));
+        assert_eq!(transaction_effect("BEGIN TRANSACTION", d), TxEffect::Begin);
+        assert_eq!(transaction_effect("BEGIN", d), TxEffect::None);
+        assert_eq!(transaction_effect("END", d), TxEffect::None);
+        assert_eq!(transaction_effect("COMMIT TRAN", d), TxEffect::End);
+        assert_eq!(transaction_effect("ROLLBACK", d), TxEffect::End);
+        assert_eq!(transaction_effect("MULTI", Dialect::Redis), TxEffect::None);
+        assert!(is_modifying("SET k v", Dialect::Redis));
+        assert!(!is_modifying("GET k", Dialect::Redis));
+        assert_eq!(texts("GET a\nSET b 1", Dialect::Redis), ["GET a", "SET b 1"]);
     }
 
     #[test]

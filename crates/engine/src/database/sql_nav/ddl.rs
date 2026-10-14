@@ -42,7 +42,8 @@ pub struct ObjectInfo {
 pub(crate) fn lit(kind: DbKind, s: &str) -> String {
     let s = s.replace('\'', "''");
     match kind {
-        DbKind::Mysql | DbKind::Mariadb => format!("'{}'", s.replace('\\', "\\\\")),
+        DbKind::Mysql | DbKind::Mariadb | DbKind::ClickHouse => format!("'{}'", s.replace('\\', "\\\\")),
+        DbKind::SqlServer => format!("N'{s}'"),
         _ => format!("'{s}'"),
     }
 }
@@ -60,8 +61,8 @@ fn full_name(kind: DbKind, schema: &str, name: &str) -> String {
 /// (SQLite).
 pub fn routines_query(kind: DbKind, schema: &str) -> Option<String> {
     match kind {
-        DbKind::Sqlite => None,
-        _ => Some(format!(
+        DbKind::Sqlite | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => None,
+        DbKind::Postgres | DbKind::Mysql | DbKind::Mariadb | DbKind::SqlServer => Some(format!(
             "SELECT DISTINCT routine_name, lower(routine_type), coalesce(data_type, '') FROM information_schema.routines \
              WHERE routine_schema = {} ORDER BY 1",
             lit(kind, schema)
@@ -98,6 +99,7 @@ pub fn info_query(kind: DbKind, schema: &str, name: &str, what: InfoKind) -> Opt
              UNION ALL SELECT 'definition', NULL, view_definition FROM information_schema.views WHERE table_schema = {s} AND table_name = {n}"
         ),
         (DbKind::Sqlite, InfoKind::Routine) => return None,
+        (DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb, _) => return None,
         (DbKind::Sqlite, _) => {
             let master = format!("{}.sqlite_master", codecraft_db::sql::quote_ident(DbKind::Sqlite, schema));
             format!(

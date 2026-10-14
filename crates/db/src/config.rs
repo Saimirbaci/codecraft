@@ -15,10 +15,27 @@ pub enum DbKind {
     Postgres,
     Mysql,
     Mariadb,
+    /// Microsoft SQL Server (and Azure SQL) through TDS (track DD).
+    SqlServer,
+    /// ClickHouse over its HTTP interface.
+    ClickHouse,
+    /// Redis (and Valkey/KeyDB): keys, not tables.
+    Redis,
+    /// DuckDB through its command-line shell, file-based.
+    DuckDb,
 }
 
 impl DbKind {
-    pub const ALL: [DbKind; 4] = [DbKind::Sqlite, DbKind::Postgres, DbKind::Mysql, DbKind::Mariadb];
+    pub const ALL: [DbKind; 8] = [
+        DbKind::Sqlite,
+        DbKind::Postgres,
+        DbKind::Mysql,
+        DbKind::Mariadb,
+        DbKind::SqlServer,
+        DbKind::ClickHouse,
+        DbKind::Redis,
+        DbKind::DuckDb,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -26,19 +43,60 @@ impl DbKind {
             DbKind::Postgres => "PostgreSQL",
             DbKind::Mysql => "MySQL",
             DbKind::Mariadb => "MariaDB",
+            DbKind::SqlServer => "Microsoft SQL Server",
+            DbKind::ClickHouse => "ClickHouse",
+            DbKind::Redis => "Redis",
+            DbKind::DuckDb => "DuckDB",
         }
     }
 
     pub fn default_port(self) -> Option<u16> {
         match self {
-            DbKind::Sqlite => None,
+            DbKind::Sqlite | DbKind::DuckDb => None,
             DbKind::Postgres => Some(5432),
             DbKind::Mysql | DbKind::Mariadb => Some(3306),
+            DbKind::SqlServer => Some(1433),
+            DbKind::ClickHouse => Some(8123),
+            DbKind::Redis => Some(6379),
         }
     }
 
     pub fn is_file_based(self) -> bool {
-        self == DbKind::Sqlite
+        matches!(self, DbKind::Sqlite | DbKind::DuckDb)
+    }
+
+    /// Whether consoles can open transactions (Commit/Rollback, manual commit). ClickHouse and
+    /// Redis have none; DuckDB runs each statement in its own CLI process.
+    pub fn supports_transactions(self) -> bool {
+        !matches!(self, DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb)
+    }
+
+    /// Whether the data source speaks SQL (Redis consoles run Redis commands).
+    pub fn is_sql(self) -> bool {
+        self != DbKind::Redis
+    }
+
+    /// What the data source dialog says under the kind: limits the user should know about.
+    pub fn notes(self) -> &'static str {
+        match self {
+            DbKind::ClickHouse => {
+                "HTTP interface (8123; 8443 with ssl=true). No transactions: every statement commits. \
+                 Options: max_execution_time, setting.<name>."
+            }
+            DbKind::Redis => {
+                "Database is the index (0-15). Keys are browsed with SCAN, never KEYS. No transactions. \
+                 Options: tls=true."
+            }
+            DbKind::DuckDb => {
+                "Runs the duckdb CLI (option duckdb_path). Each statement runs in its own process: no \
+                 transactions or session state across statements."
+            }
+            DbKind::SqlServer => {
+                "SQL Server authentication; batches split on GO. Options: encrypt (off|on|strict), \
+                 trust_server_certificate."
+            }
+            DbKind::Sqlite | DbKind::Postgres | DbKind::Mysql | DbKind::Mariadb => "",
+        }
     }
 
     pub fn parse(s: &str) -> Option<DbKind> {
@@ -47,15 +105,25 @@ impl DbKind {
             "postgres" | "postgresql" | "pg" => Some(DbKind::Postgres),
             "mysql" => Some(DbKind::Mysql),
             "mariadb" => Some(DbKind::Mariadb),
+            "sqlserver" | "sql server" | "mssql" | "microsoft sql server" | "tsql" | "azure sql" => {
+                Some(DbKind::SqlServer)
+            }
+            "clickhouse" | "ch" => Some(DbKind::ClickHouse),
+            "redis" | "valkey" | "keydb" => Some(DbKind::Redis),
+            "duckdb" | "duck" => Some(DbKind::DuckDb),
             _ => None,
         }
     }
 
+    /// How consoles split and classify statements. ClickHouse lexes like MySQL (backticks, `#`
+    /// comments, backslash escapes); DuckDB like PostgreSQL.
     pub fn dialect(self) -> crate::Dialect {
         match self {
             DbKind::Sqlite => crate::Dialect::Sqlite,
-            DbKind::Postgres => crate::Dialect::Postgres,
-            DbKind::Mysql | DbKind::Mariadb => crate::Dialect::Mysql,
+            DbKind::Postgres | DbKind::DuckDb => crate::Dialect::Postgres,
+            DbKind::Mysql | DbKind::Mariadb | DbKind::ClickHouse => crate::Dialect::Mysql,
+            DbKind::SqlServer => crate::Dialect::TSql,
+            DbKind::Redis => crate::Dialect::Redis,
         }
     }
 }
@@ -251,7 +319,7 @@ impl DataSourceConfig {
         if self.kind.is_file_based() {
             match &self.path {
                 Some(p) if !p.as_os_str().is_empty() => Ok(()),
-                _ => Err(DbError::Config("an SQLite data source needs a database file".into())),
+                _ => Err(DbError::Config(format!("a {} data source needs a database file", self.kind.label()))),
             }
         } else if self.host.trim().is_empty() {
             Err(DbError::Config(format!("a {} data source needs a host", self.kind.label())))

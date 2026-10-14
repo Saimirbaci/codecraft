@@ -855,11 +855,7 @@ impl DbState {
                 return only.clone();
             }
         }
-        match ds.config.kind {
-            DbKind::Sqlite => "main".into(),
-            DbKind::Postgres => "public".into(),
-            DbKind::Mysql | DbKind::Mariadb => ds.config.database.clone(),
-        }
+        super::tx::fallback_schema(&ds.config)
     }
 
     // ------------------------------------------------------------ Create / Modify Table
@@ -877,9 +873,11 @@ impl DbState {
             columns: vec![ddl::ColumnDef {
                 name: "id".into(),
                 data_type: match kind {
-                    DbKind::Sqlite => "INTEGER".into(),
+                    DbKind::Sqlite | DbKind::DuckDb => "INTEGER".into(),
                     DbKind::Postgres => "integer".into(),
-                    DbKind::Mysql | DbKind::Mariadb => "int".into(),
+                    DbKind::Mysql | DbKind::Mariadb | DbKind::SqlServer => "int".into(),
+                    DbKind::ClickHouse => "UInt64".into(),
+                    DbKind::Redis => String::new(),
                 },
                 nullable: false,
                 ..Default::default()

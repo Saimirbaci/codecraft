@@ -48,6 +48,8 @@ pub struct DbUi {
     pub save_name: String,
     /// The Data Tools window (track DB).
     pub data: crate::database_data_ui::DataUi,
+    /// The Redis key browser (track DD).
+    pub redis: crate::redis_ui::RedisUi,
 }
 
 type TransposedCache = ((u64, usize, usize), Vec<Column>, Vec<Vec<Cell>>);
@@ -113,6 +115,8 @@ enum Kind {
     Leaf,
     /// A function or procedure (track DC).
     Routine,
+    /// A numbered Redis database: double-click browses its keys (track DD).
+    RedisDb,
     Message,
 }
 
@@ -215,6 +219,10 @@ fn build_rows(s: &Session, st: &UiState) -> Vec<Row> {
             }
             continue;
         };
+        if ds.config.kind == DbKind::Redis {
+            push_redis_dbs(s, st, ds, info, &mut rows);
+            continue;
+        }
         let mut depth = 1;
         if !info.databases.is_empty() {
             let mut shown_current = false;
@@ -250,6 +258,39 @@ fn build_rows(s: &Session, st: &UiState) -> Vec<Row> {
         }
     }
     rows
+}
+
+/// A Redis data source's databases (`db0`…), with key counts once the key browser read them.
+fn push_redis_dbs(
+    s: &Session,
+    st: &UiState,
+    ds: &codecraft_engine::database::DataSource,
+    info: &codecraft_engine::db::DatabaseInfo,
+    rows: &mut Vec<Row>,
+) {
+    let t = &st.theme;
+    let id = ds.config.id.as_str();
+    let browser = s.db.redis.get(id);
+    for schema in &info.schemas {
+        let n = schema.trim_start_matches("db").parse::<u32>().unwrap_or(0);
+        let keys = browser.and_then(|b| b.keyspace.get(&n).copied());
+        let mut r = Row::new(1, Kind::RedisDb, node_key(id, Some(schema), None), id);
+        r.icon = "⊟";
+        r.icon_color = t.type_;
+        r.label = schema.clone();
+        r.label_color = if keys.unwrap_or(0) > 0 { t.text } else { t.text_muted };
+        let mut detail = Vec::new();
+        if info.default_schema.as_deref() == Some(schema.as_str()) {
+            detail.push("default".to_string());
+        }
+        if let Some(k) = keys {
+            detail.push(format!("{k} keys"));
+        }
+        r.detail = detail.join(" · ");
+        r.tooltip = "Double-click to browse the keys".into();
+        r.schema = Some(schema.clone());
+        rows.push(r);
+    }
 }
 
 fn push_schemas(
@@ -616,6 +657,10 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                             "sql.openDdl",
                             json!({ "dataSource": row.source, "schema": row.schema, "name": row.table, "routine": true }),
                         )),
+                        Kind::RedisDb => actions.push(TreeAction::Cmd(
+                            "db.redis.open",
+                            json!({ "dataSource": row.source, "db": row.schema }),
+                        )),
                         _ if row.expandable => actions.push(toggle(row)),
                         _ => {}
                     }
@@ -702,6 +747,10 @@ fn base_context_menu(ui: &mut egui::Ui, row: &Row, actions: &mut Vec<TreeAction>
         }
         Kind::Database => {
             item(ui, "Refresh", "db.refresh", ds.clone());
+            item(ui, "Open Query Console", "db.newConsole", ds);
+        }
+        Kind::RedisDb => {
+            item(ui, "Browse Keys", "db.redis.open", json!({ "dataSource": row.source, "db": row.schema }));
             item(ui, "Open Query Console", "db.newConsole", ds);
         }
         Kind::Routine => {
@@ -803,19 +852,26 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                     f.set_kind(kind);
                 }
                 ui.end_row();
+                // What this kind can and cannot do (no transactions, the CLI, GO batches …).
+                if !f.kind.notes().is_empty() {
+                    ui.label("");
+                    ui.add(egui::Label::new(RichText::new(f.kind.notes()).small().color(theme.text_muted)).wrap());
+                    ui.end_row();
+                }
                 ui.label("Name");
                 ui.add(TextEdit::singleline(&mut f.name).hint_text("optional").desired_width(300.0));
                 ui.end_row();
                 if f.kind.is_file_based() {
                     ui.label("File");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            TextEdit::singleline(&mut f.path)
-                                .hint_text("data.db (relative to the project)")
-                                .desired_width(250.0),
-                        );
+                        let hint = if f.kind == DbKind::DuckDb {
+                            "data.duckdb (relative to the project)"
+                        } else {
+                            "data.db (relative to the project)"
+                        };
+                        ui.add(TextEdit::singleline(&mut f.path).hint_text(hint).desired_width(250.0));
                         if ui.button("…").on_hover_text("Choose a database file").clicked() {
-                            let mut dlg = rfd::FileDialog::new().set_title("SQLite Database File");
+                            let mut dlg = rfd::FileDialog::new().set_title(format!("{} Database File", f.kind.label()));
                             if let Some(root) = &root {
                                 dlg = dlg.set_directory(root);
                             }
@@ -825,6 +881,15 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         }
                     });
                     ui.end_row();
+                    if f.kind == DbKind::DuckDb {
+                        ui.label("Options");
+                        ui.add(
+                            TextEdit::singleline(&mut f.options)
+                                .hint_text("duckdb_path=/opt/homebrew/bin/duckdb")
+                                .desired_width(300.0),
+                        );
+                        ui.end_row();
+                    }
                     ui.label("");
                     ui.checkbox(&mut f.read_only, "Read-only");
                     ui.end_row();
@@ -850,15 +915,17 @@ fn dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                     ui.label("");
                     ui.checkbox(&mut f.save_password, "Save password in the Keychain");
                     ui.end_row();
-                    ui.label("Database");
+                    ui.label(if f.kind == DbKind::Redis { "Database index" } else { "Database" });
                     ui.add(TextEdit::singleline(&mut f.database).desired_width(300.0));
                     ui.end_row();
                     ui.label("Options");
-                    ui.add(
-                        TextEdit::singleline(&mut f.options)
-                            .hint_text("sslmode=require; connect_timeout=10")
-                            .desired_width(300.0),
-                    );
+                    let hint = match f.kind {
+                        DbKind::SqlServer => "encrypt=on; trust_server_certificate=true",
+                        DbKind::ClickHouse => "ssl=true; max_execution_time=60; setting.max_threads=4",
+                        DbKind::Redis => "tls=true; connect_timeout=10",
+                        _ => "sslmode=require; connect_timeout=10",
+                    };
+                    ui.add(TextEdit::singleline(&mut f.options).hint_text(hint).desired_width(300.0));
                     ui.end_row();
                     ui.label("");
                     ui.checkbox(&mut f.read_only, "Read-only");
@@ -1041,7 +1108,11 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if small_button(ui, "■", "Cancel", running, st.theme.error, st) {
                     cmd = Some(("db.cancel", Value::Null));
                 }
-                ui.add_enabled_ui(can_run, |ui| {
+                let explainable = source
+                    .as_ref()
+                    .and_then(|id| s.db.source(id))
+                    .is_none_or(|d| !matches!(d.config.kind, DbKind::Redis | DbKind::DuckDb));
+                ui.add_enabled_ui(can_run && explainable, |ui| {
                     ui.menu_button(RichText::new("Explain").size(12.5).color(st.theme.text), |ui| {
                         if ui.button("Explain Plan").clicked() {
                             cmd = Some(("db.explainPlan", Value::Null));
@@ -1061,8 +1132,17 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 ui.separator();
                 // Transaction mode, isolation, Commit/Rollback and the indicator (track DB).
                 if let Some(src) = source.as_ref().filter(|id| s.db.source(id).is_some()) {
-                    if let Some(c) = crate::database_data_ui::console_tx(ui, s, st, &worker, src) {
-                        cmd = Some(c);
+                    let kind = s.db.source(src).map(|d| d.config.kind).unwrap_or_default();
+                    if kind.supports_transactions() {
+                        if let Some(c) = crate::database_data_ui::console_tx(ui, s, st, &worker, src) {
+                            cmd = Some(c);
+                        }
+                    } else {
+                        ui.label(RichText::new("No transactions").size(12.0).color(st.theme.text_muted))
+                            .on_hover_text(codecraft_engine::db::tx::no_transactions(kind));
+                    }
+                    if kind == DbKind::Redis && small_button(ui, "🔑", "Browse Keys", true, st.theme.text, st) {
+                        cmd = Some(("db.redis.open", json!({ "dataSource": src })));
                     }
                     ui.separator();
                 }

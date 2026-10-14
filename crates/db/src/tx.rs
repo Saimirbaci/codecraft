@@ -80,15 +80,17 @@ impl Isolation {
     pub fn supported(kind: DbKind) -> &'static [Isolation] {
         match kind {
             DbKind::Sqlite => &[Isolation::Serializable],
-            DbKind::Postgres | DbKind::Mysql | DbKind::Mariadb => &Isolation::ALL,
+            DbKind::Postgres | DbKind::Mysql | DbKind::Mariadb | DbKind::SqlServer => &Isolation::ALL,
+            // No transactions (see `DbKind::supports_transactions`).
+            DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => &[],
         }
     }
 
     /// The server's default level.
     pub fn default_for(kind: DbKind) -> Isolation {
         match kind {
-            DbKind::Sqlite => Isolation::Serializable,
-            DbKind::Postgres => Isolation::ReadCommitted,
+            DbKind::Sqlite | DbKind::DuckDb => Isolation::Serializable,
+            DbKind::Postgres | DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis => Isolation::ReadCommitted,
             DbKind::Mysql | DbKind::Mariadb => Isolation::RepeatableRead,
         }
     }
@@ -101,14 +103,19 @@ pub fn session_isolation_sql(kind: DbKind, level: Isolation) -> DbResult<Option<
         return Err(DbError::Unsupported(format!("{} does not support {}", kind.label(), level.label())));
     }
     Ok(match kind {
-        DbKind::Sqlite => None,
+        DbKind::Sqlite | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => None,
         DbKind::Postgres => Some(format!("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL {}", level.sql())),
         DbKind::Mysql | DbKind::Mariadb => Some(format!("SET SESSION TRANSACTION ISOLATION LEVEL {}", level.sql())),
+        // Session-wide in T-SQL.
+        DbKind::SqlServer => Some(format!("SET TRANSACTION ISOLATION LEVEL {}", level.sql())),
     })
 }
 
 /// The statements that open a transaction, at `level` when given.
 pub fn begin_statements(kind: DbKind, level: Option<Isolation>) -> DbResult<Vec<String>> {
+    if !kind.supports_transactions() {
+        return Err(DbError::Unsupported(no_transactions(kind)));
+    }
     if let Some(l) = level
         && !Isolation::supported(kind).contains(&l)
     {
@@ -122,7 +129,24 @@ pub fn begin_statements(kind: DbKind, level: Option<Isolation>) -> DbResult<Vec<
         }
         (DbKind::Mysql | DbKind::Mariadb, None) => vec!["START TRANSACTION".into()],
         (DbKind::Sqlite | DbKind::Postgres, _) => vec!["BEGIN".into()],
+        (DbKind::SqlServer, Some(l)) => {
+            vec![format!("SET TRANSACTION ISOLATION LEVEL {}", l.sql()), "BEGIN TRANSACTION".into()]
+        }
+        (DbKind::SqlServer, None) => vec!["BEGIN TRANSACTION".into()],
+        (DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb, _) => {
+            return Err(DbError::Unsupported(no_transactions(kind)));
+        }
     })
+}
+
+/// Why a data source cannot open a transaction.
+pub fn no_transactions(kind: DbKind) -> String {
+    match kind {
+        DbKind::DuckDb => "DuckDB data sources run each statement in its own process: no transactions \
+                           (every statement commits)"
+            .into(),
+        _ => format!("{} has no transactions: every statement commits on its own", kind.label()),
+    }
 }
 
 /// What is known about a connection's transaction.
@@ -226,16 +250,26 @@ fn savepoint_ident(kind: DbKind, name: &str) -> DbResult<String> {
 
 pub fn savepoint(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
     let id = savepoint_ident(conn.kind(), name)?;
+    if conn.kind() == DbKind::SqlServer {
+        return run(conn, &format!("SAVE TRANSACTION {id}"));
+    }
     run(conn, &format!("SAVEPOINT {id}"))
 }
 
 pub fn rollback_to(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
     let id = savepoint_ident(conn.kind(), name)?;
+    if conn.kind() == DbKind::SqlServer {
+        return run(conn, &format!("ROLLBACK TRANSACTION {id}"));
+    }
     run(conn, &format!("ROLLBACK TO SAVEPOINT {id}"))
 }
 
+/// SQL Server has no RELEASE: a savepoint lasts until the transaction ends.
 pub fn release(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
     let id = savepoint_ident(conn.kind(), name)?;
+    if conn.kind() == DbKind::SqlServer {
+        return Ok(());
+    }
     run(conn, &format!("RELEASE SAVEPOINT {id}"))
 }
 

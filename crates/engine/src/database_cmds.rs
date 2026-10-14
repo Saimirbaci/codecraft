@@ -25,6 +25,7 @@ mod data;
 mod edit;
 mod grid;
 mod import;
+mod redis;
 pub(crate) mod sql_editor;
 mod schema;
 
@@ -36,6 +37,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     v.extend(sql_editor::specs());
     v.extend(data::specs());
     v.extend(schema::specs());
+    v.extend(redis::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);
@@ -45,7 +47,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "db.addDataSource",
             "Add Data Source…",
             None,
-            "{name?, kind: sqlite|postgres|mysql|mariadb, host?, port?, database?, user?, password?, \
+            "{name?, kind: sqlite|postgres|mysql|mariadb|sqlserver|clickhouse|redis|duckdb, host?, port?, \
+             database? (Redis: the database index), user?, password?, \
              savePassword?: bool, path?, options?: {key: value}, readOnly?: bool, color?: red|orange|yellow|green|blue|violet|gray, \
              confirmWrites?: bool (production: confirm data modifications), manualCommit?: bool, \
              sshTunnel?: SSH server name (empty: direct)} — without params opens the dialog",
@@ -272,7 +275,7 @@ fn config_from_params(
         let k = k.as_str().ok_or_else(|| bad("`kind` must be a string"))?;
         cfg.kind = DbKind::parse(k).ok_or_else(|| bad(format!("unknown database kind `{k}`")))?;
     } else if base.is_none() {
-        return Err(bad("missing `kind` (sqlite, postgres, mysql or mariadb)"));
+        return Err(bad("missing `kind` (sqlite, postgres, mysql, mariadb, sqlserver, clickhouse, redis or duckdb)"));
     }
     let text = |key: &str| -> Result<Option<String>, CommandError> {
         match p.get(key) {
@@ -452,7 +455,7 @@ fn add_data_source(s: &mut Session, p: &Value) -> CmdResult {
             Some(k) => k
                 .as_str()
                 .and_then(DbKind::parse)
-                .ok_or_else(|| bad(format!("unknown database kind {k} (sqlite, postgres, mysql or mariadb)")))?,
+                .ok_or_else(|| bad(format!("unknown database kind {k} (sqlite, postgres, mysql, mariadb, sqlserver, clickhouse, redis or duckdb)")))?,
         };
         s.db.dialog = Some(DataSourceDialog::new(None, DataSourceForm::for_kind(kind)));
         return Ok(json!({ "dialog": true }));

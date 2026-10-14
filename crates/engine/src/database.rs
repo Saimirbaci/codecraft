@@ -33,6 +33,7 @@ mod edit;
 pub mod exec;
 pub mod history;
 pub mod import;
+pub mod redis_browser;
 pub mod script;
 pub mod sql_nav;
 pub mod tx;
@@ -294,7 +295,8 @@ impl DataSourceForm {
         f
     }
 
-    /// Switch the kind, filling the port and host defaults the user hasn't changed.
+    /// Switch the kind, filling the port, host, database and user defaults the user hasn't
+    /// changed.
     pub fn set_kind(&mut self, kind: DbKind) {
         let old_default = self.kind.default_port().map(|p| p.to_string()).unwrap_or_default();
         if self.port.is_empty() || self.port == old_default {
@@ -303,8 +305,11 @@ impl DataSourceForm {
         if !kind.is_file_based() && self.host.is_empty() {
             self.host = "localhost".into();
         }
-        if kind == DbKind::Postgres && self.database.is_empty() {
-            self.database = "postgres".into();
+        if self.database.is_empty() || self.database == default_database(self.kind) {
+            self.database = default_database(kind).into();
+        }
+        if self.user.is_empty() || self.user == default_user(self.kind) {
+            self.user = default_user(kind).into();
         }
         self.kind = kind;
     }
@@ -361,6 +366,26 @@ impl DataSourceForm {
             o.insert("options".into(), serde_json::to_value(parse_options(&self.options)).unwrap_or_default());
         }
         v
+    }
+}
+
+/// The database a new data source of `kind` starts with (Redis: the database index).
+fn default_database(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::Postgres => "postgres",
+        DbKind::SqlServer => "master",
+        DbKind::ClickHouse => "default",
+        DbKind::Redis => "0",
+        DbKind::Sqlite | DbKind::Mysql | DbKind::Mariadb | DbKind::DuckDb => "",
+    }
+}
+
+/// The user a new data source of `kind` starts with.
+fn default_user(kind: DbKind) -> &'static str {
+    match kind {
+        DbKind::SqlServer => "sa",
+        DbKind::ClickHouse => "default",
+        _ => "",
     }
 }
 
@@ -632,6 +657,8 @@ pub struct DbState {
     pub data: data_tools::DataTools,
     /// Create/Modify Table, Drop/Rename/Truncate, SQL Generator, ER diagram, Compare (track DA).
     pub schema: schema_tools::SchemaTools,
+    /// Redis key browsers (track DD).
+    pub redis: redis_browser::RedisBrowsers,
 }
 
 impl Default for DbState {
@@ -669,6 +696,7 @@ impl Default for DbState {
             txs: tx::TxBook::default(),
             data: data_tools::DataTools::default(),
             schema: Default::default(),
+            redis: Default::default(),
         }
     }
 }
@@ -729,6 +757,7 @@ impl DbState {
             || self.data.busy()
             || self.txs.guard.is_some()
             || self.schema.busy()
+            || self.redis.busy()
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -1095,6 +1124,7 @@ impl DbState {
 
     /// Close every connection of a data source (or all of them).
     pub(crate) fn disconnect(&mut self, source: Option<&str>) {
+        self.redis_disconnect(source);
         self.tunnels.close(source);
         let keys: Vec<String> =
             self.workers.iter().filter(|(_, w)| source.is_none_or(|s| w.source == s)).map(|(k, _)| k.clone()).collect();
@@ -1520,6 +1550,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     }
     changed |= sql_nav::pump(s);
     changed |= schema_tools::pump(s);
+    changed |= redis_browser::pump(s);
     s.db.history.flush();
     changed
 }
@@ -2003,6 +2034,18 @@ mod tests {
         f.port = "3307".into();
         f.set_kind(DbKind::Postgres);
         assert_eq!(f.port, "3307");
+        f.set_kind(DbKind::Redis);
+        assert_eq!((f.port.as_str(), f.database.as_str(), f.user.as_str()), ("3307", "0", ""));
+        f.port = String::new();
+        f.set_kind(DbKind::ClickHouse);
+        assert_eq!((f.port.as_str(), f.database.as_str(), f.user.as_str()), ("8123", "default", "default"));
+        f.set_kind(DbKind::SqlServer);
+        assert_eq!((f.port.as_str(), f.database.as_str(), f.user.as_str()), ("1433", "master", "sa"));
+        f.database = "app".into();
+        f.set_kind(DbKind::DuckDb);
+        assert_eq!((f.port.as_str(), f.database.as_str(), f.user.as_str()), ("", "app", ""));
+        f.set_kind(DbKind::Postgres);
+        f.port = "3307".into();
         f.password = "pw".into();
         let p = f.to_params();
         assert_eq!(p["password"], "pw");

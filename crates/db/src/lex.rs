@@ -27,7 +27,9 @@ pub(crate) fn tokens(chars: &[char], dialect: Dialect) -> Vec<Tok> {
         match c {
             '-' if next == Some('-') => i = skip_line(chars, i),
             '#' if dialect == Dialect::Mysql => i = skip_line(chars, i),
-            '/' if next == Some('*') => i = skip_block_comment(chars, i, dialect == Dialect::Postgres),
+            '/' if next == Some('*') => {
+                i = skip_block_comment(chars, i, matches!(dialect, Dialect::Postgres | Dialect::TSql));
+            }
             '\'' => {
                 let backslash = dialect == Dialect::Mysql
                     || dialect == Dialect::Postgres
@@ -44,7 +46,7 @@ pub(crate) fn tokens(chars: &[char], dialect: Dialect) -> Vec<Tok> {
                 i = skip_quoted(chars, i, '`', false);
                 out.push(Tok::Literal(start, i));
             }
-            '[' if dialect == Dialect::Sqlite => {
+            '[' if matches!(dialect, Dialect::Sqlite | Dialect::TSql) => {
                 i = skip_quoted(chars, i, ']', false);
                 out.push(Tok::Literal(start, i));
             }

@@ -53,11 +53,57 @@ pub fn table_def(conn: &mut dyn Connection, schema: &str, table: &str) -> DbResu
         DbKind::Postgres => pg_table(conn, schema, table)?,
         DbKind::Mysql | DbKind::Mariadb => my_table(conn, schema, table)?,
         DbKind::Sqlite => sqlite_table(conn, schema, table)?,
+        DbKind::SqlServer | DbKind::ClickHouse | DbKind::DuckDb => generic_table(conn, schema, table)?,
+        DbKind::Redis => return Err(DbError::Unsupported("Redis has no tables".into())),
     };
     if t.columns.is_empty() {
         return Err(DbError::Query(format!("no table {}", qualified(conn.kind(), schema, table))));
     }
     Ok(t)
+}
+
+/// A definition from the driver's [`Connection::table_details`] (SQL Server, ClickHouse, DuckDB):
+/// columns, primary key, indexes and foreign keys without actions, checks or comments.
+fn generic_table(conn: &mut dyn Connection, schema: &str, table: &str) -> DbResult<TableDef> {
+    let d = conn.table_details(schema, table)?;
+    let mut def = TableDef { schema: schema.into(), name: table.into(), ..Default::default() };
+    for c in &d.columns {
+        let identity = c.data_type.ends_with(" identity");
+        def.columns.push(ColumnDef {
+            name: c.name.clone(),
+            data_type: c.data_type.trim_end_matches(" identity").to_string(),
+            nullable: c.nullable,
+            default: c.default.clone().unwrap_or_default(),
+            auto_increment: identity,
+            original: c.name.clone(),
+            ..Default::default()
+        });
+    }
+    if let Some(pk) = d.indexes.iter().find(|i| i.primary) {
+        def.primary_key = pk.columns.clone();
+        def.primary_key_name = pk.name.clone();
+    } else {
+        def.primary_key = d.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect();
+    }
+    for i in d.indexes.iter().filter(|i| !i.primary) {
+        def.indexes.push(IndexDef {
+            name: i.name.clone(),
+            columns: i.columns.clone(),
+            unique: i.unique,
+            ..Default::default()
+        });
+    }
+    for f in &d.foreign_keys {
+        def.foreign_keys.push(ForeignKeyDef {
+            name: f.name.clone(),
+            columns: f.columns.clone(),
+            ref_schema: f.ref_schema.clone().unwrap_or_default(),
+            ref_table: f.ref_table.clone(),
+            ref_columns: f.ref_columns.clone(),
+            ..Default::default()
+        });
+    }
+    Ok(def)
 }
 
 // ---------------------------------------------------------------- PostgreSQL
@@ -669,6 +715,40 @@ pub fn views(conn: &mut dyn Connection, schema: &str, only: Option<&[String]>) -
                 .map(|r| ViewDef { name: get(r, 0), materialized: false, query: sqlite_view_query(&get(r, 1)) })
                 .collect()
         }
+        DbKind::SqlServer => rows(
+            conn,
+            &format!(
+                "SELECT v.name, OBJECT_DEFINITION(v.object_id) FROM sys.views v JOIN sys.schemas s \
+                 ON s.schema_id = v.schema_id WHERE s.name = {s} ORDER BY v.name"
+            ),
+        )?
+        .iter()
+        .map(|r| ViewDef { name: get(r, 0), materialized: false, query: sqlite_view_query(&get(r, 1)) })
+        .collect(),
+        DbKind::ClickHouse => rows(
+            conn,
+            &format!(
+                "SELECT name, engine, as_select FROM system.tables WHERE database = {s} \
+                 AND engine IN ('View', 'MaterializedView') ORDER BY name"
+            ),
+        )?
+        .iter()
+        .map(|r| ViewDef { name: get(r, 0), materialized: get(r, 1) == "MaterializedView", query: get(r, 2) })
+        .collect(),
+        DbKind::DuckDb => rows(
+            conn,
+            &format!(
+                "SELECT view_name, sql FROM duckdb_views() WHERE schema_name = {s} AND NOT internal ORDER BY view_name"
+            ),
+        )?
+        .iter()
+        .map(|r| ViewDef {
+            name: get(r, 0),
+            materialized: false,
+            query: sqlite_view_query(get(r, 1).trim().trim_end_matches(';')),
+        })
+        .collect(),
+        DbKind::Redis => Vec::new(),
     };
     if let Some(only) = only {
         out.retain(|v| only.contains(&v.name));
@@ -765,6 +845,27 @@ pub fn object_ddl(conn: &mut dyn Connection, o: &ObjectRef) -> DbResult<String> 
             }
             Ok(join_statements(&out))
         }
+        ObjectKind::Table if kind == DbKind::ClickHouse => {
+            let r = rows(conn, &format!("SHOW CREATE TABLE {}", qualified(kind, &o.schema, &o.name)))?;
+            let ddl = r.first().map(|r| get(r, 0)).unwrap_or_default();
+            if ddl.is_empty() {
+                return Err(DbError::Query(format!("no table {}", o.display())));
+            }
+            Ok(format!("{};\n", ddl.trim_end().trim_end_matches(';')))
+        }
+        ObjectKind::Table if kind == DbKind::DuckDb => {
+            let r = rows(
+                conn,
+                &format!(
+                    "SELECT sql FROM duckdb_tables() WHERE schema_name = {} AND table_name = {}",
+                    lit(kind, &o.schema)?,
+                    lit(kind, &o.name)?
+                ),
+            )?;
+            let ddl =
+                r.first().map(|r| get(r, 0)).ok_or_else(|| DbError::Query(format!("no table {}", o.display())))?;
+            Ok(join_statements(&[ddl]))
+        }
         ObjectKind::Table => {
             let t = table_def(conn, &o.schema, &o.name)?;
             table_ddl(kind, &t)
@@ -845,6 +946,11 @@ pub fn schema_ddl(conn: &mut dyn Connection, schema: &str) -> DbResult<String> {
             out.push('\n');
         }
         DbKind::Sqlite => {}
+        DbKind::SqlServer | DbKind::DuckDb => {
+            out.push_str(&format!("CREATE SCHEMA {};\n\n", quote_ident(kind, schema)))
+        }
+        DbKind::ClickHouse => out.push_str(&format!("CREATE DATABASE {};\n\n", quote_ident(kind, schema))),
+        DbKind::Redis => return Err(DbError::Unsupported("Redis has no schemas".into())),
     }
     let model = schema_model(conn, schema, None)?;
     for i in dependency_order(&model.tables) {

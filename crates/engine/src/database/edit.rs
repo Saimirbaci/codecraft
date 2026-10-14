@@ -291,6 +291,12 @@ impl DbState {
         if r.edits.submitting {
             return Err("submitting changes…".into());
         }
+        if let Some(kind) = self.source(&r.source).map(|d| d.config.kind).filter(|k| !k.supports_transactions()) {
+            return Err(format!(
+                "cannot edit data in the grid: {} (use statements in the console)",
+                codecraft_db::tx::no_transactions(kind)
+            ));
+        }
         self.edit_target(r).map(|_| ())
     }
 
