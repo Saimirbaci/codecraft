@@ -70,6 +70,48 @@ pub fn unstage_text(head: &str, index: &str, head_range: &Range<usize>) -> Optio
 }
 
 /// The file's mode in the index (`100644` when it has none yet).
+/// Whether a change (work tree vs `HEAD`) is in the index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum StageState {
+    /// None of its lines are staged.
+    Unstaged,
+    /// All of it is staged (the work tree matches the index there).
+    Staged,
+    /// Some lines are staged, others not.
+    Partly,
+}
+
+impl StageState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unstaged => "Not staged",
+            Self::Staged => "Staged",
+            Self::Partly => "Partly staged",
+        }
+    }
+
+    pub fn can_stage(self) -> bool {
+        self != Self::Staged
+    }
+
+    pub fn can_unstage(self) -> bool {
+        self != Self::Unstaged
+    }
+}
+
+/// Compare the index with `HEAD` and the work tree around one change (as the gutter markers
+/// compute it: `current` against `head`). `None` if neither side differs there (stale marker).
+pub fn stage_state(head: &str, index: &str, current: &str, change: &LineChange) -> Option<StageState> {
+    let unstaged = stage_text(index, current, &(change.start..change.end)).is_some();
+    let staged = unstage_text(head, index, &(change.old_start..change.old_end)).is_some();
+    match (staged, unstaged) {
+        (false, true) => Some(StageState::Unstaged),
+        (true, false) => Some(StageState::Staged),
+        (true, true) => Some(StageState::Partly),
+        (false, false) => None,
+    }
+}
+
 fn index_mode(git: &Git, path: &str) -> Result<String> {
     let out = git.read_text(["ls-files", "-s", "--", &pathspec(path)])?;
     Ok(out.split_whitespace().next().filter(|m| m.len() == 6).unwrap_or("100644").to_string())
@@ -148,6 +190,28 @@ mod tests {
         assert_eq!(stage_text("a\nb\n", "a\n", &(1..1)).unwrap(), "a\n");
         assert_eq!(stage_text("a\n", "a\nz\n", &(1..2)).unwrap(), "a\nz\n");
         assert_eq!(apply_forward("x\n", "", &line_changes("x\n", "")[0]), "");
+    }
+
+    #[test]
+    fn stage_state_compares_head_index_and_work_tree() {
+        let head = "a\nb\nc\nd\ne\n";
+        let current = "a\nB\nc\nd\nE\nE2\n";
+        let changes = line_changes(head, current);
+        assert_eq!(changes.len(), 2);
+        // Nothing staged.
+        assert_eq!(stage_state(head, head, current, &changes[0]), Some(StageState::Unstaged));
+        // The first change staged entirely.
+        let index = stage_text(head, current, &(1..2)).unwrap();
+        assert_eq!(stage_state(head, &index, current, &changes[0]), Some(StageState::Staged));
+        assert_eq!(stage_state(head, &index, current, &changes[1]), Some(StageState::Unstaged));
+        // Half of the second change staged (E staged, E2 not).
+        let partly = "a\nB\nc\nd\nE\n";
+        assert_eq!(stage_state(head, partly, current, &changes[1]), Some(StageState::Partly));
+        // A stale marker.
+        assert_eq!(stage_state(head, head, head, &changes[0]), None);
+        assert!(StageState::Partly.can_stage() && StageState::Partly.can_unstage());
+        assert!(!StageState::Staged.can_stage() && !StageState::Unstaged.can_unstage());
+        assert_eq!(StageState::Partly.label(), "Partly staged");
     }
 
     #[test]

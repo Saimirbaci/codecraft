@@ -160,6 +160,9 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::terminal_cmds::specs());
         specs.extend(crate::vcs_cmds::specs());
         specs.extend(crate::vcs_ext_cmds::specs());
+        specs.extend(crate::vcs::changelists::specs());
+        specs.extend(crate::vcs::shelf::specs());
+        specs.extend(crate::github_prs::specs());
         specs.extend(crate::debug_cmds::specs());
         specs.extend(crate::database_cmds::specs());
         specs.extend(crate::agent_cmds::specs());

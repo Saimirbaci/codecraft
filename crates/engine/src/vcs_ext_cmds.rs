@@ -210,12 +210,23 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                     Some(c) => return Err(CommandError::BadParams(format!("there is no change #{c}"))),
                     None if n == 0 => 0,
                     None if next => m.next_unresolved((m.selected + 1) % n).unwrap_or(m.selected),
-                    None => (1..=n)
-                        .map(|k| (m.selected + n - k) % n)
-                        .find(|i| m.resolutions.get(*i).is_some_and(Option::is_none))
-                        .unwrap_or(m.selected),
+                    None => m.prev_unresolved(m.selected).unwrap_or(m.selected),
                 };
-                Ok(json!({ "selected": m.selected }))
+                Ok(json!({ "selected": m.selected, "resultLines": m.result_lines(m.selected).map(|r| [r.start, r.end]) }))
+            },
+        ),
+        spec(
+            "vcs.merge.setResult",
+            "Edit Merge Result",
+            None,
+            "{text: string} — replace the result text (the merge editor's centre pane); changes the edit touches count as resolved by hand",
+            g,
+            merge_open,
+            |s, p| {
+                let text = req_str(p, "text")?.to_string();
+                let m = s.vcs.merge.as_mut().ok_or_else(|| CommandError::Failed("no merge is open".into()))?;
+                m.set_text(text);
+                Ok(json!({ "unresolved": m.unresolved() }))
             },
         ),
         spec(
