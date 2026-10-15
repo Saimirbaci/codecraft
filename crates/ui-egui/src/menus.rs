@@ -33,6 +33,8 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("Run", "debug.atCaret"),
     ("Run", "debug.coreDump"),
     ("Run", "debug.remote"),
+    ("Run", "debug.pythonRemote"),
+    ("Run › Debugging Actions", "debug.jumpToLine"),
     ("Run › Debugging Actions", "debug.disassembly.stepOverInstruction"),
     ("Run › Debugging Actions", "debug.disassembly.stepIntoInstruction"),
     ("Code", "code.showAssembly"),

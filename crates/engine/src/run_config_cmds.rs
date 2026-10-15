@@ -21,14 +21,18 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.create",
             "New Run Configuration",
             None,
-            "{name?: string, kind?: cargo|command|python|cpp|zig|npm|django|fastapi|flask|dockerfile|compose|cmake, \
+            "{name?: string, kind?: cargo|command|python|cpp|zig|npm|django|fastapi|flask|dockerfile|compose|cmake|\
+             remote|coredump|pythonremote, \
              command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, envFile?: string (a .env file, relative to the project), \
              workingDir?: string, beforeLaunch?: [{kind: build}|{kind: runConfiguration, name}|{kind: external, \
-             command, workingDir?}], debugger?: {initCommands?: [string], stopAtEntry?: bool, env?}, \
-             storeAsProjectFile?: bool, executable?: string (cmake)} → {index}. A new configuration starts from \
+             command, workingDir?}], debugger?: {initCommands?: [string], stopAtEntry?: bool, env?, justMyCode?: bool, \
+             subProcess?: bool}, storeAsProjectFile?: bool, executable?: string (cmake)} → {index}. A new configuration starts from \
              its kind's template (runConfig.template.update). Cargo commands omit `cargo` (`run --bin app -- --port 80`); \
              python: `main.py --arg` or `-m pytest`; cpp: sources and flags, then `-- args` (compiled and run); \
-             zig: `build run`; npm: `run dev`; cmake: a CMake target, then `-- args` (built, then its executable runs).",
+             zig: `build run`; npm: `run dev`; cmake: a CMake target, then `-- args` (built, then its executable runs); \
+             debug only (Run debugs them): remote: `host:port [program]` (gdb-remote) or `connect://host:port \
+             --platform remote-linux program -- args` (lldb-server platform); coredump: `core [program]`; \
+             pythonremote: `host:port [local=remote …]` (python -m debugpy --listen).",
             Context::Global,
             has_project,
             create,

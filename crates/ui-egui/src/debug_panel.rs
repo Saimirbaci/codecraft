@@ -48,6 +48,8 @@ pub struct DebugUi {
     attach_scroll: bool,
     /// The Memory, Disassembly and Registers tabs and the debug forms.
     pub views: ViewsUi,
+    /// Breakpoint popup, step targets, Set Value, completions (M14 track DBG).
+    pub dbg: crate::debug_dbg_ui::DbgUi,
 }
 
 /// What the user did this frame; applied after painting (the tree is drawn from `&Session`).
@@ -55,6 +57,8 @@ enum Action {
     Command(&'static str, Value),
     Copy(String),
     SelectBreakpoint(u64),
+    /// Set Value… on a variable: (parent reference, name, current value).
+    SetValue(i64, String, String),
 }
 
 pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
@@ -94,15 +98,11 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
                 st.debug.selected_breakpoint = Some(id);
                 s.debug.tab = DebugTab::Breakpoints;
             }
+            Action::SetValue(parent, name, value) => crate::debug_dbg_ui::begin_set_value(st, parent, name, value),
         }
     }
 }
 
-/// Ask the Breakpoints tab to select a breakpoint (the editor's gutter context click).
-pub fn select_breakpoint(s: &mut Session, st: &mut UiState, id: u64) {
-    st.debug.selected_breakpoint = Some(id);
-    run_command(s, st, "debug.showTab", &json!({ "tab": "breakpoints" }));
-}
 
 // ---------------------------------------------------------------- header: tabs, toolbar, status
 
@@ -221,6 +221,7 @@ fn status_label(ui: &mut Ui, debug: &DebugState, theme: &Theme) {
     if !session.name.is_empty() {
         ui.label(RichText::new(&session.name).strong());
     }
+    crate::debug_dbg_ui::processes(ui, session, theme);
 }
 
 // ---------------------------------------------------------------- icons
@@ -548,6 +549,7 @@ fn variables(
     Frame::new().fill(theme.editor_bg).inner_margin(Margin::same(2)).show(ui, |ui| {
         ScrollArea::vertical().id_salt("debug-vars-scroll").auto_shrink([false, false]).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            crate::debug_dbg_ui::stop_details(ui, session, theme);
             let tree = Tree { debug, session, theme };
             if let Some(evaluation) = &debug.evaluation {
                 match (&evaluation.result, evaluation.pending) {
@@ -826,6 +828,10 @@ impl Tree<'_> {
                     actions.push(Action::Command("debug.addWatch", json!({ "expression": expr })));
                     ui.close();
                 }
+                if glyph == Glyph::Variable && self.debug.is_stopped() && parent > 0 && ui.button("Set Value…").clicked() {
+                    actions.push(Action::SetValue(parent, v.name.clone(), v.value.clone()));
+                    ui.close();
+                }
                 if glyph == Glyph::Variable && self.debug.is_stopped() {
                     ui.separator();
                     let expr = v.evaluate_name.clone().unwrap_or_else(|| v.name.clone());
@@ -920,10 +926,21 @@ fn console(ui: &mut Ui, debug: &DebugState, theme: &Theme, view: &mut DebugUi, a
         ui.label(RichText::new("›").color(theme.link).font(FontId::monospace(14.0)));
         let enabled = debug.is_active();
         let lldb = debug.session.as_ref().is_some_and(|x| x.adapter.starts_with("lldb") || x.adapter == "codelldb");
+        // Tab completes (DAP completions) instead of moving the focus.
+        let input_id = egui::Id::new("debug-console-input");
+        let had_focus = ui.memory(|m| m.has_focus(input_id));
+        if enabled && had_focus && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Tab)) {
+            let column = view.console_input.chars().count();
+            actions.push(Action::Command(
+                "debug.consoleComplete",
+                json!({ "text": view.console_input.clone(), "column": column }),
+            ));
+        }
         let resp = ui.add_enabled(
             enabled,
             TextEdit::singleline(&mut view.console_input)
                 .id(egui::Id::new("debug-console-input"))
+                .lock_focus(true)
                 .desired_width(f32::INFINITY)
                 .font(FontId::monospace(13.0))
                 .hint_text(
@@ -966,6 +983,13 @@ fn console(ui: &mut Ui, debug: &DebugState, theme: &Theme, view: &mut DebugUi, a
             resp.request_focus();
         }
     });
+    let input = view.console_input.clone();
+    let (picked, cmds) = crate::debug_dbg_ui::console_completions(ui, debug, theme, &input, &mut view.dbg);
+    actions.extend(cmds.into_iter().map(|(id, p)| Action::Command(id, p)));
+    if let Some(text) = picked {
+        view.console_input = text;
+        ui.memory_mut(|m| m.request_focus(egui::Id::new("debug-console-input")));
+    }
 }
 
 // ---------------------------------------------------------------- Breakpoints
@@ -989,12 +1013,11 @@ pub fn paint_breakpoint(painter: &egui::Painter, c: Pos2, radius: f32, bp: &Brea
 
 fn breakpoints(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut DebugUi, actions: &mut Vec<Action>) {
     let debug = &s.debug;
+    // Exception breakpoints (M14 track DBG): Rust panics, C++ throw/catch, Python exceptions.
+    for (id, params) in crate::debug_dbg_ui::exception_breakpoints(ui, s, theme) {
+        actions.push(Action::Command(id, params));
+    }
     ui.horizontal(|ui| {
-        let mut on_panic = debug.break_on_panic;
-        if ui.checkbox(&mut on_panic, "Break on Rust panics").changed() {
-            actions.push(Action::Command("debug.breakOnPanic", json!({ "enabled": on_panic })));
-        }
-        ui.add_space(8.0);
         if ui.add_enabled(!debug.breakpoints.is_empty(), egui::Button::new("Remove All")).clicked() {
             actions.push(Action::Command("debug.removeAllBreakpoints", Value::Null));
             view.selected_breakpoint = None;
@@ -1090,6 +1113,10 @@ fn breakpoints(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut DebugUi, acti
                         "navigate.openLocation",
                         json!({ "path": bp.path, "line": bp.line, "column": 0 }),
                     ));
+                    ui.close();
+                }
+                if ui.button("Edit…").clicked() {
+                    actions.push(Action::Command("debug.editBreakpoint", json!({ "id": bp.id })));
                     ui.close();
                 }
                 if ui.button("Remove").clicked() {

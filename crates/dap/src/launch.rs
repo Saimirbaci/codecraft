@@ -35,6 +35,21 @@ pub struct PythonLaunch {
     pub python: Option<PathBuf>,
     pub just_my_code: bool,
     pub stop_on_entry: bool,
+    /// Debug the processes the program starts too (debugpy's `subProcess`; each child arrives
+    /// as a `startDebugging` request).
+    pub sub_process: bool,
+    /// Django template debugging (breakpoints in templates, `django: true`).
+    pub django: bool,
+    /// Jinja template debugging (Flask, `jinja: true`).
+    pub jinja: bool,
+}
+
+/// A local directory and where the same files live on the remote machine (`pathMappings`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PathMapping {
+    pub local_root: String,
+    pub remote_root: String,
 }
 
 /// A Node.js program under js-debug.
@@ -109,8 +124,15 @@ pub fn python(launch: &PythonLaunch) -> Value {
         "console": "internalConsole",
         "redirectOutput": true,
         "showReturnValue": true,
+        "subProcess": launch.sub_process,
     }));
     if let Some(map) = value.as_object_mut() {
+        if launch.django {
+            map.insert("django".into(), true.into());
+        }
+        if launch.jinja {
+            map.insert("jinja".into(), true.into());
+        }
         match (&launch.module, &launch.program) {
             (Some(module), _) => {
                 map.insert("module".into(), module.clone().into());
@@ -295,6 +317,74 @@ pub fn valid_remote_address(address: &str) -> bool {
         && port.parse::<u16>().is_ok_and(|p| p > 0)
 }
 
+/// Run the program on a remote machine through an `lldb-server platform` (`platform select`,
+/// `platform connect`), then debug it there. `url` is `connect://host:port`; `platform` is
+/// `remote-linux`, `remote-macosx`, `remote-android`, … `program` is the local executable, which
+/// LLDB uploads to the platform's working directory.
+pub fn native_platform(
+    kind: AdapterKind,
+    name: &str,
+    platform: &str,
+    url: &str,
+    program: &std::path::Path,
+    args: &[String],
+    init_commands: &[String],
+) -> Value {
+    let mut init = init_commands.to_vec();
+    init.push(format!("platform select {}", platform.trim()));
+    init.push(format!("platform connect {}", url.trim()));
+    match kind {
+        AdapterKind::CodeLldb => json!({
+            "name": name,
+            "type": "lldb",
+            "request": "launch",
+            "program": program.display().to_string(),
+            "args": args,
+            "initCommands": init,
+        }),
+        _ => json!({
+            "name": name,
+            "type": "lldb-dap",
+            "request": "launch",
+            "program": program.display().to_string(),
+            "args": args,
+            "initCommands": init,
+        }),
+    }
+}
+
+/// An `lldb-server platform` URL (`connect://host:port`).
+pub fn valid_platform_url(url: &str) -> bool {
+    url.trim().strip_prefix("connect://").is_some_and(valid_remote_address)
+}
+
+/// An LLDB platform name (`remote-linux`).
+pub fn valid_platform_name(platform: &str) -> bool {
+    let p = platform.trim();
+    !p.is_empty() && p.len() <= 64 && p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// `attach` arguments for a Python program started with `python -m debugpy --listen host:port`
+/// (or `debugpy.listen()`), possibly on another machine: the adapter connects to it. Path
+/// mappings translate local file paths to the remote machine's.
+pub fn python_remote(name: &str, host: &str, port: u16, mappings: &[PathMapping], just_my_code: bool) -> Value {
+    let mut value = json!({
+        "name": name,
+        "type": "python",
+        "request": "attach",
+        "connect": { "host": host.trim(), "port": port },
+        "justMyCode": just_my_code,
+        "redirectOutput": true,
+        "showReturnValue": true,
+    });
+    if !mappings.is_empty()
+        && let Some(map) = value.as_object_mut()
+    {
+        map.insert("pathMappings".into(), json!(mappings));
+    }
+    value
+}
+
 /// `attach` arguments for a running Python process (debugpy injects itself by process id).
 pub fn python_attach(name: &str, pid: u32, just_my_code: bool) -> Value {
     json!({
@@ -389,6 +479,46 @@ mod tests {
         let code = native(AdapterKind::CodeLldb, &launch);
         assert_eq!(code["env"], json!({"RUST_BACKTRACE": "1"}));
         assert_eq!(code["type"], json!("lldb"));
+    }
+
+    #[test]
+    fn platform_and_python_remote_arguments() {
+        let v = native_platform(
+            AdapterKind::LldbDap,
+            "p",
+            "remote-linux",
+            "connect://10.0.0.2:1234",
+            std::path::Path::new("/p/app"),
+            &["--x".into()],
+            &["settings set a b".into()],
+        );
+        assert_eq!(v["request"], json!("launch"));
+        assert_eq!(
+            v["initCommands"],
+            json!(["settings set a b", "platform select remote-linux", "platform connect connect://10.0.0.2:1234"])
+        );
+        assert_eq!(v["args"], json!(["--x"]));
+        assert!(valid_platform_url("connect://host:1"));
+        assert!(!valid_platform_url("host:1"));
+        assert!(!valid_platform_url("connect://host"));
+        assert!(valid_platform_name("remote-linux"));
+        assert!(!valid_platform_name("remote linux"));
+        assert!(!valid_platform_name(""));
+        let mapping = PathMapping { local_root: "/home/me/app".into(), remote_root: "/srv/app".into() };
+        let r = python_remote("r", " 127.0.0.1 ", 5678, &[mapping], false);
+        assert_eq!(r["connect"], json!({"host": "127.0.0.1", "port": 5678}));
+        assert_eq!(r["pathMappings"], json!([{"localRoot": "/home/me/app", "remoteRoot": "/srv/app"}]));
+        assert_eq!(r["justMyCode"], json!(false));
+        assert!(python_remote("r", "h", 1, &[], true).get("pathMappings").is_none());
+    }
+
+    #[test]
+    fn python_flags() {
+        let v = python(&PythonLaunch { sub_process: true, django: true, ..Default::default() });
+        assert_eq!((v["subProcess"].clone(), v["django"].clone()), (json!(true), json!(true)));
+        assert!(v.get("jinja").is_none());
+        let v = python(&PythonLaunch { jinja: true, ..Default::default() });
+        assert_eq!((v["subProcess"].clone(), v["jinja"].clone()), (json!(false), json!(true)));
     }
 
     #[test]

@@ -131,6 +131,11 @@ pub(crate) fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
             return Ok(v);
         }
     }
+    // Remote Debug, Core Dump and Python Debug Server configurations only debug (M14 track DBG).
+    let selected = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone());
+    if selected.is_some_and(|n| s.run_store.user.iter().any(|c| c.name.trim() == n && c.kind.debug_only())) {
+        return crate::debug_cmds::debug_config(s, &json!({ "beforeLaunch": false }));
+    }
     let config = match s.run_configs.get(s.selected_run_config) {
         Some(c) => c.clone(),
         None if is_cargo_project(s) => RunConfig::cargo("cargo run", CargoInvocation::new(CargoCommand::Run, root(s)?)),

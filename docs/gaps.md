@@ -10,8 +10,11 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    `size=N`, with the toolchain's LLDB formatters (or a sibling toolchain's when missing) and the
    pointer dropped from pointer+summary values; Run › Attach to Process… (Alt+Shift+F5) lists
    processes from `ps` (filter, all users) and attaches with lldb-dap (native/Rust) or debugpy
-   (Python); Stop detaches.) Python attach depends on debugpy's process injection (not tested
-   end to end); closing the window kills the adapter rather than detaching first.
+   (Python); Stop detaches.) ~~Python attach depends on debugpy's process injection (not tested
+   end to end)~~ (M14 DBG, 2026-10-15: tested end to end; here macOS refuses to inject into
+   python.org's hardened Python, so the test skips, and CodeCraft now reports the OS's refusal at
+   once instead of after debugpy's connection timeout; item 53); closing the window kills the
+   adapter rather than detaching first.
 2. ~~No VCS~~ (landed in M3). ~~3-way merge view, per-hunk staging, worktrees, GitHub~~ (X,
    2026-10-13: Stage/Unstage/Rollback in the gutter change popup (index-only, the work tree is
    untouched); a three-way merge window for conflicted files (yours/base/theirs from the index
@@ -329,8 +332,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Tool Windows, Jump to Last Tool Window; Window › Notifications › Close First/Close All.
     Window › Merge All Project Windows is out of scope (macOS window tabs; project windows are
     egui viewports). Remaining: no inline (single-line) folds for Fold Selection, and folds stay on
-    their start lines when lines are inserted above; Force Step Over / Smart Step Into / Force Run
-    to Cursor do the plain step (DAP cannot ignore breakpoints, lldb-dap has no step-in targets);
+    their start lines when lines are inserted above; Force Step Over / Force Run to Cursor do the
+    plain step (DAP cannot ignore breakpoints); ~~Smart Step Into does the plain step~~ (M14 DBG:
+    a chooser of the line's calls, DAP `stepInTargets` or LLDB `thread step-in --step-in-target`,
+    item 53);
     File System Sync, Aggregator, Grid Position, JSON Schema and Rust Resolve Context widgets are
     toggles without a widget; Find Usages' test filter goes by path (not `#[cfg(test)]` modules);
     the "All Programs" actions act on the one debug session CodeCraft runs; Active Tool Window's
@@ -344,8 +349,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     (`gdb-remote`) debugging from Run › Debug…, Code › Show Assembly. Xcode's lldb-dap (lldb-1600)
     lacks `readMemory`/`writeMemory`/`dataBreakpointInfo`/stepping granularity and misaligns
     `disassemble`, so CodeCraft checks the adapter's capabilities and falls back to LLDB console
-    commands. Remaining: core-dump and remote debugging are not run configuration kinds; the
-    console disassembly fallback shows only the current function; watchpoints last for the
+    commands. Remaining: ~~core-dump and remote debugging are not run configuration kinds~~ (M14
+    DBG: Remote Debug and Core Dump configuration kinds, tested end to end with debugserver and an
+    LLDB-saved core, item 53); the console disassembly fallback shows only the current function; watchpoints last for the
     session (no conditions or hit counts); older consoles need `p`/`expr` for expressions; no
     search in the Memory view and bytes are edited through a hex field; Show Assembly has no
     source-to-asm mapping, LLVM IR/MIR views or target choice; on this machine only the console
@@ -764,3 +770,61 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     directory (no per-configuration profile); the gutter run menu has no "Run with Coverage";
     `zig`, `tsc`, jest and the AI provider were exercised only through fakes (fake
     scripts, a 127.0.0.1 server).
+
+## M14 (2026-10-15)
+
+53. Debugging depth (track DBG), verified end to end with the real lldb-dap (Xcode) and debugpy
+    1.8 here: breakpoints with conditions, hit counts, logpoints (`{expr}`), temporary (gone once
+    hit) and enabled flags, all saved in `.codecraft/breakpoints.json`, edited in a properties
+    popup from the gutter's right-click (enabled, condition, hit count, log message, remove once
+    hit); exception breakpoints per language in View Breakpoints, saved with the project and sent
+    to a running session at once: Rust panics (a `rust_panic` function breakpoint,
+    `rust_begin_unwind` when that symbol is missing, an adapter's own `rust_panic` filter when it
+    has one; a panic stop says `panic`, shows the user's frame and carries the panic message), C++
+    throw/catch (`cpp_throw`/`cpp_catch`), Python raised / uncaught / user-uncaught; Python: Debug
+    from the gutter on a pytest test runs `pytest file::test` under debugpy, `debug.test` debugs a
+    test-tree row (Rust, pytest, C/C++), Django `runserver` gets `--noreload`, uvicorn loses
+    `--reload*`, `flask run` gets `--no-reload --no-debugger` (plus debugpy's `django`/`jinja`
+    template flags), subprocesses are debugged (debugpy `startDebugging` child sessions over the
+    adapter's socket; the process that stopped is shown, the parent comes back when the child
+    ends), justMyCode and subprocess debugging per configuration (Debugger section), attach to a
+    Python process by pid (fails fast with the OS's reason), remote attach to `python -m debugpy
+    --listen host:port` with path mappings (Run › Attach to Python Debug Server…, a Python Debug
+    Server configuration kind); native: a Remote Debug configuration kind (`gdb-remote host:port`
+    to gdbserver / `lldb-server gdbserver` / debugserver, or `connect://host:port --platform
+    remote-linux` to an `lldb-server platform` that launches the program) and a Core Dump kind
+    (Run debugs both), Run to Cursor, Jump to Line / set next statement (DAP `gotoTargets`/`goto`,
+    LLDB `thread jump`), Set Value (`setVariable`, `setExpression`), Smart Step Into (a chooser;
+    DAP `stepInTargets`, LLDB's calls of the line stepped with `--step-in-target`), the value a
+    function returned after Step Out (LLDB `thread info`, debugpy's `(return)` local) and an
+    exception's type and message (`exceptionInfo`); values: Rust `Option`/`Result`/enums read
+    `Some(5)`, `Err("bad")`, `Rect { w: 3, h: 4 }` (decoded from the DWARF variant part this LLDB
+    shows as `$variants$`; expanding shows the variant's fields), arrays `[1, 2, 3, 4]`, `Box<i32>`
+    its value, alongside the toolchain formatters' `String`/`&str`/`Vec`/`HashMap`/`Rc`/`Arc`/slices;
+    C++ libc++ `std::string`/`vector`/`map`/`unique_ptr` read through LLDB's formatters; Python
+    `DataFrame 3 rows × 2 columns: a, b`, `Series 3 values, int64, name a`, numpy shapes and
+    plain objects as `Point(x=1, y=2)`; hover evaluation of `a.b.c` paths in the editor, debug
+    console completion on Tab (DAP `completions`, LLDB expressions through `p …`); for agents:
+    `debug.stopSummary` (reason, thread, top frames with path/1-based line/code, a source excerpt,
+    locals, return value, exception, hit breakpoints, the last output, the last error),
+    `debug.waitForStop {timeoutMs}` and `debug.poll {token}` (non-blocking tokens answered
+    through the pump), `debug.start`, `debug.step {action}` and `debug.runToLine` handing back a
+    wait token, `debug.evaluate` with one level of children, `debug.variables`, `debug.setValue`,
+    `debug.breakpoint.set/remove/list` with 1-based lines and compact JSON,
+    `debug.exceptionBreakpoints`. Remaining: Xcode's lldb-dap has no `stepInTargets`/`goto`, so
+    LLDB's step targets come from a lexical scan of the line (a call inside a macro or a
+    multi-line call is missed) and Jump to Line is `thread jump` (a breakpoint on the line jumped
+    to doesn't trigger, side effects of skipped code don't happen); LLDB's hit count `N` means
+    "stop from the N-th hit on" while debugpy's means "exactly the N-th" (`>= N`, `% N` work
+    there); Rust enum decoding reads the variant from LLDB's text (nested enums inside a variant
+    show `{…}` until expanded, `Box<u8>` still reads as a character) and `Rc`/`Arc` show
+    `strong=…, weak=…` without the value; DataFrame/object summaries evaluate small expressions
+    in the program (a property with side effects would run); subprocess debugging is debugpy
+    only (no lldb-dap `follow-fork`), the Debug tool window shows one process at a time (no
+    process picker; agents see the list), and a stopped parent stays paused in the background
+    while a child is shown; the `lldb-server platform` mode is unit-tested only (no lldb-server on
+    macOS), and Python attach by pid could not run here (macOS refused the injection); Django and
+    Flask arguments are unit-tested (not installed here; FastAPI/uvicorn ran end to end);
+    completion in the console is a list of buttons (no keyboard navigation of the list); there
+    is no editor context menu with Jump to Line (Run › Debugging Actions › Jump to Line acts on
+    the caret line).

@@ -42,6 +42,12 @@ pub struct Capabilities {
     pub supports_instruction_breakpoints: bool,
     /// `restartFrame` (Run › Debugging Actions › Reset Frame).
     pub supports_restart_frame: bool,
+    /// `completions` (debug console completion).
+    pub supports_completions_request: bool,
+    /// `exceptionInfo` (what was thrown, for the stop summary).
+    pub supports_exception_info_request: bool,
+    /// `setExpression` (Set Value on a watch or an evaluated expression).
+    pub supports_set_expression: bool,
     pub exception_breakpoint_filters: Vec<ExceptionBreakpointsFilter>,
 }
 
@@ -269,6 +275,89 @@ pub struct DataBreakpoint {
     pub hit_condition: Option<String>,
 }
 
+/// A place execution can jump to (`gotoTargets` response).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct GotoTarget {
+    pub id: i64,
+    pub label: String,
+    pub line: i64,
+    pub column: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GotoTargetsBody {
+    pub targets: Vec<GotoTarget>,
+}
+
+/// A function a step into can stop in (`stepInTargets` response).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct StepInTarget {
+    pub id: i64,
+    pub label: String,
+    pub line: Option<i64>,
+    pub column: Option<i64>,
+    pub end_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StepInTargetsBody {
+    pub targets: Vec<StepInTarget>,
+}
+
+/// One proposal of a `completions` response. `start`/`length` (in UTF-16 units of the text,
+/// zero-based) say what it replaces; without them it replaces the word before the column.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CompletionItem {
+    pub label: String,
+    pub text: Option<String>,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub detail: Option<String>,
+    pub start: Option<i64>,
+    pub length: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompletionsBody {
+    pub targets: Vec<CompletionItem>,
+}
+
+/// `setVariable` / `setExpression` response body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SetVariableBody {
+    pub value: String,
+    #[serde(rename = "type")]
+    pub type_: Option<String>,
+    pub variables_reference: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExceptionDetails {
+    pub message: Option<String>,
+    pub type_name: Option<String>,
+    pub full_type_name: Option<String>,
+    pub stack_trace: Option<String>,
+}
+
+/// `exceptionInfo` response body.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExceptionInfoBody {
+    pub exception_id: String,
+    pub description: Option<String>,
+    /// `never`, `always`, `unhandled`, `userUnhandled`.
+    pub break_mode: String,
+    pub details: Option<ExceptionDetails>,
+}
+
 // ---------------------------------------------------------------- events
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,6 +471,25 @@ mod tests {
         let bp =
             DataBreakpoint { data_id: "16FDFCCF8/4".into(), access_type: Some("write".into()), ..Default::default() };
         assert_eq!(serde_json::to_value(bp).unwrap(), json!({"dataId": "16FDFCCF8/4", "accessType": "write"}));
+    }
+
+    #[test]
+    fn stepping_and_completion_bodies_parse() {
+        let goto: GotoTargetsBody = parse(&json!({"targets": [{"id": 3, "label": "line 7", "line": 7}]})).unwrap();
+        assert_eq!((goto.targets[0].id, goto.targets[0].line), (3, 7));
+        let step: StepInTargetsBody = parse(&json!({"targets": [{"id": 1, "label": "work"}, {"id": 2}]})).unwrap();
+        assert_eq!(step.targets.len(), 2);
+        let completions: CompletionsBody =
+            parse(&json!({"targets": [{"label": "total", "type": "variable", "start": 0, "length": 3}]})).unwrap();
+        assert_eq!(completions.targets[0].type_.as_deref(), Some("variable"));
+        let set: SetVariableBody = parse(&json!({"value": "99", "type": "int"})).unwrap();
+        assert_eq!(set.value, "99");
+        let info: ExceptionInfoBody = parse(&json!({"exceptionId": "ValueError", "breakMode": "always",
+            "details": {"message": "bad", "typeName": "ValueError"}}))
+        .unwrap();
+        assert_eq!(info.details.and_then(|d| d.message).as_deref(), Some("bad"));
+        let caps: Capabilities = parse(&json!({"supportsCompletionsRequest": true})).unwrap();
+        assert!(caps.supports_completions_request && !caps.supports_set_expression);
     }
 
     #[test]

@@ -529,6 +529,45 @@ impl DebugMarks {
     }
 }
 
+/// The expression under the pointer for a debugger hover: the identifier there with the
+/// `a.b.` / `a::` / `a->` path before it (no calls). `None` on keywords, numbers and blanks.
+pub(crate) fn hover_expression(doc: &codecraft_text::Document, offset: usize) -> Option<String> {
+    let range = codecraft_text::movement::word_range_at(doc, offset);
+    let word = doc.slice(range.clone());
+    let first = word.chars().next()?;
+    if !(first.is_alphabetic() || first == '_') || word.len() > 80 {
+        return None;
+    }
+    if matches!(
+        word.as_str(),
+        "fn" | "let" | "mut" | "if" | "else" | "for" | "while" | "return" | "def" | "class" | "in" | "and" | "or"
+            | "not" | "int" | "void" | "auto" | "const" | "struct" | "pub" | "use" | "import" | "from" | "self"
+            | "true" | "false" | "None" | "True" | "False"
+    ) {
+        return None;
+    }
+    let line = doc.char_to_line(range.start);
+    let line_start = doc.position_to_offset(codecraft_text::Position::new(line, 0));
+    let before: Vec<char> = doc.slice(line_start..range.start).chars().collect();
+    let mut start = before.len();
+    loop {
+        let rest: String = before.get(..start).map(|c| c.iter().collect()).unwrap_or_default();
+        let sep = [".", "::", "->"].into_iter().find(|s| rest.ends_with(s));
+        let Some(sep) = sep else { break };
+        let mut k = start - sep.chars().count();
+        let end = k;
+        while k > 0 && before.get(k - 1).is_some_and(|c| c.is_alphanumeric() || *c == '_') {
+            k -= 1;
+        }
+        if k == end {
+            break;
+        }
+        start = k;
+    }
+    let prefix: String = before.get(start..).map(|c| c.iter().collect()).unwrap_or_default();
+    Some(format!("{prefix}{word}"))
+}
+
 fn breakpoint_tooltip(bp: &codecraft_engine::debug::Breakpoint) -> String {
     let mut text = String::from(if bp.temporary { "Temporary line breakpoint" } else { "Line breakpoint" });
     if !bp.enabled {
@@ -1451,10 +1490,22 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         if !msgs.is_empty() {
             response = response.on_hover_text_at_pointer(msgs.join("\n\n"));
         } else if !marks.locals.is_empty() {
-            // While suspended: the value of the variable under the pointer.
+            // While suspended: the value of the variable under the pointer, else the debugger's
+            // evaluation of the expression there (`self.items`, `point.x`).
             let word = doc.slice(codecraft_text::movement::word_range_at(doc, off));
             if let Some((name, value)) = marks.locals.iter().find(|(n, _)| *n == word) {
                 response = response.on_hover_text_at_pointer(format!("{name} = {value}"));
+            } else if let Some(expression) = hover_expression(doc, off) {
+                match &s.debug.hover {
+                    Some(h) if h.expression == expression && !h.pending => {
+                        if let Ok(v) = &h.result {
+                            let value: String = v.value.chars().take(300).collect();
+                            response = response.on_hover_text_at_pointer(format!("{expression} = {value}"));
+                        }
+                    }
+                    Some(h) if h.expression == expression => {}
+                    _ => commands.push(("debug.hoverEvaluate", json!({ "expression": expression }))),
+                }
             }
         }
     }
@@ -1486,7 +1537,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         && let Some(bp) = marks.breakpoints.iter().find(|b| b.line == line)
     {
         if response.secondary_clicked() {
-            gutter_menu_breakpoint = Some(bp.id);
+            gutter_menu_breakpoint = Some((bp.id, pos));
         }
         response = response.on_hover_text_at_pointer(breakpoint_tooltip(bp));
     }
@@ -1524,8 +1575,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     for (cmd, params) in commands {
         crate::run_command(s, st, cmd, &params);
     }
-    if let Some(id) = gutter_menu_breakpoint {
-        crate::debug_panel::select_breakpoint(s, st, id);
+    if let Some((id, pos)) = gutter_menu_breakpoint {
+        // The breakpoint properties popup (M14 track DBG), like RustRover's right-click.
+        crate::debug_dbg_ui::open_breakpoint_popup(s, st, id, Some(pos));
     }
     crate::rc_ui::gutter_run_menu(ui, s, st, path.as_deref(), run_menu);
     if crumbs_shown {

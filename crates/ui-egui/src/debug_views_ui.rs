@@ -34,6 +34,8 @@ pub struct ViewsUi {
     core: String,
     program: String,
     address: String,
+    /// Python Debug Server path mappings (`local=remote; …`).
+    mappings: String,
 }
 
 fn mono() -> FontId {
@@ -435,6 +437,12 @@ pub fn chooser_forms(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut ViewsUi
         {
             cmds.push(("debug.remote", Value::Null));
         }
+        if ui
+            .selectable_label(s.debug.form == Some(DebugForm::PythonRemote), "Attach to Python Debug Server…")
+            .clicked()
+        {
+            cmds.push(("debug.pythonRemote", Value::Null));
+        }
     });
     let Some(form) = s.debug.form else { return };
     ui.add_space(4.0);
@@ -453,6 +461,15 @@ pub fn chooser_forms(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut ViewsUi
                 field(ui, &mut view.address, "host:port (gdbserver, lldb-server gdbserver, debugserver)");
                 ui.end_row();
             }
+            DebugForm::PythonRemote => {
+                ui.label(RichText::new("Connect to").color(theme.text_muted));
+                field(ui, &mut view.address, "host:port of `python -m debugpy --listen host:port …`");
+                ui.end_row();
+                ui.label(RichText::new("Path mappings").color(theme.text_muted));
+                field(ui, &mut view.mappings, "/local/dir=/remote/dir; … (optional)");
+                ui.end_row();
+                return;
+            }
         }
         ui.label(RichText::new("Program").color(theme.text_muted));
         field(ui, &mut view.program, "local executable with symbols (optional)");
@@ -470,6 +487,18 @@ pub fn chooser_forms(ui: &mut Ui, s: &Session, theme: &Theme, view: &mut ViewsUi
             let address = view.address.trim().to_owned();
             let ready = !address.is_empty();
             ("debug.remote", json!({ "address": address, "program": program }), ready)
+        }
+        DebugForm::PythonRemote => {
+            let address = view.address.trim().to_owned();
+            let ready = !address.is_empty();
+            let mappings: serde_json::Map<String, Value> = view
+                .mappings
+                .split(';')
+                .filter_map(|m| m.split_once('='))
+                .filter(|(l, r)| !l.trim().is_empty() && !r.trim().is_empty())
+                .map(|(l, r)| (l.trim().to_owned(), Value::String(r.trim().to_owned())))
+                .collect();
+            ("debug.pythonRemote", json!({ "address": address, "pathMappings": mappings }), ready)
         }
     };
     if ui.add_enabled(ready, egui::Button::new("Debug")).clicked() {

@@ -29,6 +29,17 @@ use codecraft_workspace::{NotificationLevel, ToolWindowId};
 use crate::{CommandError, Session};
 pub use codecraft_dap::processes::{ProcessInfo, ProcessKind};
 
+pub(crate) mod actions;
+pub(crate) mod agent;
+mod children;
+pub mod exceptions;
+mod python_values;
+mod rust_values;
+
+pub use actions::{CompletionEntry, Completions, ExceptionStop, StepTarget, StepTargets, call_candidates};
+pub use children::ProcessEntry;
+pub use exceptions::ExceptionBreakpoints;
+
 /// The debug console keeps at most this many lines.
 pub const MAX_CONSOLE_LINES: usize = 20_000;
 /// How long an adapter has to end the session after `disconnect` before its group is killed.
@@ -226,6 +237,8 @@ pub enum DebugForm {
     CoreDump,
     /// Remote Debug…: a gdbserver/lldb-server address and a local copy of the program.
     Remote,
+    /// Attach to Python Debug Server…: a `debugpy --listen` address and path mappings.
+    PythonRemote,
 }
 
 /// The tabs of the Debug tool window.
@@ -264,6 +277,18 @@ pub struct DebugSession {
     pub execution: Option<(PathBuf, usize)>,
     pub inline_values: Vec<InlineValue>,
     pub debuggee_pid: Option<u32>,
+    /// The value the function just stepped out of returned (`(return) name`), when known.
+    #[serde(default)]
+    pub return_value: Option<VariableInfo>,
+    /// What an exception stop threw.
+    #[serde(default)]
+    pub exception: Option<ExceptionStop>,
+    /// The breakpoints (our ids) the stop hit.
+    #[serde(default)]
+    pub hit_breakpoints: Vec<u64>,
+    /// The processes of a multi-process session (Python subprocesses); empty with one process.
+    #[serde(default)]
+    pub processes: Vec<ProcessEntry>,
 }
 
 impl DebugSession {
@@ -287,6 +312,9 @@ impl DebugSession {
         self.loading.clear();
         self.execution = None;
         self.inline_values.clear();
+        self.return_value = None;
+        self.exception = None;
+        self.hit_breakpoints.clear();
     }
 }
 
@@ -385,10 +413,31 @@ pub enum DebugTarget {
     #[serde(rename_all = "camelCase")]
     Remote {
         name: String,
+        /// `host:port` of a gdbserver / `lldb-server gdbserver` / debugserver (`gdb-remote`), or
+        /// `connect://host:port` of an `lldb-server platform`, which launches `program` there.
         address: String,
-        /// A local copy of the remote executable, for symbols.
+        /// A local copy of the remote executable, for symbols (required with a platform).
         #[serde(default)]
         program: Option<PathBuf>,
+        /// The LLDB platform for `connect://` addresses (`remote-linux` by default).
+        #[serde(default)]
+        platform: Option<String>,
+        /// Program arguments (platform mode).
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    /// A Python program started with `python -m debugpy --listen host:port …` (or that called
+    /// `debugpy.listen()`), here or on another machine. Stopping detaches.
+    #[serde(rename_all = "camelCase")]
+    PythonRemote {
+        name: String,
+        host: String,
+        port: u16,
+        /// Local directories and where the same files are on the remote machine.
+        #[serde(default)]
+        path_mappings: Vec<dap::launch::PathMapping>,
+        #[serde(default = "yes")]
+        just_my_code: bool,
     },
     /// Run › Attach to an Unstarted Process…: wait for a process with this name (or this
     /// executable's name) to start, then attach (lldb `process attach --name X --waitfor`).
@@ -413,6 +462,7 @@ impl DebugTarget {
             | Self::Attach { name, .. }
             | Self::CoreDump { name, .. }
             | Self::Remote { name, .. }
+            | Self::PythonRemote { name, .. }
             | Self::AttachWait { name, .. } => name,
         }
     }
@@ -538,6 +588,20 @@ pub struct DebugState {
     pub views: crate::debug_views::DebugViews,
     /// Code › Show Assembly.
     pub asm: crate::asm::AsmState,
+    /// C++ and Python exception breakpoints (Rust panics: `break_on_panic`).
+    pub exceptions: ExceptionBreakpoints,
+    /// The breakpoint whose properties popup is open (the editor gutter's right-click).
+    pub breakpoint_popup: Option<u64>,
+    /// The value of the expression under the mouse while paused.
+    pub hover: Option<Evaluation>,
+    /// The debug console's completion list.
+    pub completions: Option<Completions>,
+    /// Smart Step Into's chooser.
+    pub step_targets: Option<StepTargets>,
+    /// The last failed debugger action (for agents' stop summary).
+    pub last_error: Option<String>,
+    pub(crate) agent: agent::AgentState,
+    hover_epoch: u64,
     attach_rx: Option<Receiver<Result<Vec<ProcessInfo>, String>>>,
     next_id: u64,
     /// The project whose breakpoints are loaded (`Some(None)`: none open, loaded nothing).
@@ -568,6 +632,14 @@ impl Default for DebugState {
             attach: None,
             views: crate::debug_views::DebugViews::default(),
             asm: crate::asm::AsmState::default(),
+            exceptions: ExceptionBreakpoints::default(),
+            breakpoint_popup: None,
+            hover: None,
+            completions: None,
+            step_targets: None,
+            last_error: None,
+            agent: agent::AgentState::default(),
+            hover_epoch: 0,
             attach_rx: None,
             next_id: 1,
             loaded_for: None,
@@ -729,6 +801,9 @@ enum RunSpec {
     Attach { pid: u32, process: ProcessKind },
     Core { core: PathBuf, program: Option<PathBuf> },
     Remote { address: String, program: Option<PathBuf> },
+    /// `lldb-server platform`: launch `program` on the remote machine.
+    Platform { platform: String, url: String, program: PathBuf },
+    PythonRemote { host: String, port: u16, mappings: Vec<dap::launch::PathMapping>, just_my_code: bool },
     AttachWait { process: String },
 }
 
@@ -784,6 +859,15 @@ enum Pending {
         epoch: u64,
         request: crate::debug_views::ViewRequest,
     },
+    /// Jump to Line, Set Value, step targets, completions, return values (see `actions`).
+    Action {
+        epoch: u64,
+        request: actions::ActionRequest,
+    },
+    /// The Rust panic function breakpoint (`fallback`: `rust_begin_unwind` was tried already).
+    PanicBreakpoint {
+        fallback: bool,
+    },
     Other,
 }
 
@@ -801,7 +885,7 @@ impl Pending {
                 | Self::View { .. }
                 | Self::SetBreakpoints { .. }
                 | Self::ResetFrame
-        )
+        ) || matches!(self, Self::Action { request, .. } if request.blocks_settling())
     }
 }
 
@@ -810,6 +894,10 @@ enum EvalPurpose {
     Watch(String),
     Console,
     Evaluate(String),
+    /// The value under the mouse.
+    Hover(String),
+    /// An agent's `debug.evaluate` (answered through its token).
+    Agent(u64),
 }
 
 struct Runtime {
@@ -842,6 +930,14 @@ struct Runtime {
     launch_args: Option<Value>,
     /// The run configuration's debugger options (init commands, stop at entry, debuggee env).
     options: crate::run_config_store::DebuggerOptions,
+    /// The last step command (a Step Out's stop reads the return value).
+    last_step: Option<Step>,
+    /// The function a Step Out left (labels the return value).
+    step_from_function: Option<String>,
+    /// Child sessions (Python subprocesses).
+    children: children::Children,
+    /// The adapter's ids of the Rust panic function breakpoint (a stop there is a panic).
+    panic_breakpoints: Vec<i64>,
 }
 
 impl Runtime {
@@ -867,6 +963,10 @@ impl Runtime {
             canonical_root,
             launch_args: None,
             options: Default::default(),
+            last_step: None,
+            step_from_function: None,
+            children: children::Children::default(),
+            panic_breakpoints: Vec::new(),
         }
     }
 
@@ -880,12 +980,17 @@ impl Runtime {
     fn attached(&self) -> bool {
         matches!(
             self.plan.run,
-            RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. } | RunSpec::AttachWait { .. }
+            RunSpec::Attach { .. }
+                | RunSpec::Core { .. }
+                | RunSpec::Remote { .. }
+                | RunSpec::AttachWait { .. }
+                | RunSpec::PythonRemote { .. }
         )
     }
 
     /// End the session with `disconnect`: detach from an attached process, else terminate.
-    fn end(&self, grace: Duration) {
+    fn end(&mut self, grace: Duration) {
+        self.children.end_all(grace);
         if let Some(client) = self.client() {
             if self.attached() { client.detach(grace) } else { client.terminate(grace) }
         }
@@ -930,7 +1035,8 @@ impl Runtime {
     }
 
     /// Kill everything now (window closing).
-    fn kill(self, pid: Option<u32>, exited: bool) {
+    fn kill(mut self, pid: Option<u32>, exited: bool) {
+        self.children.kill_all();
         match self.phase {
             Phase::Build { handle, .. } => {
                 let _ = handle.kill();
@@ -991,7 +1097,7 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                     python: python.clone(),
                     just_my_code: *just_my_code,
                 },
-                args: args.clone(),
+                args: python_debug_args(program.as_deref(), module.as_deref(), args),
                 cwd: cwd.clone().or_else(|| program.as_ref().and_then(|p| p.parent().map(Path::to_path_buf))),
                 env: env.clone(),
             })
@@ -1066,7 +1172,28 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                 env: Vec::new(),
             })
         }
-        DebugTarget::Remote { name, address, program } => {
+        DebugTarget::Remote { name, address, program, platform, args } if address.trim().starts_with("connect://") => {
+            if !dap::launch::valid_platform_url(address) {
+                return Err(format!("`{address}` is not a connect://host:port address"));
+            }
+            let platform = platform.clone().unwrap_or_else(|| "remote-linux".into());
+            if !dap::launch::valid_platform_name(&platform) {
+                return Err(format!("`{platform}` is not an LLDB platform name (remote-linux, remote-macosx, …)"));
+            }
+            let program = program.clone().ok_or("a platform connection needs the program to launch there")?;
+            if !program.is_file() {
+                return Err(format!("{} does not exist", program.display()));
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::Platform { platform, url: address.trim().to_owned(), program },
+                args: args.clone(),
+                cwd: None,
+                env: Vec::new(),
+            })
+        }
+        DebugTarget::Remote { name, address, program, .. } => {
             if !dap::launch::valid_remote_address(address) {
                 return Err(format!("`{address}` is not a host:port address"));
             }
@@ -1077,6 +1204,29 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
                 name: name.clone(),
                 build: None,
                 run: RunSpec::Remote { address: address.trim().to_owned(), program: program.clone() },
+                args: Vec::new(),
+                cwd: None,
+                env: Vec::new(),
+            })
+        }
+        DebugTarget::PythonRemote { name, host, port, path_mappings, just_my_code } => {
+            if !dap::launch::valid_remote_address(&format!("{}:{port}", host.trim())) {
+                return Err(format!("`{host}:{port}` is not a host:port address"));
+            }
+            if path_mappings.len() > 64
+                || path_mappings.iter().any(|m| m.local_root.trim().is_empty() || m.remote_root.trim().is_empty())
+            {
+                return Err("each path mapping needs a local and a remote directory".into());
+            }
+            Ok(LaunchPlan {
+                name: name.clone(),
+                build: None,
+                run: RunSpec::PythonRemote {
+                    host: host.trim().to_owned(),
+                    port: *port,
+                    mappings: path_mappings.clone(),
+                    just_my_code: *just_my_code,
+                },
                 args: Vec::new(),
                 cwd: None,
                 env: Vec::new(),
@@ -1103,6 +1253,53 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
             cwd: cwd.clone().or_else(|| program.parent().map(Path::to_path_buf)),
             env: Vec::new(),
         }),
+    }
+}
+
+/// A Python web framework's arguments for debugging: its auto-reloader restarts the server in
+/// a new process (breakpoints would stop in a process the debugger didn't start), so Django's
+/// `runserver` gets `--noreload`, uvicorn loses `--reload` (and its `--reload-*` options) and
+/// `flask run` gets `--no-reload --no-debugger` (Werkzeug's debugger would catch exceptions
+/// first), as PyCharm does.
+pub fn python_debug_args(program: Option<&Path>, module: Option<&str>, args: &[String]) -> Vec<String> {
+    let manage_py = program.and_then(Path::file_name).is_some_and(|n| n == "manage.py");
+    match module {
+        _ if manage_py => {
+            let mut out = args.to_vec();
+            if args.first().is_some_and(|a| a == "runserver") && !args.iter().any(|a| a == "--noreload") {
+                out.push("--noreload".into());
+            }
+            out
+        }
+        Some("uvicorn") => {
+            let mut out = Vec::new();
+            let mut skip_value = false;
+            for a in args {
+                if skip_value {
+                    skip_value = false;
+                    continue;
+                }
+                match a.as_str() {
+                    "--reload" => {}
+                    "--reload-dir" | "--reload-include" | "--reload-exclude" | "--reload-delay" => skip_value = true,
+                    other if other.starts_with("--reload-") || other.starts_with("--reload=") => {}
+                    _ => out.push(a.clone()),
+                }
+            }
+            out
+        }
+        Some("flask") => {
+            let mut out: Vec<String> = args.iter().filter(|a| *a != "--reload" && *a != "--debugger").cloned().collect();
+            if out.iter().any(|a| a == "run") {
+                for flag in ["--no-reload", "--no-debugger"] {
+                    if !out.iter().any(|a| a == flag) {
+                        out.push(flag.into());
+                    }
+                }
+            }
+            out
+        }
+        _ => args.to_vec(),
     }
 }
 
@@ -1250,6 +1447,7 @@ fn prepare(
         }
         RunSpec::Python { program, module, python, just_my_code } => {
             let adapter = dap::discover::find_debugpy(python.as_deref()).map_err(|e| e.to_string())?;
+            let django = program.as_deref().and_then(Path::file_name).is_some_and(|n| n == "manage.py");
             let launch = dap::launch::python(&dap::launch::PythonLaunch {
                 name: plan.name.clone(),
                 program: program.clone(),
@@ -1258,14 +1456,30 @@ fn prepare(
                 cwd: plan.cwd.clone(),
                 env: plan.env.clone(),
                 python: python.clone(),
-                just_my_code: *just_my_code,
+                just_my_code: options.just_my_code.unwrap_or(*just_my_code),
                 stop_on_entry: options.stop_at_entry,
+                sub_process: options.sub_process.unwrap_or(true),
+                django,
+                jinja: module.as_deref() == Some("flask"),
             });
             (adapter, launch)
         }
+        RunSpec::PythonRemote { host, port, mappings, just_my_code } => {
+            // `debugpy --listen` serves its own adapter there: talk DAP to it directly.
+            let just_my_code = options.just_my_code.unwrap_or(*just_my_code);
+            let launch = dap::launch::python_remote(&plan.name, host, *port, mappings, just_my_code);
+            let (client, events) = connect_remote(host, *port)?;
+            return Ok(Prepared { client, events, adapter: "debugpy (remote)".into(), kind: AdapterKind::Debugpy, launch });
+        }
+        RunSpec::Platform { platform, url, program } => {
+            let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
+            let init = extra_init(rust_init_commands(adapter.kind), adapter.kind);
+            let args = dap::launch::native_platform(adapter.kind, &plan.name, platform, url, program, &plan.args, &init);
+            (adapter, args)
+        }
         RunSpec::Attach { pid, process: ProcessKind::Python } => {
             let adapter = dap::discover::find_debugpy(None).map_err(|e| e.to_string())?;
-            (adapter, dap::launch::python_attach(&plan.name, *pid, true))
+            (adapter, dap::launch::python_attach(&plan.name, *pid, options.just_my_code.unwrap_or(true)))
         }
         RunSpec::Attach { pid, process } => {
             let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
@@ -1315,6 +1529,23 @@ fn prepare(
     Ok(Prepared { client, events, adapter: adapter.name, kind: adapter.kind, launch })
 }
 
+/// How long a remote debug server has to accept the connection (it may still be starting).
+const REMOTE_CONNECT_WINDOW: Duration = Duration::from_secs(20);
+
+/// Connect to a debug adapter listening on `host:port`, retrying while it starts (worker thread).
+fn connect_remote(host: &str, port: u16) -> Result<(DapClient, Receiver<DapEvent>), String> {
+    let deadline = std::time::Instant::now() + REMOTE_CONNECT_WINDOW;
+    loop {
+        match DapClient::connect_tcp_host("debugpy", host, port, Duration::from_secs(3)) {
+            Ok(connected) => return Ok(connected),
+            Err(e) if std::time::Instant::now() >= deadline => {
+                return Err(format!("cannot connect to the debug server at {host}:{port}: {e}"));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+}
+
 /// Rust pretty printers for lldb-dap (programs that may or may not be Rust: core dumps, remote).
 fn rust_init_commands(kind: AdapterKind) -> Vec<String> {
     if kind != AdapterKind::LldbDap {
@@ -1362,8 +1593,15 @@ pub(crate) fn compile_and_reload(s: &mut Session) -> Result<String, CommandError
     let target =
         s.debug.last_target.clone().ok_or_else(|| CommandError::Disabled("there is no debug session".into()))?;
     let plan = plan_for(&target).map_err(CommandError::Failed)?;
-    if matches!(plan.run, RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. } | RunSpec::AttachWait { .. })
-    {
+    if matches!(
+        plan.run,
+        RunSpec::Attach { .. }
+            | RunSpec::Core { .. }
+            | RunSpec::Remote { .. }
+            | RunSpec::AttachWait { .. }
+            | RunSpec::PythonRemote { .. }
+            | RunSpec::Platform { .. }
+    ) {
         return Err(CommandError::Failed(format!(
             "{}: CodeCraft didn't start this program (attached, core dump or remote), so it can't rebuild and restart it",
             target.name()
@@ -1569,13 +1807,15 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         },
         Phase::Live { events, .. } => {
             let batch: Vec<DapEvent> = events.try_iter().take(MAX_EVENTS_PER_PUMP).collect();
-            if batch.is_empty() {
-                return changed;
-            }
+            let has_children = !rt.children.is_empty();
+            changed |= !batch.is_empty();
             for event in batch {
                 on_dap_event(s, event);
             }
-            true
+            if has_children {
+                changed |= children::pump(s);
+            }
+            changed
         }
     }
 }
@@ -1658,8 +1898,11 @@ fn on_dap_event(s: &mut Session, event: DapEvent) {
     match event {
         DapEvent::Response(response) => on_response(s, response),
         DapEvent::Event { event, body } => on_event(s, &event, &body),
+        DapEvent::Request { seq, command, arguments } if command == "startDebugging" => {
+            // debugpy's subprocesses (js-debug's child sessions are refused there).
+            children::start_debugging(s, None, seq, &arguments);
+        }
         DapEvent::Request { seq, command, .. } => {
-            // Child sessions (js-debug's `startDebugging`) are not supported yet.
             if let Some(client) = s.debug.rt.as_ref().and_then(Runtime::client) {
                 let _ = client.respond(seq, &command, Err(format!("CodeCraft does not support {command} yet")));
             }
@@ -1670,7 +1913,11 @@ fn on_dap_event(s: &mut Session, event: DapEvent) {
                 s.debug.error(e);
             }
         }
-        DapEvent::Exited { .. } => on_adapter_exit(s),
+        DapEvent::Exited { .. } => {
+            if !children::focused_ended(s) {
+                on_adapter_exit(s);
+            }
+        }
     }
 }
 
@@ -1797,6 +2044,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                 return;
             }
             let rust = rt.is_rust();
+            let python = rt.kind == AdapterKind::Debugpy;
             let Some(session) = s.debug.session.as_mut() else { return };
             session.loading.remove(&reference);
             let vars: Vec<VariableInfo> = match response.result {
@@ -1824,6 +2072,15 @@ fn on_response(s: &mut Session, response: dap::Response) {
                 }],
             };
             session.variables.insert(reference, vars.clone());
+            if rust {
+                // Enums, arrays and boxes LLDB leaves as `T @ 0x…` get readable summaries.
+                rust_values::summarize(s, reference, &vars);
+            } else if python {
+                // DataFrames, Series, arrays and plain objects.
+                python_values::summarize(s, reference, &vars);
+            }
+            let Some(session) = s.debug.session.as_mut() else { return };
+            let Some(rt) = s.debug.rt.as_ref() else { return };
             let is_locals = session.scopes.first().is_some_and(|x| x.reference == reference);
             let parent = rt.ref_paths.get(&reference).cloned().unwrap_or_default();
             for v in vars.iter().filter(|v| v.reference > 0) {
@@ -1833,6 +2090,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                 }
             }
             if is_locals {
+                actions::pick_return_value(s, &vars);
                 compute_inline_values(s, &vars);
             }
         }
@@ -1860,6 +2118,8 @@ fn on_response(s: &mut Session, response: dap::Response) {
         Pending::View { epoch, request } => {
             crate::debug_views::on_response(s, epoch == epoch_now, request, response.result);
         }
+        Pending::Action { epoch, request } => actions::on_response(s, epoch == epoch_now, request, response.result),
+        Pending::PanicBreakpoint { fallback } => exceptions::on_panic_breakpoint(s, fallback, response.result),
         Pending::Resume | Pending::ResumeCommand => {
             // A console command answers even when it fails; its output says so.
             let result = match (response.command == "evaluate", response.result) {
@@ -1873,6 +2133,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
                 (_, result) => result,
             };
             if let Err(e) = result {
+                s.debug.last_error = Some(e.clone());
                 s.debug.error(e);
                 // Still where we were: show it again.
                 let Some(rt) = s.debug.rt.as_mut() else { return };
@@ -1914,6 +2175,10 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
                 }
             }
         }
+        "exited" | "terminated" if s.debug.rt.as_ref().is_some_and(|rt| rt.children.child_focused()) => {
+            // A subprocess shown in the Debug tool window ended: back to the main process.
+            children::focused_ended(s);
+        }
         "exited" => {
             let ev: dap::ExitedEvent = dap::types::parse(body).unwrap_or_default();
             if let Some(rt) = s.debug.rt.as_mut() {
@@ -1943,7 +2208,18 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
                 Some("important") => DebugConsoleKind::Error,
                 _ => DebugConsoleKind::Info,
             };
+            // debugpy injects itself into a process with LLDB/GDB: when the OS refuses, say so now
+            // rather than after the adapter's long connection timeout.
+            let injecting = s.debug.rt.as_ref().is_some_and(|rt| {
+                matches!(rt.plan.run, RunSpec::Attach { process: ProcessKind::Python, .. }) && !rt.configured
+            });
+            let refused = injecting && ev.output.contains("attach failed");
+            let message = ev.output.lines().find(|l| l.contains("attach failed")).map(|l| l.trim().to_owned());
             s.debug.push_console(kind, ev.output);
+            if refused {
+                let message = message.unwrap_or_else(|| "attach failed".into());
+                fail(s, &format!("could not attach: {}", message.trim_start_matches("error: ")));
+            }
         }
         "breakpoint" => {
             let ev: dap::BreakpointEvent = dap::types::parse(body).unwrap_or_default();
@@ -1971,8 +2247,9 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
         }
         "process" => {
             let ev: dap::ProcessEvent = dap::types::parse(body).unwrap_or_default();
-            // An attached process is not ours to kill when the session ends.
-            if s.debug.rt.as_ref().is_some_and(Runtime::attached) {
+            // An attached process is not ours to kill when the session ends (nor is a
+            // subprocess, which goes with its parent).
+            if s.debug.rt.as_ref().is_some_and(|rt| rt.attached() || rt.children.child_focused()) {
                 return;
             }
             if let (Some(session), Some(pid)) =
@@ -1997,23 +2274,10 @@ fn configure(s: &mut Session) {
         send_breakpoints(s, &path);
     }
     let break_on_panic = s.debug.break_on_panic;
+    let settings = s.debug.exceptions.clone();
     let Some(rt) = s.debug.rt.as_mut() else { return };
-    let rust = matches!(rt.plan.run, RunSpec::Native { rust: true, .. });
-    if rust && break_on_panic && rt.capabilities.supports_function_breakpoints {
-        let panic = dap::FunctionBreakpoint { name: "rust_panic".into(), ..Default::default() };
-        rt.request(Pending::Setup, |c| c.set_function_breakpoints(&[panic]));
-    }
-    if !rt.capabilities.exception_breakpoint_filters.is_empty() {
-        // Python: stop on uncaught exceptions (debugpy's default in other IDEs too).
-        let filters: Vec<String> = rt
-            .capabilities
-            .exception_breakpoint_filters
-            .iter()
-            .filter(|f| f.default || (rt.kind == AdapterKind::Debugpy && f.filter == "uncaught"))
-            .map(|f| f.filter.clone())
-            .collect();
-        rt.request(Pending::Setup, |c| c.set_exception_breakpoints(&filters));
-    }
+    // Rust panics, C++ throw/catch, Python raised/uncaught/user-uncaught (View Breakpoints).
+    exceptions::send(rt, &settings, break_on_panic);
     if rt.capabilities.supports_configuration_done_request {
         rt.request(Pending::ConfigurationDone, DapClient::configuration_done);
     } else {
@@ -2021,13 +2285,13 @@ fn configure(s: &mut Session) {
     }
 }
 
-/// Send one file's breakpoints (and a pending Run to Cursor location) to the adapter.
-fn send_breakpoints(s: &mut Session, path: &Path) {
-    let dbg = &mut s.debug;
-    let Some(rt) = dbg.rt.as_mut() else { return };
-    if !rt.configured {
-        return;
-    }
+/// One file's enabled breakpoints as DAP wants them, with our ids (`None` for a Run to Cursor
+/// location at `cursor`).
+fn breakpoint_list(
+    dbg: &DebugState,
+    path: &Path,
+    cursor: Option<&(PathBuf, usize)>,
+) -> (Vec<dap::SourceBreakpoint>, Vec<Option<u64>>) {
     let mut list = Vec::new();
     let mut ids = Vec::new();
     for bp in dbg.breakpoints.iter().filter(|b| b.path == path && b.enabled) {
@@ -2040,13 +2304,28 @@ fn send_breakpoints(s: &mut Session, path: &Path) {
         });
         ids.push(Some(bp.id));
     }
-    if let Some((cursor_path, line)) = &rt.run_to_cursor
+    if let Some((cursor_path, line)) = cursor
         && cursor_path == path
         && !list.iter().any(|b| b.line == line_to_dap(*line))
     {
         list.push(dap::SourceBreakpoint { line: line_to_dap(*line), ..Default::default() });
         ids.push(None);
     }
+    (list, ids)
+}
+
+/// Send one file's breakpoints (and a pending Run to Cursor location) to the adapter (and to
+/// the subprocesses' connections).
+fn send_breakpoints(s: &mut Session, path: &Path) {
+    let cursor = s.debug.rt.as_ref().and_then(|rt| rt.run_to_cursor.clone());
+    let (list, ids) = breakpoint_list(&s.debug, path, cursor.as_ref());
+    let child_list = breakpoint_list(&s.debug, path, None);
+    let Some(rt) = s.debug.rt.as_mut() else { return };
+    if !rt.configured {
+        return;
+    }
+    let adapter_path = rt.to_adapter(path);
+    rt.children.send_breakpoints(path, &adapter_path, &child_list.0, &child_list.1);
     if list.is_empty() {
         if !rt.sent.remove(path) {
             return;
@@ -2054,7 +2333,6 @@ fn send_breakpoints(s: &mut Session, path: &Path) {
     } else {
         rt.sent.insert(path.to_path_buf());
     }
-    let adapter_path = rt.to_adapter(path);
     rt.request(Pending::SetBreakpoints { ids }, |c| c.set_breakpoints(&adapter_path, &list));
 }
 
@@ -2066,18 +2344,25 @@ fn line_from_dap(line: i64) -> usize {
     usize::try_from(line.saturating_sub(1)).unwrap_or(0)
 }
 
-fn on_stopped(s: &mut Session, ev: dap::StoppedEvent) {
+fn on_stopped(s: &mut Session, mut ev: dap::StoppedEvent) {
     let Some(rt) = s.debug.rt.as_mut() else { return };
+    // lldb-dap reports the panic function breakpoint as a plain breakpoint.
+    if ev.hit_breakpoint_ids.iter().any(|id| rt.panic_breakpoints.contains(id)) {
+        ev.reason = "panic".into();
+        ev.description = Some("Rust panic".into());
+    }
     rt.epoch += 1;
     rt.stops += 1;
     rt.last_stop = None;
     let first = rt.stops == 1;
     let epoch = rt.epoch;
     let cursor = rt.run_to_cursor.take();
+    let last_step = rt.last_step.take();
     // Temporary breakpoints go away once hit.
     let hit: Vec<u64> = ev.hit_breakpoint_ids.iter().filter_map(|id| rt.adapter_ids.get(id)).copied().collect();
     let Some(session) = s.debug.session.as_mut() else { return };
     session.clear_stop();
+    session.hit_breakpoints = hit.clone();
     if let Some(thread) = ev.thread_id {
         session.thread = Some(thread);
     }
@@ -2122,7 +2407,11 @@ fn on_stopped(s: &mut Session, ev: dap::StoppedEvent) {
         Some(d) if !d.is_empty() => format!("Paused: {d}"),
         _ => format!("Paused ({})", ev.reason),
     };
+    s.debug.step_targets = None;
+    s.debug.hover = None;
     crate::debug_views::after_stop(s);
+    actions::after_stop(s, &ev.reason, ev.thread_id, last_step);
+    children::refresh_entries(s);
 }
 
 fn on_stack_trace(s: &mut Session, body: &Value, reveal: bool) {
@@ -2312,6 +2601,50 @@ fn on_evaluate(s: &mut Session, current: bool, purpose: EvalPurpose, result: Res
             }
             Err(e) => s.debug.push_console(DebugConsoleKind::Error, e),
         },
+        EvalPurpose::Hover(expression) => {
+            if !current || s.debug.hover.as_ref().is_none_or(|h| h.expression != expression) {
+                return;
+            }
+            let result = parsed.map(|body| VariableInfo {
+                name: expression.clone(),
+                value: body.result,
+                type_name: body.type_.filter(|t| !t.is_empty()),
+                reference: body.variables_reference,
+                evaluate_name: Some(expression.clone()),
+                memory_reference: body.memory_reference,
+            });
+            s.debug.hover = Some(Evaluation { expression, result, pending: false });
+        }
+        EvalPurpose::Agent(token) => match parsed {
+            Ok(body) => {
+                let value = VariableInfo {
+                    name: String::new(),
+                    value: dap::lldb::strip_echo(&body.result).trim_end_matches('\n').to_owned(),
+                    type_name: body.type_.filter(|t| !t.is_empty()),
+                    reference: body.variables_reference,
+                    evaluate_name: None,
+                    memory_reference: body.memory_reference,
+                };
+                let mut json = agent::variable_json(&value);
+                if let Some(map) = json.as_object_mut() {
+                    map.remove("name");
+                }
+                if value.reference > 0 && current {
+                    // One level of children in the same answer.
+                    let reference = value.reference;
+                    let request = actions::ActionRequest::AgentChildren { token, value: json.clone() };
+                    let sent = s.debug.rt.as_mut().is_some_and(|rt| {
+                        let epoch = rt.epoch;
+                        rt.request(Pending::Action { epoch, request }, |c| c.variables(reference))
+                    });
+                    if sent {
+                        return;
+                    }
+                }
+                agent::deliver(s, token, Ok(json));
+            }
+            Err(e) => agent::deliver(s, token, Err(e)),
+        },
         EvalPurpose::Evaluate(expression) => {
             let result = parsed.map(|body| VariableInfo {
                 name: expression.clone(),
@@ -2370,6 +2703,7 @@ fn step_with(s: &mut Session, step: Step, by_instruction: bool) -> Result<(), Co
     }
     let thread = current_thread(s).ok_or_else(|| CommandError::Failed("no thread to step".into()))?;
     let frame = s.debug.session.as_ref().and_then(|x| x.selected_frame()).map(|f| f.id);
+    let function = s.debug.session.as_ref().and_then(|x| x.frames.first()).map(|f| f.name.clone());
     let Some(rt) = s.debug.rt.as_mut() else { return Err(CommandError::Disabled("not debugging".into())) };
     let previous = s.debug.session.as_ref().and_then(|x| x.status.clone());
     let by_instruction = by_instruction && matches!(step, Step::Over | Step::Into);
@@ -2395,12 +2729,16 @@ fn step_with(s: &mut Session, step: Step, by_instruction: bool) -> Result<(), Co
         return Err(CommandError::Failed("the debugger is not responding".into()));
     }
     rt.last_stop = previous;
+    rt.last_step = Some(step);
+    rt.step_from_function = function;
     rt.epoch += 1;
     if let Some(session) = &mut s.debug.session {
         session.status = Some(DebugStatus::Running);
         session.clear_stop();
     }
     s.debug.views.on_resume();
+    s.debug.last_error = None;
+    s.debug.step_targets = None;
     s.status = "Running".into();
     Ok(())
 }
@@ -2508,6 +2846,25 @@ pub(crate) fn evaluate(s: &mut Session, expression: &str, console: bool) -> Resu
     } else {
         s.debug.evaluation =
             Some(Evaluation { expression: expression.to_owned(), result: Err(String::new()), pending: true });
+    }
+    Ok(())
+}
+
+/// An agent's evaluation in `frame` (`context`: watch, repl, hover or clipboard); the answer
+/// goes to `token` with one level of children.
+pub(crate) fn evaluate_for_agent(
+    s: &mut Session,
+    expression: &str,
+    frame: Option<i64>,
+    context: &str,
+    token: u64,
+) -> Result<(), CommandError> {
+    let Some(rt) = s.debug.rt.as_mut().filter(|rt| rt.client().is_some()) else {
+        return Err(CommandError::Disabled("the debugger is not running".into()));
+    };
+    let epoch = rt.epoch;
+    if !rt.request(Pending::Evaluate { epoch, purpose: EvalPurpose::Agent(token) }, |c| c.evaluate(expression, frame, context)) {
+        return Err(CommandError::Failed("the debugger is not responding".into()));
     }
     Ok(())
 }
@@ -2841,6 +3198,9 @@ struct BreakpointsFile {
     breakpoints: Vec<StoredBreakpoint>,
     watches: Vec<String>,
     break_on_panic: Option<bool>,
+    /// C++ and Python exception breakpoints (absent: the defaults).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    exceptions: Option<ExceptionBreakpoints>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -2867,7 +3227,7 @@ fn breakpoints_file(root: &Path) -> PathBuf {
 }
 
 /// Load the project's breakpoints and watches once per project. True if anything was loaded.
-fn ensure_loaded(s: &mut Session) -> bool {
+pub(crate) fn ensure_loaded(s: &mut Session) -> bool {
     let root = s.ws.project.as_ref().map(|p| p.root.clone());
     if s.debug.loaded_for.as_ref() == Some(&root) {
         return false;
@@ -2920,6 +3280,9 @@ fn ensure_loaded(s: &mut Session) -> bool {
     if let Some(v) = stored.break_on_panic {
         s.debug.break_on_panic = v;
     }
+    if let Some(e) = stored.exceptions {
+        s.debug.exceptions = e;
+    }
     true
 }
 
@@ -2930,7 +3293,12 @@ pub(crate) fn save(s: &mut Session) {
         return;
     }
     let file = breakpoints_file(&root);
-    if s.debug.breakpoints.is_empty() && s.debug.watches.is_empty() && !file.exists() {
+    if s.debug.breakpoints.is_empty()
+        && s.debug.watches.is_empty()
+        && s.debug.exceptions.is_default()
+        && s.debug.break_on_panic
+        && !file.exists()
+    {
         return;
     }
     let stored = BreakpointsFile {
@@ -2952,6 +3320,7 @@ pub(crate) fn save(s: &mut Session) {
             .collect(),
         watches: s.debug.watches.iter().map(|w| w.expression.clone()).collect(),
         break_on_panic: (!s.debug.break_on_panic).then_some(false),
+        exceptions: (!s.debug.exceptions.is_default()).then(|| s.debug.exceptions.clone()),
     };
     let text = match serde_json::to_string_pretty(&stored) {
         Ok(text) => text,
@@ -3047,6 +3416,12 @@ pub(crate) fn snapshot(s: &Session) -> Value {
         "watches": s.debug.watches,
         "evaluation": s.debug.evaluation,
         "breakOnPanic": s.debug.break_on_panic,
+        "exceptionBreakpoints": exceptions::state(s),
+        "breakpointPopup": s.debug.breakpoint_popup,
+        "hover": s.debug.hover,
+        "completions": s.debug.completions,
+        "stepTargets": s.debug.step_targets,
+        "lastError": s.debug.last_error,
         "views": s.debug.views,
         "console": s.debug.console.iter().rev().take(200).rev().map(|l| json!({
             "kind": l.kind, "text": console_text(l),

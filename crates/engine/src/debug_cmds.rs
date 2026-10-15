@@ -209,14 +209,23 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 ok()
             },
         ),
-        // A DAP step is never "forced" past breakpoints and lldb-dap has no step-in targets, so the
-        // force/smart variants do the plain step.
+        // A DAP step is never "forced" past breakpoints, so Force Step Over does the plain step.
         spec("run.debuggingActions.forceStepOver", "Force Step Over", None, "", Context::Global, stopped, |s, _| {
             step(s, Step::Over)
         }),
-        spec("run.debuggingActions.smartStepInto", "Smart Step Into", None, "", Context::Global, stopped, |s, _| {
-            step(s, Step::Into)
-        }),
+        spec(
+            "run.debuggingActions.smartStepInto",
+            "Smart Step Into",
+            None,
+            "Choose which call on the line to step into (DAP stepInTargets; LLDB: the calls on the source line, \
+             stepped with `thread step-in --step-in-target`); one call steps at once → {via, stepTargets?}",
+            Context::Global,
+            stopped,
+            |s, _| {
+                let via = debug::actions::smart_step_into(s)?;
+                Ok(json!({ "via": via, "stepTargets": s.debug.step_targets }))
+            },
+        ),
         spec(
             "run.debuggingActions.forceRunToCursor",
             "Force Run to Cursor",
@@ -472,7 +481,9 @@ fn debug_remote(s: &mut Session, p: &Value) -> CmdResult {
     let program = opt_path(p, "program").map(|x| path_in_project(s, x));
     let name = opt_str(p, "name").map_or_else(|| format!("Remote {}", address.trim()), str::to_owned);
     s.debug.form = None;
-    debug::start(s, DebugTarget::Remote { name: name.clone(), address, program })?;
+    let platform = opt_str(p, "platform").map(str::to_owned);
+    let args = strings(p, "args")?;
+    debug::start(s, DebugTarget::Remote { name: name.clone(), address, program, platform, args })?;
     started(s, &name)
 }
 
@@ -526,6 +537,16 @@ fn cargo_root(s: &Session) -> Option<PathBuf> {
     project.cargo.as_ref().map(|m| m.workspace_root.clone())
 }
 
+/// [`location`] for the other debugger command modules.
+pub(crate) fn location_of(s: &Session, p: &Value) -> Result<(PathBuf, usize), CommandError> {
+    location(s, p)
+}
+
+/// [`check_line`] for the other debugger command modules.
+pub(crate) fn check_line_of(s: &Session, path: &Path, line: usize) -> Result<(), CommandError> {
+    check_line(s, path, line)
+}
+
 /// The file and zero-based line from params, else the active editor's caret line.
 fn location(s: &Session, p: &Value) -> Result<(PathBuf, usize), CommandError> {
     let line = opt_usize(p, "line")?;
@@ -574,7 +595,14 @@ pub(crate) fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
             return Ok(v);
         }
     }
-    let target = match s.run_configs.get(s.selected_run_config) {
+    // Remote Debug, Core Dump and Python Debug Server configurations only debug.
+    let debug_only = selected.as_deref().and_then(|n| {
+        let root = s.project_root()?;
+        s.run_store.user.iter().find(|c| c.name.trim() == n).and_then(|c| c.debug_target(&root))
+    });
+    let target = match (debug_only, s.run_configs.get(s.selected_run_config)) {
+        (Some(target), _) => target.map_err(CommandError::Failed)?,
+        (None, c) => match c {
         Some(c) => match (c.cargo_invocation(), &c.command) {
             (Some(invocation), _) => DebugTarget::Cargo { name: c.name.clone(), invocation: invocation.clone() },
             (None, Some(command)) => process_target(&c.name, command).ok_or_else(|| {
@@ -589,6 +617,7 @@ pub(crate) fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
             let root = cargo_root(s).ok_or_else(|| CommandError::Failed("no run configuration to debug".into()))?;
             DebugTarget::Cargo { name: "cargo run".into(), invocation: CargoInvocation::new(CargoCommand::Run, root) }
         }
+        },
     };
     let name = target.name().to_owned();
     let options = selected
@@ -717,6 +746,20 @@ fn context_target(s: &Session, path: &Path, line: usize) -> Option<DebugTarget> 
         Language::Python => {
             let cwd = root.clone().or_else(|| path.parent().map(Path::to_path_buf));
             let python = root.as_deref().and_then(project_python);
+            // A pytest test (gutter Debug on `def test_…`) or file, like Run does.
+            let text = match s.ws.doc_by_path(path).and_then(|d| s.ws.doc(d)) {
+                Some(d) => Some(d.doc.text()),
+                None => codecraft_fs::read_text_file(path).ok(),
+            };
+            if let (Some(dir), Some(text)) = (&cwd, &text)
+                && let Some(config) = crate::run_configs::context_config(dir, path, text, line)
+                && let Some(cmd) = &config.command
+                && cmd.args.iter().any(|a| a == "pytest")
+                && let Some(DebugTarget::Python { name, program, module, args, cwd, env, just_my_code, .. }) =
+                    process_target(&config.name, cmd)
+            {
+                return Some(DebugTarget::Python { name, program, module, args, cwd, env, python, just_my_code });
+            }
             Some(DebugTarget::Python {
                 name: file_name,
                 program: Some(path.to_path_buf()),
@@ -832,6 +875,13 @@ fn project_python(root: &Path) -> Option<PathBuf> {
 
 fn debug_at_caret(s: &mut Session, p: &Value) -> CmdResult {
     let (path, line) = location(s, p)?;
+    debug_location(s, &path, line)
+}
+
+/// Debug what is at `path:line` (zero-based): a Rust test or `main`, a pytest test, a Python,
+/// Zig or JavaScript file, a C/C++ test or program. `null` (and a status) when there is nothing.
+pub(crate) fn debug_location(s: &mut Session, path: &Path, line: usize) -> CmdResult {
+    let path = path.to_path_buf();
     // C/C++: the test at the line (its CMake target built first), else the program's `main`
     // (M13 track RC: gutter Debug for C++ tests).
     if matches!(Language::from_path(&path), Language::C | Language::Cpp) {

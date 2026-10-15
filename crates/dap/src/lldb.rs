@@ -80,6 +80,62 @@ pub fn step_instruction_command(over: bool) -> &'static str {
     if over { "thread step-inst-over" } else { "thread step-inst" }
 }
 
+/// The thread's description, which says `Return value: (int) $0 = 3` after a step out.
+pub const THREAD_INFO_COMMAND: &str = "thread info";
+
+/// A path or name quoted for an LLDB command line.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Set the next statement: move the thread's program counter to `line` (1-based) of `path`
+/// (Jump to Line where the adapter has no `goto`). Side effects of skipped code don't happen.
+pub fn thread_jump_command(path: &std::path::Path, line: i64) -> String {
+    format!("thread jump --file {} --line {line}", quoted(&path.display().to_string()))
+}
+
+/// Step into the call of `function` on the current line (Smart Step Into where the adapter has
+/// no `stepInTargets`).
+pub fn step_in_target_command(function: &str) -> String {
+    format!("thread step-in --step-in-target {}", quoted(function))
+}
+
+/// The return value `thread info` reports after a step out: `(type, value)` from
+/// `Return value: (int) $0 = 3`. Multi-line values keep their first line.
+pub fn parse_return_value(output: &str) -> Option<(Option<String>, String)> {
+    let line = strip_echo(output).lines().find_map(|l| l.trim().strip_prefix("Return value:"))?.trim();
+    let (type_name, rest) = match line.strip_prefix('(') {
+        Some(rest) => {
+            // The type may itself contain parentheses (`(int (*)(int))`): match them.
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, c) in rest.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(i);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end?;
+            (Some(rest.get(..end)?.trim().to_owned()), rest.get(end + 1..)?.trim())
+        }
+        None => (None, line),
+    };
+    // `$0 = 3`: the value after the convenience variable.
+    let value = match rest.strip_prefix('$').and_then(|r| r.split_once('=')) {
+        Some((_, value)) => value,
+        None => rest,
+    };
+    let value = value.trim();
+    (!value.is_empty()).then(|| (type_name.filter(|t| !t.is_empty()), value.to_owned()))
+}
+
 /// The selected frame's function with source lines mixed in.
 pub const DISASSEMBLE_FRAME_COMMAND: &str = "disassemble --frame --mixed";
 
@@ -191,6 +247,25 @@ fn split_token(text: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn return_values_and_jump_commands() {
+        let out = "(lldb) thread info\nthread #1: tid = 0x46c0228, 0x000000010000305c t`main at t.cpp:16:9, stop reason = step out\nReturn value: (int) $0 = 3\n\n";
+        assert_eq!(parse_return_value(out), Some((Some("int".into()), "3".into())));
+        assert_eq!(
+            parse_return_value("Return value: (int (*)(int)) $1 = 0x0000000100003f00 (t`twice(int))"),
+            Some((Some("int (*)(int)".into()), "0x0000000100003f00 (t`twice(int))".into()))
+        );
+        assert_eq!(parse_return_value("Return value: 5"), Some((None, "5".into())));
+        assert_eq!(parse_return_value("thread #1: stop reason = step over"), None);
+        assert_eq!(parse_return_value("Return value: (int"), None);
+        assert_eq!(parse_return_value("Return value: (é) $0 = "), None);
+        assert_eq!(
+            thread_jump_command(std::path::Path::new("/a b/m\"x.c"), 7),
+            "thread jump --file \"/a b/m\\\"x.c\" --line 7"
+        );
+        assert_eq!(step_in_target_command("twice"), "thread step-in --step-in-target \"twice\"");
+    }
 
     #[test]
     fn memory_read_output_parses() {

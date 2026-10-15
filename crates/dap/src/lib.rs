@@ -204,6 +204,34 @@ impl DapClient {
         Self::connect(name, stream, writer)
     }
 
+    /// Connect to an adapter listening on `host:port` (debugpy's child sessions connect to the
+    /// address its `startDebugging` request names). Name resolution and connecting block for at
+    /// most `timeout` per address, so call this from a worker thread.
+    pub fn connect_tcp_host(
+        name: &str,
+        host: &str,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<(Self, Receiver<DapEvent>)> {
+        use std::net::ToSocketAddrs;
+        if host.is_empty() || host.len() > 255 || host.contains(char::is_whitespace) {
+            return Err(DapError::Protocol(format!("`{host}` is not a host name")));
+        }
+        let addresses: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.take(8).collect();
+        let mut last = None;
+        for address in addresses {
+            match std::net::TcpStream::connect_timeout(&address, timeout) {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    let writer = stream.try_clone()?;
+                    return Self::connect(name, stream, writer);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.map_or_else(|| DapError::Protocol(format!("`{host}` has no address")), DapError::Io))
+    }
+
     /// The adapter's process id (`None` for connected streams).
     pub fn pid(&self) -> Option<u32> {
         self.inner.pid()
@@ -403,6 +431,55 @@ impl DapClient {
     /// to the frame's start and a `stopped` event (reason `restart`) follows.
     pub fn restart_frame(&self, frame_id: i64) -> Result<RequestId> {
         self.request("restartFrame", json!({ "frameId": frame_id }))
+    }
+
+    /// Where execution can jump to on `line` of `path` (`supportsGotoTargetsRequest`).
+    pub fn goto_targets(&self, path: &Path, line: i64) -> Result<RequestId> {
+        self.request("gotoTargets", json!({ "source": Source::from_path(path), "line": line }))
+    }
+
+    /// Set the next statement: `thread_id` continues from `target_id` (a `stopped` event with
+    /// reason `goto` follows).
+    pub fn goto(&self, thread_id: i64, target_id: i64) -> Result<RequestId> {
+        self.request("goto", json!({ "threadId": thread_id, "targetId": target_id }))
+    }
+
+    /// The functions a step into from `frame_id` can stop in (`supportsStepInTargetsRequest`).
+    pub fn step_in_targets(&self, frame_id: i64) -> Result<RequestId> {
+        self.request("stepInTargets", json!({ "frameId": frame_id }))
+    }
+
+    /// Step into one of the [`DapClient::step_in_targets`].
+    pub fn step_in_target(&self, thread_id: i64, target_id: i64) -> Result<RequestId> {
+        self.request("stepIn", json!({ "threadId": thread_id, "targetId": target_id }))
+    }
+
+    /// Completions for the debug console's `text` at `column` (1-based, UTF-16 units).
+    pub fn completions(&self, text: &str, column: i64, frame_id: Option<i64>) -> Result<RequestId> {
+        let mut args = json!({ "text": text, "column": column });
+        if let (Some(frame), Some(map)) = (frame_id, args.as_object_mut()) {
+            map.insert("frameId".into(), frame.into());
+        }
+        self.request("completions", args)
+    }
+
+    /// Change the child `name` of `variables_reference` to `value` (an expression).
+    pub fn set_variable(&self, variables_reference: i64, name: &str, value: &str) -> Result<RequestId> {
+        self.request("setVariable", json!({ "variablesReference": variables_reference, "name": name, "value": value }))
+    }
+
+    /// Assign `value` to the assignable `expression` in `frame_id` (`supportsSetExpression`).
+    pub fn set_expression(&self, expression: &str, value: &str, frame_id: Option<i64>) -> Result<RequestId> {
+        let mut args = json!({ "expression": expression, "value": value });
+        if let (Some(frame), Some(map)) = (frame_id, args.as_object_mut()) {
+            map.insert("frameId".into(), frame.into());
+        }
+        self.request("setExpression", args)
+    }
+
+    /// What was thrown in the stopped `thread_id` (`supportsExceptionInfoRequest`).
+    pub fn exception_info(&self, thread_id: i64) -> Result<RequestId> {
+        self.request("exceptionInfo", json!({ "threadId": thread_id }))
     }
 
     /// `disconnect` as a plain request (see [`DapClient::terminate`] for ending a session).

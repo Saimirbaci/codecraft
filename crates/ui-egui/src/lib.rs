@@ -23,6 +23,7 @@ mod database_panel;
 mod database_schema_ui;
 mod database_settings_ui;
 mod dataframe_ui;
+mod debug_dbg_ui;
 mod debug_panel;
 mod debug_views_ui;
 mod diff_view;
@@ -654,6 +655,7 @@ impl App {
         testing_panel::windows(ui, s, st);
         valgrind_ui::windows(ui, s, st);
         debug_panel::attach_window(ui, s, st);
+        debug_dbg_ui::windows(ui, s, st);
         bookmarks_panel::windows(ui, s, st);
         history_ui::windows(ui, s, st);
         inspections_ui::windows(ui, s, st);
