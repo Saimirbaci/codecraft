@@ -670,55 +670,9 @@ fn runs_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, build: bool) 
 
 // ---------------------------------------------------------------- Problems / Find / Structure
 
-fn severity_mark(theme: &crate::theme::Theme, s: Severity) -> (&'static str, Color32) {
-    match s {
-        Severity::Error => ("✖", theme.error),
-        Severity::Warning => ("⚠", theme.warning),
-        Severity::Info => ("ℹ", theme.weak),
-        Severity::Hint => ("·", theme.weak),
-    }
-}
-
+/// The Problems tool window: File and Project tabs (M14 track CA, `inspect_ui.rs`).
 fn problems_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
-    let theme = st.theme.clone();
-    let all = s.ws.all_problems();
-    if all.is_empty() {
-        ui.label(RichText::new("No problems found").color(theme.text_muted));
-        return;
-    }
-    let mut open = None;
-    ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (path, list) in &all {
-            let name =
-                s.ws.project
-                    .as_ref()
-                    .map(|p| p.relative(path).into_owned())
-                    .unwrap_or_else(|| path.display().to_string());
-            egui::CollapsingHeader::new(RichText::new(format!("{name}   {} problem(s)", list.len())).strong())
-                .id_salt(path)
-                .default_open(true)
-                .show(ui, |ui| {
-                    for p in list.iter().take(500) {
-                        let (mark, color) = severity_mark(&theme, p.severity);
-                        let mut job = LayoutJob::default();
-                        job.append(mark, 0.0, TextFormat { color, ..Default::default() });
-                        let msg: String = p.message.lines().next().unwrap_or_default().chars().take(300).collect();
-                        job.append(&format!("  {msg}"), 0.0, TextFormat { color: theme.text, ..Default::default() });
-                        job.append(
-                            &format!("  :{}:{}", p.start.line + 1, p.start.column + 1),
-                            0.0,
-                            TextFormat { color: theme.text_muted, ..Default::default() },
-                        );
-                        if ui.add(egui::Label::new(job).sense(Sense::click())).on_hover_text(&p.message).clicked() {
-                            open = Some((p.path.clone(), p.start.line, p.start.column));
-                        }
-                    }
-                });
-        }
-    });
-    if let Some((path, line, column)) = open {
-        run_command(s, st, "navigate.openLocation", &json!({ "path": path, "line": line, "column": column }));
-    }
+    crate::inspect_ui::problems_view(ui, s, st);
 }
 
 fn find_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {

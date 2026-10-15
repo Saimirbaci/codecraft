@@ -5,6 +5,25 @@
 //! Inspections are the external linters of Inspect Code (`inspections.rs`); running one by name
 //! runs its tool on the scope (turning a Rust lint on with `-W` when it is allow-by-default) and
 //! keeps only that inspection's findings.
+//!
+//! M14 track CA adds the submodules: inspection profiles (`profiles`), custom glob scopes
+//! (`glob`), the analyzers rust-analyzer, clangd, the Clang Static Analyzer, cppcheck and SQL
+//! (`analyzers`, `rust_analyzer`, `cpp`, `sql`), baselines (`baseline`), JSON/SARIF/HTML export
+//! (`export`), jobs by id and the agent commands (`jobs`, `agent_cmds`), the commit check
+//! (`commit_check`) and managed installs (`install`).
+
+pub mod agent_cmds;
+pub mod analyzers;
+pub mod baseline;
+pub mod commit_check;
+pub mod cpp;
+pub mod export;
+pub mod glob;
+pub mod install;
+pub mod jobs;
+pub mod profiles;
+pub mod rust_analyzer;
+pub mod sql;
 
 use std::path::PathBuf;
 
@@ -82,6 +101,11 @@ pub fn catalogue(s: &Session) -> Vec<InspectionInfo> {
         (Tool::Eslint, "Every ESLint rule enabled for the project"),
         (Tool::ClangTidy, "Every clang-tidy check enabled for the project"),
         (Tool::ZigFmt, "Zig formatting"),
+        (Tool::RustAnalyzer, "rust-analyzer diagnostics for the whole workspace"),
+        (Tool::Clangd, "clangd diagnostics (compiler warnings, clang-tidy)"),
+        (Tool::ClangAnalyzer, "The Clang Static Analyzer per translation unit"),
+        (Tool::Cppcheck, "cppcheck checks"),
+        (Tool::Sql, "SQL inspections over .sql files"),
     ]
     .iter()
     .map(|(t, d)| InspectionInfo { name: t.label().to_string(), tool: *t, description: (*d).to_string() })
@@ -123,19 +147,48 @@ pub struct AnalysisState {
     pub by_name: Option<ByNameDialog>,
     /// The Configure Current File Analysis popup is open for this file.
     pub level_popup: Option<PathBuf>,
+    /// Inspection profiles of the project and the IDE (M14 CA).
+    pub profiles: profiles::Profiles,
+    /// The baseline runs compare with (M14 CA).
+    pub baseline: baseline::BaselineState,
+    /// Analysis jobs by id (M14 CA).
+    pub jobs: jobs::Jobs,
+    /// The commit waiting on its code analysis (M14 CA).
+    pub commit: commit_check::CommitCheckState,
+    /// Managed analyzer installs (M14 CA).
+    pub install: install::InstallState,
+}
+
+impl AnalysisState {
+    /// Keep the IDE's inspection profiles and managed tools under `dir` (tests, embedders).
+    pub fn set_home(&mut self, dir: PathBuf) {
+        self.profiles.home.dir_override = Some(dir);
+    }
+}
+
+/// Drain the analysis services (called from `inspections::pump`).
+pub(crate) fn pump(s: &mut Session) -> bool {
+    let changed = install::pump(s);
+    s.inspections.services_busy = s.analysis.install.running.is_some();
+    changed
 }
 
 /// The tool and filter for an inspection name.
 fn resolve(name: &str) -> (Option<Vec<Tool>>, Option<String>) {
     let name = name.trim();
-    if let Some(t) = [Tool::Clippy, Tool::CargoCheck, Tool::Ruff, Tool::Mypy, Tool::Pyright, Tool::Eslint, Tool::ClangTidy, Tool::ZigFmt]
+    if let Some(t) = Tool::ALL
         .into_iter()
-        .find(|t| t.label().eq_ignore_ascii_case(name))
+        .filter(|t| !matches!(t, Tool::CargoAudit | Tool::CargoDeny))
+        .find(|t| t.label().eq_ignore_ascii_case(name) || t.id().eq_ignore_ascii_case(name))
     {
         return (Some(vec![t]), None);
     }
     if let Some((_, tool, _)) = KNOWN.iter().find(|(n, ..)| *n == name) {
         return (Some(vec![*tool]), Some(name.to_string()));
+    }
+    // The rules of the M14 analyzers (SQL, the Clang Static Analyzer, rust-analyzer, …).
+    if let Some(t) = Tool::ALL.into_iter().find(|t| profiles::known_rules(*t).iter().any(|(n, _)| *n == name)) {
+        return (Some(vec![t]), Some(name.to_string()));
     }
     if inspections::clippy::is_lint_name(name) {
         return (Some(vec![Tool::Clippy]), Some(name.to_string()));
@@ -210,22 +263,34 @@ fn configure_level(s: &mut Session, p: &Value) -> CmdResult {
 
 fn export_results(s: &mut Session, p: &Value) -> CmdResult {
     let results = s.inspections.results.clone().ok_or_else(|| CommandError::Failed("no inspection results to export".into()))?;
+    let requested = match opt_str(p, "format") {
+        Some(f) => Some(export::Format::parse(f).ok_or_else(|| CommandError::BadParams(format!("unknown format '{f}' (json, sarif, html)")))?),
+        None => None,
+    };
     let Some(path) = opt_path(p, "path") else {
+        let format = requested.unwrap_or(export::Format::Json);
         s.effects.push(Effect::PickFile {
             title: "Export Inspection Results".into(),
             command: "inspections.export".into(),
             param: "path".into(),
             save: true,
-            extensions: vec!["json".into()],
-            default_name: Some("inspection-results.json".into()),
+            extensions: vec![format.extension().into()],
+            default_name: Some(format!("inspection-results.{}", format.extension())),
         });
-        return Ok(json!({ "picker": true }));
+        return Ok(json!({ "picker": true, "format": format.id() }));
     };
-    let text = serde_json::to_string_pretty(&OfflineFile { format: OFFLINE_FORMAT.into(), results })
-        .map_err(|e| CommandError::Failed(e.to_string()))?;
+    // JSON (View Offline Inspection Results reads it), SARIF 2.1.0 or HTML (M14 CA).
+    let format = requested.or_else(|| export::Format::from_path(&path)).unwrap_or(export::Format::Json);
+    let root = s.project_root();
+    let text = match format {
+        export::Format::Json => serde_json::to_string_pretty(&OfflineFile { format: OFFLINE_FORMAT.into(), results }),
+        export::Format::Sarif => serde_json::to_string_pretty(&export::to_sarif(&results, root.as_deref())),
+        export::Format::Html => Ok(export::to_html(&results, root.as_deref())),
+    }
+    .map_err(|e| CommandError::Failed(e.to_string()))?;
     codecraft_fs::write_text_file_atomic(&path, &text).map_err(|e| CommandError::Failed(format!("cannot write {}: {e}", path.display())))?;
     s.status = format!("Exported inspection results to {}", path.display());
-    Ok(json!({ "path": path }))
+    Ok(json!({ "path": path, "format": format.id() }))
 }
 
 const OFFLINE_FORMAT: &str = "codecraft-inspection-results/1";
@@ -245,7 +310,7 @@ fn view_offline(s: &mut Session, p: &Value) -> CmdResult {
             command: "code.analyzeCode.viewOfflineInspectionResults".into(),
             param: "path".into(),
             save: false,
-            extensions: vec!["json".into()],
+            extensions: vec!["json".into(), "sarif".into()],
             default_name: None,
         });
         return Ok(json!({ "picker": true }));
@@ -255,9 +320,19 @@ fn view_offline(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::Failed(format!("{} is too large", path.display())));
     }
     let text = std::fs::read_to_string(&path).map_err(|e| CommandError::Failed(format!("cannot read {}: {e}", path.display())))?;
-    let file: OfflineFile = serde_json::from_str(&text)
-        .or_else(|_| serde_json::from_str::<InspectionResults>(&text).map(|results| OfflineFile { format: OFFLINE_FORMAT.into(), results }))
-        .map_err(|e| CommandError::Failed(format!("{} is not an inspection results file: {e}", path.display())))?;
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // A SARIF log (ours or another tool's; M14 CA).
+    let sarif = serde_json::from_str::<Value>(&text).ok().filter(|v| v.get("runs").is_some() && v.get("version").is_some());
+    let file: OfflineFile = match sarif {
+        Some(v) => {
+            let root = s.project_root();
+            let results = export::from_sarif(&v, root.as_deref(), "SARIF").map_err(CommandError::Failed)?;
+            OfflineFile { format: OFFLINE_FORMAT.into(), results }
+        }
+        None => serde_json::from_str(&text)
+            .or_else(|_| serde_json::from_str::<InspectionResults>(&text).map(|results| OfflineFile { format: OFFLINE_FORMAT.into(), results }))
+            .map_err(|e| CommandError::Failed(format!("{} is not an inspection results file: {e}", path.display())))?,
+    };
     let mut results = file.results;
     // Ids must be indexes (a hand-edited file may not keep them).
     results.findings.truncate(inspections::MAX_FINDINGS);
@@ -265,18 +340,35 @@ fn view_offline(s: &mut Session, p: &Value) -> CmdResult {
         f.id = i;
     }
     results.resolved.retain(|id| *id < results.findings.len());
-    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     results.scope_label = format!("Offline ({name}): {}", results.scope_label);
     let n = results.open().count();
     inspections::cancel(s);
+    // Imported results get a job id like a run (agents read them with analysis.results).
+    s.inspections.next_job = s.inspections.next_job.saturating_add(1);
+    let job = s.inspections.next_job;
+    results.job = job;
+    // Fixes check that files did not change; offline results know nothing of the files.
+    results.hashes.clear();
     s.inspections.selected = results.open().next().map(|f| f.id);
     s.inspections.results = Some(results);
+    jobs::started(s, job);
+    jobs::ended(s, job, false);
     s.ws.layout.show(ToolWindowId::InspectionResults);
     s.status = format!("Offline inspection results: {n} problem(s)");
-    Ok(json!({ "problems": n }))
+    Ok(json!({ "problems": n, "job": job }))
 }
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
+    let mut v = base_specs();
+    // M14 CA.
+    v.extend(profiles::specs());
+    v.extend(agent_cmds::specs());
+    v.extend(commit_check::specs());
+    v.extend(install::specs());
+    v
+}
+
+fn base_specs() -> Vec<CommandSpec> {
     vec![
         spec(
             "code.analyzeCode.runInspectionByName",
@@ -309,7 +401,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "code.analyzeCode.viewOfflineInspectionResults",
             "View Offline Inspection Results…",
             None,
-            "{path?: string} — open inspection results exported to JSON (Inspection Results › Export); without `path` asks for the file",
+            "{path?: string} — open inspection results exported to JSON (Inspection Results › Export) or a SARIF 2.1.0 log; without `path` asks for the file",
             Context::Global,
             always,
             view_offline,
@@ -318,7 +410,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "inspections.export",
             "Export Inspection Results",
             None,
-            "{path?: string} — write the Inspection Results to a JSON file (View Offline Inspection Results reads it)",
+            "{path?: string, format?: \"json\"|\"sarif\"|\"html\" (default: from the extension)} — write the Inspection Results to a file: JSON (View Offline Inspection Results reads it), SARIF 2.1.0 or an HTML report",
             Context::Global,
             |s| s.inspections.results.as_ref().map(|_| ()).ok_or_else(|| "no inspection results".into()),
             export_results,
@@ -379,14 +471,8 @@ mod tests {
         use crate::inspections::{Finding, Scope};
         let mk = |insp: &str| Finding::new(Tool::Clippy, insp, Severity::Warning, "/a.rs".into(), Default::default());
         let mut r = InspectionResults {
-            kind: JobKind::Inspect,
-            scope: Scope { kind: ScopeKind::Project, path: None },
-            scope_label: String::new(),
             findings: vec![mk("clippy::a"), mk("clippy::needless_return"), mk("unused_variables"), mk("clippy::needless_return")],
-            tools: Vec::new(),
-            truncated: false,
-            hashes: Default::default(),
-            resolved: Default::default(),
+            ..InspectionResults::new(JobKind::Inspect, Scope::new(ScopeKind::Project, None), "")
         };
         inspections::keep_only(&mut r, "needless_return");
         assert_eq!(r.findings.len(), 2);
@@ -434,14 +520,8 @@ mod tests {
         let mut f = Finding::new(Tool::Clippy, "clippy::x", Severity::Warning, path.clone(), Default::default());
         f.id = 7;
         s.inspections.results = Some(InspectionResults {
-            kind: JobKind::Inspect,
-            scope: Scope { kind: ScopeKind::Project, path: None },
-            scope_label: "Project 'p'".into(),
             findings: vec![f],
-            tools: Vec::new(),
-            truncated: false,
-            hashes: Default::default(),
-            resolved: Default::default(),
+            ..InspectionResults::new(JobKind::Inspect, Scope::new(ScopeKind::Project, None), "Project 'p'")
         });
         let out = tmp.path().join("r.json");
         assert_eq!(s.execute("inspections.export", &json!({})).unwrap()["picker"], true);

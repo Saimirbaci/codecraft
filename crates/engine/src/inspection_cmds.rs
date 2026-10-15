@@ -21,7 +21,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "code.inspectCode",
             "Inspect Code…",
             None,
-            "{scope?: \"file\"|\"directory\"|\"project\"|\"uncommitted\", path?: string, tools?: [\"clippy\"|\"check\"|\"ruff\"|\"mypy\"|\"pyright\"|\"eslint\"|\"clang-tidy\"|\"zig\"|\"cargo-audit\"|\"cargo-deny\"]} — run the linters on a scope into the Inspection Results tool window (Clippy, or cargo check when Clippy is off or missing; others when installed). Without `scope` opens the scope dialog.",
+            "{scope?: \"file\"|\"directory\"|\"project\"|\"uncommitted\"|\"glob\", path?: string, pattern?: string (glob scope), profile?: string, tools?: [\"clippy\"|\"check\"|\"rust_analyzer\"|\"ruff\"|\"mypy\"|\"pyright\"|\"eslint\"|\"clangd\"|\"clang_analyzer\"|\"clang-tidy\"|\"cppcheck\"|\"sql\"|\"zig\"|\"cargo-audit\"|\"cargo-deny\"]} — run the analyzers the inspection profile turns on (or `tools`) on a scope into the Inspection Results tool window → {job}. Without `scope` opens the scope dialog.",
             Context::Global,
             has_project,
             |s, p| run_or_dialog(s, p, JobKind::Inspect),
@@ -58,25 +58,52 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "inspections.dialog.set",
             "Set Inspection Scope",
             None,
-            "{scope: \"file\"|\"directory\"|\"project\"|\"uncommitted\"}",
+            "{scope?: \"file\"|\"directory\"|\"project\"|\"uncommitted\"|\"glob\", pattern?: string (the custom scope's glob), profile?: string}",
             Context::Global,
             has_dialog,
             |s, p| {
-                let kind = scope_param(p)?.ok_or_else(|| CommandError::BadParams("missing `scope`".into()))?;
+                let kind = scope_param(p)?;
+                let pattern = opt_str(p, "pattern").map(str::to_string);
+                let profile = opt_str(p, "profile").map(str::to_string);
+                if kind.is_none() && pattern.is_none() && profile.is_none() {
+                    return Err(CommandError::BadParams("pass `scope`, `pattern` or `profile`".into()));
+                }
+                if let Some(name) = &profile {
+                    crate::analysis::profiles::resolve(s, Some(name)).map_err(CommandError::BadParams)?;
+                }
                 if let Some(d) = &mut s.inspections.dialog {
-                    d.scope = kind;
+                    if let Some(k) = kind {
+                        d.scope = k;
+                    }
+                    if let Some(g) = pattern {
+                        d.pattern = g.chars().take(4096).collect();
+                        if kind.is_none() {
+                            d.scope = ScopeKind::Glob;
+                        }
+                    }
+                    if let Some(name) = profile {
+                        d.profile = name;
+                    }
                 }
                 ok()
             },
         ),
         spec("inspections.dialog.ok", "Run Inspection", None, "", Context::Global, has_dialog, |s, _| {
-            let d = s.inspections.dialog.take().ok_or_else(|| CommandError::Failed("no scope dialog".into()))?;
+            let d = s.inspections.dialog.clone().ok_or_else(|| CommandError::Failed("no scope dialog".into()))?;
             let path = match d.scope {
                 ScopeKind::File => d.file.clone(),
                 ScopeKind::Directory => d.directory.clone(),
                 _ => None,
             };
-            inspections::start(s, d.kind, d.scope, path, None, true)?;
+            let opts = inspections::StartOptions {
+                format: true,
+                pattern: (d.scope == ScopeKind::Glob).then(|| d.pattern.clone()),
+                profile: Some(d.profile.clone()).filter(|p| !p.is_empty()),
+                ..inspections::StartOptions::default()
+            };
+            // The dialog stays open on a bad scope (an empty glob, no matching file).
+            inspections::start_opts(s, d.kind, d.scope, path, opts)?;
+            s.inspections.dialog = None;
             ok()
         }),
         spec("inspections.dialog.cancel", "Cancel", None, "", Context::Global, always, |s, _| {
@@ -87,8 +114,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         spec("inspections.rerun", "Rerun Inspection", None, "", Context::Global, has_last, |s, _| {
             let (kind, scope, tools) =
                 s.inspections.last.clone().ok_or_else(|| CommandError::Failed("nothing to rerun".into()))?;
-            inspections::start(s, kind, scope.kind, scope.path, tools, true)?;
-            ok()
+            let profile = s.inspections.results.as_ref().map(|r| r.profile.clone()).filter(|p| !p.is_empty());
+            let opts = inspections::StartOptions { tools, format: true, pattern: scope.pattern.clone(), profile, ..Default::default() };
+            let job = inspections::start_opts(s, kind, scope.kind, scope.path, opts)?;
+            Ok(json!({ "job": job }))
         }),
         spec("inspections.cancel", "Stop Inspection", None, "", Context::Global, is_running, |s, _| {
             inspections::cancel(s);
@@ -289,7 +318,7 @@ fn scope_param(p: &Value) -> Result<Option<ScopeKind>, CommandError> {
         None => Ok(None),
         Some(v) => ScopeKind::parse(v)
             .map(Some)
-            .ok_or_else(|| CommandError::BadParams(format!("unknown scope `{v}` (file, directory, project, uncommitted)"))),
+            .ok_or_else(|| CommandError::BadParams(format!("unknown scope `{v}` (file, directory, project, uncommitted, glob)"))),
     }
 }
 
@@ -313,19 +342,30 @@ fn run_or_dialog(s: &mut Session, p: &Value, kind: JobKind) -> CmdResult {
     let tools = tools_param(p)?;
     match scope_param(p)? {
         Some(scope) => {
-            inspections::start(s, kind, scope, opt_path(p, "path"), tools, bool_or(p, "format", true))?;
-            Ok(json!({ "started": true }))
+            let opts = inspections::StartOptions {
+                tools,
+                format: bool_or(p, "format", true),
+                pattern: opt_str(p, "pattern").map(str::to_string),
+                profile: opt_str(p, "profile").map(str::to_string),
+                ..Default::default()
+            };
+            let job = inspections::start_opts(s, kind, scope, opt_path(p, "path"), opts)?;
+            Ok(json!({ "started": true, "job": job }))
         }
         None => {
             let file = s.ws.active().and_then(|(_, d)| d.path.clone());
             let directory = file.as_deref().and_then(Path::parent).map(Path::to_path_buf);
             let previous = s.inspections.last.as_ref().map(|(_, sc, _)| sc.kind);
+            let pattern = s.inspections.last.as_ref().and_then(|(_, sc, _)| sc.pattern.clone()).unwrap_or_default();
+            crate::analysis::profiles::ensure_loaded(s);
             s.inspections.dialog = Some(ScopeDialog {
                 kind,
                 scope: previous.unwrap_or(ScopeKind::Project),
                 file,
                 directory,
                 has_vcs: s.vcs.repo.is_some(),
+                pattern,
+                profile: s.analysis.profiles.active.clone(),
             });
             Ok(json!({ "dialog": true }))
         }

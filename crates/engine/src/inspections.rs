@@ -63,6 +63,17 @@ pub enum Tool {
     CargoAudit,
     /// `cargo deny` advisories, licenses, bans and sources (M12 track RS).
     CargoDeny,
+    /// `rust-analyzer diagnostics`: its native diagnostics for the whole workspace (M14 CA).
+    RustAnalyzer,
+    /// `clang --analyze` (the Clang Static Analyzer) per translation unit (M14 CA).
+    ClangAnalyzer,
+    /// clangd's diagnostics (compiler warnings and its built-in clang-tidy) from a background
+    /// clangd that opens each file (M14 CA).
+    Clangd,
+    /// cppcheck, when installed (M14 CA).
+    Cppcheck,
+    /// CodeCraft's own SQL inspections over `.sql` files (M14 CA).
+    Sql,
 }
 
 impl Tool {
@@ -78,6 +89,63 @@ impl Tool {
             Self::Pyright => "Pyright",
             Self::CargoAudit => "cargo audit",
             Self::CargoDeny => "cargo deny",
+            Self::RustAnalyzer => "rust-analyzer",
+            Self::ClangAnalyzer => "Clang Static Analyzer",
+            Self::Clangd => "clangd",
+            Self::Cppcheck => "cppcheck",
+            Self::Sql => "SQL",
+        }
+    }
+
+    /// Every tool, in the order a run reports them.
+    pub const ALL: [Tool; 15] = [
+        Self::Clippy,
+        Self::CargoCheck,
+        Self::RustAnalyzer,
+        Self::CargoAudit,
+        Self::CargoDeny,
+        Self::Ruff,
+        Self::Mypy,
+        Self::Pyright,
+        Self::Eslint,
+        Self::Clangd,
+        Self::ClangAnalyzer,
+        Self::ClangTidy,
+        Self::Cppcheck,
+        Self::ZigFmt,
+        Self::Sql,
+    ];
+
+    /// The stable id agents and profiles use (`clippy`, `rust_analyzer`, `clang_analyzer`, …).
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Clippy => "clippy",
+            Self::CargoCheck => "cargo_check",
+            Self::Ruff => "ruff",
+            Self::Eslint => "eslint",
+            Self::ClangTidy => "clang_tidy",
+            Self::ZigFmt => "zig_fmt",
+            Self::Mypy => "mypy",
+            Self::Pyright => "pyright",
+            Self::CargoAudit => "cargo_audit",
+            Self::CargoDeny => "cargo_deny",
+            Self::RustAnalyzer => "rust_analyzer",
+            Self::ClangAnalyzer => "clang_analyzer",
+            Self::Clangd => "clangd",
+            Self::Cppcheck => "cppcheck",
+            Self::Sql => "sql",
+        }
+    }
+
+    /// The language the tool checks: `rust`, `python`, `cpp`, `javascript`, `zig` or `sql`.
+    pub fn language(self) -> &'static str {
+        match self {
+            Self::Clippy | Self::CargoCheck | Self::RustAnalyzer | Self::CargoAudit | Self::CargoDeny => "rust",
+            Self::Ruff | Self::Mypy | Self::Pyright => "python",
+            Self::Eslint => "javascript",
+            Self::ClangTidy | Self::ClangAnalyzer | Self::Clangd | Self::Cppcheck => "cpp",
+            Self::ZigFmt => "zig",
+            Self::Sql => "sql",
         }
     }
 
@@ -93,6 +161,13 @@ impl Tool {
             "pyright" | "basedpyright" => Some(Self::Pyright),
             "cargo_audit" | "audit" => Some(Self::CargoAudit),
             "cargo_deny" | "deny" => Some(Self::CargoDeny),
+            "rust_analyzer" | "ra" => Some(Self::RustAnalyzer),
+            "clang_analyzer" | "clang_analyze" | "clang_static_analyzer" | "static_analyzer" | "analyze" => {
+                Some(Self::ClangAnalyzer)
+            }
+            "clangd" => Some(Self::Clangd),
+            "cppcheck" => Some(Self::Cppcheck),
+            "sql" => Some(Self::Sql),
             _ => None,
         }
     }
@@ -165,6 +240,12 @@ pub struct Finding {
     /// The lint's documentation.
     pub url: Option<String>,
     pub fixes: Vec<Fix>,
+    /// Line-independent identity (analyzer, rule, file, the line's text) for baselines (M14 CA).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    /// Already in the baseline: not a new problem (M14 CA).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub baseline: bool,
 }
 
 impl Finding {
@@ -183,12 +264,20 @@ impl Finding {
             description: String::new(),
             url: None,
             fixes: Vec::new(),
+            fingerprint: String::new(),
+            baseline: false,
         }
     }
 
     /// The fix "Fix all" and Code Cleanup apply (the first machine-applicable one).
     pub fn safe_fix(&self) -> Option<&Fix> {
         self.fixes.iter().find(|f| f.applicability.is_safe())
+    }
+
+    /// The rule id profiles, filters and agents use: the lint code when there is one
+    /// (`clippy::needless_return`, `F401`), else the inspection (`E0308`, `Compiler errors`).
+    pub fn rule(&self) -> &str {
+        self.code.as_deref().unwrap_or(&self.inspection)
     }
 }
 
@@ -203,6 +292,9 @@ pub enum ScopeKind {
     Project,
     /// Files with uncommitted changes (from the Git status).
     Uncommitted,
+    /// Project files whose relative path matches a glob (`pattern`: `src/**/*.rs, !**/gen/**`;
+    /// M14 CA).
+    Glob,
 }
 
 impl ScopeKind {
@@ -211,7 +303,8 @@ impl ScopeKind {
             "file" | "current_file" | "currentfile" => Some(Self::File),
             "directory" | "dir" | "folder" => Some(Self::Directory),
             "project" | "whole_project" | "all" => Some(Self::Project),
-            "uncommitted" | "uncommitted_files" | "changes" | "vcs" => Some(Self::Uncommitted),
+            "uncommitted" | "uncommitted_files" | "changes" | "changed" | "vcs" | "git" => Some(Self::Uncommitted),
+            "glob" | "custom" | "pattern" => Some(Self::Glob),
             _ => None,
         }
     }
@@ -222,6 +315,7 @@ impl ScopeKind {
             Self::Directory => "directory",
             Self::Project => "project",
             Self::Uncommitted => "uncommitted",
+            Self::Glob => "glob",
         }
     }
 }
@@ -231,6 +325,15 @@ pub struct Scope {
     pub kind: ScopeKind,
     /// The file or directory (absolute); `None` for project and uncommitted scopes.
     pub path: Option<PathBuf>,
+    /// The glob of a [`ScopeKind::Glob`] scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+impl Scope {
+    pub fn new(kind: ScopeKind, path: Option<PathBuf>) -> Self {
+        Self { kind, path, pattern: None }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,9 +378,35 @@ pub struct InspectionResults {
     /// Findings fixed or suppressed since the run (hidden, kept so ids stay stable).
     #[serde(default)]
     pub resolved: BTreeSet<usize>,
+    /// The run's job id (agents ask for results by it; 0 for imported results; M14 CA).
+    #[serde(default)]
+    pub job: u64,
+    /// The inspection profile the run used.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub profile: String,
+    /// The baseline file findings were compared with (those in it have `baseline: true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<PathBuf>,
 }
 
 impl InspectionResults {
+    /// Empty results of a run.
+    pub fn new(kind: JobKind, scope: Scope, scope_label: impl Into<String>) -> Self {
+        Self {
+            kind,
+            scope,
+            scope_label: scope_label.into(),
+            findings: Vec::new(),
+            tools: Vec::new(),
+            truncated: false,
+            hashes: BTreeMap::new(),
+            resolved: BTreeSet::new(),
+            job: 0,
+            profile: String::new(),
+            baseline: None,
+        }
+    }
+
     /// Findings not fixed or suppressed yet.
     pub fn open(&self) -> impl Iterator<Item = &Finding> {
         self.findings.iter().filter(|f| !self.resolved.contains(&f.id))
@@ -307,6 +436,12 @@ pub struct ScopeDialog {
     pub directory: Option<PathBuf>,
     /// Whether the project is a Git repository (the Uncommitted scope needs it).
     pub has_vcs: bool,
+    /// The custom scope's glob (`src/**/*.rs`; M14 CA).
+    #[serde(default)]
+    pub pattern: String,
+    /// The inspection profile to run with (M14 CA).
+    #[serde(default)]
+    pub profile: String,
 }
 
 /// The paste box of Analyze Stack Trace or Thread Dump….
@@ -319,6 +454,8 @@ pub struct StackDialog {
 pub struct Running {
     pub kind: JobKind,
     pub scope: Scope,
+    /// The job id ([`InspectionResults::job`] once it finishes).
+    pub job: u64,
     /// The last line a tool printed ("Checking app v0.1.0", …).
     pub progress: String,
     cancel: Arc<AtomicBool>,
@@ -368,22 +505,80 @@ pub struct InspectionsState {
     pub only: Option<String>,
     /// Silent Code Cleanup: the running cleanup applies without the preview.
     pub silent: bool,
+    /// The last job id handed out (M14 CA).
+    pub next_job: u64,
+    /// How the results tree is grouped (M14 CA).
+    pub group_by: GroupBy,
+    /// Show only problems that are not in the baseline (M14 CA).
+    pub only_new: bool,
+    /// A tool install or a commit check is in progress (set by `analysis::pump`; M14 CA).
+    pub(crate) services_busy: bool,
 }
 
 impl InspectionsState {
     pub fn busy(&self) -> bool {
-        self.running.is_some()
+        self.running.is_some() || self.services_busy
     }
 
-    /// Whether a finding passes the severity filter and is still open.
+    /// Whether a finding passes the severity and baseline filters and is still open.
     pub fn visible(&self, f: &Finding) -> bool {
-        !self.hidden.contains(&f.severity) && self.results.as_ref().is_some_and(|r| !r.resolved.contains(&f.id))
+        !self.hidden.contains(&f.severity)
+            && !(self.only_new && f.baseline)
+            && self.results.as_ref().is_some_and(|r| !r.resolved.contains(&f.id))
+    }
+}
+
+/// How the Inspection Results tree groups problems (M14 CA).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupBy {
+    /// Inspection (rule) → file → problems (RustRover's default).
+    #[default]
+    Rule,
+    /// Severity → file → problems.
+    Severity,
+    /// Analyzer → rule → problems.
+    Analyzer,
+    /// File → rule → problems.
+    File,
+}
+
+impl GroupBy {
+    pub const ALL: [GroupBy; 4] = [Self::Rule, Self::Severity, Self::Analyzer, Self::File];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "rule" | "inspection" => Some(Self::Rule),
+            "severity" => Some(Self::Severity),
+            "analyzer" | "tool" => Some(Self::Analyzer),
+            "file" | "directory" => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Rule => "rule",
+            Self::Severity => "severity",
+            Self::Analyzer => "analyzer",
+            Self::File => "file",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Rule => "Inspection",
+            Self::Severity => "Severity",
+            Self::Analyzer => "Analyzer",
+            Self::File => "File",
+        }
     }
 }
 
 // ---------------------------------------------------------------- scopes
 
 /// Resolve a scope against the session: the files it covers and a label.
+#[derive(Clone, Debug)]
 pub(crate) struct ResolvedScope {
     pub scope: Scope,
     pub label: String,
@@ -407,6 +602,16 @@ impl ResolvedScope {
 }
 
 pub(crate) fn resolve_scope(s: &Session, kind: ScopeKind, path: Option<PathBuf>) -> Result<ResolvedScope, CommandError> {
+    resolve_scope_with(s, kind, path, None)
+}
+
+/// [`resolve_scope`] with the glob of a custom scope.
+pub(crate) fn resolve_scope_with(
+    s: &Session,
+    kind: ScopeKind,
+    path: Option<PathBuf>,
+    pattern: Option<&str>,
+) -> Result<ResolvedScope, CommandError> {
     let root = s.project_root().ok_or_else(|| CommandError::Failed("no project is open".into()))?;
     let active = s.ws.active().and_then(|(_, d)| d.path.clone());
     let rel = |p: &Path| match p.strip_prefix(&root) {
@@ -430,7 +635,7 @@ pub(crate) fn resolve_scope(s: &Session, kind: ScopeKind, path: Option<PathBuf>)
                 return Err(CommandError::Failed(format!("{} is not a file", path.display())));
             }
             let label = format!("File {}", rel(&path));
-            Ok(ResolvedScope { scope: Scope { kind, path: Some(path.clone()) }, label, files: vec![path], only: None })
+            Ok(ResolvedScope { scope: Scope::new(kind, Some(path.clone())), label, files: vec![path], only: None })
         }
         ScopeKind::Directory => {
             let dir = path
@@ -442,12 +647,12 @@ pub(crate) fn resolve_scope(s: &Session, kind: ScopeKind, path: Option<PathBuf>)
             }
             let label = format!("Directory {}", rel(&dir));
             let files = tree_files(&dir);
-            Ok(ResolvedScope { scope: Scope { kind, path: Some(dir) }, label, files, only: None })
+            Ok(ResolvedScope { scope: Scope::new(kind, Some(dir)), label, files, only: None })
         }
         ScopeKind::Project => {
             let name = s.ws.project.as_ref().map(|p| p.name.clone()).unwrap_or_else(|| rel(&root));
             Ok(ResolvedScope {
-                scope: Scope { kind, path: None },
+                scope: Scope::new(kind, None),
                 label: format!("Project '{name}'"),
                 files: tree_files(&root),
                 only: None,
@@ -474,8 +679,29 @@ pub(crate) fn resolve_scope(s: &Session, kind: ScopeKind, path: Option<PathBuf>)
             }
             let only = files.iter().cloned().collect();
             Ok(ResolvedScope {
-                scope: Scope { kind, path: None },
+                scope: Scope::new(kind, None),
                 label: format!("Uncommitted files ({})", files.len()),
+                files,
+                only: Some(only),
+            })
+        }
+        ScopeKind::Glob => {
+            let pattern = pattern
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .ok_or_else(|| CommandError::BadParams("the glob scope needs `pattern` (e.g. \"src/**/*.rs\")".into()))?;
+            let glob = crate::analysis::glob::PathGlob::parse(pattern).map_err(CommandError::BadParams)?;
+            let files: Vec<PathBuf> = tree_files(&root)
+                .into_iter()
+                .filter(|f| f.strip_prefix(&root).is_ok_and(|r| glob.matches(r)))
+                .collect();
+            if files.is_empty() {
+                return Err(CommandError::Failed(format!("no project file matches '{pattern}'")));
+            }
+            let only = files.iter().cloned().collect();
+            Ok(ResolvedScope {
+                scope: Scope { kind, path: None, pattern: Some(pattern.to_string()) },
+                label: format!("Files matching '{pattern}' ({})", files.len()),
                 files,
                 only: Some(only),
             })
@@ -502,6 +728,14 @@ pub(crate) struct JobSpec {
     pub format: bool,
     /// Run Inspection by Name: a lint to turn on (`-W lint`) and keep alone in the results.
     pub only: Option<String>,
+    /// The run's job id (M14 CA).
+    pub job: u64,
+    /// The inspection profile: which analyzers and rules run, at which severity (M14 CA).
+    pub profile: Arc<crate::analysis::profiles::InspectionProfile>,
+    /// Programs and directories of the M14 analyzers (clang, cmake, managed tools; M14 CA).
+    pub env: crate::analysis::analyzers::AnalyzerEnv,
+    /// Findings already in this baseline are marked `baseline` (M14 CA).
+    pub baseline: Option<Arc<crate::analysis::baseline::Baseline>>,
 }
 
 /// Start Inspect Code or Code Cleanup on a scope (cancelling a run in progress).
@@ -529,7 +763,41 @@ pub(crate) fn start_with(
     only: Option<String>,
     silent: bool,
 ) -> Result<(), CommandError> {
-    let scope = resolve_scope(s, scope_kind, path)?;
+    let opts = StartOptions { tools, format, only, silent, ..StartOptions::default() };
+    start_opts(s, kind, scope_kind, path, opts).map(|_| ())
+}
+
+/// Everything about a run besides its kind and scope (M14 CA).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StartOptions {
+    pub tools: Option<Vec<Tool>>,
+    pub format: bool,
+    pub only: Option<String>,
+    pub silent: bool,
+    /// The glob of a custom scope.
+    pub pattern: Option<String>,
+    /// An inspection profile by name (default: the project's active one).
+    pub profile: Option<String>,
+    /// An already resolved scope (the commit check's files).
+    pub resolved: Option<ResolvedScope>,
+    /// Keep the Inspection Results tool window as it is (agents, the commit check).
+    pub quiet: bool,
+}
+
+/// Start a run; returns its job id.
+pub(crate) fn start_opts(
+    s: &mut Session,
+    kind: JobKind,
+    scope_kind: ScopeKind,
+    path: Option<PathBuf>,
+    opts: StartOptions,
+) -> Result<u64, CommandError> {
+    let StartOptions { tools, format, only, silent, pattern, profile, resolved, quiet } = opts;
+    let scope = match resolved {
+        Some(r) => r,
+        None => resolve_scope_with(s, scope_kind, path, pattern.as_deref())?,
+    };
+    let profile = crate::analysis::profiles::resolve(s, profile.as_deref()).map_err(CommandError::BadParams)?;
     // Linters read the disk: save first, like RustRover does before running external tools.
     s.save_all()?;
     cancel(s);
@@ -549,6 +817,10 @@ pub(crate) fn start_with(
         })
         .unwrap_or_default();
     s.inspections.last = Some((kind, scope.scope.clone(), tools.clone()));
+    s.inspections.next_job = s.inspections.next_job.saturating_add(1);
+    let job = s.inspections.next_job;
+    let env = crate::analysis::analyzers::env(s, &root);
+    let baseline = crate::analysis::baseline::current(s);
     let spec = JobSpec {
         kind,
         root,
@@ -560,6 +832,10 @@ pub(crate) fn start_with(
         format,
         scope,
         only,
+        job,
+        profile: Arc::new(profile),
+        env,
+        baseline,
     };
     let scope_value = spec.scope.scope.clone();
     let cancel = Arc::new(AtomicBool::new(false));
@@ -573,11 +849,14 @@ pub(crate) fn start_with(
         })
         .map_err(|e| CommandError::Failed(format!("cannot start the inspection: {e}")))?;
     s.inspections.running =
-        Some(Running { kind, scope: scope_value, progress: format!("{}…", kind.title()), cancel, rx });
+        Some(Running { kind, scope: scope_value, job, progress: format!("{}…", kind.title()), cancel, rx });
     s.inspections.selected = None;
-    s.ws.layout.show(ToolWindowId::InspectionResults);
+    if !quiet {
+        s.ws.layout.show(ToolWindowId::InspectionResults);
+    }
     s.status = format!("{}…", kind.title());
-    Ok(())
+    crate::analysis::jobs::started(s, job);
+    Ok(job)
 }
 
 /// Stop the run in progress (its processes are killed).
@@ -585,6 +864,7 @@ pub(crate) fn cancel(s: &mut Session) -> bool {
     match s.inspections.running.take() {
         Some(r) => {
             r.cancel.store(true, Ordering::Relaxed);
+            crate::analysis::jobs::ended(s, r.job, true);
             true
         }
         None => false,
@@ -596,6 +876,12 @@ pub(crate) fn shutdown(s: &mut Session) {
 }
 
 pub(crate) fn pump(s: &mut Session) -> bool {
+    // The M14 analysis services: tool installs, the commit check (M14 CA).
+    let services = crate::analysis::pump(s);
+    services | pump_run(s)
+}
+
+fn pump_run(s: &mut Session) -> bool {
     let Some(running) = &mut s.inspections.running else { return false };
     let mut changed = false;
     let mut done = None;
@@ -611,19 +897,24 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
+                let job = running.job;
                 s.inspections.running = None;
+                crate::analysis::jobs::ended(s, job, true);
                 s.notify(NotificationLevel::Error, "Inspect Code", "the inspection stopped unexpectedly");
                 return true;
             }
         }
     }
     let Some(out) = done else { return changed };
+    let job = running.job;
     s.inspections.running = None;
     if out.cancelled {
         s.status = "Inspection cancelled".into();
+        crate::analysis::jobs::ended(s, job, true);
         return true;
     }
     finish(s, *out);
+    crate::analysis::jobs::ended(s, job, false);
     true
 }
 
@@ -796,8 +1087,16 @@ pub(crate) fn find_program(spec: &JobSpec, tool: Tool) -> Option<PathBuf> {
                 .find(|p| p.is_file())
         }),
         Tool::ZigFmt => codecraft_lsp::which("zig"),
-        Tool::Mypy | Tool::Pyright => crate::python_lint::find(&spec.root, tool),
+        Tool::Mypy => crate::python_lint::find(&spec.root, tool),
+        // The project's or PATH's, else the one Install basedpyright put in the managed tools.
+        Tool::Pyright => crate::python_lint::find(&spec.root, tool).or_else(|| spec.env.managed_tool("basedpyright")),
         Tool::CargoAudit | Tool::CargoDeny => crate::cargo_audit::find(tool),
+        Tool::RustAnalyzer => codecraft_lsp::find_rust_analyzer(),
+        Tool::ClangAnalyzer => spec.env.clang.clone(),
+        Tool::Clangd => spec.env.clangd.clone(),
+        Tool::Cppcheck => codecraft_lsp::which("cppcheck"),
+        // Built in: no program.
+        Tool::Sql => None,
     }
 }
 
@@ -805,23 +1104,24 @@ pub(crate) fn find_program(spec: &JobSpec, tool: Tool) -> Option<PathBuf> {
 fn scope_args(spec: &JobSpec, exts: &[&str]) -> Vec<String> {
     match (&spec.scope.scope.kind, &spec.scope.scope.path) {
         (ScopeKind::File | ScopeKind::Directory, Some(p)) => vec![p.display().to_string()],
-        (ScopeKind::Uncommitted, _) => {
+        (ScopeKind::Uncommitted | ScopeKind::Glob, _) => {
             with_ext(&spec.scope.files, exts).take(MAX_FILE_ARGS).map(|p| p.display().to_string()).collect()
         }
         _ => vec![".".into()],
     }
 }
 
-fn wanted(spec: &JobSpec, tool: Tool) -> bool {
+/// Whether a tool runs: the ones asked for, else every one the inspection profile turns on.
+pub(crate) fn wanted(spec: &JobSpec, tool: Tool) -> bool {
     match &spec.tools {
-        None => true,
+        None => spec.profile.analyzer_enabled(tool),
         Some(list) => {
             list.contains(&tool) || (tool == Tool::Clippy && list.contains(&Tool::CargoCheck))
         }
     }
 }
 
-fn count_label(n: usize) -> String {
+pub(crate) fn count_label(n: usize) -> String {
     format!("{n} problem{}", if n == 1 { "" } else { "s" })
 }
 
@@ -863,6 +1163,10 @@ fn run_job(spec: &JobSpec, cancel: &AtomicBool, tx: &Sender<Msg>) -> JobOutput {
             Err(e) if e == CANCELLED => cancelled = true,
             Err(e) => log::warn!("advisory tools: {e}"),
         }
+    }
+    // C/C++: make sure CMake projects have a compile_commands.json for the analyzers (M14 CA).
+    if !cancelled {
+        crate::analysis::analyzers::prepare_cpp(spec, cancel, &progress);
     }
     let linters: [(Tool, &[&str]); 6] = [
         (Tool::Ruff, PY_EXTS),
@@ -909,28 +1213,34 @@ fn run_job(spec: &JobSpec, cancel: &AtomicBool, tx: &Sender<Msg>) -> JobOutput {
             Err(e) => tools.push(ToolRun { tool, command_line, outcome: format!("failed: {e}"), ok: false }),
         }
     }
-    let mut results = InspectionResults {
-        kind: spec.kind,
-        scope: spec.scope.scope.clone(),
-        scope_label: spec.scope.label.clone(),
-        findings: Vec::new(),
-        tools,
-        truncated: false,
-        hashes: BTreeMap::new(),
-        resolved: BTreeSet::new(),
-    };
+    // rust-analyzer, clangd, the Clang Static Analyzer, cppcheck and SQL (M14 CA); Code Cleanup
+    // only needs the analyzers with machine-applicable fixes above.
+    if !cancelled && spec.kind == JobKind::Inspect {
+        cancelled = crate::analysis::analyzers::run(spec, cancel, &progress, &mut tools, &mut findings);
+    }
+    let mut results = InspectionResults::new(spec.kind, spec.scope.scope.clone(), spec.scope.label.clone());
+    results.tools = tools;
+    results.job = spec.job;
+    results.profile = spec.profile.name.clone();
     if cancelled {
         return JobOutput { results, rewrites: Vec::new(), cleanup_errors: Vec::new(), cancelled: true };
     }
-    let (findings, truncated) = finalize(findings, |p| spec.scope.contains(p));
+    // The profile's rule switches and severities, NOLINT comments, one report per problem.
+    let findings = crate::analysis::analyzers::postprocess(spec, findings);
+    let (mut findings, truncated) = finalize(findings, |p| spec.scope.contains(p));
     results.truncated = truncated;
+    let mut texts: HashMap<PathBuf, Option<String>> = HashMap::new();
     for f in &findings {
-        if !results.hashes.contains_key(&f.path)
-            && let Some(text) = read_normalized(&f.path)
-        {
-            results.hashes.insert(f.path.clone(), text_hash(&text));
+        if !texts.contains_key(&f.path) {
+            let text = read_normalized(&f.path);
+            if let Some(t) = &text {
+                results.hashes.insert(f.path.clone(), text_hash(t));
+            }
+            texts.insert(f.path.clone(), text);
         }
     }
+    crate::analysis::baseline::mark(&spec.root, spec.baseline.as_deref(), &mut findings, &texts);
+    results.baseline = spec.baseline.as_ref().map(|b| b.path.clone());
     results.findings = findings;
     let (rewrites, cleanup_errors) = match spec.kind {
         JobKind::Inspect => (Vec::new(), Vec::new()),
@@ -1025,6 +1335,20 @@ pub fn docs_url(tool: Tool, code: &str, severity: Severity) -> Option<String> {
         Tool::CargoAudit | Tool::CargoDeny => {
             code.starts_with("RUSTSEC-").then(|| format!("https://rustsec.org/advisories/{code}.html"))
         }
+        Tool::RustAnalyzer => {
+            if code.starts_with("clippy::") || code.starts_with('E') || code.contains('_') {
+                docs_url(Tool::Clippy, code, severity)
+            } else {
+                Some(format!("https://rust-analyzer.github.io/book/diagnostics.html#{code}"))
+            }
+        }
+        Tool::ClangAnalyzer => Some("https://clang.llvm.org/docs/analyzer/checkers.html".into()),
+        Tool::Clangd => match code.strip_prefix("-W") {
+            Some(flag) => Some(format!("https://clang.llvm.org/docs/DiagnosticsReference.html#w{flag}")),
+            None if code.contains('-') && !code.starts_with("clang-diagnostic") => docs_url(Tool::ClangTidy, code, severity),
+            None => None,
+        },
+        Tool::Cppcheck | Tool::Sql => None,
     }
 }
 
@@ -1040,6 +1364,10 @@ pub fn suppress_label(f: &Finding) -> String {
         Tool::Mypy => format!("Suppress with # type: ignore[{code}]"),
         Tool::Pyright => format!("Suppress with # pyright: ignore[{code}]"),
         Tool::CargoAudit | Tool::CargoDeny => format!("Ignore {code} in the tool's configuration"),
+        Tool::RustAnalyzer => format!("Suppress '{code}' for item"),
+        Tool::ClangAnalyzer | Tool::Clangd => format!("Suppress with NOLINT({code})"),
+        Tool::Cppcheck => format!("Suppress with // cppcheck-suppress {code}"),
+        Tool::Sql => format!("Suppress with -- noinspection {code}"),
     }
 }
 
@@ -1108,6 +1436,75 @@ pub fn tree(state: &InspectionsState) -> ResultTree {
     groups.into_iter().map(|((_, name), files)| (name, files.into_iter().collect())).collect()
 }
 
+/// A top-level node of the grouped results tree (M14 CA).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Group {
+    pub label: String,
+    /// The file of a group by file.
+    pub path: Option<PathBuf>,
+    /// The most severe problem under it.
+    pub worst: Severity,
+    pub children: Vec<SubGroup>,
+}
+
+/// A second-level node: a file (`path`) or a rule, with its problems.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SubGroup {
+    pub label: String,
+    pub path: Option<PathBuf>,
+    pub ids: Vec<usize>,
+}
+
+/// The results tree grouped as [`InspectionsState::group_by`] says, most severe groups first
+/// (files: by path), only visible problems.
+pub fn grouped(state: &InspectionsState) -> Vec<Group> {
+    let Some(results) = &state.results else { return Vec::new() };
+    let visible: Vec<&Finding> = results.open().filter(|f| state.visible(f)).collect();
+    // (top key, sub key) → ids; top sort key carries the worst severity.
+    type Subs = BTreeMap<(String, Option<PathBuf>), Vec<usize>>;
+    let mut top: BTreeMap<String, (Severity, Subs)> = BTreeMap::new();
+    for f in &visible {
+        let (key, sub) = match state.group_by {
+            GroupBy::Rule => (f.inspection.clone(), (file_label(&f.path), Some(f.path.clone()))),
+            GroupBy::Severity => (f.severity.label().to_string(), (file_label(&f.path), Some(f.path.clone()))),
+            GroupBy::Analyzer => (f.tool.label().to_string(), (f.inspection.clone(), None)),
+            GroupBy::File => (f.path.display().to_string(), (f.inspection.clone(), None)),
+        };
+        let e = top.entry(key).or_insert((f.severity, BTreeMap::new()));
+        if f.severity < e.0 {
+            e.0 = f.severity;
+        }
+        e.1.entry(sub).or_default().push(f.id);
+    }
+    let mut out: Vec<Group> = top
+        .into_iter()
+        .map(|(key, (worst, subs))| {
+            let path = (state.group_by == GroupBy::File).then(|| PathBuf::from(&key));
+            let label = match state.group_by {
+                GroupBy::File => file_label(Path::new(&key)),
+                GroupBy::Severity => crate::analysis::profiles::Level::of(worst).label().to_string(),
+                _ => key,
+            };
+            let mut children: Vec<SubGroup> =
+                subs.into_iter().map(|((label, path), ids)| SubGroup { label, path, ids }).collect();
+            if state.group_by == GroupBy::File {
+                children.sort_by_key(|c| c.ids.iter().filter_map(|id| results.finding(*id)).map(|f| f.severity).min());
+            }
+            Group { label, path, worst, children }
+        })
+        .collect();
+    match state.group_by {
+        // Files keep path order (BTreeMap); everything else most severe first, stable by name.
+        GroupBy::File => {}
+        _ => out.sort_by(|a, b| a.worst.cmp(&b.worst).then_with(|| a.label.cmp(&b.label))),
+    }
+    out
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -1157,17 +1554,32 @@ mod tests {
         let (findings, _) = finalize(fs, |_| true);
         let mut state = InspectionsState {
             results: Some(InspectionResults {
-                kind: JobKind::Inspect,
-                scope: Scope { kind: ScopeKind::Project, path: None },
-                scope_label: "Project".into(),
                 findings,
-                tools: Vec::new(),
-                truncated: false,
-                hashes: BTreeMap::new(),
-                resolved: BTreeSet::new(),
+                ..InspectionResults::new(JobKind::Inspect, Scope::new(ScopeKind::Project, None), "Project")
             }),
             ..InspectionsState::default()
         };
+        // Grouped views (M14 CA): by severity errors first, by analyzer one group, by file per path.
+        state.group_by = GroupBy::Severity;
+        let g = grouped(&state);
+        assert_eq!(g.iter().map(|g| g.label.as_str()).collect::<Vec<_>>(), ["Error", "Warning"]);
+        assert_eq!(g[1].children.len(), 2, "two files with warnings");
+        state.group_by = GroupBy::Analyzer;
+        let g = grouped(&state);
+        assert_eq!((g.len(), g[0].label.as_str(), g[0].children.len()), (1, "Clippy", 2));
+        state.group_by = GroupBy::File;
+        let g = grouped(&state);
+        assert_eq!(g.iter().map(|g| g.label.as_str()).collect::<Vec<_>>(), ["a.rs", "b.rs"]);
+        assert_eq!(g[0].children[0].label, "E0308", "the file's most severe rule first");
+        assert_eq!(g[0].path.as_deref(), Some(Path::new("/p/a.rs")));
+        state.group_by = GroupBy::Rule;
+        let g = grouped(&state);
+        assert_eq!(g[0].label, "E0308");
+        // Only new problems: baseline ones are hidden.
+        state.results.as_mut().unwrap().findings[1].baseline = true;
+        state.only_new = true;
+        assert_eq!(grouped(&state).iter().map(|g| g.children.iter().map(|c| c.ids.len()).sum::<usize>()).sum::<usize>(), 3);
+        state.only_new = false;
         let t = tree(&state);
         // Errors first; files sorted; occurrences in order.
         assert_eq!(t[0].0, "E0308");

@@ -91,6 +91,11 @@ fn skip(id: &str, params: &Value) -> bool {
     {
         return true;
     }
+    // Analysis jobs start every installed analyzer (clang, clangd, rust-analyzer…) and installs
+    // run uv (analysis_ca tests drive them with fakes; M14 CA).
+    if matches!(id, "analysis.run" | "analysis.installTool") && !params.is_null() {
+        return true;
+    }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
         || matches!(

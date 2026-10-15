@@ -51,13 +51,25 @@ pub(crate) fn run(
     progress: &dyn Fn(&str),
 ) -> Result<(ToolRun, Vec<Finding>), String> {
     let program = super::find_program(spec, Tool::Clippy).unwrap_or_else(codecraft_cargo::find_cargo);
-    let mut clippy = spec.use_clippy && !spec.tools.as_ref().is_some_and(|t| t == &[Tool::CargoCheck]);
+    // Clippy when asked for by name, else when Settings › Rust turns it on or the inspection
+    // profile turns on Clippy lint groups — unless the profile turns Clippy off (M14 CA).
+    let asked = spec.tools.as_ref().is_some_and(|t| t.contains(&Tool::Clippy));
+    let mut clippy = !spec.tools.as_ref().is_some_and(|t| t == &[Tool::CargoCheck])
+        && (asked || ((spec.use_clippy || !spec.profile.clippy_groups.is_empty()) && spec.profile.clippy_enabled()));
     let mut note = String::new();
     loop {
         let mut args = args(clippy);
-        // Run Inspection by Name turns the lint on (allow-by-default Clippy lints included).
-        if clippy && let Some(lint) = spec.only.as_deref().filter(|l| is_lint_name(l)) {
-            args.extend(["--".to_string(), "-W".to_string(), lint.to_string()]);
+        if clippy {
+            // The profile's lint groups and rule switches (M14 CA).
+            let mut flags = spec.profile.clippy_args();
+            // Run Inspection by Name turns the lint on (allow-by-default Clippy lints included).
+            if let Some(lint) = spec.only.as_deref().filter(|l| is_lint_name(l)) {
+                flags.extend(["-W".to_string(), lint.to_string()]);
+            }
+            if !flags.is_empty() {
+                args.push("--".to_string());
+                args.extend(flags);
+            }
         }
         let command_line = format!("cargo {}", args.join(" "));
         progress(&format!("Running {command_line}…"));

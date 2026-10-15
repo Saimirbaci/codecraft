@@ -507,7 +507,8 @@ pub fn enclosing_item_line(text: &str, line: usize) -> Option<usize> {
 }
 
 /// The change that suppresses a finding: `#[allow(lint)]` on the enclosing Rust item,
-/// `# noqa: CODE` (ruff), `// eslint-disable-next-line rule`, `// NOLINT(check)` (clang-tidy).
+/// `# noqa: CODE` (ruff), `// eslint-disable-next-line rule`, `// NOLINT(check)` (clang-tidy,
+/// clangd, the Clang Static Analyzer), `// cppcheck-suppress id`, `-- noinspection Id` (SQL).
 pub fn suppress_change(f: &Finding, text: &str) -> Result<TextChange, String> {
     let code = f.code.as_deref().ok_or_else(|| format!("'{}' cannot be suppressed", f.inspection))?;
     let lines: Vec<&str> = text.split('\n').collect();
@@ -520,7 +521,7 @@ pub fn suppress_change(f: &Finding, text: &str) -> Result<TextChange, String> {
     };
     let indent_of = |l: &str| l.chars().take_while(|c| *c == ' ' || *c == '\t').collect::<String>();
     match f.tool {
-        Tool::Clippy | Tool::CargoCheck => {
+        Tool::Clippy | Tool::CargoCheck | Tool::RustAnalyzer => {
             let item = enclosing_item_line(text, f.start.line).ok_or("no enclosing item to put #[allow] on")?;
             let l = line_text(item)?;
             Ok(at(item, 0, format!("{}#[allow({code})]\n", indent_of(l))))
@@ -542,10 +543,18 @@ pub fn suppress_change(f: &Finding, text: &str) -> Result<TextChange, String> {
             let l = line_text(f.start.line)?;
             Ok(at(f.start.line, 0, format!("{}// eslint-disable-next-line {code}\n", indent_of(l))))
         }
-        Tool::ClangTidy => {
+        Tool::ClangTidy | Tool::ClangAnalyzer | Tool::Clangd => {
             let l = line_text(f.start.line)?;
+            if l.contains("NOLINT") {
+                return Err("this line already has a NOLINT comment".into());
+            }
             Ok(at(f.start.line, l.chars().count(), format!("  // NOLINT({code})")))
         }
+        Tool::Cppcheck => {
+            let l = line_text(f.start.line)?;
+            Ok(at(f.start.line, 0, format!("{}// cppcheck-suppress {code}\n", indent_of(l))))
+        }
+        Tool::Sql => crate::analysis::sql::suppress_change(f, text),
         Tool::ZigFmt => Err("zig fmt problems cannot be suppressed".into()),
         Tool::CargoAudit | Tool::CargoDeny => Err("advisories are ignored in the tool's own configuration (audit.toml / deny.toml)".into()),
         Tool::Mypy | Tool::Pyright => {
@@ -679,14 +688,12 @@ mod tests {
         f2.id = 1;
         f2.fixes.push(fix(1, &[(0, 0, 0, 1, "z")]).1);
         let mut r = InspectionResults {
-            kind: super::super::JobKind::Inspect,
-            scope: super::super::Scope { kind: super::super::ScopeKind::Project, path: None },
-            scope_label: String::new(),
             findings: vec![f1, f2],
-            tools: Vec::new(),
-            truncated: false,
-            hashes: BTreeMap::new(),
-            resolved: BTreeSet::new(),
+            ..InspectionResults::new(
+                super::super::JobKind::Inspect,
+                super::super::Scope::new(super::super::ScopeKind::Project, None),
+                "",
+            )
         };
         remap(&mut r, Path::new("/a.rs"), before, &after, &splices);
         assert_eq!(r.findings[0].start, Position::new(2, 1));

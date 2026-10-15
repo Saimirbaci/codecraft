@@ -9,7 +9,7 @@ use egui::{Align, Color32, CornerRadius, FontId, Id, Layout, RichText, ScrollAre
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_engine::inspections::{self, Finding, JobKind, ResultTree as Tree, ScopeKind};
+use codecraft_engine::inspections::{self, Finding, GroupBy, Group, JobKind, ScopeKind, Tool};
 use codecraft_workspace::Severity;
 
 use crate::theme::Theme;
@@ -31,10 +31,6 @@ fn rel(s: &Session, path: &Path) -> String {
     }
 }
 
-fn file_name(path: &Path) -> String {
-    path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string()
-}
-
 // ---------------------------------------------------------------- tool window
 
 /// The Inspection Results tool window: toolbar, the inspection → file → problem tree and the
@@ -43,6 +39,7 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     let theme = st.theme.clone();
     let mut cmds: Vec<(&'static str, Value)> = Vec::new();
     toolbar(ui, s, &theme, &mut cmds);
+    toolbar2(ui, s, &theme, &mut cmds);
     ui.separator();
     if s.inspections.results.is_none() {
         if s.inspections.running.is_none() {
@@ -56,7 +53,7 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
         flush(s, st, cmds);
         return;
     }
-    let tree = inspections::tree(&s.inspections);
+    let tree = inspections::grouped(&s.inspections);
     let width = ui.available_width();
     let height = ui.available_height();
     let tree_w = (width * 0.5).clamp(200.0, width.max(200.0));
@@ -74,6 +71,77 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
         });
     });
     flush(s, st, cmds);
+}
+
+/// The second toolbar row (M14 CA): grouping, profile, baseline, export and import.
+fn toolbar2(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Vec<(&'static str, Value)>) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Group by").color(theme.text_muted).small());
+        let current = s.inspections.group_by;
+        egui::ComboBox::from_id_salt("inspection-group-by").selected_text(current.label()).show_ui(ui, |ui| {
+            for g in GroupBy::ALL {
+                if ui.selectable_label(g == current, g.label()).clicked() && g != current {
+                    cmds.push(("inspections.groupBy", json!({ "by": g.id() })));
+                }
+            }
+        });
+        if let Some(r) = &s.inspections.results
+            && !r.profile.is_empty()
+        {
+            ui.label(RichText::new(format!("Profile: {}", r.profile)).color(theme.text_muted).small())
+                .on_hover_text("Settings › Editor › Inspections");
+        }
+        ui.separator();
+        let has_baseline = s.inspections.results.as_ref().is_some_and(|r| r.baseline.is_some());
+        let mut only_new = s.inspections.only_new;
+        if ui
+            .add_enabled(has_baseline, egui::Checkbox::new(&mut only_new, "Only new"))
+            .on_hover_text("Hide problems that are in the baseline")
+            .on_disabled_hover_text("Save a baseline first (Baseline ▸ Save as Baseline)")
+            .changed()
+        {
+            cmds.push(("inspections.onlyNew", json!({ "show": only_new })));
+        }
+        ui.menu_button("Baseline", |ui| {
+            if ui.button("Save as Baseline").on_hover_text("The open problems become the baseline").clicked() {
+                cmds.push(("analysis.baseline.save", json!({})));
+                ui.close();
+            }
+            if ui.button("Load Baseline").clicked() {
+                cmds.push(("analysis.baseline.load", json!({})));
+                ui.close();
+            }
+            if ui.add_enabled(has_baseline, egui::Button::new("Clear Baseline")).clicked() {
+                cmds.push(("analysis.baseline.clear", json!({})));
+                ui.close();
+            }
+        });
+        ui.menu_button("Export", |ui| {
+            for (label, format) in [("JSON…", "json"), ("SARIF 2.1.0…", "sarif"), ("HTML report…", "html")] {
+                if ui.button(label).clicked() {
+                    cmds.push(("inspections.export", json!({ "format": format })));
+                    ui.close();
+                }
+            }
+        });
+        if ui.button("Import…").on_hover_text("View Offline Inspection Results (JSON or SARIF)").clicked() {
+            cmds.push(("code.analyzeCode.viewOfflineInspectionResults", json!({})));
+        }
+        // basedpyright is missing: offer the managed install (only on this explicit click).
+        let missing_pyright = s
+            .inspections
+            .results
+            .as_ref()
+            .is_some_and(|r| r.tools.iter().any(|t| t.tool == Tool::Pyright && t.outcome.starts_with("not installed")));
+        if missing_pyright && s.analysis.install.running.is_none() {
+            if ui.button("Install basedpyright").on_hover_text("uv tool install into $CODECRAFT_HOME/tools").clicked() {
+                cmds.push(("analysis.installTool", json!({ "tool": "basedpyright", "confirm": true })));
+            }
+        } else if let Some(j) = &s.analysis.install.running {
+            ui.add(egui::Spinner::new().size(12.0));
+            ui.label(RichText::new(format!("Installing {}…", j.tool)).color(theme.text_muted).small());
+        }
+    });
 }
 
 fn flush(s: &mut Session, st: &mut UiState, cmds: Vec<(&'static str, Value)>) {
@@ -97,7 +165,7 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Vec<(&'static str
         }
         ui.separator();
         let counts = s.inspections.results.as_ref().map(|r| r.counts()).unwrap_or_default();
-        for sev in [Severity::Error, Severity::Warning, Severity::Info] {
+        for sev in [Severity::Error, Severity::Warning, Severity::Info, Severity::Hint] {
             let (mark, color) = severity_mark(theme, sev);
             let shown = !s.inspections.hidden.contains(&sev);
             let n = counts.get(&sev).copied().unwrap_or(0);
@@ -141,47 +209,46 @@ fn plural_severity(s: Severity) -> &'static str {
     }
 }
 
-fn tree_view(ui: &mut Ui, s: &Session, theme: &Theme, tree: &Tree, cmds: &mut Vec<(&'static str, Value)>) {
+fn tree_view(ui: &mut Ui, s: &Session, theme: &Theme, tree: &[Group], cmds: &mut Vec<(&'static str, Value)>) {
     let Some(results) = &s.inspections.results else { return };
     if tree.is_empty() {
         let msg = if results.open().next().is_none() { "No problems found." } else { "All problems are filtered out." };
         ui.label(RichText::new(msg).color(theme.text_muted));
         return;
     }
-    for (name, files) in tree {
-        let count: usize = files.iter().map(|(_, ids)| ids.len()).sum();
-        let worst = files
-            .iter()
-            .flat_map(|(_, ids)| ids.iter())
-            .filter_map(|id| results.finding(*id))
-            .map(|f| f.severity)
-            .min()
-            .unwrap_or(Severity::Warning);
-        let (mark, color) = severity_mark(theme, worst);
+    let by = s.inspections.group_by;
+    for group in tree {
+        let count: usize = group.children.iter().map(|c| c.ids.len()).sum();
+        let (mark, color) = severity_mark(theme, group.worst);
         let mut job = LayoutJob::default();
         job.append(&format!("{mark} "), 0.0, TextFormat { color, ..Default::default() });
-        job.append(name, 0.0, TextFormat { color: theme.text, ..Default::default() });
+        job.append(&group.label, 0.0, TextFormat { color: theme.text, ..Default::default() });
         job.append(
             &format!("  {count} problem{}", if count == 1 { "" } else { "s" }),
             0.0,
             TextFormat { color: theme.text_muted, ..Default::default() },
         );
-        egui::CollapsingHeader::new(job).id_salt(("inspection", name)).default_open(true).show(ui, |ui| {
-            for (path, ids) in files {
-                let label = format!("{}  {}", file_name(path), ids.len());
-                egui::CollapsingHeader::new(RichText::new(label).color(theme.text))
-                    .id_salt(("inspection-file", name, path))
+        let key = group.path.as_ref().map_or_else(|| group.label.clone(), |p| p.display().to_string());
+        let header = egui::CollapsingHeader::new(job).id_salt(("inspection", by.id(), &key)).default_open(true).show(ui, |ui| {
+            for child in &group.children {
+                let label = format!("{}  {}", child.label, child.ids.len());
+                let r = egui::CollapsingHeader::new(RichText::new(label).color(theme.text))
+                    .id_salt(("inspection-sub", by.id(), &key, &child.label, &child.path))
                     .default_open(true)
                     .show(ui, |ui| {
-                        for id in ids {
+                        for id in &child.ids {
                             let Some(f) = results.finding(*id) else { continue };
                             occurrence_row(ui, s, theme, f, cmds);
                         }
-                    })
-                    .header_response
-                    .on_hover_text(rel(s, path));
+                    });
+                if let Some(path) = &child.path {
+                    r.header_response.on_hover_text(rel(s, path));
+                }
             }
         });
+        if let Some(path) = &group.path {
+            header.header_response.on_hover_text(rel(s, path));
+        }
     }
 }
 
@@ -252,6 +319,7 @@ fn description(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Vec<(&'static
     if ui.link(RichText::new(&loc).color(theme.link)).on_hover_text("Jump to Source (double-click the problem)").clicked() {
         cmds.push(("inspections.navigate", json!({ "id": f.id })));
     }
+    source_preview(ui, s, theme, f);
     ui.add_space(6.0);
     ui.horizontal_wrapped(|ui| {
         for (i, fix) in f.fixes.iter().enumerate() {
@@ -289,6 +357,38 @@ fn description(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Vec<(&'static
     }
 }
 
+/// A few lines of source around the problem, its line highlighted (read once per problem and
+/// kept in egui's memory: the file is not read every frame).
+fn source_preview(ui: &mut Ui, s: &Session, theme: &Theme, f: &Finding) {
+    let job = s.inspections.results.as_ref().map_or(0, |r| r.job);
+    let id = Id::new(("inspection-preview", job, f.id, f.start.line, f.path.display().to_string()));
+    let cached: Option<Vec<(usize, String)>> = ui.data(|d| d.get_temp(id));
+    let lines = cached.unwrap_or_else(|| {
+        let lines = codecraft_engine::analysis::agent_cmds::source_lines(s, &f.path, f.start.line, 2, 2);
+        ui.data_mut(|d| d.insert_temp(id, lines.clone()));
+        lines
+    });
+    if lines.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    egui::Frame::new().fill(theme.editor_bg).stroke(Stroke::new(1.0, theme.border)).inner_margin(4.0).show(ui, |ui| {
+        for (i, text) in &lines {
+            let here = *i == f.start.line;
+            let row = format!("{:>5}  {text}", i + 1);
+            let label = RichText::new(row).font(FontId::monospace(11.5)).color(if here { theme.text_editor } else { theme.text_muted });
+            if here {
+                egui::Frame::new().fill(theme.caret_row).show(ui, |ui| {
+                    ui.set_min_width(ui.available_width());
+                    ui.label(label);
+                });
+            } else {
+                ui.label(label);
+            }
+        }
+    });
+}
+
 // ---------------------------------------------------------------- windows
 
 pub fn windows(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
@@ -296,6 +396,8 @@ pub fn windows(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     scope_dialog(&ctx, s, st);
     stack_dialog(&ctx, s, st);
     stack_window(&ctx, s, st);
+    // The commit check's progress and warning (M14 CA).
+    crate::inspect_ui::windows(&ctx, s, st);
 }
 
 fn scope_dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
@@ -327,9 +429,43 @@ fn scope_dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             choice(ui, ScopeKind::File, format!("File '{file}'"), d.file.is_some());
             let dir = d.directory.as_deref().map(|p| rel(s, p)).unwrap_or_default();
             choice(ui, ScopeKind::Directory, format!("Directory '{dir}'"), d.directory.is_some());
+            // A custom scope: a glob over project-relative paths (M14 CA).
+            ui.horizontal(|ui| {
+                choice(ui, ScopeKind::Glob, "Custom scope".into(), true);
+                if let Some(dd) = s.inspections.dialog.as_mut() {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut dd.pattern)
+                            .id(Id::new("inspection-scope-pattern"))
+                            .hint_text("src/**/*.rs, !**/generated/**")
+                            .desired_width(260.0),
+                    );
+                    r.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::TextEdit, true, "Scope pattern"));
+                    if r.changed() && dd.scope != ScopeKind::Glob {
+                        dd.scope = ScopeKind::Glob;
+                    }
+                }
+            });
+            if d.kind == JobKind::Inspect {
+                ui.horizontal(|ui| {
+                    ui.label("Inspection profile:");
+                    let names: Vec<String> = s.analysis.profiles.list().into_iter().map(|(p, _, _)| p.name).collect();
+                    egui::ComboBox::from_id_salt("inspection-scope-profile").selected_text(d.profile.clone()).show_ui(ui, |ui| {
+                        for n in names {
+                            if ui.selectable_label(n == d.profile, &n).clicked() && n != d.profile {
+                                cmds.push(("inspections.dialog.set", json!({ "profile": n })));
+                            }
+                        }
+                    });
+                    if ui.small_button("Configure…").on_hover_text("Settings › Editor › Inspections").clicked() {
+                        cmds.push(("settings.inspections", Value::Null));
+                    }
+                });
+            }
             ui.add_space(4.0);
             let hint = match d.kind {
-                JobKind::Inspect => "Runs Clippy (or cargo check) and the installed linters: ruff, ESLint, clang-tidy, zig fmt.",
+                JobKind::Inspect => {
+                    "Runs the analyzers the profile turns on: Clippy or cargo check, rust-analyzer, ruff, mypy/pyright, clangd, the Clang Static Analyzer, clang-tidy, cppcheck, ESLint, SQL."
+                }
                 JobKind::Cleanup => "Applies every machine-applicable fix, then rustfmt / ruff format / zig fmt, in a preview.",
             };
             ui.label(RichText::new(hint).color(theme.text_muted).small());

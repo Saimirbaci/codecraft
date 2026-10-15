@@ -506,6 +506,8 @@ impl Session {
         self.layouts.set_home(dir.to_path_buf());
         self.file_templates.set_home(dir.to_path_buf());
         self.copyright.set_home(dir.to_path_buf());
+        // IDE inspection profiles and managed analyzers (M14 CA).
+        self.analysis.set_home(dir.to_path_buf());
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
         self.cpp.isolated = true;
         // zig and tsc too (M13 track RC).

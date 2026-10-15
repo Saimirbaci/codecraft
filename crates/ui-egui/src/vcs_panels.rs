@@ -562,6 +562,15 @@ fn commit_box(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd
             *cmd = Some(("vcs.setAmend", json!({ "amend": amend })));
         }
         ui.checkbox(&mut s.vcs.commit.sign_off, "Sign-off");
+        // Commit checks: inspect the files before committing (M14 track CA).
+        let mut analyze = codecraft_engine::analysis::profiles::commit_check(s);
+        if ui
+            .checkbox(&mut analyze, "Analyze code")
+            .on_hover_text("Inspect the files being committed with the active inspection profile first")
+            .changed()
+        {
+            *cmd = Some(("vcs.commit.analyzeCode", json!({ "enabled": analyze })));
+        }
     });
     let id = Id::new("vcs-commit-message");
     // Cmd+Enter commits (and must not insert a newline).
