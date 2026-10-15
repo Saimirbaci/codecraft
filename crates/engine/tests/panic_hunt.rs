@@ -87,7 +87,15 @@ fn skip(id: &str, params: &Value) -> bool {
     // Profiling runs the real samply/perf/py-spy, and Clear Recent edits the real profiler state
     // (profiler_cmds tests fuzz them with fakes and a temp dir).
     if id.starts_with("run.profile")
-        || matches!(id, "run.attachProfilerToProcess" | "profiler.install" | "profiler.clearRecent")
+        || matches!(
+            id,
+            "run.attachProfilerToProcess"
+                | "profiler.install"
+                | "profiler.clearRecent"
+                // M14 track PF: record with real profilers (profiler_agent_cmds tests use fakes).
+                | "profiler.record"
+                | "profiler.profileMemory"
+        )
     {
         return true;
     }

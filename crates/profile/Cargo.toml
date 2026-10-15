@@ -1,6 +1,6 @@
 [package]
 name = "codecraft-profile"
-description = "CodeCraft profiler model: samply/gecko, speedscope and collapsed-stack parsing into call trees and flame graphs"
+description = "CodeCraft profiler model: samply/gecko, speedscope, collapsed stacks, perf, xctrace, macOS call graphs and Python cProfile/tracemalloc parsing into call trees, flame graphs and per-line statistics"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -10,20 +10,27 @@
 //! cycles or absurd depths are cut, and sizes are capped. Nothing here panics.
 
 mod analysis;
+pub mod callgraph;
 pub mod collapsed;
 pub mod gecko;
 mod model;
 pub mod perf;
+pub mod python;
 pub mod speedscope;
+pub mod xctrace;
+pub mod xml;
 
 use std::io::Read;
 use std::path::Path;
 
 pub use analysis::{
-    Analysis, CallNode, CallTree, Edge, FlameGraph, FlameRect, MethodStat, callees, callers, matched_weight, methods,
-    search,
+    Analysis, CallNode, CallTree, Edge, FlameGraph, FlameRect, FunctionDelta, MethodStat, callees, callers, compare,
+    matched_weight, methods, outermost_matches, path_hashes, path_weights, search, subtree_methods,
 };
-pub use model::{Format, Frame, MAX_DEPTH, Profile, ProfileBuilder, StackNode, Thread, Unit};
+pub use model::{
+    Format, Frame, LineStat, MAX_DEPTH, Profile, ProfileBuilder, StackNode, TIMELINE_BUCKETS, Thread, Unit,
+    fold_lines, is_address,
+};
 
 /// Largest snapshot read from disk (compressed size).
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
@@ -41,7 +48,7 @@ pub enum ProfileError {
     #[error("the profile has no samples")]
     Empty,
     #[error(
-        "unrecognized profile format (supported: samply / Firefox Profiler JSON, speedscope JSON, collapsed stacks, perf script output, DTrace aggregations)"
+        "unrecognized profile format (supported: samply / Firefox Profiler JSON, speedscope JSON, collapsed stacks, perf script output, DTrace aggregations, xctrace Time Profiler exports, macOS sample / malloc_history call graphs, CodeCraft cProfile / tracemalloc JSON)"
     )]
     Unrecognized,
 }
@@ -70,8 +77,14 @@ pub fn parse(bytes: &[u8]) -> Result<Profile, ProfileError> {
     let first = bytes.iter().find(|b| !b.is_ascii_whitespace()).copied();
     if matches!(first, Some(b'{' | b'[')) {
         let v: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| ProfileError::Format(e.to_string()))?;
+        match python::kind(&v) {
+            Some("cprofile") => return python::parse_cprofile(&v),
+            Some("tracemalloc") => return python::parse_tracemalloc(&v),
+            _ => {}
+        }
         if speedscope::looks_speedscope(&v) {
-            return speedscope::parse(&v);
+            // py-spy and memray record the line each sample was at.
+            return speedscope::parse(&v).map(fold_lines);
         }
         if gecko::looks_gecko(&v) {
             return gecko::parse(&v);
@@ -87,11 +100,17 @@ pub fn parse(bytes: &[u8]) -> Result<Profile, ProfileError> {
     if text.trim().is_empty() {
         return Err(ProfileError::Empty);
     }
+    if first == Some(b'<') && xctrace::looks_xctrace(&text) {
+        return xctrace::parse(&text);
+    }
+    if callgraph::looks_callgraph(&text) {
+        return callgraph::parse(&text);
+    }
     if perf::looks_perf_script(&text) {
         return perf::parse(&text);
     }
     if collapsed::looks_collapsed(&text) {
-        return collapsed::parse(&text);
+        return collapsed::parse(&text).map(fold_lines);
     }
     if collapsed::looks_dtrace(&text) {
         return collapsed::parse_dtrace(&text);
@@ -134,6 +153,19 @@ mod tests {
         assert_eq!(parse(b"\xEF\xBB\xBFmain;a 1\n").unwrap().format, Format::Collapsed);
         assert_eq!(parse(b"app 1/1 0.1: x\n\t10 f (/a)\n").unwrap().format, Format::PerfScript);
         assert_eq!(parse(b"\n  a`f\n  3\n").unwrap().format, Format::Dtrace);
+        let xc = include_bytes!("../tests/fixtures/xctrace-time-profile.xml");
+        assert_eq!(parse(xc).unwrap().format, Format::Xctrace);
+        let cg = include_bytes!("../tests/fixtures/sample-callgraph.txt");
+        assert_eq!(parse(cg).unwrap().format, Format::CallGraph);
+        let cp = br#"{"codecraft":"cprofile","functions":[{"name":"f","file":"a.py","line":1,"tt":0.5,"ct":0.5,"callers":[]}]}"#;
+        assert_eq!(parse(cp).unwrap().format, Format::CProfile);
+        let tm = br#"{"codecraft":"tracemalloc","traces":[{"size":5,"frames":[{"name":"f","file":"a.py","line":3}]}]}"#;
+        assert_eq!(parse(tm).unwrap().format, Format::Tracemalloc);
+        // py-spy collapsed frames carry lines: folded into one function with line statistics.
+        let p = parse(b"main (a.py:1);work (a.py:5) 3\nmain (a.py:1);work (a.py:6) 1\n").unwrap();
+        assert_eq!(p.frames.len(), 2);
+        assert_eq!(p.lines.len(), 3);
+        assert_eq!(p.frames[1].line, Some(5));
     }
 
     #[test]

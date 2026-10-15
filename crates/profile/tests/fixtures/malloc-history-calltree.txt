@@ -1,0 +1,43 @@
+malloc_history Report Version:  2.0
+Process:         alloc [77413]
+Path:            /private/tmp/*/alloc
+Load Address:    0x1006a8000
+Identifier:      alloc
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  leaks [77412]
+
+Physical footprint:         71.6M
+Physical footprint (peak):  129.1M
+----
+
+Stack logging was dynamically enabled in target process, after it was launched,
+so no backtraces are available for earlier allocations.
+
+Malloc blocks with no stack:    189   total size: 187K
+
+Call graph:
+    3003 (62.6M) << TOTAL >>
+      3001 (62.6M) start  (in dyld) + 2360  [0x18d8620e0]
+      + 1000 (62.5M) main  (in alloc) + 52  [0x1006abea0]
+      + ! 1000 (62.5M) big  (in alloc) + 28  [0x1006abe00]
+      + !   1000 (62.5M) _malloc_zone_malloc_instrumented_or_legacy  (in libsystem_malloc.dylib) + 264  [0x18da24adc]
+      + 2000 (62.5K) main  (in alloc) + 128  [0x1006abeec]
+      + ! 2000 (62.5K) small  (in alloc) + 28  [0x1006abe44]
+      + !   2000 (62.5K) _malloc_zone_malloc_instrumented_or_legacy  (in libsystem_malloc.dylib) + 264  [0x18da24adc]
+      + 1 (16.0K) main  (in alloc) + 244  [0x1006abf60]
+      +   1 (16.0K) printf  (in libsystem_c.dylib) + 80  [0x18daad304]
+      +     1 (16.0K) _malloc_zone_malloc_instrumented_or_legacy  (in libsystem_malloc.dylib) + 264  [0x18da24adc]
+      2 (80 bytes) start  (in dyld) + 1844  [0x18d861edc]
+        2 (80 bytes) unsetenv  (in libsystem_c.dylib) + 96  [0x18da86d20]
+          1 (64 bytes) _owned_ptr_alloc  (in libsystem_c.dylib) + 40  [0x18da8640c]
+          ! 1 (64 bytes) _malloc_zone_malloc_instrumented_or_legacy  (in libsystem_malloc.dylib) + 264  [0x18da24adc]
+          1 (16 bytes) _owned_ptr_alloc  (in libsystem_c.dylib) + 24  [0x18da863fc]
+            1 (16 bytes) _malloc_zone_malloc_instrumented_or_legacy  (in libsystem_malloc.dylib) + 264  [0x18da24adc]
+
+Total number in stack -- this line is here to get the correct format for importing with the Sampler instrument in Instruments.app
+
+Binary Images:
+       0x1006a8000 -        0x1006abfff +alloc (0) <01929185-F4AF-4BEF-BEF8-3775FC9C1E63> /tmp/*/alloc
+       0x18d85c000 -        0x18d8e4a17  dyld (1.0.0 - 1162) <37BBC384-0755-31C7-A808-0ED49E44DD8E> /usr/lib/dyld

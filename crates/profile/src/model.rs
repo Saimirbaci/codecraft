@@ -14,6 +14,10 @@ pub const MAX_FRAMES: usize = 4_000_000;
 pub const MAX_STACKS: usize = 16_000_000;
 /// Threads kept.
 pub const MAX_THREADS: usize = 10_000;
+/// Buckets of a thread's activity timeline.
+pub const TIMELINE_BUCKETS: usize = 200;
+/// Timed samples kept for the timeline (later ones still count, but not on the timeline).
+pub const MAX_TIMED_SAMPLES: usize = 4_000_000;
 
 /// What sample weights count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,6 +94,14 @@ pub enum Format {
     PerfScript,
     /// DTrace stack aggregation output.
     Dtrace,
+    /// `xctrace export` of an Instruments Time Profiler table (macOS).
+    Xctrace,
+    /// macOS `sample` / `malloc_history -callTree` call graph text.
+    CallGraph,
+    /// Python cProfile statistics (converted by CodeCraft's helper).
+    CProfile,
+    /// Python tracemalloc snapshot (written by CodeCraft's helper).
+    Tracemalloc,
 }
 
 impl Format {
@@ -101,6 +113,10 @@ impl Format {
             Self::Collapsed => "collapsed stacks",
             Self::PerfScript => "perf script",
             Self::Dtrace => "DTrace aggregation",
+            Self::Xctrace => "Instruments Time Profiler (xctrace)",
+            Self::CallGraph => "call graph (sample / malloc_history)",
+            Self::CProfile => "Python cProfile",
+            Self::Tracemalloc => "Python tracemalloc",
         }
     }
 }
@@ -157,12 +173,29 @@ pub struct Thread {
     pub weights: Vec<(u32, u64)>,
     /// Samples read (before merging).
     pub samples: u64,
+    /// Weight per time bucket over [`Profile::duration_ns`] ([`TIMELINE_BUCKETS`] buckets), when
+    /// the format has sample times; empty otherwise.
+    #[serde(default)]
+    pub activity: Vec<u64>,
 }
 
 impl Thread {
     pub fn total(&self) -> u64 {
         self.weights.iter().fold(0u64, |a, (_, w)| a.saturating_add(*w))
     }
+}
+
+/// Samples attributed to one source line of a function (from formats that record the line
+/// each sample was at: xctrace, py-spy, tracemalloc, memray).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineStat {
+    pub frame: u32,
+    /// 1-based.
+    pub line: u32,
+    /// Weight of samples whose leaf is at this line.
+    pub self_weight: u64,
+    /// Weight of samples with this line anywhere on the stack (counted once per sample).
+    pub total: u64,
 }
 
 /// A loaded profile.
@@ -173,6 +206,18 @@ pub struct Profile {
     pub frames: Vec<Frame>,
     pub stacks: Vec<StackNode>,
     pub threads: Vec<Thread>,
+    /// Per-line weights, sorted by `(frame, line)`; empty when the format has no sample lines.
+    #[serde(default)]
+    pub lines: Vec<LineStat>,
+    /// Call counts per frame (cProfile), indexed like `frames`; empty when unknown.
+    #[serde(default)]
+    pub calls: Vec<u64>,
+    /// Time from the first to the last sample, when the format has sample times.
+    #[serde(default)]
+    pub duration_ns: Option<u64>,
+    /// Facts worth telling the reader (peak memory, what the numbers mean).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 impl Profile {
@@ -206,6 +251,158 @@ impl Profile {
     pub fn sample_count(&self) -> u64 {
         self.threads.iter().fold(0u64, |a, t| a.saturating_add(t.samples))
     }
+
+    /// The line statistics of one frame (a slice of [`Profile::lines`]).
+    pub fn lines_of(&self, frame: u32) -> &[LineStat] {
+        let start = self.lines.partition_point(|l| l.frame < frame);
+        let end = self.lines.partition_point(|l| l.frame <= frame);
+        self.lines.get(start..end.max(start)).unwrap_or(&[])
+    }
+
+    /// Calls of a frame (cProfile), when known.
+    pub fn calls_of(&self, frame: u32) -> Option<u64> {
+        self.calls.get(frame as usize).copied().filter(|c| *c > 0)
+    }
+
+    /// Weight of samples whose leaf frame has no symbol (a bare `0x…` address).
+    pub fn unsymbolicated_weight(&self) -> u64 {
+        let bare: Vec<bool> = self.frames.iter().map(|f| is_address(&f.name)).collect();
+        if !bare.iter().any(|b| *b) {
+            return 0;
+        }
+        let mut total = 0u64;
+        for t in &self.threads {
+            for (stack, w) in &t.weights {
+                let leaf = self.stacks.get(*stack as usize).map(|s| s.frame);
+                if leaf.and_then(|f| bare.get(f as usize).copied()).unwrap_or(false) {
+                    total = total.saturating_add(*w);
+                }
+            }
+        }
+        total
+    }
+}
+
+/// Whether a frame name is a bare address (`0x1a2b`), i.e. not symbolicated.
+pub fn is_address(name: &str) -> bool {
+    name.strip_prefix("0x").is_some_and(|h| !h.is_empty() && h.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
+/// Merge frames that differ only by line (the line a sample was at) into one frame per
+/// function, moving the per-sample lines into [`Profile::lines`]. A merged frame's line becomes
+/// its hottest line (most total weight), so Jump to Source lands where the time went. Frames
+/// without a file are kept as they are; thread activity, notes and the duration are kept.
+pub fn fold_lines(p: Profile) -> Profile {
+    if !p.frames.iter().any(|f| f.file.is_some() && f.line.is_some()) {
+        return p;
+    }
+    type Key = (String, Option<String>, Option<String>);
+    let mut func_ids: HashMap<Key, u32> = HashMap::new();
+    let mut frames: Vec<Frame> = Vec::new();
+    let mut map: Vec<u32> = Vec::with_capacity(p.frames.len());
+    let mut line_of: Vec<Option<u32>> = Vec::with_capacity(p.frames.len());
+    for f in &p.frames {
+        let line = if f.file.is_some() { f.line.filter(|l| *l > 0) } else { None };
+        let key = (f.name.clone(), f.module.clone(), f.file.clone());
+        let id = match func_ids.get(&key) {
+            Some(id) => *id,
+            None => {
+                let Ok(id) = u32::try_from(frames.len()) else { break };
+                let keep_line = if f.file.is_some() { None } else { f.line };
+                frames.push(Frame { line: keep_line, ..f.clone() });
+                func_ids.insert(key, id);
+                id
+            }
+        };
+        map.push(id);
+        line_of.push(line);
+    }
+    // Stacks, rebuilt in index order (parents first).
+    let mut stack_ids: HashMap<(Option<u32>, u32), u32> = HashMap::new();
+    let mut stacks: Vec<StackNode> = Vec::new();
+    let mut smap: Vec<u32> = Vec::with_capacity(p.stacks.len());
+    for (i, s) in p.stacks.iter().enumerate() {
+        let parent = s.parent.filter(|q| (*q as usize) < i).and_then(|q| smap.get(q as usize).copied());
+        let frame = map.get(s.frame as usize).copied().unwrap_or(0);
+        let id = match stack_ids.get(&(parent, frame)) {
+            Some(id) => *id,
+            None => {
+                let Ok(id) = u32::try_from(stacks.len()) else { break };
+                stacks.push(StackNode { parent, frame });
+                stack_ids.insert((parent, frame), id);
+                id
+            }
+        };
+        smap.push(id);
+    }
+    // Line statistics and remapped weights.
+    let mut lines: HashMap<(u32, u32), (u64, u64)> = HashMap::new();
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    let mut threads = Vec::with_capacity(p.threads.len());
+    for t in &p.threads {
+        let mut merged: HashMap<u32, u64> = HashMap::new();
+        for (stack, w) in &t.weights {
+            let Some(new) = smap.get(*stack as usize).copied() else { continue };
+            let e = merged.entry(new).or_insert(0);
+            *e = e.saturating_add(*w);
+            seen.clear();
+            let mut leaf = true;
+            let mut cur = Some(*stack);
+            let mut depth = 0;
+            while let Some(id) = cur {
+                let Some(node) = p.stacks.get(id as usize) else { break };
+                if let (Some(Some(line)), Some(func)) = (line_of.get(node.frame as usize), map.get(node.frame as usize))
+                {
+                    let key = (*func, *line);
+                    let e = lines.entry(key).or_insert((0, 0));
+                    if leaf {
+                        e.0 = e.0.saturating_add(*w);
+                    }
+                    if !seen.contains(&key) {
+                        e.1 = e.1.saturating_add(*w);
+                        seen.push(key);
+                    }
+                }
+                leaf = false;
+                cur = node.parent.filter(|q| *q < id);
+                depth += 1;
+                if depth > MAX_DEPTH {
+                    break;
+                }
+            }
+        }
+        let mut weights: Vec<(u32, u64)> = merged.into_iter().collect();
+        weights.sort_unstable();
+        threads.push(Thread { weights, ..t.clone() });
+    }
+    let mut lines: Vec<LineStat> = lines
+        .into_iter()
+        .map(|((frame, line), (self_weight, total))| LineStat { frame, line, self_weight, total })
+        .collect();
+    lines.sort_unstable_by_key(|l| (l.frame, l.line));
+    // A merged frame points at its hottest line.
+    let mut best: HashMap<u32, (u64, u32)> = HashMap::new();
+    for l in &lines {
+        let e = best.entry(l.frame).or_insert((0, l.line));
+        if l.total > e.0 {
+            *e = (l.total, l.line);
+        }
+    }
+    for (frame, (_, line)) in best {
+        if let Some(f) = frames.get_mut(frame as usize) {
+            f.line = Some(line);
+        }
+    }
+    let mut calls = Vec::new();
+    if !p.calls.is_empty() {
+        calls = vec![0u64; frames.len()];
+        for (old, c) in p.calls.iter().enumerate() {
+            if let Some(slot) = map.get(old).and_then(|n| calls.get_mut(*n as usize)) {
+                *slot = slot.saturating_add(*c);
+            }
+        }
+    }
+    Profile { frames, stacks, threads, lines, calls, ..p }
 }
 
 /// Builds a [`Profile`], interning frames and stacks so identical ones are shared.
@@ -215,6 +412,8 @@ pub struct ProfileBuilder {
     frame_ids: HashMap<Frame, u32>,
     stack_ids: HashMap<(Option<u32>, u32), u32>,
     weights: Vec<HashMap<u32, u64>>,
+    /// (thread, time in ns, weight) of timed samples.
+    times: Vec<(u32, u64, u64)>,
 }
 
 impl ProfileBuilder {
@@ -299,6 +498,40 @@ impl ProfileBuilder {
         *e = e.saturating_add(weight);
     }
 
+    /// Record a sample taken at `time_ns` (for the threads timeline).
+    pub fn sample_at(&mut self, thread: usize, stack: u32, weight: u64, time_ns: u64) {
+        let before = self.profile.threads.get(thread).map_or(0, |t| t.samples);
+        self.sample(thread, stack, weight);
+        let counted = self.profile.threads.get(thread).is_some_and(|t| t.samples > before);
+        if counted
+            && self.times.len() < MAX_TIMED_SAMPLES
+            && let Ok(t) = u32::try_from(thread)
+        {
+            self.times.push((t, time_ns, weight));
+        }
+    }
+
+    /// Add a note for the reader.
+    pub fn note(&mut self, text: impl Into<String>) {
+        if self.profile.notes.len() < 32 {
+            self.profile.notes.push(text.into());
+        }
+    }
+
+    /// Add to a frame's call count (cProfile).
+    pub fn add_calls(&mut self, frame: u32, calls: u64) {
+        let i = frame as usize;
+        if i >= self.profile.frames.len() {
+            return;
+        }
+        if self.profile.calls.len() < self.profile.frames.len() {
+            self.profile.calls.resize(self.profile.frames.len(), 0);
+        }
+        if let Some(slot) = self.profile.calls.get_mut(i) {
+            *slot = slot.saturating_add(calls);
+        }
+    }
+
     pub fn has_samples(&self) -> bool {
         self.weights.iter().any(|w| !w.is_empty())
     }
@@ -309,6 +542,26 @@ impl ProfileBuilder {
             let mut v: Vec<(u32, u64)> = w.into_iter().filter(|(_, w)| *w > 0).collect();
             v.sort_unstable();
             t.weights = v;
+        }
+        if !self.profile.calls.is_empty() {
+            self.profile.calls.resize(self.profile.frames.len(), 0);
+        }
+        let first = self.times.iter().map(|t| t.1).min();
+        let last = self.times.iter().map(|t| t.1).max();
+        if let (Some(first), Some(last)) = (first, last) {
+            let span = u128::from(last.saturating_sub(first)) + 1;
+            self.profile.duration_ns = Some(last.saturating_sub(first));
+            for (thread, time, weight) in &self.times {
+                let Some(t) = self.profile.threads.get_mut(*thread as usize) else { continue };
+                if t.activity.is_empty() {
+                    t.activity = vec![0; TIMELINE_BUCKETS];
+                }
+                let offset = u128::from(time.saturating_sub(first));
+                let bucket = usize::try_from(offset * TIMELINE_BUCKETS as u128 / span).unwrap_or(0);
+                if let Some(slot) = t.activity.get_mut(bucket.min(TIMELINE_BUCKETS - 1)) {
+                    *slot = slot.saturating_add(*weight);
+                }
+            }
         }
         self.profile.threads.retain(|t| !t.weights.is_empty());
         if self.profile.threads.is_empty() {
@@ -361,6 +614,49 @@ mod tests {
         assert_eq!(p.threads[0].weights, vec![(s1, 5)]);
         assert_eq!(p.threads[0].samples, 2);
         assert_eq!(p.stack_frames(s1), vec![a, c]);
+    }
+
+    #[test]
+    fn timeline_buckets_and_fold() {
+        let mut b = ProfileBuilder::new(Format::Xctrace, Unit::Nanoseconds);
+        let at = |line: u32| Frame { name: "f".into(), file: Some("a.c".into()), line: Some(line), module: None };
+        let main =
+            b.frame(Frame { name: "main".into(), file: Some("a.c".into()), line: Some(1), module: None }).unwrap();
+        let f5 = b.frame(at(5)).unwrap();
+        let f6 = b.frame(at(6)).unwrap();
+        let s5 = b.stack_of(&[main, f5]).unwrap().unwrap();
+        let s6 = b.stack_of(&[main, f6]).unwrap().unwrap();
+        let t = b.thread("t").unwrap();
+        let idle = b.thread("idle").unwrap();
+        b.sample_at(t, s5, 10, 1_000);
+        b.sample_at(t, s5, 10, 1_010);
+        b.sample_at(t, s6, 10, 11_000);
+        b.sample_at(99, s6, 10, 50_000);
+        b.note("n");
+        let _ = idle;
+        let p = b.finish().unwrap();
+        assert_eq!(p.duration_ns, Some(10_000));
+        assert_eq!(p.threads.len(), 1);
+        let act = &p.threads[0].activity;
+        assert_eq!(act.len(), TIMELINE_BUCKETS);
+        assert_eq!(act[0], 20);
+        assert_eq!(act[TIMELINE_BUCKETS - 1], 10);
+        let p = fold_lines(p);
+        assert_eq!(p.frames.len(), 2);
+        let f = p.frames.iter().position(|x| x.name == "f").unwrap() as u32;
+        assert_eq!(p.frames[f as usize].line, Some(5));
+        let lines = p.lines_of(f);
+        assert_eq!(
+            lines.iter().map(|l| (l.line, l.self_weight, l.total)).collect::<Vec<_>>(),
+            vec![(5, 20, 20), (6, 10, 10)]
+        );
+        let m = p.frames.iter().position(|x| x.name == "main").unwrap() as u32;
+        assert_eq!(p.lines_of(m), &[LineStat { frame: m, line: 1, self_weight: 0, total: 30 }]);
+        assert_eq!(p.total(), 30);
+        assert_eq!(p.threads[0].activity[0], 20);
+        assert_eq!(p.notes, vec!["n".to_string()]);
+        assert!(p.lines_of(99).is_empty());
+        assert!(is_address("0x1f") && !is_address("0x") && !is_address("main"));
     }
 
     #[test]

@@ -152,7 +152,10 @@ fn stop(s: &mut Session, _: &Value) -> CmdResult {
             .or_else(|| s.ws.runs.iter().rev().find(|r| s.runs.is_running(r.id)).map(|r| r.id));
     match target {
         Some(t) => {
-            crate::runs::stop(s, t);
+            // A profiling run stops like Ctrl+C, so the profiler still writes its snapshot.
+            if !crate::profiler::stop(s, t) {
+                crate::runs::stop(s, t);
+            }
             ok()
         }
         None => {

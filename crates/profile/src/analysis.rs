@@ -346,6 +346,144 @@ pub fn matched_weight(tree: &CallTree, hits: &[bool]) -> u64 {
     total
 }
 
+/// The method list restricted to the subtrees under `roots` (call nodes): self weight inside
+/// them and total weight (outermost occurrence per path), heaviest self first.
+pub fn subtree_methods(p: &Profile, tree: &CallTree, roots: &[u32]) -> Vec<MethodStat> {
+    let mut by_frame: HashMap<u32, MethodStat> = HashMap::new();
+    let mut on_path: HashMap<u32, u32> = HashMap::new();
+    let mut work: Vec<(u32, bool)> = roots.iter().rev().map(|r| (*r, true)).collect();
+    while let Some((id, entering)) = work.pop() {
+        let Some(n) = tree.node(id) else { continue };
+        if entering {
+            let count = on_path.entry(n.frame).or_insert(0);
+            let e = by_frame.entry(n.frame).or_insert(MethodStat { frame: n.frame, self_weight: 0, total: 0 });
+            e.self_weight = e.self_weight.saturating_add(n.self_weight);
+            if *count == 0 {
+                e.total = e.total.saturating_add(n.total);
+            }
+            *count = count.saturating_add(1);
+            work.push((id, false));
+            work.extend(n.children.iter().rev().map(|c| (*c, true)));
+        } else if let Some(count) = on_path.get_mut(&n.frame) {
+            *count = count.saturating_sub(1);
+        }
+    }
+    let mut v: Vec<MethodStat> = by_frame.into_values().collect();
+    let name = |f: u32| p.frame(f).map_or("", |f| f.name.as_str());
+    v.sort_by(|a, b| {
+        b.self_weight.cmp(&a.self_weight).then(b.total.cmp(&a.total)).then_with(|| name(a.frame).cmp(name(b.frame)))
+    });
+    v
+}
+
+/// The outermost call nodes whose frame matches (no matching ancestor), heaviest first.
+pub fn outermost_matches(tree: &CallTree, hits: &[bool]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut work: Vec<u32> = tree.roots.clone();
+    while let Some(id) = work.pop() {
+        let Some(n) = tree.node(id) else { continue };
+        if hits.get(n.frame as usize).copied().unwrap_or(false) {
+            out.push(id);
+        } else {
+            work.extend(n.children.iter().copied());
+        }
+    }
+    out.sort_by(|a, b| {
+        let w = |i: &u32| tree.node(*i).map_or(0, |n| n.total);
+        w(b).cmp(&w(a)).then(a.cmp(b))
+    });
+    out
+}
+
+fn fnv(mut h: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// A hash per call node of its path from the root by frame names and modules (so the same path
+/// in two profiles has the same hash, whatever the frame ids).
+pub fn path_hashes(p: &Profile, tree: &CallTree) -> Vec<u64> {
+    let mut out = vec![0u64; tree.nodes.len()];
+    for (i, n) in tree.nodes.iter().enumerate() {
+        // Parents come before children.
+        let parent = n.parent.and_then(|q| out.get(q as usize).copied()).unwrap_or(0xcbf2_9ce4_8422_2325);
+        let f = p.frame(n.frame);
+        let mut h = fnv(parent, f.map_or("", |f| f.name.as_str()).as_bytes());
+        h = fnv(h, &[0xff]);
+        h = fnv(h, f.and_then(|f| f.module.as_deref()).unwrap_or("").as_bytes());
+        if let Some(slot) = out.get_mut(i) {
+            *slot = h;
+        }
+    }
+    out
+}
+
+/// Total weight per path hash (for diffing another profile's call tree against this one).
+pub fn path_weights(p: &Profile, tree: &CallTree) -> HashMap<u64, u64> {
+    let hashes = path_hashes(p, tree);
+    let mut out = HashMap::with_capacity(hashes.len());
+    for (n, h) in tree.nodes.iter().zip(hashes) {
+        let e = out.entry(h).or_insert(0u64);
+        *e = e.saturating_add(n.total);
+    }
+    out
+}
+
+/// One function in two profiles (`a` the baseline, `b` the new one).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionDelta {
+    pub name: String,
+    pub module: Option<String>,
+    pub location: Option<String>,
+    pub a_self: u64,
+    pub a_total: u64,
+    pub b_self: u64,
+    pub b_total: u64,
+}
+
+/// Match functions of two profiles by name, module and file.
+pub fn compare(a: &Profile, a_methods: &[MethodStat], b: &Profile, b_methods: &[MethodStat]) -> Vec<FunctionDelta> {
+    type Key = (String, Option<String>, Option<String>);
+    let key = |f: &crate::model::Frame| -> Key { (f.name.clone(), f.module.clone(), f.file.clone()) };
+    let mut out: Vec<FunctionDelta> = Vec::new();
+    let mut index: HashMap<Key, usize> = HashMap::new();
+    for (p, methods, is_a) in [(b, b_methods, false), (a, a_methods, true)] {
+        for m in methods {
+            let Some(f) = p.frame(m.frame) else { continue };
+            let k = key(f);
+            let i = match index.get(&k) {
+                Some(i) => *i,
+                None => {
+                    out.push(FunctionDelta {
+                        name: f.name.clone(),
+                        module: f.module.clone(),
+                        location: f.location(),
+                        a_self: 0,
+                        a_total: 0,
+                        b_self: 0,
+                        b_total: 0,
+                    });
+                    index.insert(k, out.len() - 1);
+                    out.len() - 1
+                }
+            };
+            if let Some(d) = out.get_mut(i) {
+                if is_a {
+                    d.a_self = d.a_self.saturating_add(m.self_weight);
+                    d.a_total = d.a_total.saturating_add(m.total);
+                } else {
+                    d.b_self = d.b_self.saturating_add(m.self_weight);
+                    d.b_total = d.b_total.saturating_add(m.total);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Everything the Profiler tool window shows for one thread selection.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Analysis {
@@ -462,6 +600,34 @@ mod tests {
         let row = &a.flame.rows[3];
         let mid = row[row.len() / 2];
         assert_eq!(a.flame.visible(3, mid.start, mid.start + 1), &[mid]);
+    }
+
+    #[test]
+    fn focus_diff_and_compare() {
+        let a = profile("main;work;leaf 6\nmain;io 4\n");
+        let b = profile("main;work;leaf 12\nmain;io 4\nmain;new 4\n");
+        let ta = CallTree::build(&a, None);
+        let tb = CallTree::build(&b, None);
+        // Focus on `work`: only its subtree.
+        let hits = search(&b, "work");
+        let roots = outermost_matches(&tb, &hits);
+        assert_eq!(roots.len(), 1);
+        let m = subtree_methods(&b, &tb, &roots);
+        let names: Vec<&str> = m.iter().map(|s| b.frame(s.frame).unwrap().name.as_str()).collect();
+        assert_eq!(names, vec!["leaf", "work"]);
+        assert_eq!(m[1].total, 12);
+        // Path hashes match across profiles by name.
+        let wa = path_weights(&a, &ta);
+        let hb = path_hashes(&b, &tb);
+        let leaf_b = tb.nodes.iter().position(|n| b.frame(n.frame).unwrap().name == "leaf").unwrap();
+        assert_eq!(wa.get(&hb[leaf_b]), Some(&6));
+        let new_b = tb.nodes.iter().position(|n| b.frame(n.frame).unwrap().name == "new").unwrap();
+        assert_eq!(wa.get(&hb[new_b]), None);
+        let d = compare(&a, &methods(&a, &ta), &b, &methods(&b, &tb));
+        let get = |n: &str| d.iter().find(|x| x.name == n).unwrap();
+        assert_eq!((get("leaf").a_self, get("leaf").b_self), (6, 12));
+        assert_eq!((get("new").a_self, get("new").b_self), (0, 4));
+        assert_eq!(get("main").a_total, 10);
     }
 
     #[test]

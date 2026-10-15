@@ -1,0 +1,35 @@
+Analysis of sampling hot (pid 93602) every 1 millisecond
+Process:         hot [93602]
+Path:            /private/tmp/*/hot
+Load Address:    0x102be8000
+Identifier:      hot
+Version:         0
+Code Type:       ARM64
+Platform:        macOS
+Parent Process:  ??? [1]
+
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         961K
+Physical footprint (peak):  977K
+----
+
+Call graph:
+    779 Thread_74254597   DispatchQueue_1: com.apple.main-thread  (serial)
+      779 start  (in dyld) + 2360  [0x18d8620e0]
+        720 main  (in hot) + 68  [0x102bebf20]  hot.c:21
+        + 720 outer  (in hot) + 60  [0x102bebe38]  hot.c:10
+        +   720 inner  (in hot) + 28,108,...  [0x102bebd90,0x102bebde0,...]  hot.c:5
+        59 main  (in hot) + 92  [0x102bebf38]  hot.c:22
+          59 light  (in hot) + 60  [0x102bebea8]  hot.c:15
+            59 inner  (in hot) + 28,108,...  [0x102bebd90,0x102bebde0,...]  hot.c:5
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        inner  (in hot)        779
+
+Binary Images:
+       0x102be8000 -        0x102bebffb +hot (0) <F5210FF1-7049-430C-B038-2BA5248BBE0A> /tmp/*/hot
+       0x18d85c000 -        0x18d8e4a17  dyld (1.0.0 - 1162) <37BBC384-0755-31C7-A808-0ED49E44DD8E> /usr/lib/dyld

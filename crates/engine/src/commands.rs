@@ -197,6 +197,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::http_cmds::specs());
         specs.extend(crate::python_cmds::specs());
         specs.extend(crate::profiler_cmds::specs());
+        specs.extend(crate::profiler_agent_cmds::specs());
         specs.extend(crate::sql_lang_cmds::specs());
         specs.extend(crate::rust_cmds::specs());
         specs.extend(crate::notebook_cmds::specs());
