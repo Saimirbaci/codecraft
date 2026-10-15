@@ -1,7 +1,9 @@
 //! CodeCraft version control over the `git` CLI (L0, no workspace deps): repository discovery,
 //! status, line changes for gutter markers, commits, push/pull/fetch, branches and tags, log with
 //! a commit graph, blame, stash, rollback, reset, patches, remotes, clone and conflicts, per-hunk
-//! staging, three-way merge, work trees and GitHub through the `gh` CLI.
+//! staging (and whether a hunk is staged), three-way merge, work trees, changelists, the shelf
+//! (changes set aside as patches) and GitHub through the `gh` CLI (pull requests, repositories,
+//! forks, gists).
 //!
 //! We drive the `git` binary rather than a library so the user's configuration, hooks,
 //! credential helpers, SSH agent and commit signing all work as they do in a terminal. Every
@@ -18,6 +20,7 @@
 )]
 
 pub mod blame;
+pub mod changelist;
 pub mod cmd;
 pub mod github;
 pub mod hunks;
@@ -27,6 +30,7 @@ pub mod merge3;
 pub mod ops;
 pub mod refs;
 pub mod repo;
+pub mod shelf;
 pub mod status;
 pub mod worktree;
 

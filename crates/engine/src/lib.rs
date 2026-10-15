@@ -47,6 +47,7 @@ mod editor_cmds;
 pub mod feedback;
 mod feedback_cmds;
 mod file_cmds;
+pub mod github_prs;
 mod ide_cmds;
 pub mod ide_server;
 pub mod http_client;
@@ -476,6 +477,8 @@ impl Session {
         self.copyright.set_home(dir.to_path_buf());
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
         self.cpp.isolated = true;
+        // Never the real GitHub CLI (it acts on the user's account): tests point it at a fake.
+        self.vcs.gh_program = dir.join("gh-isolated");
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).

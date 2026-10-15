@@ -258,24 +258,19 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "git.uncommittedChanges.shelveChanges",
             "Shelve Changes…",
             None,
-            "Git stashes stand in for shelves: open the Stash dialog",
+            "{files?: [path], changelist?: string} — open the Shelve Changes dialog with the checked changes (or the given files, or a changelist's); shelves are patches under .codecraft/shelf",
             g,
             idle,
-            stash_dialog,
+            vcs::shelf::shelve_dialog,
         ),
         spec(
             "git.uncommittedChanges.showShelf",
             "Show Shelf",
             None,
-            "Show the stashes in the Commit tool window",
+            "Show the Shelf tab of the Commit tool window",
             g,
             has_repo,
-            |s, _| {
-                s.vcs.commit_tab = CommitTab::Stashes;
-                s.ws.layout.show(ToolWindowId::Commit);
-                vcs::request_refresh(s, true);
-                ok()
-            },
+            vcs::shelf::show_shelf_cmd,
         ),
         spec(
             "git.uncommittedChanges.stashChanges",

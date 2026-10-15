@@ -63,6 +63,11 @@ fn skip(id: &str, params: &Value) -> bool {
     if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
         return true;
     }
+    // Share Project on GitHub and Create Gist create things on the user's GitHub account
+    // (`isolate_home` also hides `gh`; vcs_changes tests use a fake one).
+    if matches!(id, "vcs.github.share" | "vcs.github.createGist") && !params.is_null() {
+        return true;
+    }
     // Docker commands run the real `docker` CLI (docker_cmds tests fuzz them with a fake one).
     if id.starts_with("docker.")
         || id.starts_with("tools.services.docker")

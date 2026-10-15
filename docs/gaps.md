@@ -20,9 +20,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    (list, open as project, remove/force remove); GitHub through the `gh` CLI when installed: your
    repositories in the Clone dialog (also File › New › Project from Version Control, `owner/repo`
    shorthand), Create Pull Request… (pushes the branch first), install hint when `gh` is
-   missing). Remaining: the merge view is per-chunk cards with a result preview, not an editable
-   3-pane editor; the change popup doesn't show whether a hunk is already staged; no View Pull
-   Requests, Sync Fork, Share on GitHub or GitLab API features (GitLab clone is plain git).
+   missing). ~~The merge view is per-chunk cards, not an editable 3-pane editor; the change
+   popup doesn't show whether a hunk is staged; no View Pull Requests, Sync Fork or Share on
+   GitHub~~ (VC, 2026-10-15: see item 47). Remaining: no GitLab API features (GitLab clone is
+   plain git); see item 47 for what the new Git/GitHub features still lack.
 3. ~~No terminal tool window~~ (landed in M3, with `claude` launched already connected).
 4. ~~Highlighting is lexical only~~ (M3: semantic tokens with mutable underline and unresolved
    references, inlay hints for types and parameters). ~~Parameter-name hints are not clickable;
@@ -551,3 +552,35 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     groups, at most 100,000 keys in the browser, Redis consoles still get SQL completion; DuckDB
     needs its CLI, runs each statement in its own process (no transactions or session state),
     may lose HUGEINT/DECIMAL precision, no Explain Plan; no Dump for the four new kinds.
+
+## M13 (2026-10-15)
+
+47. Git and GitHub (track VC): changelists in the Commit tool window (a group per list with its
+    own Include checkbox, the active list where new changes go, New/Edit/Delete/Set Active,
+    Move to Another Changelist, Include Only This Changelist, Commit Changelist, kept in
+    `.codecraft/changelists.json` once more than the default list exists), Tools › Tasks &
+    Contexts › Add Change List for '<task>' and the dynamic "Edit '<task>'" label; Shelve
+    Changes (binary-safe patches per file under `.codecraft/shelf/`, written before the files
+    are reverted, invisible to git) with a Shelf tab: preview, Unshelve whole or per file (a file
+    changed since merges three ways, conflicts go to the merge view), Unshelve and Keep, Rename,
+    Delete; a three-pane merge editor (yours / editable result / theirs scrolling together, »/«
+    accept arrows and × ignore per change, a conflict counter, previous/next, Accept Left/Right,
+    hand edits in the result count as resolving the changes they touch, Apply, Save with
+    Markers); the gutter change popup says Staged / Not staged / Partly staged (index vs `HEAD`
+    vs the buffer) and enables Stage/Unstage accordingly; GitHub through `gh`: View Pull
+    Requests (Git tool window tab: state/author/label/search filters, details, reviews and
+    comments, changed files with their diff, inline review comments read-only, Checkout, Merge
+    with merge/squash/rebase and delete branch, Open in Browser), Share Project on GitHub (`gh
+    repo create --push`; a plain folder is initialised with a first commit), Sync Fork (`gh repo
+    sync`, then fetch) and Create Gist. Remaining: changelists hold whole files (no partial
+    changelists of hunks) and unversioned files stay outside them; a hand edit inside a change
+    marks it resolved even if conflict markers are left in it; the side panes scroll together
+    with the result but are not aligned line by line (no connecting bands), and there's no
+    word-level highlighting or syntax colouring in the merge editor; the shelf has no "shelve
+    silently", no import of IntelliJ `.idea/shelf` patches and no unshelve into another
+    changelist; pull requests: review comments are read-only (no replying, approving or
+    requesting changes), the first 100 inline comments and pull requests only, no CI checks or
+    timeline, the diff is the raw unified patch (not the side-by-side viewer); Sync Fork updates
+    the fork's default branch on GitHub (not the current branch locally); Share asks no questions
+    about which files to put in the first commit (it adds everything not ignored); still no
+    GitLab API features. GitHub was only exercised against a fake `gh` here.

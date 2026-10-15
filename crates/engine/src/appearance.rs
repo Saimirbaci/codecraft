@@ -180,6 +180,9 @@ pub fn dynamic_label(s: &Session, id: &str) -> Option<String> {
         "view.appearance.enterFullScreen" => exit(a.full_screen, "Enter Full Screen", "Full Screen"),
         "view.appearance.enterZenMode" => exit(a.zen, "Enter Zen Mode", "Zen Mode"),
         "view.appearance.zoomIde" => format!("Zoom IDE (Current: {}%)…", zoom_percent(&s.ws.settings)),
+        // Tools › Tasks & Contexts names the active task.
+        "tools.tasksContexts.editDefaultTask" => crate::tasks_contexts::edit_label(s),
+        "tools.tasksContexts.addChangeListForDefaultTask" => crate::vcs::changelists::add_for_task_label(s),
         _ => return None,
     })
 }

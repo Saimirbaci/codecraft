@@ -29,6 +29,9 @@ use codecraft_workspace::{BackgroundTask, DocId, NotificationLevel, ToolWindowId
 
 use crate::{CommandError, Effect, Session};
 
+pub mod changelists;
+pub mod shelf;
+
 /// Commits per log page.
 pub const LOG_PAGE: usize = 200;
 /// Console lines kept.
@@ -67,6 +70,8 @@ pub enum GitTab {
     #[default]
     Log,
     Console,
+    /// Git › GitHub › View Pull Requests.
+    PullRequests,
 }
 
 /// Tabs of the Commit tool window.
@@ -75,6 +80,8 @@ pub enum CommitTab {
     #[default]
     Changes,
     Stashes,
+    /// Shelved changes (`.codecraft/shelf`).
+    Shelf,
 }
 
 /// The commit message box and which changes are included (checkboxes).
@@ -164,6 +171,11 @@ pub struct HunkPopup {
     pub old_text: String,
     /// The current lines.
     pub new_text: String,
+    /// Whether the change is in the index (`None` while loading or unknown).
+    #[serde(default)]
+    pub stage: Option<codecraft_vcs::hunks::StageState>,
+    #[serde(default)]
+    pub stage_loading: bool,
 }
 
 /// Forms of the Git dialogs. The UI edits their fields in place and confirms with the matching
@@ -271,6 +283,35 @@ pub enum Dialog {
         base: String,
         draft: bool,
     },
+    /// Git › Uncommitted Changes › Shelve Changes…
+    Shelve {
+        name: String,
+        files: Vec<String>,
+        /// Keep the changes in the work tree too.
+        keep: bool,
+    },
+    /// New Changelist… (`original: None`) or Edit Changelist….
+    ChangeList {
+        original: Option<String>,
+        name: String,
+        comment: String,
+        active: bool,
+        /// Files to move into a new list.
+        files: Vec<String>,
+    },
+    /// Git › GitHub › Share Project on GitHub.
+    ShareOnGitHub {
+        name: String,
+        description: String,
+        private: bool,
+        remote: String,
+    },
+    /// Git › GitHub › Create Gist….
+    CreateGist {
+        path: String,
+        description: String,
+        public: bool,
+    },
 }
 
 /// The operation running now.
@@ -308,6 +349,17 @@ enum OpKind {
     },
     /// A hunk was staged or unstaged: close its popup.
     Hunk,
+    /// Shelve / unshelve / delete: reload the shelf (unshelving may leave conflicts).
+    Shelf,
+    /// Share Project on GitHub created the repository: discover it again.
+    Share {
+        root: PathBuf,
+    },
+    /// A `gh` action: reload the pull requests, and open the URL it printed.
+    Gh {
+        reload_prs: bool,
+        open_url: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -367,6 +419,9 @@ enum Event {
     GhRepos(Result<Vec<GhRepo>, GitError>),
     MergeLoaded { rel: String, labels: (String, String), result: Result<MergeVersions, GitError> },
     Generated(Result<String, String>),
+    Shelves(Vec<codecraft_vcs::shelf::Shelf>),
+    ShelfPatch { id: String, path: String, result: Result<String, GitError> },
+    HunkStage { doc: DocId, start: usize, state: Option<codecraft_vcs::hunks::StageState> },
 }
 
 pub struct VcsState {
@@ -417,6 +472,20 @@ pub struct VcsState {
     pub clone_github: bool,
     /// The last pull request created.
     pub last_pull_request: Option<String>,
+    /// Changelists of the project (`.codecraft/changelists.json`).
+    pub changelists: codecraft_vcs::changelist::ChangeLists,
+    changelists_for: Option<PathBuf>,
+    /// Shelved changes, newest first.
+    pub shelves: Vec<codecraft_vcs::shelf::Shelf>,
+    pub shelves_loading: bool,
+    /// The shelf (and file) selected in the Shelf tab.
+    pub shelf_selected: Option<(String, Option<String>)>,
+    /// Patch of the selected shelved file: (shelf id, path, text or error).
+    pub shelf_patch: Option<(String, String, Result<String, String>)>,
+    /// Pull requests (Git › GitHub › View Pull Requests).
+    pub prs: crate::github_prs::PrState,
+    /// The last repository or gist created on GitHub.
+    pub last_github_url: Option<String>,
     markers: HashMap<DocId, Markers>,
     heads: HashMap<String, HeadText>,
     head_oid: Option<String>,
@@ -473,6 +542,14 @@ impl Default for VcsState {
             github_loading: false,
             clone_github: false,
             last_pull_request: None,
+            changelists: codecraft_vcs::changelist::ChangeLists::default(),
+            changelists_for: None,
+            shelves: Vec::new(),
+            shelves_loading: false,
+            shelf_selected: None,
+            shelf_patch: None,
+            prs: crate::github_prs::PrState::default(),
+            last_github_url: None,
             markers: HashMap::new(),
             heads: HashMap::new(),
             head_oid: None,
@@ -543,6 +620,9 @@ impl VcsState {
             || self.merge_loading.is_some()
             || self.worktrees_loading
             || self.github_loading
+            || self.shelves_loading
+            || self.prs.busy()
+            || self.hunk.as_ref().is_some_and(|h| h.stage_loading)
             || self.markers.values().any(|m| m.pending || m.seen_at.is_some())
             || self.blame.values().any(|b| b.loading || b.seen_at.is_some())
     }
@@ -676,6 +756,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
         handle(s, ev);
     }
+    changed |= crate::github_prs::pump(s);
     changed |= update_markers(s);
     changed |= update_blame(s);
     changed
@@ -725,7 +806,8 @@ fn discover_if_needed(s: &mut Session) -> bool {
     // The project changed: forget the old repository.
     let env = std::mem::take(&mut s.vcs.git_env);
     let gh_program = std::mem::take(&mut s.vcs.gh_program);
-    let open_dialog_free = VcsState { git_env: env, gh_program, ..VcsState::default() };
+    let last_github_url = s.vcs.last_github_url.take();
+    let open_dialog_free = VcsState { git_env: env, gh_program, last_github_url, ..VcsState::default() };
     let old_console = std::mem::take(&mut s.vcs.console);
     if let Some(op) = s.vcs.op.take() {
         op.cancel.cancel();
@@ -786,8 +868,10 @@ fn handle(s: &mut Session, ev: Event) {
                 Ok(Some(info)) => {
                     s.vcs.repo = Some(info);
                     s.vcs.unavailable = None;
+                    changelists::load(s);
                     request_refresh(s, true);
                     load_log(s, true);
+                    shelf::load(s);
                 }
                 Ok(None) => s.vcs.unavailable = None,
                 Err(e) => s.vcs.unavailable = Some(e.to_string()),
@@ -919,6 +1003,30 @@ fn handle(s: &mut Session, ev: Event) {
             s.vcs.github_loading = false;
             s.vcs.github_repos = Some(result.map_err(|e| err_text(&e)));
         }
+        Event::Shelves(list) => {
+            s.vcs.shelves_loading = false;
+            s.vcs.shelves = list;
+            if let Some((id, _)) = &s.vcs.shelf_selected
+                && !s.vcs.shelves.iter().any(|sh| &sh.id == id)
+            {
+                s.vcs.shelf_selected = None;
+                s.vcs.shelf_patch = None;
+            }
+        }
+        Event::ShelfPatch { id, path, result } => {
+            if s.vcs.shelf_selected.as_ref().is_some_and(|(i, p)| *i == id && p.as_deref() == Some(path.as_str())) {
+                s.vcs.shelf_patch = Some((id, path, result.map_err(|e| e.to_string())));
+            }
+        }
+        Event::HunkStage { doc, start, state } => {
+            if let Some(h) = &mut s.vcs.hunk
+                && h.doc == doc
+                && h.change.start == start
+            {
+                h.stage = state;
+                h.stage_loading = false;
+            }
+        }
         Event::MergeLoaded { rel, labels, result } => {
             if s.vcs.merge_loading.as_deref() != Some(rel.as_str()) {
                 return;
@@ -989,6 +1097,7 @@ fn apply_snapshot(s: &mut Session, snap: Snapshot) {
     let refs_changed = snap.refs.is_some();
     s.vcs.status = snap.status;
     s.vcs.state = snap.state;
+    changelists::sync(s);
     if let Some((branches, tags, remotes, stashes)) = snap.refs {
         s.vcs.branches = branches;
         s.vcs.tags = tags;
@@ -1162,7 +1271,23 @@ pub fn show_hunk(s: &mut Session, doc: DocId, line: usize) -> Result<(), Command
             .unwrap_or_default();
     let old_text = lines::base_text(&base, &change);
     let old_text = old_text.strip_suffix('\n').unwrap_or(&old_text).to_string();
-    s.vcs.hunk = Some(HunkPopup { doc, change, old_text, new_text });
+    let current = s.ws.doc(doc).map(|d| d.doc.text()).unwrap_or_default();
+    let rel = s.ws.doc(doc).and_then(|d| d.path.clone()).and_then(|p| s.vcs.rel(&p));
+    let git = s.vcs.git();
+    let stage_loading = rel.is_some() && git.is_some();
+    s.vcs.hunk = Some(HunkPopup { doc, change: change.clone(), old_text, new_text, stage: None, stage_loading });
+    if let (Some(rel), Some(git)) = (rel, git) {
+        let tx = s.vcs.tx.clone();
+        spawn("hunk-stage", move || {
+            // The index version (`:path`); a file not in the index has nothing staged.
+            let index = match codecraft_vcs::log::text_at(&git, "", &rel) {
+                Ok(Some(t)) => t.replace("\r\n", "\n"),
+                _ => base.as_str().to_string(),
+            };
+            let state = codecraft_vcs::hunks::stage_state(&base, &index, &current, &change);
+            let _ = tx.send(Event::HunkStage { doc, start: change.start, state });
+        });
+    }
     Ok(())
 }
 
@@ -1425,6 +1550,7 @@ where
     }
     let git = match &kind {
         OpKind::Clone { target, .. } => s.vcs.git_in(target.parent().unwrap_or(Path::new("/"))),
+        OpKind::Share { root } => s.vcs.git_in(root),
         _ => s.vcs.git().ok_or_else(|| CommandError::Failed("the project is not a Git repository".into()))?,
     };
     let cancel = CancelToken::new();
@@ -1508,6 +1634,35 @@ fn op_done(s: &mut Session, label: &str, kind: OpKind, result: Result<String, Gi
             }
         }
         OpKind::Hunk if result.is_ok() => s.vcs.hunk = None,
+        OpKind::Shelf => {
+            shelf::load(s);
+            s.vcs.show_conflicts_after_refresh = true;
+        }
+        OpKind::Share { .. } => {
+            if let Ok(url) = &result {
+                s.vcs.dialog = None;
+                s.vcs.last_github_url = url.lines().map(str::trim).rfind(|l| l.starts_with("https://")).map(str::to_string);
+            }
+            // The project may have just become a repository: discover it again.
+            if s.vcs.repo.is_none() {
+                s.vcs.discovered_for = None;
+                return;
+            }
+        }
+        OpKind::Gh { reload_prs, open_url } => {
+            if let Ok(out) = &result {
+                s.vcs.dialog = None;
+                if let Some(url) = out.lines().map(str::trim).rfind(|l| l.starts_with("https://")) {
+                    s.vcs.last_github_url = Some(url.to_string());
+                    if open_url {
+                        s.effects.push(Effect::OpenUrl(url.to_string()));
+                    }
+                }
+            }
+            if reload_prs {
+                crate::github_prs::reload(s);
+            }
+        }
         _ => {}
     }
     request_refresh(s, true);
@@ -1790,7 +1945,7 @@ impl VcsState {
         })
     }
 
-    fn gh_in(&self, program: PathBuf, dir: &Path) -> codecraft_vcs::github::Gh {
+    pub(crate) fn gh_in(&self, program: PathBuf, dir: &Path) -> codecraft_vcs::github::Gh {
         let mut gh = codecraft_vcs::github::Gh::new(program, dir);
         for (k, v) in &self.git_env {
             gh = gh.with_env(k, v);
@@ -1933,4 +2088,29 @@ pub fn create_pull_request(s: &mut Session, mut req: PullRequestRequest, open: b
         }
         codecraft_vcs::github::create_pull_request(&gh, &req)
     })
+}
+
+// ---------------------------------------------------------------- operations for other modules
+
+/// Run a GitHub CLI action as the repository operation (one at a time, cancellable, reported in
+/// the console and a notification). `f` gets the git invoker and captures its own `gh`.
+pub(crate) fn start_gh_op<F>(
+    s: &mut Session,
+    label: &str,
+    reload_prs: bool,
+    open_url: bool,
+    f: F,
+) -> Result<(), CommandError>
+where
+    F: FnOnce(&Git) -> Result<String, GitError> + Send + 'static,
+{
+    start_op(s, label, OpKind::Gh { reload_prs, open_url }, f)
+}
+
+/// Share Project on GitHub: runs in `root`, which may not be a repository yet.
+pub(crate) fn start_share_op<F>(s: &mut Session, root: PathBuf, f: F) -> Result<(), CommandError>
+where
+    F: FnOnce(&Git) -> Result<String, GitError> + Send + 'static,
+{
+    start_op(s, "Share Project on GitHub", OpKind::Share { root }, f)
 }

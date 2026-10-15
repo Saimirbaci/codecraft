@@ -281,29 +281,47 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     let mut cmd: Option<(&'static str, Value)> = None;
     ui.horizontal(|ui| {
         let stashes = s.vcs.stashes.len();
-        for (tab, label) in
-            [(CommitTab::Changes, "Changes".to_string()), (CommitTab::Stashes, format!("Stashes ({stashes})"))]
-        {
+        let shelves = s.vcs.shelves.len();
+        for (tab, label) in [
+            (CommitTab::Changes, "Changes".to_string()),
+            (CommitTab::Stashes, format!("Stashes ({stashes})")),
+            (CommitTab::Shelf, format!("Shelf ({shelves})")),
+        ] {
             if ui.selectable_label(s.vcs.commit_tab == tab, label).clicked() {
                 s.vcs.commit_tab = tab;
+                if tab == CommitTab::Shelf {
+                    cmd = Some(("vcs.shelves", json!({ "refresh": true })));
+                }
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if icon(ui, &theme, "⟳", "Refresh") {
                 cmd = Some(("vcs.refresh", Value::Null));
             }
-            if ui.small_button("Rollback…").on_hover_text("Roll back the checked changes").clicked() {
-                cmd = Some(("git.uncommittedChanges.rollback", Value::Null));
-            }
             if s.vcs.op.is_some() {
                 ui.add(egui::Spinner::new().size(12.0));
             }
         });
     });
+    if s.vcs.commit_tab == CommitTab::Changes {
+        // The Changes toolbar (its own row: the tool window is often narrow).
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Rollback…").on_hover_text("Roll back the checked changes").clicked() {
+                cmd = Some(("git.uncommittedChanges.rollback", Value::Null));
+            }
+            if ui.small_button("Shelve…").on_hover_text("Shelve the checked changes").clicked() {
+                cmd = Some(("git.uncommittedChanges.shelveChanges", Value::Null));
+            }
+            if ui.small_button("New Changelist…").on_hover_text("Group changes in another changelist").clicked() {
+                cmd = Some(("vcs.changelist.new", Value::Null));
+            }
+        });
+    }
     ui.separator();
     match s.vcs.commit_tab {
         CommitTab::Changes => changes_view(ui, s, st, &theme, &mut cmd),
         CommitTab::Stashes => stashes_view(ui, s, &theme, &mut cmd),
+        CommitTab::Shelf => crate::vcs_changes_ui::shelf_view(ui, s, st, &theme, &mut cmd),
     }
     if let Some((id, params)) = cmd {
         run_command(s, st, id, &params);
@@ -380,8 +398,13 @@ fn changes_view(
             ui.add_space(8.0);
             ui.label(RichText::new("No changes").color(theme.text_muted));
         }
-        group(ui, s, st, theme, "Changes", &changes, cmd);
-        group(ui, s, st, theme, "Unversioned Files", &unversioned, cmd);
+        // Tracked changes by changelist (the active list first is not reordered: list order).
+        for (name, files) in codecraft_engine::vcs::changelists::groups(s) {
+            let in_list: Vec<FileStatus> =
+                files.iter().filter_map(|p| changes.iter().find(|f| &f.path == p).cloned()).collect();
+            group(ui, s, theme, &name, &in_list, cmd, Some(&files));
+        }
+        group(ui, s, theme, "Unversioned Files", &unversioned, cmd, None);
         if s.vcs.status.truncated {
             ui.label(RichText::new("Too many changes: the list is cut.").color(theme.warning).small());
         }
@@ -391,13 +414,15 @@ fn changes_view(
 fn group(
     ui: &mut Ui,
     s: &mut Session,
-    st: &mut UiState,
     theme: &Theme,
     title: &str,
     files: &[FileStatus],
     cmd: &mut Option<(&'static str, Value)>,
+    // A changelist (its paths): shown even when empty, with its menu and the active mark.
+    list: Option<&[String]>,
 ) {
-    if files.is_empty() {
+    let only_list = list.is_some() && s.vcs.changelists.lists.len() == 1;
+    if files.is_empty() && (list.is_none() || only_list) {
         return;
     }
     let included = files.iter().filter(|f| s.vcs.is_included(f)).count();
@@ -428,7 +453,17 @@ fn group(
                 }
             }
         }
-        ui.label(RichText::new(title).strong());
+        let active = list.is_some() && s.vcs.changelists.active == title;
+        let mut name = ui.add(egui::Label::new(RichText::new(title).strong()).sense(Sense::click()));
+        if let Some(c) = s.vcs.changelists.get(title).map(|l| l.comment.clone()).filter(|c| !c.is_empty()) {
+            name = name.on_hover_text(c);
+        }
+        if let Some(paths) = list {
+            name.context_menu(|ui| crate::vcs_changes_ui::list_menu(ui, s, title, paths, cmd));
+        }
+        if active && s.vcs.changelists.lists.len() > 1 {
+            ui.label(RichText::new("active").small().color(theme.accent));
+        }
         ui.label(
             RichText::new(format!("{} file{}", files.len(), if files.len() == 1 { "" } else { "s" }))
                 .color(theme.text_muted)
@@ -508,10 +543,16 @@ fn group(
                     *cmd = Some(("vcs.showConflicts", Value::Null));
                     ui.close();
                 }
+                if f.conflict.is_none() && ui.button("Shelve Changes…").clicked() {
+                    *cmd = Some(("git.uncommittedChanges.shelveChanges", json!({ "files": [f.path] })));
+                    ui.close();
+                }
+                if list.is_some() {
+                    crate::vcs_changes_ui::move_menu(ui, s, &f.path, cmd);
+                }
             });
         });
     }
-    let _ = st;
 }
 
 fn commit_box(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd: &mut Option<(&'static str, Value)>) {
@@ -640,11 +681,18 @@ pub fn show_git(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     }
     let mut cmd: Option<(&'static str, Value)> = None;
     ui.horizontal(|ui| {
-        for (tab, label) in [(GitTab::Log, "Log"), (GitTab::Console, "Console")] {
+        let mut tabs = vec![(GitTab::Log, "Log"), (GitTab::Console, "Console")];
+        if s.vcs.github_remote().is_some() || s.vcs.git_tab == GitTab::PullRequests {
+            tabs.push((GitTab::PullRequests, "Pull Requests"));
+        }
+        for (tab, label) in tabs {
             if ui.selectable_label(s.vcs.git_tab == tab, label).clicked() {
                 s.vcs.git_tab = tab;
                 if tab == GitTab::Log && !s.vcs.log.loaded {
                     cmd = Some(("vcs.log", json!({})));
+                }
+                if tab == GitTab::PullRequests && !s.vcs.prs.loaded && !s.vcs.prs.loading {
+                    cmd = Some(("git.gitHub.viewPullRequests", Value::Null));
                 }
             }
         }
@@ -661,6 +709,7 @@ pub fn show_git(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     match s.vcs.git_tab {
         GitTab::Log => log_view(ui, s, st, &theme, &mut cmd),
         GitTab::Console => console_view(ui, s, &theme),
+        GitTab::PullRequests => crate::pull_requests_ui::show(ui, s, &theme, &mut cmd),
     }
     if let Some((id, params)) = cmd {
         run_command(s, st, id, &params);
@@ -944,7 +993,7 @@ pub fn overlays(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     dialogs(ctx, s, st);
     compare_window(ctx, s, st);
     hunk_popup(ctx, s, st);
-    crate::vcs_merge_ui::merge_window(ctx, s, st);
+    crate::merge_editor::merge_window(ctx, s, st);
     if s.vcs.busy() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -999,6 +1048,23 @@ fn hunk_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         LineChangeKind::Deleted => "Deleted lines",
                     };
                     ui.label(RichText::new(what).strong().small());
+                    match h.stage {
+                        Some(stage) => {
+                            let color = match stage {
+                                codecraft_engine::vcs_git::hunks::StageState::Staged => theme.success,
+                                codecraft_engine::vcs_git::hunks::StageState::Partly => theme.warning,
+                                codecraft_engine::vcs_git::hunks::StageState::Unstaged => theme.text_muted,
+                            };
+                            ui.label(RichText::new(stage.label()).small().color(color))
+                                .on_hover_text("Compared with the index (git add)");
+                        }
+                        None if h.stage_loading => {
+                            ui.add(egui::Spinner::new().size(10.0));
+                        }
+                        None => {}
+                    }
+                    let can_stage = h.stage.is_none_or(|st| st.can_stage());
+                    let can_unstage = h.stage.is_none_or(|st| st.can_unstage());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if icon(ui, &theme, "×", "Close (Esc)") {
                             close = true;
@@ -1012,10 +1078,18 @@ fn hunk_popup(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         if ui.small_button("Rollback").on_hover_text("Rollback Lines (⌥⌘Z)").clicked() {
                             cmd = Some(("vcs.rollbackHunk", Value::Null));
                         }
-                        if ui.small_button("Unstage").on_hover_text("Take these lines out of the index").clicked() {
+                        if ui
+                            .add_enabled(can_unstage, egui::Button::new("Unstage").small())
+                            .on_hover_text("Take these lines out of the index")
+                            .clicked()
+                        {
                             cmd = Some(("vcs.unstageHunk", Value::Null));
                         }
-                        if ui.small_button("Stage").on_hover_text("Stage only these lines").clicked() {
+                        if ui
+                            .add_enabled(can_stage, egui::Button::new("Stage").small())
+                            .on_hover_text("Stage only these lines")
+                            .clicked()
+                        {
                             cmd = Some(("vcs.stageHunk", Value::Null));
                         }
                     });
@@ -1117,6 +1191,11 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         Dialog::NewWorktree { .. } => "New Worktree".into(),
         Dialog::Worktrees { .. } => "Worktrees".into(),
         Dialog::CreatePullRequest { .. } => "Create Pull Request".into(),
+        Dialog::Shelve { .. } => "Shelve Changes".into(),
+        Dialog::ChangeList { original: None, .. } => "New Changelist".into(),
+        Dialog::ChangeList { .. } => "Edit Changelist".into(),
+        Dialog::ShareOnGitHub { .. } => "Share Project on GitHub".into(),
+        Dialog::CreateGist { .. } => "Create Gist".into(),
     };
     let field_w = 360.0;
     crate::windows::resizable(egui::Window::new(title).default_width(480.0), st, "vcs-dialog")
@@ -1606,6 +1685,16 @@ fn dialogs(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 }
                 other @ (Dialog::NewWorktree { .. } | Dialog::Worktrees { .. } | Dialog::CreatePullRequest { .. }) => {
                     let r = crate::vcs_merge_ui::more_dialogs(ui, s, &theme, other, busy.is_some(), enter);
+                    action = r.0;
+                    close |= r.1;
+                }
+                other @ (Dialog::Shelve { .. } | Dialog::ChangeList { .. }) => {
+                    let r = crate::vcs_changes_ui::dialogs(ui, s, &theme, other, busy.is_some(), enter);
+                    action = r.0;
+                    close |= r.1;
+                }
+                other @ (Dialog::ShareOnGitHub { .. } | Dialog::CreateGist { .. }) => {
+                    let r = crate::pull_requests_ui::dialogs(ui, s, &theme, other, busy.is_some(), enter);
                     action = r.0;
                     close |= r.1;
                 }
