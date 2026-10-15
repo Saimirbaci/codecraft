@@ -73,6 +73,9 @@ pub(crate) struct RunForm {
     pub(crate) debugger_init: String,
     pub(crate) debugger_stop: bool,
     pub(crate) debugger_env: String,
+    /// Python: justMyCode and subprocess debugging (M14 track DBG).
+    pub(crate) debugger_just_my_code: bool,
+    pub(crate) debugger_sub_process: bool,
     store_as_project_file: bool,
     executable: String,
 }
@@ -93,6 +96,8 @@ impl RunForm {
             debugger_init: c.debugger.init_commands.join("\n"),
             debugger_stop: c.debugger.stop_at_entry,
             debugger_env: env_text(&c.debugger.env),
+            debugger_just_my_code: c.debugger.just_my_code.unwrap_or(true),
+            debugger_sub_process: c.debugger.sub_process.unwrap_or(true),
             store_as_project_file: c.store_as_project_file,
             executable: c.executable.clone(),
         }
@@ -107,7 +112,10 @@ impl RunForm {
             "workingDir": self.working_dir,
             "target": self.target,
             "beforeLaunch": self.before_launch,
-            "debugger": { "initCommands": self.debugger_init, "stopAtEntry": self.debugger_stop, "env": self.debugger_env },
+            "debugger": {
+                "initCommands": self.debugger_init, "stopAtEntry": self.debugger_stop, "env": self.debugger_env,
+                "justMyCode": self.debugger_just_my_code, "subProcess": self.debugger_sub_process,
+            },
             "storeAsProjectFile": self.store_as_project_file,
             "executable": self.executable,
         });

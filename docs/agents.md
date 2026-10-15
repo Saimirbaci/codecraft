@@ -297,7 +297,7 @@ A failing expression is a tool error with the debugger's message.
 
 - Schemas: `crates/mcp/src/engine_tools.rs`; transports: `crates/mcp/src/{server,stdio,bridge}.rs`.
 - Execution, capabilities, waits: `crates/engine/src/agent_tools.rs`; the commands they use that
-  were new (`debug.stopSummary`, `debug.variablesOf`, `files.*`, `analysis.problems`,
+  were new (`debug.agentSummary`, `debug.variablesOf`, `files.*`, `analysis.problems`,
   `lsp.query`/`lsp.queryResult`, `run.output`, `run.stopTab`, `run.configurations`,
   `test.summary`, `test.runFiltered`, `profiler.hotspots`, `commands.search`, `project.info`):
   `crates/engine/src/agent_tools_cmds.rs`; the policy: `crates/engine/src/agent_access.rs`; the

@@ -43,6 +43,7 @@ pub mod database;
 mod database_cmds;
 pub mod debug;
 mod debug_cmds;
+mod debug_agent_cmds;
 pub mod debug_views;
 pub mod asm;
 mod decorations;

@@ -87,8 +87,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             problems,
         ),
         spec(
-            "debug.stopSummary",
-            "Debugger Stop Summary",
+            "debug.agentSummary",
+            "Debugger Stop Summary (Agents)",
             None,
             "{frames?: int (default 5), context?: int (excerpt lines around each frame's line, default 1)} → {state: \
              none|building|starting|running|stopped|exited|failed, reason?, thread?, frames?, locals?, …}",
@@ -625,6 +625,17 @@ pub(crate) fn stop_summary(s: &Session, frames: usize, context: usize) -> Value 
         }
     };
     out.insert("state".into(), json!(state));
+    // What the debugger's own summary knows beyond this one: the exception or panic (type and
+    // message), the value a step out returned, the breakpoints hit, the exit code, the last error.
+    if let Value::Object(more) = crate::debug::agent::stop_summary(s, 1, 0) {
+        for key in ["exception", "returnValue", "breakpoints", "exitCode", "lastError"] {
+            if let Some(v) = more.get(key).filter(|v| !v.is_null())
+                && !out.contains_key(key)
+            {
+                out.insert(key.into(), v.clone());
+            }
+        }
+    }
     Value::Object(out)
 }
 
@@ -1409,7 +1420,7 @@ mod tests {
     fn summaries_without_sessions() {
         let mut s = Session::new();
         s.lsp_enabled = false;
-        assert_eq!(s.execute("debug.stopSummary", &Value::Null).unwrap()["state"], "none");
+        assert_eq!(s.execute("debug.agentSummary", &Value::Null).unwrap()["state"], "none");
         assert!(s.execute("debug.variablesOf", &Value::Null).is_err());
         assert!(s.execute("run.output", &Value::Null).is_err());
         assert!(s.execute("run.stopTab", &Value::Null).is_err());

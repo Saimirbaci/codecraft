@@ -185,6 +185,8 @@ pub(crate) fn debugger_section(ui: &mut egui::Ui, theme: &crate::theme::Theme, f
                 .desired_width(f32::INFINITY),
         );
         ui.checkbox(&mut f.debugger_stop, "Stop at the program's entry point");
+        ui.checkbox(&mut f.debugger_just_my_code, "Python: debug only my code (justMyCode)");
+        ui.checkbox(&mut f.debugger_sub_process, "Python: debug subprocesses too");
         ui.horizontal(|ui| {
             ui.label("Debuggee environment:");
             ui.add(

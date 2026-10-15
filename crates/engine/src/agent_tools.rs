@@ -259,6 +259,7 @@ const READ_COMMANDS: &[&str] = &[
     "db.listDataSources",
     "debug.state",
     "debug.stopSummary",
+    "debug.agentSummary",
     "debug.variablesOf",
     "files.read",
     "inspections.results",

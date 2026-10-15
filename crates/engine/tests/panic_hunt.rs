@@ -117,6 +117,9 @@ fn skip(id: &str, params: &Value) -> bool {
                 | "test.rerunFailed"
                 | "run.testsInFile"
                 | "debug.testsInFile"
+                | "debug.start"
+                | "debug.test"
+                | "debug.pythonRemote"
                 | "zig.runStep"
                 | "zig.debugStep"
                 // M14 AX: `cargo test <name>` / `pytest -k <name>`.

@@ -59,6 +59,21 @@ pub enum RunKind {
     /// `executable` (empty = the target's artifact from the File API) runs (M13 track RC).
     #[serde(rename = "cmake")]
     CMake,
+    /// CLion's Remote Debug (debug only, M14 track DBG): `command` is the `host:port` of a
+    /// gdbserver / `lldb-server gdbserver` / debugserver (`gdb-remote`), or `connect://host:port` of
+    /// an `lldb-server platform` (with `--platform remote-linux`), then optionally the local copy of
+    /// the program (symbols; the program a platform launches) and `--` its arguments.
+    #[serde(rename = "remote")]
+    RemoteDebug,
+    /// Debug a core dump (debug only): `command` is the core file, then optionally the program
+    /// that crashed.
+    #[serde(rename = "coredump")]
+    CoreDump,
+    /// PyCharm's remote attach to a debug server (debug only): `command` is the `host:port` of a
+    /// program started with `python -m debugpy --listen host:port`, then `local=remote` path
+    /// mappings.
+    #[serde(rename = "pythonremote")]
+    PythonRemote,
 }
 
 impl RunKind {
@@ -76,8 +91,13 @@ impl RunKind {
             "dockerfile" | "docker" => Ok(Self::Dockerfile),
             "compose" | "docker-compose" | "dockercompose" => Ok(Self::DockerCompose),
             "cmake" | "cmake application" | "cmakeapplication" => Ok(Self::CMake),
+            "remote" | "remote debug" | "remotedebug" | "gdb-remote" | "lldb-remote" => Ok(Self::RemoteDebug),
+            "coredump" | "core dump" | "core" | "core-dump" => Ok(Self::CoreDump),
+            "pythonremote" | "python remote" | "python-remote" | "debugpy" | "python debug server" => {
+                Ok(Self::PythonRemote)
+            }
             other => Err(format!(
-                "unknown configuration type `{other}` (cargo, command, python, cpp, zig, npm, django, fastapi, flask, dockerfile, compose or cmake)"
+                "unknown configuration type `{other}` (cargo, command, python, cpp, zig, npm, django, fastapi, flask, dockerfile, compose, cmake, remote, coredump or pythonremote)"
             )),
         }
     }
@@ -96,7 +116,15 @@ impl RunKind {
             Self::Dockerfile => "Dockerfile",
             Self::DockerCompose => "Docker Compose",
             Self::CMake => "CMake Application",
+            Self::RemoteDebug => "Remote Debug",
+            Self::CoreDump => "Core Dump",
+            Self::PythonRemote => "Python Debug Server",
         }
+    }
+
+    /// Configurations that can only be debugged (Run debugs them too).
+    pub fn debug_only(self) -> bool {
+        matches!(self, Self::RemoteDebug | Self::CoreDump | Self::PythonRemote)
     }
 
     /// The id `runConfig.create/update` take (`kind` param), as in the JSON files.
@@ -114,11 +142,14 @@ impl RunKind {
             Self::Dockerfile => "dockerfile",
             Self::DockerCompose => "compose",
             Self::CMake => "cmake",
+            Self::RemoteDebug => "remote",
+            Self::CoreDump => "coredump",
+            Self::PythonRemote => "pythonremote",
         }
     }
 
     /// Every kind, in the order the UI offers them.
-    pub const ALL: [RunKind; 12] = [
+    pub const ALL: [RunKind; 15] = [
         Self::Cargo,
         Self::Command,
         Self::Python,
@@ -131,6 +162,9 @@ impl RunKind {
         Self::Dockerfile,
         Self::DockerCompose,
         Self::CMake,
+        Self::RemoteDebug,
+        Self::CoreDump,
+        Self::PythonRemote,
     ];
 
     /// What the Command field of a new configuration of this kind starts with.
@@ -148,6 +182,9 @@ impl RunKind {
             Self::Dockerfile => "Dockerfile",
             Self::DockerCompose => "compose.yaml up",
             Self::CMake => "app",
+            Self::RemoteDebug => "127.0.0.1:1234 target/debug/app",
+            Self::CoreDump => "core app",
+            Self::PythonRemote => "127.0.0.1:5678",
         }
     }
 
@@ -166,6 +203,9 @@ impl RunKind {
             Self::Dockerfile => "Dockerfile -p 8080:80 -- app --port 80",
             Self::DockerCompose => "compose.yaml up web   or   down",
             Self::CMake => "my_target -- --arg",
+            Self::RemoteDebug => "host:1234 build/app   or   connect://host:1234 --platform remote-linux build/app -- --arg",
+            Self::CoreDump => "/cores/core.1234 build/app",
+            Self::PythonRemote => "host:5678 /local/src=/srv/app",
         }
     }
 }
@@ -297,6 +337,12 @@ pub struct DebuggerOptions {
     pub stop_at_entry: bool,
     /// Extra environment for the debuggee only (on top of the configuration's).
     pub env: Vec<(String, String)>,
+    /// Python: step and stop in your own code only (debugpy `justMyCode`; `None` = on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub just_my_code: Option<bool>,
+    /// Python: debug the subprocesses the program starts too (debugpy `subProcess`; `None` = on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub_process: Option<bool>,
 }
 
 impl DebuggerOptions {
@@ -337,6 +383,15 @@ impl DebuggerOptions {
         }
         if let Some(e) = v.get("env") {
             self.env = parse_env(e)?;
+        }
+        for (key, field) in [("justMyCode", &mut self.just_my_code), ("subProcess", &mut self.sub_process)] {
+            match v.get(key) {
+                None => {}
+                // `null` (or `true`, the default) is stored as "not set".
+                Some(Value::Null) | Some(Value::Bool(true)) => *field = None,
+                Some(Value::Bool(false)) => *field = Some(false),
+                Some(_) => return Err(format!("`{key}` must be true or false")),
+            }
         }
         Ok(())
     }
@@ -719,6 +774,96 @@ impl UserRunConfig {
         Ok(CmakeApp { target, executable, args: args.to_vec(), build_dir, configure })
     }
 
+    /// What a debug-only configuration (Remote Debug, Core Dump, Python Debug Server) debugs;
+    /// `None` for the other kinds.
+    pub fn debug_target(&self, project: &Path) -> Option<Result<crate::debug::DebugTarget, String>> {
+        use crate::debug::DebugTarget;
+        if !self.kind.debug_only() {
+            return None;
+        }
+        let name = self.name.trim().to_string();
+        let cwd = self.cwd(project, project);
+        let path = |p: &str| {
+            let p = PathBuf::from(p);
+            crate::normalize_path(&if p.is_absolute() { p } else { cwd.join(p) })
+        };
+        let words = match split_words(&self.command) {
+            Ok(w) => w,
+            Err(e) => return Some(Err(format!("`{name}`: {e}"))),
+        };
+        let (head, args) = Self::split_dashes(&words);
+        Some(match self.kind {
+            RunKind::RemoteDebug => {
+                let mut platform = None;
+                let mut rest = Vec::new();
+                let mut it = head.iter();
+                while let Some(w) = it.next() {
+                    if w == "--platform" {
+                        platform = it.next().cloned();
+                    } else if let Some(p) = w.strip_prefix("--platform=") {
+                        platform = Some(p.to_owned());
+                    } else {
+                        rest.push(w.clone());
+                    }
+                }
+                match rest.as_slice() {
+                    [address, program @ ..] if program.len() <= 1 => {
+                        let valid = if address.starts_with("connect://") {
+                            crate::dap::launch::valid_platform_url(address)
+                        } else {
+                            crate::dap::launch::valid_remote_address(address)
+                        };
+                        if valid {
+                            Ok(DebugTarget::Remote {
+                                name,
+                                address: address.clone(),
+                                program: program.first().map(|p| path(p)),
+                                platform,
+                                args: args.to_vec(),
+                            })
+                        } else {
+                            Err(format!("`{name}`: `{address}` is not host:port or connect://host:port"))
+                        }
+                    }
+                    _ => Err(format!("`{name}`: give the address, then optionally the program")),
+                }
+            }
+            RunKind::CoreDump => match head {
+                [core] => Ok(DebugTarget::CoreDump { name, core: path(core), program: None }),
+                [core, program] => Ok(DebugTarget::CoreDump { name, core: path(core), program: Some(path(program)) }),
+                _ => Err(format!("`{name}`: give the core file, then optionally the program")),
+            },
+            RunKind::PythonRemote => match head.split_first() {
+                Some((address, mappings)) => {
+                    let parsed = address.rsplit_once(':').and_then(|(h, p)| Some((h.to_owned(), p.parse::<u16>().ok()?)));
+                    let mappings: Result<Vec<_>, String> = mappings
+                        .iter()
+                        .map(|m| match m.split_once('=') {
+                            Some((l, r)) if !l.is_empty() && !r.is_empty() => Ok(crate::dap::launch::PathMapping {
+                                local_root: path(l).display().to_string(),
+                                remote_root: r.to_owned(),
+                            }),
+                            _ => Err(format!("`{name}`: path mappings are local=remote, not `{m}`")),
+                        })
+                        .collect();
+                    match (parsed, mappings) {
+                        (Some((host, port)), Ok(path_mappings)) => Ok(DebugTarget::PythonRemote {
+                            name,
+                            host,
+                            port,
+                            path_mappings,
+                            just_my_code: self.debugger.just_my_code.unwrap_or(true),
+                        }),
+                        (None, _) => Err(format!("`{name}`: `{address}` is not host:port")),
+                        (_, Err(e)) => Err(e),
+                    }
+                }
+                None => Err(format!("`{name}`: give the debug server's host:port")),
+            },
+            _ => return None,
+        })
+    }
+
     /// The runnable configuration; Cargo runs default to `cargo_root`.
     pub fn to_run_config(&self, project: &Path, cargo_root: &Path) -> Result<RunConfig, String> {
         let mut config = self.to_local_run_config(project, cargo_root)?;
@@ -789,6 +934,17 @@ impl UserRunConfig {
             }
             RunKind::DockerCompose => {
                 let cmd = crate::docker::run::compose_command(&words()?, project, &self.cwd(project, project), &env);
+                Ok(RunConfig::process(name, cmd))
+            }
+            RunKind::RemoteDebug | RunKind::CoreDump | RunKind::PythonRemote => {
+                // Debug only: Run debugs it (`run.run`); anything else that runs it says so.
+                self.debug_target(project).unwrap_or_else(|| Err("not a debug configuration".into()))?;
+                let message = format!("{name} is a {} configuration: use Run › Debug", self.kind.label());
+                let mut cmd = ProcessCommand::shell(
+                    format!("echo {} >&2; exit 2", codecraft_cargo::shell_quote(&message)),
+                    self.cwd(project, project),
+                );
+                cmd.env = env;
                 Ok(RunConfig::process(name, cmd))
             }
             RunKind::CMake => {
