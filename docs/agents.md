@@ -95,7 +95,7 @@ Settings › Tools › Agent Access (commands `agentAccess.get/set/reset/clearSe
 | `debug` | start/attach, breakpoints, stepping, evaluation | Ask |
 | `profile` | start/stop the profiler | Ask |
 | `write` | `file_write`, `file_edit`, any command that edits the project | Ask |
-| `db-write` | SQL that modifies data (INSERT/UPDATE/DELETE/DDL) | Ask |
+| `db-write` | SQL that is not a plain read: INSERT/UPDATE/DELETE/DDL, `SET`/`BEGIN`/`PREPARE`, `SELECT … INTO`, `EXPLAIN ANALYZE`, and reads that call a function known to change state (`nextval`, `pg_terminate_backend`, `dblink_exec`, `GET_LOCK`, `load_extension`, …) | Ask |
 
 Each is Off, Ask or Allow. **Ask** shows an approval card in the IDE (the tool and its JSON input;
 **Allow** once, **Always** for this session and this caller and capability, **Deny**); the call
@@ -104,7 +104,10 @@ jobs get Ask capabilities without a card (their user chose Auto; Off stays off);
 the cards; **Review** jobs are never allowed `write` (their changes belong in the worktree).
 Agents can't change the policy, answer approvals, start other agents or reconfigure the IDE
 integration through `codecraft_execute` (`agentAccess.*` except `get`, `agent.*`, `ide.*`,
-`feedback.*` are refused). A data source marked *confirm writes* (production) still asks its own
+`feedback.*` are refused), nor publish or change things outside this machine: `git.push`/`vcs.push`,
+sharing on GitHub/GitLab, gists, creating or merging pull requests, fork sync, deployment uploads
+and syncs, creating/renaming/deleting files on remote hosts, and `docker.prune` are refused (the
+user runs them). A data source marked *confirm writes* (production) still asks its own
 confirmation in the IDE, and headless such writes are refused.
 
 ## Tools

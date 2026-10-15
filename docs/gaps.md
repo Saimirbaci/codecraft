@@ -806,7 +806,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     [--format json|sarif|text]`, `profile [--seconds N]`, `test [filter]`. `docs/agents.md`
     documents every tool with an example call and result. Tested with the real debugpy,
     lldb-dap, rust-analyzer, cargo and ruff here, a fake samply, SQLite, the built CLI binary
-    over stdio, and a fake agent CLI that receives the bridge. Remaining: Claude Code connected
+    over stdio, and a fake agent CLI that receives the bridge. Agents can't push, share, open or merge pull requests, upload to deployment servers or prune Docker (refused, not askable), and an agent's SQL needs `db-write` unless it is a plain read without known side-effect functions (lead, 2026-10-15). Remaining: Claude Code connected
     over `/ide` filters which IDE-server tools its model sees, so the engine tools may only reach
     it through the bridge or `claude mcp add` (not verified against a real `claude`, which tests
     never run); headless Gemini and Grok jobs (Auto/Review) get no MCP server (their CLIs only

@@ -286,8 +286,38 @@ const READ_COMMANDS: &[&str] = &[
 const WRITE_COMMANDS: &[&str] =
     &["inspections.fix", "inspections.fixAll", "inspections.suppress", "test.export", "test.clearHistory"];
 
+/// Commands that act outside this machine or can't be taken back: publishing code (push, GitHub
+/// and GitLab sharing, gists, pull requests, fork sync), changing deployed servers, pruning
+/// Docker. The user runs these; agents only see them in search results.
+const OUTWARD_COMMANDS: &[&str] = &[
+    "git.push",
+    "vcs.push",
+    "vcs.createPullRequest",
+    "vcs.pr.merge",
+    "vcs.github.share",
+    "vcs.github.createGist",
+    "git.gitLab.shareProjectOnGitLab",
+    "remote.sync.apply",
+    "remote.host.delete",
+    "remote.host.mkdir",
+    "remote.host.rename",
+    "docker.prune",
+];
+
+/// Prefixes of [`OUTWARD_COMMANDS`]-like groups.
+const OUTWARD_PREFIXES: &[&str] = &[
+    "git.gitHub.createGist",
+    "git.gitHub.createPullRequest",
+    "git.gitHub.shareProjectOnGitHub",
+    "git.gitHub.syncFork",
+    "tools.deployment.upload",
+    "tools.deployment.sync",
+    "tools.deployment.automaticUpload",
+];
+
 /// The capability a command needs through `codecraft_execute`; `None` = agents may not run it
-/// (their own permissions, approvals, other agents, the IDE integration itself).
+/// (their own permissions, approvals, other agents, the IDE integration itself, and commands
+/// that publish or change things outside this machine).
 pub fn command_capability(id: &str) -> Option<Capability> {
     let id = crate::registry().canonical(id);
     if READ_COMMANDS.contains(&id) {
@@ -297,6 +327,8 @@ pub fn command_capability(id: &str) -> Option<Capability> {
         || id.starts_with("agent.")
         || id.starts_with("ide.")
         || id.starts_with("feedback.")
+        || OUTWARD_COMMANDS.contains(&id)
+        || OUTWARD_PREFIXES.iter().any(|p| id.starts_with(p))
     {
         return None;
     }
@@ -342,10 +374,124 @@ fn find_source(s: &Session, wanted: &str) -> Option<String> {
         .map(|d| d.config.id.clone())
 }
 
-/// Whether `sql` modifies data on `source`.
+/// Whether `sql` may modify data on `source`. Stricter than the production guard: an agent's
+/// statement counts as reading only when it starts with a plain read (`SELECT` without `INTO`,
+/// `WITH` without a write, `SHOW`, `DESCRIBE`, `EXPLAIN` without `ANALYZE`, `VALUES`, `TABLE`,
+/// `PRAGMA` without `=`) and calls no function known to change state; session changes (`SET`,
+/// `BEGIN`, `PREPARE`, …) need db-write too.
 fn sql_writes(s: &Session, source: &str, sql: &str) -> bool {
     let dialect = s.db.dialect_for(None, Some(source));
-    codecraft_db::split_statements(sql, dialect).iter().any(|st| codecraft_db::is_modifying(&st.text, dialect))
+    codecraft_db::split_statements(sql, dialect)
+        .iter()
+        .any(|st| codecraft_db::is_modifying(&st.text, dialect) || !agent_reads_only(&st.text, dialect))
+}
+
+/// Functions that change state although they can be called from a `SELECT`.
+const SIDE_EFFECT_FUNCTIONS: &[&str] = &[
+    // PostgreSQL
+    "NEXTVAL",
+    "SETVAL",
+    "SET_CONFIG",
+    "PG_TERMINATE_BACKEND",
+    "PG_CANCEL_BACKEND",
+    "PG_RELOAD_CONF",
+    "PG_ROTATE_LOGFILE",
+    "PG_ADVISORY_LOCK",
+    "PG_ADVISORY_XACT_LOCK",
+    "PG_TRY_ADVISORY_LOCK",
+    "PG_SWITCH_WAL",
+    "PG_CREATE_RESTORE_POINT",
+    "PG_PROMOTE",
+    "PG_DROP_REPLICATION_SLOT",
+    "PG_CREATE_LOGICAL_REPLICATION_SLOT",
+    "PG_CREATE_PHYSICAL_REPLICATION_SLOT",
+    "PG_FILE_WRITE",
+    "PG_FILE_UNLINK",
+    "PG_FILE_RENAME",
+    "LO_IMPORT",
+    "LO_EXPORT",
+    "LO_UNLINK",
+    "LO_CREATE",
+    "DBLINK",
+    "DBLINK_EXEC",
+    "QUERY_TO_XML",
+    // MySQL / MariaDB
+    "GET_LOCK",
+    "RELEASE_LOCK",
+    "RELEASE_ALL_LOCKS",
+    "LOAD_FILE",
+    "SLEEP",
+    "BENCHMARK",
+    // SQLite
+    "LOAD_EXTENSION",
+    "WRITEFILE",
+    "EDIT",
+];
+
+/// The statement's words, upper-cased, with comments and string literals left out.
+fn sql_words(sql: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut chars = sql.chars().peekable();
+    let flush = |cur: &mut String, words: &mut Vec<String>| {
+        if !cur.is_empty() {
+            words.push(std::mem::take(cur).to_ascii_uppercase());
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                flush(&mut cur, &mut words);
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                flush(&mut cur, &mut words);
+                chars.next();
+                let mut prev = ' ';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+            }
+            '\'' => {
+                flush(&mut cur, &mut words);
+                for n in chars.by_ref() {
+                    if n == '\'' {
+                        break;
+                    }
+                }
+            }
+            c if c.is_alphanumeric() || c == '_' => cur.push(c),
+            _ => flush(&mut cur, &mut words),
+        }
+    }
+    flush(&mut cur, &mut words);
+    words
+}
+
+/// Whether an agent's statement only reads (see [`sql_writes`]).
+fn agent_reads_only(sql: &str, dialect: codecraft_db::Dialect) -> bool {
+    if dialect == codecraft_db::Dialect::Redis {
+        return !codecraft_db::is_modifying(sql, dialect);
+    }
+    let words = sql_words(sql);
+    let Some(first) = words.first() else { return true };
+    let has = |w: &str| words.iter().skip(1).any(|x| x == w);
+    let plain_read = match first.as_str() {
+        "SELECT" => !has("INTO"),
+        "WITH" => !["INSERT", "UPDATE", "DELETE", "MERGE", "INTO"].iter().any(|w| has(w)),
+        "EXPLAIN" => !has("ANALYZE") && !has("ANALYSE"),
+        "SHOW" | "DESCRIBE" | "DESC" | "VALUES" | "TABLE" => true,
+        "PRAGMA" => !sql.contains('='),
+        _ => false,
+    };
+    plain_read && !words.iter().any(|w| SIDE_EFFECT_FUNCTIONS.contains(&w.as_str()))
 }
 
 /// The capability one call needs (some depend on the arguments).
@@ -1462,4 +1608,49 @@ pub fn result_text(r: &ToolResult) -> &str {
 /// A tool result's JSON (Null when it is not JSON).
 pub fn result_json(r: &ToolResult) -> Value {
     serde_json::from_str(result_text(r)).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codecraft_db::Dialect;
+
+    #[test]
+    fn agent_reads_only_plain_reads() {
+        for sql in [
+            "select * from t",
+            "-- note\nSELECT a FROM t WHERE b = 'drop table x'",
+            "with x as (select 1) select * from x",
+            "show tables",
+            "explain select 1",
+            "pragma table_info(t)",
+        ] {
+            assert!(agent_reads_only(sql, Dialect::Postgres), "{sql}");
+        }
+        for sql in [
+            "select nextval('s')",
+            "SELECT pg_terminate_backend(42)",
+            "select * into t2 from t",
+            "explain analyze select 1",
+            "set role admin",
+            "begin",
+            "prepare p as delete from t",
+            "pragma query_only = 0",
+            "select dblink_exec('x', 'drop table t')",
+            "update t set a = 1",
+        ] {
+            assert!(!agent_reads_only(sql, Dialect::Postgres), "{sql}");
+        }
+    }
+
+    #[test]
+    fn outward_commands_are_not_for_agents() {
+        for id in ["git.push", "vcs.push", "vcs.github.share", "vcs.pr.merge", "docker.prune"] {
+            if crate::registry().get(id).is_some() {
+                assert_eq!(command_capability(id), None, "{id}");
+            }
+        }
+        assert_eq!(command_capability("git.gitHub.shareProjectOnGitHub"), None);
+        assert_eq!(command_capability("tools.deployment.uploadToDefaultServer"), None);
+    }
 }
