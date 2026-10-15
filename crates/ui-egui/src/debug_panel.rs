@@ -70,6 +70,9 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
         st.debug.focus_evaluate = true;
     }
     let mut actions = Vec::new();
+    // Several debug sessions: one tab each (M15 track DM).
+    let tabs = crate::debug_dbg_ui::session_tabs(ui, s, &theme);
+    actions.extend(tabs.into_iter().map(|(id, params)| Action::Command(id, params)));
     header(ui, s, &theme, &mut actions);
     ui.add_space(2.0);
     let mut cmds: Vec<debug_views_ui::Cmd> = Vec::new();
@@ -166,12 +169,7 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
             "run.debuggingActions.resumeProgram",
             enabled("run.debuggingActions.resumeProgram"),
         ),
-        (
-            Icon::Pause,
-            "Pause Program",
-            "run.debuggingActions.pauseAllPrograms",
-            enabled("run.debuggingActions.pauseAllPrograms"),
-        ),
+        (Icon::Pause, "Pause Program", "debug.pause", enabled("debug.pause")),
         (Icon::Stop, "Stop", "debug.stop", enabled("debug.stop")),
         (Icon::StepOver, "Step Over", "run.debuggingActions.stepOver", enabled("run.debuggingActions.stepOver")),
         (Icon::StepInto, "Step Into", "run.debuggingActions.stepInto", enabled("run.debuggingActions.stepInto")),

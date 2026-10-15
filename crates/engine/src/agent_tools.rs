@@ -150,9 +150,16 @@ enum Wait {
         tool: String,
         args: Value,
     },
-    /// The debugger to stop (settled) or the session to end.
+    /// The debugger to stop (settled) or the session to end: debug session `session` (or one of
+    /// its subprocess sessions); `None`: any session (M15 track DM).
     DebugStop {
         frames: usize,
+        session: Option<u64>,
+    },
+    /// Another wait, for debug session `session` (a tool call with a `session` argument).
+    InSession {
+        session: u64,
+        inner: Box<Wait>,
     },
     /// The stop to settle after selecting a thread or frame, then answer.
     DebugSettle {
@@ -796,8 +803,12 @@ fn on_timeout(s: &mut Session, name: &str, wait: &Wait) -> ToolResult {
                 s.agent_tools.approval_timeout.as_secs()
             ))
         }
-        Wait::DebugStop { frames } => {
-            let mut v = stop_summary(s, *frames, 1);
+        Wait::InSession { session, inner } => crate::debug::with_session(s, *session, |s| on_timeout(s, name, inner)),
+        Wait::DebugStop { frames, session } => {
+            let mut v = match session {
+                Some(id) => crate::debug::with_session(s, *id, |s| stop_summary(s, *frames, 1)),
+                None => stop_summary(s, *frames, 1),
+            };
             if let Some(o) = v.as_object_mut() {
                 o.insert("timedOut".into(), json!(true));
                 o.insert(
@@ -849,7 +860,14 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
             Ok(Decision::Deny) | Err(TryRecvError::Disconnected) => Some(done_err("denied by the user")),
             Err(TryRecvError::Empty) => None,
         },
-        Wait::DebugStop { frames } => debug_settled(s).then(|| done_json(stop_summary(s, *frames, 1))),
+        Wait::InSession { session, inner } => crate::debug::with_session(s, *session, |s| poll(s, caller, inner)),
+        Wait::DebugStop { frames, session } => {
+            let ready = crate::debug::agent::ready_session(s, *session)?;
+            Some(done_json(match ready {
+                Some(id) => crate::debug::with_session(s, id, |s| stop_summary(s, *frames, 1)),
+                None => stop_summary(s, *frames, 1),
+            }))
+        }
         Wait::DebugSettle { then } => {
             if !debug_settled(s) {
                 return None;
@@ -1106,6 +1124,25 @@ fn zero_based_location(s: &Session, args: &Value) -> Result<(std::path::PathBuf,
 
 fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step {
     let _ = caller;
+    // Debug tools act on the debug session their `session` argument names (M15 track DM).
+    if name.starts_with("debug_")
+        && name != t::DEBUG_START
+        && let Some(v) = args.get("session").filter(|v| !v.is_null())
+    {
+        let id = match crate::debug::resolve_session(&s.debug, v) {
+            Ok(id) => id,
+            Err(e) => return cmd_err(e),
+        };
+        let mut inner = args.clone();
+        if let Some(o) = inner.as_object_mut() {
+            o.remove("session");
+        }
+        return match crate::debug::with_session(s, id, |s| run_tool(s, caller, name, &inner)) {
+            Step::Wait(Wait::DebugStop { frames, .. }, t) => Step::Wait(Wait::DebugStop { frames, session: Some(id) }, t),
+            Step::Wait(w, t) => Step::Wait(Wait::InSession { session: id, inner: Box::new(w) }, t),
+            done => done,
+        };
+    }
     match name {
         t::COMMANDS => exec_done(s, "commands.search", args.clone()),
         t::EXECUTE => {
@@ -1156,7 +1193,8 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
         t::DEBUG_CONTROL => debug_control(s, args),
         t::DEBUG_WAIT_FOR_STOP => {
             let frames = usize_arg(args, "frames", 5, 50);
-            Step::Wait(Wait::DebugStop { frames }, timeout_arg(args, 30_000))
+            // Any session's stop (with one session, that one's).
+            Step::Wait(Wait::DebugStop { frames, session: None }, timeout_arg(args, 30_000))
         }
         t::DEBUG_STACK => debug_stack(s, args),
         t::DEBUG_VARIABLES => debug_variables(s, args),
@@ -1603,7 +1641,7 @@ fn debug_control(s: &mut Session, args: &Value) -> Step {
         "stepOver" => ("run.debuggingActions.stepOver", Value::Null, true),
         "stepInto" => ("run.debuggingActions.stepInto", Value::Null, true),
         "stepOut" => ("run.debuggingActions.stepOut", Value::Null, true),
-        "pause" => ("run.debuggingActions.pauseAllPrograms", Value::Null, true),
+        "pause" => ("debug.pause", Value::Null, true),
         "stop" => ("debug.stop", Value::Null, false),
         "runToLine" => {
             let (path, line) = match zero_based_location(s, args) {
@@ -1625,7 +1663,9 @@ fn debug_control(s: &mut Session, args: &Value) -> Step {
     let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(wait_default);
     let frames = usize_arg(args, "frames", 5, 50);
     if wait {
-        Step::Wait(Wait::DebugStop { frames }, timeout_arg(args, 30_000))
+        // The session acted on (or one of its subprocess sessions).
+        let session = s.debug.selected_id();
+        Step::Wait(Wait::DebugStop { frames, session }, timeout_arg(args, 30_000))
     } else {
         done_json(stop_summary(s, frames, 1))
     }

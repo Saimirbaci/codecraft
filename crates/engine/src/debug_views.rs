@@ -199,6 +199,18 @@ impl DebugViews {
         self.memory.input = input;
     }
 
+    /// Empty views for another session (the console history and the memory address typed are
+    /// kept, like [`DebugViews::reset`]).
+    pub(crate) fn fresh(&self) -> Self {
+        let mut out = Self {
+            console_history: self.console_history.clone(),
+            next_watchpoint: self.next_watchpoint,
+            ..Self::default()
+        };
+        out.memory.input = self.memory.input.clone();
+        out
+    }
+
     /// The program stopped: registers compare against this stop from now on.
     pub(crate) fn on_stop(&mut self) {
         let r = &mut self.registers;

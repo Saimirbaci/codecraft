@@ -261,6 +261,23 @@ children of a structured value (`ref` from locals, scopes or an evaluation).
 **`debug_evaluate`** (debug) — `{ "expression": "total * 10", "frame": 0 }` → `{ "expression": "total * 10", "value": "30", "type": "int" }`.
 A failing expression is a tool error with the debugger's message.
 
+**Several sessions** (a client and a server, a Python program's subprocesses) — `debug_start`
+leaves the other sessions running (debugging the same configuration again restarts it) and its
+result's `sessionId` names the new session. `debug_control`, `debug_wait_for_stop`,
+`debug_stack`, `debug_variables` and `debug_evaluate` take `session` (that id, or the session's
+name); without it they act on the selected session (the one that stopped last).
+`debug_wait_for_stop` without `session` returns the first session that stops; with `session` it
+waits for that one (or one of its subprocesses). With more than one session every summary lists
+them; a subprocess's summary has `process` and `parentSession`.
+```json
+{ "session": 2, "timeoutMs": 60000 }
+→ { "state": "stopped", "reason": "breakpoint", "session": "client.py", "sessionId": 2, …,
+    "sessions": [{ "id": 1, "name": "server.py", "state": "stopped", "reason": "breakpoint" },
+                 { "id": 2, "name": "client.py", "state": "stopped", "reason": "breakpoint", "selected": true }] }
+```
+Through `codecraft_execute`: `debug.sessions`, `debug.selectSession`, `debug.closeSession`,
+`debug.stopAll`, and a `session` param on every `debug.*` / `run.debuggingActions.*` command.
+
 ### Profiling
 
 **`profile_start`** (profile) — a run configuration (`config`) or a command line (`command`:

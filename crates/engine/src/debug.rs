@@ -32,9 +32,12 @@ pub use codecraft_dap::processes::{ProcessInfo, ProcessKind};
 pub(crate) mod actions;
 pub(crate) mod agent;
 mod children;
+mod cpp_values;
 pub mod exceptions;
 mod python_values;
 mod rust_values;
+#[cfg(test)]
+mod sessions_tests;
 
 pub use actions::{CompletionEntry, Completions, ExceptionStop, StepTarget, StepTargets, call_candidates};
 pub use children::ProcessEntry;
@@ -258,6 +261,16 @@ pub enum DebugTab {
 /// One debug session as the UI sees it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DebugSession {
+    /// The session's id: `debug.sessions` lists them and every debug command takes it as its
+    /// `session` param (M15 track DM). 0 for a session made outside the engine (tests).
+    #[serde(default)]
+    pub id: u64,
+    /// The session that started this one (a Python subprocess's parent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    /// When it last stopped, on a counter shared by every session (0: never).
+    #[serde(default)]
+    pub stop_order: u64,
     pub name: String,
     /// `lldb-dap`, `debugpy`, … (empty until the adapter starts).
     pub adapter: String,
@@ -558,12 +571,120 @@ fn pump_attach(s: &mut Session) -> bool {
     true
 }
 
+/// One debug session in the Debug tool window's session tabs (`debug.sessions`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub id: u64,
+    pub name: String,
+    /// `lldb-dap`, `debugpy`, … (empty until the adapter starts).
+    pub adapter: String,
+    pub status: DebugStatus,
+    /// The session the Debug tool window, the editor and commands without `session` act on.
+    pub selected: bool,
+    /// Building, starting, running or paused (not over).
+    pub live: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+}
+
+/// The state of a session that is not the selected one. The selected session's state lives in
+/// [`DebugState`]'s own fields (so every command, the Debug tool window and the editor act on
+/// it); the others wait here, are pumped in turn, and swap places with it when selected.
+pub(crate) struct Parked {
+    session: Option<DebugSession>,
+    rt: Option<Runtime>,
+    console: Vec<ConsoleLine>,
+    evaluation: Option<Evaluation>,
+    hover: Option<Evaluation>,
+    completions: Option<Completions>,
+    step_targets: Option<StepTargets>,
+    last_error: Option<String>,
+    views: crate::debug_views::DebugViews,
+    last_target: Option<DebugTarget>,
+    last_options: crate::run_config_store::DebuggerOptions,
+    /// This session's watch values (the expressions are shared by every session).
+    watches: Vec<Watch>,
+}
+
+impl Parked {
+    fn new(session: DebugSession, rt: Option<Runtime>, views: crate::debug_views::DebugViews) -> Self {
+        Self {
+            session: Some(session),
+            rt,
+            console: Vec::new(),
+            evaluation: None,
+            hover: None,
+            completions: None,
+            step_targets: None,
+            last_error: None,
+            views,
+            last_target: None,
+            last_options: Default::default(),
+            watches: Vec::new(),
+        }
+    }
+
+    fn id(&self) -> u64 {
+        self.session.as_ref().map_or(0, |x| x.id)
+    }
+
+    fn live(&self) -> bool {
+        self.rt.is_some()
+    }
+}
+
+impl Drop for Parked {
+    /// A parked session dropped (closed, or the IDE closing) leaves no processes behind.
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            let pid = self.session.as_ref().and_then(|x| x.debuggee_pid);
+            let exited = rt.exited;
+            rt.kill(pid, exited);
+        }
+    }
+}
+
+/// At most this many debug sessions run at once (subprocesses count as well).
+pub const MAX_SESSIONS: usize = 48;
+
+/// Give `watches` the values a session had for the same expressions (none for new ones).
+fn restore_watches(watches: &mut [Watch], values: &[Watch]) {
+    for w in watches {
+        match values.iter().find(|v| v.expression == w.expression) {
+            Some(v) => {
+                w.value = v.value.clone();
+                w.type_name = v.type_name.clone();
+                w.reference = v.reference;
+                w.error = v.error.clone();
+            }
+            None => w.clear(),
+        }
+    }
+}
+
+/// [`DebugState::settling`] for any session.
+fn settling_of(session: Option<&DebugSession>, rt: Option<&Runtime>) -> bool {
+    let Some(rt) = rt else { return false };
+    match &rt.phase {
+        Phase::Build { .. } | Phase::Prepare { .. } => true,
+        Phase::Live { .. } => {
+            let stopped = session.is_some_and(DebugSession::is_stopped);
+            !stopped || rt.pending.values().any(Pending::blocks_settling)
+        }
+    }
+}
+
 /// The debugger's state on the [`Session`].
 pub struct DebugState {
     pub breakpoints: Vec<Breakpoint>,
+    /// Watch expressions (shared by every session) with the selected session's values.
     pub watches: Vec<Watch>,
+    /// The selected session's debug console.
     pub console: Vec<ConsoleLine>,
-    /// The current (or last) session.
+    /// The selected (or last) session; the other sessions are in `debug.sessions`.
     pub session: Option<DebugSession>,
     pub tab: DebugTab,
     /// Expanded nodes in the Variables tree (kept across steps and sessions).
@@ -611,6 +732,13 @@ pub struct DebugState {
     /// Document revision per breakpoint file at the last line check.
     revisions: HashMap<PathBuf, u64>,
     rt: Option<Runtime>,
+    /// The sessions that are not selected (M15 track DM).
+    parked: Vec<Parked>,
+    next_session: u64,
+    /// The shared stop counter ([`DebugSession::stop_order`]).
+    stop_counter: u64,
+    /// Sessions closed while still running: removed once their adapter is gone.
+    closing: BTreeSet<u64>,
 }
 
 impl Default for DebugState {
@@ -646,6 +774,10 @@ impl Default for DebugState {
             anchors: HashMap::new(),
             revisions: HashMap::new(),
             rt: None,
+            parked: Vec::new(),
+            next_session: 1,
+            stop_counter: 0,
+            closing: BTreeSet::new(),
         }
     }
 }
@@ -664,22 +796,230 @@ impl DebugState {
         self.rt.is_some() && self.session.as_ref().is_some_and(|s| s.status() == DebugStatus::Running)
     }
 
-    /// Background work is in flight (the UI keeps polling).
+    /// Background work is in flight (the UI keeps polling): any session, the process list, Show
+    /// Assembly.
     pub fn busy(&self) -> bool {
-        self.rt.is_some() || self.attach_rx.is_some() || self.asm.running()
+        self.rt.is_some() || self.parked.iter().any(Parked::live) || self.attach_rx.is_some() || self.asm.running()
     }
 
     /// Something will change without user input: building, starting, running, or answers still
     /// pending. False once the program is paused with everything loaded (or the session ended).
     pub fn settling(&self) -> bool {
-        let Some(rt) = &self.rt else { return false };
-        match &rt.phase {
-            Phase::Build { .. } | Phase::Prepare { .. } => true,
-            Phase::Live { .. } => {
-                let stopped = self.session.as_ref().is_some_and(DebugSession::is_stopped);
-                !stopped || rt.pending.values().any(Pending::blocks_settling)
+        settling_of(self.session.as_ref(), self.rt.as_ref())
+    }
+
+    /// Every session (the selected one and the others), oldest first, for the session tabs.
+    pub fn sessions(&self) -> Vec<SessionInfo> {
+        let selected = self.session.as_ref().map(|x| x.id);
+        let info = |x: &DebugSession, live: bool| SessionInfo {
+            id: x.id,
+            name: x.name.clone(),
+            adapter: x.adapter.clone(),
+            status: x.status(),
+            selected: Some(x.id) == selected,
+            live: live && !x.status().is_finished(),
+            parent: x.parent,
+            pid: x.debuggee_pid,
+        };
+        let mut out: Vec<SessionInfo> = self
+            .parked
+            .iter()
+            .filter_map(|p| p.session.as_ref().map(|x| info(x, p.live())))
+            .chain(self.session.as_ref().map(|x| info(x, self.rt.is_some())))
+            .collect();
+        out.sort_by_key(|x| x.id);
+        out
+    }
+
+    /// How many sessions there are (over ones included).
+    pub fn session_count(&self) -> usize {
+        self.parked.len() + usize::from(self.session.is_some())
+    }
+
+    /// How many sessions are not over.
+    pub fn live_count(&self) -> usize {
+        self.sessions().iter().filter(|x| x.live).count()
+    }
+
+    /// The selected session's id.
+    pub fn selected_id(&self) -> Option<u64> {
+        self.session.as_ref().map(|x| x.id)
+    }
+
+    /// Embedders and tests: add a session without an adapter (it is listed, can be selected and
+    /// closed, and is never live).
+    pub fn add_inert_session(&mut self, mut session: DebugSession) -> u64 {
+        let id = self.next_session;
+        self.next_session = self.next_session.saturating_add(1);
+        session.id = id;
+        if self.session.is_none() {
+            self.session = Some(session);
+        } else {
+            self.parked.push(Parked::new(session, None, self.views.fresh()));
+        }
+        id
+    }
+
+    fn parked_index(&self, id: u64) -> Option<usize> {
+        self.parked.iter().position(|p| p.id() == id)
+    }
+
+    /// The session `id`'s data and runtime, wherever it is.
+    fn find(&self, id: u64) -> Option<(&DebugSession, Option<&Runtime>)> {
+        if let Some(x) = self.session.as_ref().filter(|x| x.id == id) {
+            return Some((x, self.rt.as_ref()));
+        }
+        self.parked.iter().find(|p| p.id() == id).and_then(|p| p.session.as_ref().map(|x| (x, p.rt.as_ref())))
+    }
+
+    /// Every session's data and runtime.
+    fn all(&self) -> impl Iterator<Item = (&DebugSession, Option<&Runtime>)> {
+        self.session
+            .as_ref()
+            .map(|x| (x, self.rt.as_ref()))
+            .into_iter()
+            .chain(self.parked.iter().filter_map(|p| p.session.as_ref().map(|x| (x, p.rt.as_ref()))))
+    }
+
+    /// The live sessions started by `id` (subprocesses), and theirs.
+    fn descendants(&self, id: u64) -> Vec<u64> {
+        let links: Vec<(u64, Option<u64>)> = self.all().map(|(x, _)| (x.id, x.parent)).collect();
+        let mut out = Vec::new();
+        let mut frontier = vec![id];
+        while let Some(parent) = frontier.pop() {
+            let found: Vec<u64> = links
+                .iter()
+                .filter(|(c, p)| *p == Some(parent) && *c != id && !out.contains(c))
+                .map(|(c, _)| *c)
+                .collect();
+            for child in found {
+                out.push(child);
+                frontier.push(child);
+            }
+            if out.len() > MAX_SESSIONS {
+                break;
             }
         }
+        out
+    }
+
+    /// Another session than the selected one is not over.
+    fn others_live(&self) -> bool {
+        self.parked.iter().any(Parked::live)
+    }
+
+    /// Exchange the selected session with parked session `i` (field by field).
+    fn exchange(&mut self, i: usize) -> bool {
+        if self.session.is_none() {
+            // Nothing selected: the parked one simply comes forward.
+            if i >= self.parked.len() {
+                return false;
+            }
+            let mut p = self.parked.remove(i);
+            self.session = p.session.take();
+            self.rt = p.rt.take();
+            self.console = std::mem::take(&mut p.console);
+            self.evaluation = p.evaluation.take();
+            self.hover = p.hover.take();
+            self.completions = p.completions.take();
+            self.step_targets = p.step_targets.take();
+            self.last_error = p.last_error.take();
+            let history = std::mem::take(&mut self.views.console_history);
+            self.views = std::mem::take(&mut p.views);
+            self.views.console_history = history;
+            self.last_target = p.last_target.take();
+            self.last_options = std::mem::take(&mut p.last_options);
+            restore_watches(&mut self.watches, &p.watches);
+            return true;
+        }
+        let Some(p) = self.parked.get_mut(i) else { return false };
+        std::mem::swap(&mut self.session, &mut p.session);
+        std::mem::swap(&mut self.rt, &mut p.rt);
+        std::mem::swap(&mut self.console, &mut p.console);
+        std::mem::swap(&mut self.evaluation, &mut p.evaluation);
+        std::mem::swap(&mut self.hover, &mut p.hover);
+        std::mem::swap(&mut self.completions, &mut p.completions);
+        std::mem::swap(&mut self.step_targets, &mut p.step_targets);
+        std::mem::swap(&mut self.last_error, &mut p.last_error);
+        std::mem::swap(&mut self.views, &mut p.views);
+        // The console's input history is the IDE's, not a session's.
+        std::mem::swap(&mut self.views.console_history, &mut p.views.console_history);
+        std::mem::swap(&mut self.last_target, &mut p.last_target);
+        std::mem::swap(&mut self.last_options, &mut p.last_options);
+        let mine = self.watches.clone();
+        restore_watches(&mut self.watches, &p.watches);
+        p.watches = mine;
+        true
+    }
+
+    /// Make session `id` the selected one (state only: no editor navigation). False if there is
+    /// no such session.
+    fn bring_forward(&mut self, id: u64) -> bool {
+        if self.selected_id() == Some(id) {
+            return true;
+        }
+        match self.parked_index(id) {
+            Some(i) => self.exchange(i),
+            None => false,
+        }
+    }
+
+    /// Put the selected session among the parked ones (a new one is about to start).
+    fn park_selected(&mut self) {
+        let Some(session) = self.session.take() else { return };
+        let mut p = Parked::new(session, self.rt.take(), std::mem::take(&mut self.views));
+        self.views = p.views.fresh();
+        p.console = std::mem::take(&mut self.console);
+        p.evaluation = self.evaluation.take();
+        p.hover = self.hover.take();
+        p.completions = self.completions.take();
+        p.step_targets = self.step_targets.take();
+        p.last_error = self.last_error.take();
+        p.last_target = self.last_target.clone();
+        p.last_options = self.last_options.clone();
+        p.watches = self.watches.clone();
+        for w in &mut self.watches {
+            w.clear();
+        }
+        self.parked.push(p);
+    }
+
+    /// Drop the selected session (closed): the newest live session, else the newest one, comes
+    /// forward.
+    fn drop_selected(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            let pid = self.session.as_ref().and_then(|x| x.debuggee_pid);
+            let exited = rt.exited;
+            rt.kill(pid, exited);
+        }
+        self.session = None;
+        self.console.clear();
+        self.evaluation = None;
+        self.hover = None;
+        self.completions = None;
+        self.step_targets = None;
+        self.last_error = None;
+        self.views.reset();
+        for w in &mut self.watches {
+            w.clear();
+        }
+        let next = self
+            .parked
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.live())
+            .max_by_key(|(_, p)| p.id())
+            .or_else(|| self.parked.iter().enumerate().max_by_key(|(_, p)| p.id()))
+            .map(|(i, _)| i);
+        if let Some(i) = next {
+            self.exchange(i);
+        }
+    }
+
+    fn next_session_id(&mut self) -> u64 {
+        let id = self.next_session;
+        self.next_session = self.next_session.saturating_add(1);
+        id
     }
 
     /// Breakpoints in one file.
@@ -934,10 +1274,12 @@ struct Runtime {
     last_step: Option<Step>,
     /// The function a Step Out left (labels the return value).
     step_from_function: Option<String>,
-    /// Child sessions (Python subprocesses).
+    /// Subprocess connections being made (each becomes a session of its own).
     children: children::Children,
     /// The adapter's ids of the Rust panic function breakpoint (a stop there is a panic).
     panic_breakpoints: Vec<i64>,
+    /// The session whose adapter started this one (a debugpy subprocess's parent).
+    child_of: Option<u64>,
 }
 
 impl Runtime {
@@ -967,6 +1309,7 @@ impl Runtime {
             step_from_function: None,
             children: children::Children::default(),
             panic_breakpoints: Vec::new(),
+            child_of: None,
         }
     }
 
@@ -1578,6 +1921,19 @@ pub fn rust_value(raw: String) -> String {
     }
 }
 
+/// Output without LLDB's "This version of LLDB has no plugin for the language "rust"" warning,
+/// which Xcode's LLDB prints in every Rust session although the toolchain's formatters read the
+/// values (QA #22).
+pub fn without_rust_plugin_warning(output: &str) -> String {
+    if !output.contains("no plugin for the language") {
+        return output.to_owned();
+    }
+    output
+        .split_inclusive('\n')
+        .filter(|l| !(l.contains("no plugin for the language") && l.to_ascii_lowercase().contains("rust")))
+        .collect()
+}
+
 // ---------------------------------------------------------------- starting and stopping
 
 /// Start debugging `target` (stopping a session that is still running).
@@ -1629,27 +1985,57 @@ pub(crate) fn start_with(
     options: crate::run_config_store::DebuggerOptions,
 ) -> Result<(), CommandError> {
     let plan = plan_for(&target).map_err(CommandError::Failed)?;
+    // Debugging a configuration that is being debugged restarts it (RustRover's single
+    // instance); other sessions keep running next to the new one.
+    let same: Vec<u64> = s
+        .debug
+        .all()
+        .filter(|(x, rt)| rt.is_some() && x.parent.is_none() && x.name == plan.name)
+        .map(|(x, _)| x.id)
+        .collect();
+    for id in same {
+        with_session(s, id, |s| {
+            stop(s);
+            s.debug.drop_selected();
+        });
+    }
+    // Sessions that are over make room (their tabs close).
+    s.debug.parked.retain(Parked::live);
+    let live = s.debug.live_count();
+    if live >= MAX_SESSIONS {
+        return Err(CommandError::Failed(format!(
+            "{live} debug sessions are running; stop one first (Run › Debugging Actions › Stop All Programs)"
+        )));
+    }
     if s.debug.rt.is_some() {
-        stop(s);
-        if let Some(rt) = s.debug.rt.take() {
-            let pid = s.debug.session.as_ref().and_then(|x| x.debuggee_pid);
-            let exited = rt.exited;
-            rt.kill(pid, exited);
+        s.debug.park_selected();
+    } else {
+        s.debug.drop_selected();
+        s.debug.parked.retain(Parked::live);
+        if s.debug.session.is_some() {
+            s.debug.park_selected();
         }
     }
     ensure_loaded(s);
     let _ = s.save_all();
-    reset_verification(s);
+    if !s.debug.others_live() {
+        reset_verification(s);
+    }
     for w in &mut s.debug.watches {
         w.clear();
     }
     s.debug.evaluation = None;
+    s.debug.hover = None;
+    s.debug.completions = None;
+    s.debug.step_targets = None;
+    s.debug.last_error = None;
     s.debug.choosing = false;
     s.debug.views.reset();
     s.debug.last_target = Some(target.clone());
     s.debug.last_options = options.clone();
     s.debug.console.clear();
-    s.debug.session = Some(DebugSession { name: plan.name.clone(), ..DebugSession::default() });
+    let id = s.debug.next_session_id();
+    s.debug.session = Some(DebugSession { id, name: plan.name.clone(), ..DebugSession::default() });
     s.ws.layout.show(ToolWindowId::Debug);
     let root = s.project_root();
     let phase = match &plan.build {
@@ -1703,8 +2089,232 @@ fn set_status(s: &mut Session, status: DebugStatus) {
     }
 }
 
-/// Stop the session: kill a build, cancel a start, or end the debuggee (`disconnect`).
+/// Stop the selected session (and the subprocess sessions it started): kill a build, cancel a
+/// start, or end the debuggee (`disconnect`).
 pub(crate) fn stop(s: &mut Session) -> bool {
+    let children = s.debug.selected_id().map(|id| s.debug.descendants(id)).unwrap_or_default();
+    let stopped = stop_selected(s);
+    for id in children {
+        if s.debug.find(id).is_some_and(|(_, rt)| rt.is_some()) {
+            with_session(s, id, stop_selected);
+        }
+    }
+    stopped
+}
+
+/// Stop every session (Stop All). Returns how many were running.
+pub(crate) fn stop_all(s: &mut Session) -> usize {
+    let ids: Vec<u64> = s.debug.sessions().into_iter().filter(|x| x.live).map(|x| x.id).collect();
+    for id in &ids {
+        if s.debug.find(*id).is_some_and(|(_, rt)| rt.is_some()) {
+            with_session(s, *id, stop_selected);
+        }
+    }
+    if !ids.is_empty() {
+        s.status = format!("Stopped {} debug session{}", ids.len(), if ids.len() == 1 { "" } else { "s" });
+    }
+    ids.len()
+}
+
+/// Run `f` with session `id` selected, then select the previous one again (unless `f` selected
+/// another one itself, e.g. by starting a session). Unknown ids run `f` on the selected session.
+pub(crate) fn with_session<R>(s: &mut Session, id: u64, f: impl FnOnce(&mut Session) -> R) -> R {
+    let previous = s.debug.selected_id();
+    if previous == Some(id) || !s.debug.bring_forward(id) {
+        return f(s);
+    }
+    let result = f(s);
+    if let Some(previous) = previous
+        && s.debug.selected_id() == Some(id)
+    {
+        s.debug.bring_forward(previous);
+    }
+    result
+}
+
+/// Run `f` on every session that is not over (the selected one first).
+fn for_each_live(s: &mut Session, mut f: impl FnMut(&mut Session)) {
+    if s.debug.rt.is_some() {
+        f(s);
+    }
+    let ids: Vec<u64> = s.debug.parked.iter().filter(|p| p.live()).map(Parked::id).collect();
+    for id in ids {
+        with_session(s, id, &mut f);
+    }
+}
+
+/// Run `f` on every session that is not over; how many times it returned true.
+pub(crate) fn each_session(s: &mut Session, mut f: impl FnMut(&mut Session) -> bool) -> usize {
+    let mut count = 0;
+    for_each_live(s, |s| {
+        if f(s) {
+            count += 1;
+        }
+    });
+    count
+}
+
+/// A session by id (a number or a numeric string) or by name (the newest live one with that
+/// name first).
+pub(crate) fn resolve_session(d: &DebugState, v: &Value) -> Result<u64, CommandError> {
+    let list = d.sessions();
+    let by_id = |id: u64| {
+        list.iter().find(|x| x.id == id).map(|x| x.id).ok_or_else(|| {
+            CommandError::BadParams(format!("no debug session {id} (debug.sessions lists them)"))
+        })
+    };
+    match v {
+        Value::Number(n) => by_id(n.as_u64().ok_or_else(|| CommandError::BadParams("`session` must be an id".into()))?),
+        Value::String(text) => {
+            let text = text.trim();
+            if let Ok(id) = text.parse::<u64>()
+                && list.iter().any(|x| x.id == id)
+            {
+                return Ok(id);
+            }
+            let pick = |exact: bool| {
+                list.iter()
+                    .filter(|x| if exact { x.name == text } else { x.name.eq_ignore_ascii_case(text) })
+                    .max_by_key(|x| (x.live, x.id))
+                    .map(|x| x.id)
+            };
+            pick(true).or_else(|| pick(false)).ok_or_else(|| {
+                let names: Vec<String> = list.iter().map(|x| format!("{} ({})", x.name, x.id)).collect();
+                CommandError::BadParams(if names.is_empty() {
+                    format!("no debug session `{text}`: nothing is being debugged")
+                } else {
+                    format!("no debug session `{text}`; have: {}", names.join(", "))
+                })
+            })
+        }
+        _ => Err(CommandError::BadParams("`session` is a session id or name".into())),
+    }
+}
+
+/// The session a command's `session` param names, for the commands that act on a session
+/// (`debug.*`, `run.debuggingActions.*`); `None` without the param.
+pub(crate) fn session_scope(s: &Session, id: &str, params: &Value) -> Result<Option<u64>, CommandError> {
+    if !(id.starts_with("debug.") || id.starts_with("run.debuggingActions.")) {
+        return Ok(None);
+    }
+    if matches!(id, "debug.selectSession" | "debug.closeSession" | "debug.sessions" | "debug.poll") {
+        return Ok(None);
+    }
+    match params.get("session") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => resolve_session(&s.debug, v).map(Some),
+    }
+}
+
+/// `debug.selectSession`: show session `id` in the Debug tool window and the editor.
+pub(crate) fn select_session(s: &mut Session, id: u64) -> Result<(), CommandError> {
+    if !s.debug.bring_forward(id) {
+        return Err(CommandError::BadParams(format!("no debug session {id}")));
+    }
+    s.debug.choosing = false;
+    s.ws.layout.show(ToolWindowId::Debug);
+    let Some(session) = s.debug.session.as_ref() else { return Ok(()) };
+    s.status = format!("{}: {}", session.name, session.status().label());
+    let frame = session.selected_frame().map(|f| f.id);
+    if let Some((path, line)) = session.execution.clone() {
+        reveal_line(s, &path, line);
+    }
+    // Watches added while another session was selected get this session's values.
+    if s.debug.is_stopped()
+        && let Some(rt) = s.debug.rt.as_mut()
+    {
+        let epoch = rt.epoch;
+        for w in s.debug.watches.iter().filter(|w| w.value.is_none() && w.error.is_none()) {
+            let purpose = EvalPurpose::Watch(w.expression.clone());
+            rt.request(Pending::Evaluate { epoch, purpose }, |c| c.evaluate(&w.expression, frame, "watch"));
+        }
+    }
+    refresh_processes(&mut s.debug);
+    Ok(())
+}
+
+/// `debug.closeSession`: stop session `id` if it runs and close its tab (once its adapter is
+/// gone, for a running one).
+pub(crate) fn close_session(s: &mut Session, id: u64) -> Result<(), CommandError> {
+    let (_, rt) = s.debug.find(id).ok_or_else(|| CommandError::BadParams(format!("no debug session {id}")))?;
+    if rt.is_some() {
+        with_session(s, id, stop);
+        if s.debug.find(id).is_some_and(|(_, rt)| rt.is_some()) {
+            s.debug.closing.insert(id);
+            return Ok(());
+        }
+    }
+    remove_session(s, id);
+    Ok(())
+}
+
+fn remove_session(s: &mut Session, id: u64) {
+    s.debug.closing.remove(&id);
+    if s.debug.selected_id() == Some(id) {
+        s.debug.drop_selected();
+    } else if let Some(i) = s.debug.parked_index(id) {
+        s.debug.parked.remove(i);
+    }
+    refresh_processes(&mut s.debug);
+}
+
+/// Copy each family's process list (a parent and its subprocess sessions) into its sessions, for
+/// the stop summary and the status line.
+fn refresh_processes(d: &mut DebugState) {
+    struct Link {
+        id: u64,
+        parent: Option<u64>,
+        name: String,
+        pid: Option<u32>,
+        stopped: bool,
+    }
+    let links: Vec<Link> = d
+        .all()
+        .map(|(x, _)| Link {
+            id: x.id,
+            parent: x.parent,
+            name: x.name.clone(),
+            pid: x.debuggee_pid,
+            stopped: x.is_stopped(),
+        })
+        .collect();
+    let root = |mut id: u64| {
+        for _ in 0..MAX_SESSIONS {
+            match links.iter().find(|l| l.id == id).and_then(|l| l.parent) {
+                Some(parent) if links.iter().any(|l| l.id == parent) => id = parent,
+                _ => break,
+            }
+        }
+        id
+    };
+    let entries = |me: u64| -> Vec<ProcessEntry> {
+        let family = root(me);
+        let members: Vec<&Link> = links.iter().filter(|l| root(l.id) == family).collect();
+        if members.len() < 2 {
+            return Vec::new();
+        }
+        members
+            .into_iter()
+            .map(|l| ProcessEntry {
+                label: if l.parent.is_none() { "Main process".into() } else { l.name.clone() },
+                pid: l.pid,
+                focused: l.id == me,
+                stopped: l.stopped,
+            })
+            .collect()
+    };
+    if let Some(x) = d.session.as_mut() {
+        x.processes = entries(x.id);
+    }
+    for p in &mut d.parked {
+        if let Some(x) = p.session.as_mut() {
+            x.processes = entries(x.id);
+        }
+    }
+}
+
+/// Stop the selected session only.
+fn stop_selected(s: &mut Session) -> bool {
     let Some(rt) = s.debug.rt.as_mut() else { return false };
     rt.stopping = true;
     let pid = s.debug.session.as_ref().and_then(|x| x.debuggee_pid);
@@ -1749,7 +2359,10 @@ fn end_session(s: &mut Session, status: DebugStatus, message: &str) {
         session.clear_stop();
         session.status = Some(status);
     }
-    reset_verification(s);
+    // Another session's breakpoints are still set.
+    if !s.debug.others_live() {
+        reset_verification(s);
+    }
     s.debug.views.on_session_end();
     s.status = message.to_owned();
 }
@@ -1768,22 +2381,92 @@ pub(crate) fn shutdown(s: &mut Session) {
         let exited = rt.exited;
         rt.kill(pid, exited);
     }
+    for p in &mut s.debug.parked {
+        if let Some(rt) = p.rt.take() {
+            let pid = p.session.as_ref().and_then(|x| x.debuggee_pid);
+            let exited = rt.exited;
+            rt.kill(pid, exited);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- pump
 
-/// Drain background events; true if anything changed.
+/// Drain background events of every session; true if anything changed. A session that stops
+/// comes forward (as RustRover selects the session that hit a breakpoint), and when a selected
+/// subprocess session ends its parent comes back.
 pub(crate) fn pump(s: &mut Session) -> bool {
     let mut changed = ensure_loaded(s);
     changed |= pump_attach(s);
     changed |= crate::asm::pump(s);
     changed |= follow_edits(s);
-    let Some(rt) = s.debug.rt.as_mut() else { return changed };
+    let before = s.debug.session.as_ref().map(|x| (x.id, x.status().is_finished()));
+    changed |= pump_selected(s);
+    let ids: Vec<u64> = s.debug.parked.iter().filter(|p| p.live()).map(Parked::id).collect();
+    for id in ids {
+        let previous = s.debug.selected_id();
+        if !s.debug.bring_forward(id) {
+            continue;
+        }
+        let order = s.debug.session.as_ref().map_or(0, |x| x.stop_order);
+        changed |= pump_selected(s);
+        let stopped =
+            s.debug.session.as_ref().is_some_and(|x| x.id == id && x.stop_order != order && x.is_stopped());
+        if !stopped
+            && s.debug.selected_id() == Some(id)
+            && let Some(previous) = previous
+        {
+            s.debug.bring_forward(previous);
+        }
+    }
+    changed |= back_to_parent(s, before);
+    // Sessions closed while running go once their adapter is gone.
+    let closed: Vec<u64> = s
+        .debug
+        .closing
+        .iter()
+        .copied()
+        .filter(|id| s.debug.find(*id).is_none_or(|(_, rt)| rt.is_none()))
+        .collect();
+    for id in closed {
+        remove_session(s, id);
+        changed = true;
+    }
+    if changed {
+        refresh_processes(&mut s.debug);
+    }
+    changed
+}
+
+/// The selected subprocess session just ended: select its parent again (when it still runs).
+fn back_to_parent(s: &mut Session, before: Option<(u64, bool)>) -> bool {
+    let Some((id, false)) = before else { return false };
+    let Some(session) = s.debug.session.as_ref().filter(|x| x.id == id && x.status().is_finished()) else {
+        return false;
+    };
+    let Some(parent) = session.parent else { return false };
+    let label = session.name.clone();
+    if !s.debug.find(parent).is_some_and(|(_, rt)| rt.is_some()) || !s.debug.bring_forward(parent) {
+        return false;
+    }
+    let Some(session) = s.debug.session.as_ref() else { return true };
+    let execution = session.execution.clone();
+    s.status = format!("{label} exited; showing {}", session.name);
+    s.debug.info(format!("{label} exited"));
+    if let Some((path, line)) = execution {
+        reveal_line(s, &path, line);
+    }
+    true
+}
+
+/// Drain the selected session's events.
+fn pump_selected(s: &mut Session) -> bool {
+    let Some(rt) = s.debug.rt.as_mut() else { return false };
     match &mut rt.phase {
         Phase::Build { events, .. } => {
             let batch: Vec<RunEvent> = events.try_iter().take(MAX_EVENTS_PER_PUMP).collect();
             if batch.is_empty() {
-                return changed;
+                return false;
             }
             for event in batch {
                 on_build_event(s, event);
@@ -1799,7 +2482,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
                 fail(s, &message);
                 true
             }
-            Err(crossbeam_channel::TryRecvError::Empty) => changed,
+            Err(crossbeam_channel::TryRecvError::Empty) => false,
             Err(crossbeam_channel::TryRecvError::Disconnected) => {
                 fail(s, "the debugger did not start");
                 true
@@ -1808,7 +2491,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         Phase::Live { events, .. } => {
             let batch: Vec<DapEvent> = events.try_iter().take(MAX_EVENTS_PER_PUMP).collect();
             let has_children = !rt.children.is_empty();
-            changed |= !batch.is_empty();
+            let mut changed = !batch.is_empty();
             for event in batch {
                 on_dap_event(s, event);
             }
@@ -1900,7 +2583,7 @@ fn on_dap_event(s: &mut Session, event: DapEvent) {
         DapEvent::Event { event, body } => on_event(s, &event, &body),
         DapEvent::Request { seq, command, arguments } if command == "startDebugging" => {
             // debugpy's subprocesses (js-debug's child sessions are refused there).
-            children::start_debugging(s, None, seq, &arguments);
+            children::start_debugging(s, seq, &arguments);
         }
         DapEvent::Request { seq, command, .. } => {
             if let Some(client) = s.debug.rt.as_ref().and_then(Runtime::client) {
@@ -1913,18 +2596,17 @@ fn on_dap_event(s: &mut Session, event: DapEvent) {
                 s.debug.error(e);
             }
         }
-        DapEvent::Exited { .. } => {
-            if !children::focused_ended(s) {
-                on_adapter_exit(s);
-            }
-        }
+        DapEvent::Exited { .. } => on_adapter_exit(s),
     }
 }
 
 fn on_adapter_exit(s: &mut Session) {
     let Some(rt) = s.debug.rt.take() else { return };
     let pid = s.debug.session.as_ref().and_then(|x| x.debuggee_pid);
-    let (stopping, exited) = (rt.stopping, rt.exited);
+    // A subprocess's connection closes when the subprocess ends: it is finishing (never killed
+    // unless the user stopped it).
+    let child_ended = rt.child_of.is_some() && !rt.stopping;
+    let (stopping, exited) = (rt.stopping || child_ended, rt.exited || child_ended);
     rt.kill(pid, exited);
     if stopping {
         end_session(s, DebugStatus::Exited { code: None }, "Debugging finished");
@@ -1971,12 +2653,17 @@ fn on_response(s: &mut Session, response: dap::Response) {
                     return;
                 }
             };
+            // With several sessions a breakpoint is set when any of them set it.
+            let others = s.debug.parked.iter().any(Parked::live);
             for (theirs, ours) in body.breakpoints.iter().zip(ids) {
                 let Some(ours) = ours else { continue };
                 if let Some(id) = theirs.id {
                     rt.adapter_ids.insert(id, ours);
                 }
                 if let Some(bp) = s.debug.breakpoints.iter_mut().find(|b| b.id == ours) {
+                    if others && !theirs.verified && bp.verified == Some(true) {
+                        continue;
+                    }
                     bp.verified = Some(theirs.verified);
                     bp.message = theirs.message.clone();
                 }
@@ -2045,6 +2732,7 @@ fn on_response(s: &mut Session, response: dap::Response) {
             }
             let rust = rt.is_rust();
             let python = rt.kind == AdapterKind::Debugpy;
+            let lldb = matches!(rt.kind, AdapterKind::LldbDap | AdapterKind::CodeLldb);
             let Some(session) = s.debug.session.as_mut() else { return };
             session.loading.remove(&reference);
             let vars: Vec<VariableInfo> = match response.result {
@@ -2053,13 +2741,20 @@ fn on_response(s: &mut Session, response: dap::Response) {
                     .variables
                     .into_iter()
                     .take(MAX_CHILDREN)
-                    .map(|v| VariableInfo {
-                        name: v.name,
-                        value: if rust { rust_value(v.value) } else { v.value },
-                        type_name: v.type_.filter(|t| !t.is_empty()),
-                        reference: v.variables_reference,
-                        evaluate_name: v.evaluate_name,
-                        memory_reference: v.memory_reference,
+                    .map(|v| {
+                        let type_name = v.type_.filter(|t| !t.is_empty());
+                        VariableInfo {
+                            name: v.name,
+                            value: if rust {
+                                rust_values::scalar(type_name.as_deref(), rust_value(v.value))
+                            } else {
+                                v.value
+                            },
+                            type_name,
+                            reference: v.variables_reference,
+                            evaluate_name: v.evaluate_name,
+                            memory_reference: v.memory_reference,
+                        }
                     })
                     .collect(),
                 Err(e) => vec![VariableInfo {
@@ -2078,6 +2773,9 @@ fn on_response(s: &mut Session, response: dap::Response) {
             } else if python {
                 // DataFrames, Series, arrays and plain objects.
                 python_values::summarize(s, reference, &vars);
+            } else if lldb {
+                // C/C++ references read as the value they refer to (QA #23).
+                cpp_values::summarize(s, reference, &vars);
             }
             let Some(session) = s.debug.session.as_mut() else { return };
             let Some(rt) = s.debug.rt.as_ref() else { return };
@@ -2175,10 +2873,6 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
                 }
             }
         }
-        "exited" | "terminated" if s.debug.rt.as_ref().is_some_and(|rt| rt.children.child_focused()) => {
-            // A subprocess shown in the Debug tool window ended: back to the main process.
-            children::focused_ended(s);
-        }
         "exited" => {
             let ev: dap::ExitedEvent = dap::types::parse(body).unwrap_or_default();
             if let Some(rt) = s.debug.rt.as_mut() {
@@ -2194,8 +2888,19 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
         }
         "terminated" => {
             if let Some(rt) = s.debug.rt.as_mut() {
+                // A subprocess that ends on its own is finishing: let it (its parent waits
+                // for its exit code), only detach from it.
+                let child_ended = rt.child_of.is_some() && !rt.stopping;
                 rt.stopping = true;
-                rt.end(TERMINATE_GRACE);
+                if child_ended {
+                    rt.exited = true;
+                    rt.children.end_all(TERMINATE_GRACE);
+                    if let Some(client) = rt.client() {
+                        client.detach(Duration::from_millis(500));
+                    }
+                } else {
+                    rt.end(TERMINATE_GRACE);
+                }
             }
             end_session(s, DebugStatus::Exited { code: None }, "Debugging finished");
         }
@@ -2215,7 +2920,17 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
             });
             let refused = injecting && ev.output.contains("attach failed");
             let message = ev.output.lines().find(|l| l.contains("attach failed")).map(|l| l.trim().to_owned());
-            s.debug.push_console(kind, ev.output);
+            // Xcode's LLDB warns that it has no Rust plugin in every Rust session; the toolchain's
+            // formatters read the values anyway, so the warning only confuses (QA #22).
+            let output = if s.debug.rt.as_ref().is_some_and(Runtime::is_rust) {
+                without_rust_plugin_warning(&ev.output)
+            } else {
+                ev.output
+            };
+            if output.is_empty() {
+                return;
+            }
+            s.debug.push_console(kind, output);
             if refused {
                 let message = message.unwrap_or_else(|| "attach failed".into());
                 fail(s, &format!("could not attach: {}", message.trim_start_matches("error: ")));
@@ -2247,9 +2962,8 @@ fn on_event(s: &mut Session, event: &str, body: &Value) {
         }
         "process" => {
             let ev: dap::ProcessEvent = dap::types::parse(body).unwrap_or_default();
-            // An attached process is not ours to kill when the session ends (nor is a
-            // subprocess, which goes with its parent).
-            if s.debug.rt.as_ref().is_some_and(|rt| rt.attached() || rt.children.child_focused()) {
+            // An attached process is not ours to kill when the session ends.
+            if s.debug.rt.as_ref().is_some_and(Runtime::attached) {
                 return;
             }
             if let (Some(session), Some(pid)) =
@@ -2271,7 +2985,7 @@ fn configure(s: &mut Session) {
     rt.configured = true;
     let paths: BTreeSet<PathBuf> = s.debug.breakpoints.iter().filter(|b| b.enabled).map(|b| b.path.clone()).collect();
     for path in paths {
-        send_breakpoints(s, &path);
+        send_breakpoints_here(s, &path);
     }
     let break_on_panic = s.debug.break_on_panic;
     let settings = s.debug.exceptions.clone();
@@ -2314,18 +3028,58 @@ fn breakpoint_list(
     (list, ids)
 }
 
-/// Send one file's breakpoints (and a pending Run to Cursor location) to the adapter (and to
-/// the subprocesses' connections).
+/// What kind of debugger a source file's breakpoints are for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceKind {
+    Native,
+    Python,
+    Js,
+    /// Anything else (sent to every session).
+    Any,
+}
+
+fn source_kind(path: &Path) -> SourceKind {
+    match Language::from_path(path) {
+        Language::Rust | Language::C | Language::Cpp | Language::Zig => SourceKind::Native,
+        Language::Python | Language::DjangoTemplate => SourceKind::Python,
+        Language::JavaScript | Language::TypeScript => SourceKind::Js,
+        _ => SourceKind::Any,
+    }
+}
+
+impl Runtime {
+    /// The breakpoints of `path` go to this session's adapter (Python breakpoints to debugpy,
+    /// Rust/C/C++/Zig ones to LLDB, JavaScript/TypeScript ones to js-debug).
+    fn accepts(&self, path: &Path) -> bool {
+        let mine = match &self.plan.run {
+            RunSpec::Python { .. } | RunSpec::PythonRemote { .. } | RunSpec::Attach { process: ProcessKind::Python, .. } => {
+                SourceKind::Python
+            }
+            RunSpec::Node { .. } => SourceKind::Js,
+            _ => SourceKind::Native,
+        };
+        let theirs = source_kind(path);
+        theirs == SourceKind::Any || theirs == mine
+    }
+}
+
+/// Send one file's breakpoints to every session of the matching language (breakpoints are
+/// shared by all sessions).
 fn send_breakpoints(s: &mut Session, path: &Path) {
+    let path = path.to_path_buf();
+    for_each_live(s, |s| send_breakpoints_here(s, &path));
+}
+
+/// Send one file's breakpoints (and a pending Run to Cursor location) to the selected session's
+/// adapter.
+fn send_breakpoints_here(s: &mut Session, path: &Path) {
     let cursor = s.debug.rt.as_ref().and_then(|rt| rt.run_to_cursor.clone());
     let (list, ids) = breakpoint_list(&s.debug, path, cursor.as_ref());
-    let child_list = breakpoint_list(&s.debug, path, None);
     let Some(rt) = s.debug.rt.as_mut() else { return };
-    if !rt.configured {
+    if !rt.configured || !rt.accepts(path) {
         return;
     }
     let adapter_path = rt.to_adapter(path);
-    rt.children.send_breakpoints(path, &adapter_path, &child_list.0, &child_list.1);
     if list.is_empty() {
         if !rt.sent.remove(path) {
             return;
@@ -2360,7 +3114,10 @@ fn on_stopped(s: &mut Session, mut ev: dap::StoppedEvent) {
     let last_step = rt.last_step.take();
     // Temporary breakpoints go away once hit.
     let hit: Vec<u64> = ev.hit_breakpoint_ids.iter().filter_map(|id| rt.adapter_ids.get(id)).copied().collect();
+    s.debug.stop_counter = s.debug.stop_counter.saturating_add(1);
+    let order = s.debug.stop_counter;
     let Some(session) = s.debug.session.as_mut() else { return };
+    session.stop_order = order;
     session.clear_stop();
     session.hit_breakpoints = hit.clone();
     if let Some(thread) = ev.thread_id {
@@ -2397,7 +3154,7 @@ fn on_stopped(s: &mut Session, mut ev: dap::StoppedEvent) {
         remove_breakpoint_by_id(s, *id);
     }
     if let Some((path, _)) = cursor {
-        send_breakpoints(s, &path);
+        send_breakpoints_here(s, &path);
     }
     s.ws.layout.show(ToolWindowId::Debug);
     if first {
@@ -2411,7 +3168,7 @@ fn on_stopped(s: &mut Session, mut ev: dap::StoppedEvent) {
     s.debug.hover = None;
     crate::debug_views::after_stop(s);
     actions::after_stop(s, &ev.reason, ev.thread_id, last_step);
-    children::refresh_entries(s);
+    refresh_processes(&mut s.debug);
 }
 
 fn on_stack_trace(s: &mut Session, body: &Value, reveal: bool) {
@@ -2557,7 +3314,7 @@ fn on_evaluate(s: &mut Session, current: bool, purpose: EvalPurpose, result: Res
     let parsed = result.map(|body| {
         let mut body = dap::types::parse::<dap::EvaluateBody>(&body).unwrap_or_default();
         if rust {
-            body.result = rust_value(std::mem::take(&mut body.result));
+            body.result = rust_values::scalar(body.type_.as_deref(), rust_value(std::mem::take(&mut body.result)));
         }
         body
     });
@@ -2820,7 +3577,7 @@ pub(crate) fn run_to_cursor(s: &mut Session, path: PathBuf, line: usize) -> Resu
     if let Some(rt) = s.debug.rt.as_mut() {
         rt.run_to_cursor = Some((path.clone(), line));
     }
-    send_breakpoints(s, &path);
+    send_breakpoints_here(s, &path);
     step(s, Step::Continue)
 }
 
@@ -2913,6 +3670,8 @@ pub(crate) fn add_watch(s: &mut Session, expression: &str) -> Result<usize, Comm
     if expression.is_empty() {
         return Err(CommandError::BadParams("the expression is empty".into()));
     }
+    // The project's saved watches first (they are kept with its breakpoints).
+    ensure_loaded(s);
     s.debug.watches.push(Watch::new(expression.to_owned()));
     let index = s.debug.watches.len() - 1;
     save(s);
@@ -2929,6 +3688,7 @@ pub(crate) fn add_watch(s: &mut Session, expression: &str) -> Result<usize, Comm
 }
 
 pub(crate) fn remove_watch(s: &mut Session, index: usize) -> Result<(), CommandError> {
+    ensure_loaded(s);
     if index >= s.debug.watches.len() {
         return Err(CommandError::BadParams(format!("no watch {index}")));
     }
@@ -2972,26 +3732,45 @@ pub(crate) fn install_fake(
     kind: AdapterKind,
     capabilities: dap::Capabilities,
 ) {
-    let plan = LaunchPlan {
-        name: "fake".into(),
-        build: None,
-        run: RunSpec::Native { program: Some("/fake/program".into()), rust: false },
-        args: Vec::new(),
-        cwd: None,
-        env: Vec::new(),
+    install_fake_named(s, client, events, kind, capabilities, "fake");
+}
+
+/// [`install_fake`] with a name (a Python session for a debugpy `kind`); returns its id. A
+/// running fake stays as another session.
+#[cfg(test)]
+pub(crate) fn install_fake_named(
+    s: &mut Session,
+    client: DapClient,
+    events: Receiver<DapEvent>,
+    kind: AdapterKind,
+    capabilities: dap::Capabilities,
+    name: &str,
+) -> u64 {
+    let run = if kind == AdapterKind::Debugpy {
+        RunSpec::Python { program: Some("/fake/app.py".into()), module: None, python: None, just_my_code: true }
+    } else {
+        RunSpec::Native { program: Some("/fake/program".into()), rust: false }
     };
+    let plan = LaunchPlan { name: name.into(), build: None, run, args: Vec::new(), cwd: None, env: Vec::new() };
     let mut rt = Runtime::new(plan, Phase::Live { client, events }, None);
     rt.kind = kind;
     rt.capabilities = capabilities;
     rt.configured = true;
+    // A second fake runs next to the first (multi-session tests).
+    if s.debug.rt.is_some() {
+        s.debug.park_selected();
+    }
     s.debug.views.reset();
+    let id = s.debug.next_session_id();
     s.debug.session = Some(DebugSession {
-        name: "fake".into(),
+        id,
+        name: name.into(),
         adapter: "fake".into(),
         status: Some(DebugStatus::Running),
         ..DebugSession::default()
     });
     s.debug.rt = Some(rt);
+    id
 }
 
 /// Send a view request (answered in `debug_views::on_response`). False if the adapter is gone.
@@ -3412,6 +4191,8 @@ pub(crate) fn snapshot(s: &Session) -> Value {
     json!({
         "active": s.debug.is_active(),
         "session": s.debug.session,
+        "sessions": s.debug.sessions(),
+        "selectedSession": s.debug.selected_id(),
         "breakpoints": s.debug.breakpoints,
         "watches": s.debug.watches,
         "evaluation": s.debug.evaluation,

@@ -51,7 +51,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "debug.atCaret",
             "Debug Context Configuration",
             Some("Ctrl+Shift+D"),
-            "{path?: string, line?: int} — debug the Rust test or main, Python file or Zig file at the caret",
+            "{path?: string, line?: int} — debug what is at the caret: a Rust test or main, a pytest test or Python \
+             file, a GoogleTest/Catch2/doctest/Boost.Test test or C/C++ main (its CMake target built first), a \
+             jest/vitest test (js-debug), a Zig or JavaScript file",
             Context::Editor,
             always,
             debug_at_caret,
@@ -174,38 +176,113 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         spec("run.debuggingActions.resumeProgram", "Resume Program", None, "", Context::Global, stopped, |s, _| {
             step(s, Step::Continue)
         }),
-        // CodeCraft debugs one program at a time, so the "All Programs" actions act on it.
+        // The "All Programs" actions act on every debug session (with `session`, on that one).
         spec(
             "run.debuggingActions.pauseAllPrograms",
             "Pause All Programs",
             None,
-            "",
+            "{session?: id|name} — pause every running debug session (with `session`, only that one)",
             Context::Global,
-            running,
-            |s, _| {
-                debug::pause(s)?;
-                ok()
+            any_running,
+            |s, p| {
+                if has_session_param(p) {
+                    debug::pause(s)?;
+                    return ok();
+                }
+                let paused = debug::each_session(s, |s| s.debug.is_running() && debug::pause(s).is_ok());
+                Ok(json!({ "paused": paused }))
             },
         ),
         spec(
             "run.debuggingActions.resumeAllPrograms",
             "Resume All Programs",
             None,
-            "",
+            "{session?: id|name} — resume every paused debug session (with `session`, only that one)",
             Context::Global,
-            stopped,
-            |s, _| step(s, Step::Continue),
+            any_stopped,
+            |s, p| {
+                if has_session_param(p) {
+                    return step(s, Step::Continue);
+                }
+                let resumed =
+                    debug::each_session(s, |s| s.debug.is_stopped() && debug::step(s, Step::Continue).is_ok());
+                Ok(json!({ "resumed": resumed }))
+            },
         ),
         spec(
             "run.debuggingActions.stopAllPrograms",
             "Stop All Programs",
             None,
-            "Stops the debug session and every running process",
+            "Stops every debug session and every running process",
             Context::Global,
             anything_running,
             |s, _| {
-                debug::stop(s);
+                let sessions = debug::stop_all(s);
                 crate::runs::stop_all(s);
+                Ok(json!({ "debugSessions": sessions }))
+            },
+        ),
+        // ----- several debug sessions (M15 track DM)
+        spec(
+            "debug.sessions",
+            "Debug Sessions",
+            None,
+            "→ {selected: id?, sessions: [{id, name, adapter, status, selected, live, parent?, pid?}]} — every debug \
+             session (a configuration, a subprocess, an attached process); give its id or name as the `session` \
+             param of any debug.* or run.debuggingActions.* command to act on it",
+            Context::Global,
+            always,
+            |s, _| Ok(json!({ "selected": s.debug.selected_id(), "sessions": s.debug.sessions() })),
+        ),
+        spec(
+            "debug.selectSession",
+            "Select Debug Session",
+            None,
+            "{session: id|name} — show that session in the Debug tool window (its threads, frames, variables, \
+             watches and console) and its execution point in the editor",
+            Context::Global,
+            always,
+            |s, p| {
+                let v = p.get("session").ok_or_else(|| CommandError::BadParams("missing param `session`".into()))?;
+                let id = debug::resolve_session(&s.debug, v)?;
+                debug::select_session(s, id)?;
+                Ok(json!({ "selected": id }))
+            },
+        ),
+        spec(
+            "debug.closeSession",
+            "Close Debug Session",
+            None,
+            "{session?: id|name (the selected one)} — stop the session if it runs and close its tab",
+            Context::Global,
+            has_any_session,
+            |s, p| {
+                let id = match p.get("session").filter(|v| !v.is_null()) {
+                    Some(v) => debug::resolve_session(&s.debug, v)?,
+                    None => s.debug.selected_id().ok_or_else(|| CommandError::Disabled("no debug session".into()))?,
+                };
+                debug::close_session(s, id)?;
+                Ok(json!({ "closed": id }))
+            },
+        ),
+        spec(
+            "debug.stopAll",
+            "Stop All Debug Sessions",
+            None,
+            "Stop every debug session → {stopped: int}",
+            Context::Global,
+            any_active,
+            |s, _| Ok(json!({ "stopped": debug::stop_all(s) })),
+        ),
+        spec(
+            "debug.pause",
+            "Pause Program",
+            None,
+            "{session?: id|name} — pause the selected (or given) debug session",
+            Context::Global,
+            running,
+            |s, _| {
+                debug::pause(s)?;
                 ok()
             },
         ),
@@ -501,8 +578,36 @@ fn running(s: &Session) -> Result<(), String> {
     if s.debug.is_running() { Ok(()) } else { Err("the program is not running in the debugger".into()) }
 }
 
+fn has_session_param(p: &Value) -> bool {
+    p.get("session").is_some_and(|v| !v.is_null())
+}
+
+fn any_running(s: &Session) -> Result<(), String> {
+    if s.debug.sessions().iter().any(|x| x.live && x.status == debug::DebugStatus::Running) {
+        Ok(())
+    } else {
+        Err("no program is running in the debugger".into())
+    }
+}
+
+fn any_stopped(s: &Session) -> Result<(), String> {
+    if s.debug.sessions().iter().any(|x| x.live && matches!(x.status, debug::DebugStatus::Stopped { .. })) {
+        Ok(())
+    } else {
+        Err("no program is paused in the debugger".into())
+    }
+}
+
+fn any_active(s: &Session) -> Result<(), String> {
+    if s.debug.live_count() > 0 { Ok(()) } else { Err("nothing is being debugged".into()) }
+}
+
+fn has_any_session(s: &Session) -> Result<(), String> {
+    if s.debug.session_count() > 0 { Ok(()) } else { Err("there is no debug session".into()) }
+}
+
 fn anything_running(s: &Session) -> Result<(), String> {
-    if s.debug.is_active() || s.ws.runs.iter().any(|r| r.is_running()) {
+    if s.debug.live_count() > 0 || s.ws.runs.iter().any(|r| r.is_running()) {
         Ok(())
     } else {
         Err("nothing is running".into())
@@ -898,6 +1003,20 @@ pub(crate) fn debug_location(s: &mut Session, path: &Path, line: usize) -> CmdRe
             }
         };
     }
+    // A jest/vitest (or `node --test`) test file: the test at the line under js-debug.
+    if let Some(root) = s.project_root()
+        && crate::run_configs::is_js_test_file(&path)
+        && matches!(Language::from_path(&path), Language::JavaScript | Language::TypeScript)
+    {
+        let text = match s.ws.doc_by_path(&path).and_then(|d| s.ws.doc(d)) {
+            Some(d) => d.doc.text(),
+            None => codecraft_fs::read_text_file(&path).map_err(|e| CommandError::Failed(e.to_string()))?,
+        };
+        let target = js_test_target(&root, &path, &text, line).map_err(CommandError::Failed)?;
+        let name = target.name().to_owned();
+        debug::start(s, target)?;
+        return started(s, &name);
+    }
     let Some(target) = context_target(s, &path, line) else {
         s.status = "Nothing to debug here".into();
         return Ok(Value::Null);
@@ -905,6 +1024,38 @@ pub(crate) fn debug_location(s: &mut Session, path: &Path, line: usize) -> CmdRe
     let name = target.name().to_owned();
     debug::start(s, target)?;
     started(s, &name)
+}
+
+/// Debug the jest/vitest test at `line` of a test file (the whole file when the line is above
+/// every test) under js-debug: the runner's own script runs in Node with the test's filter, jest
+/// in band (one process), vitest without file parallelism; a file without either runner runs
+/// with `node` (a `node:test` file runs its tests when executed).
+pub(crate) fn js_test_target(root: &Path, path: &Path, text: &str, line: usize) -> Result<DebugTarget, String> {
+    let test = text.lines().take(line.saturating_add(1)).filter_map(crate::run_configs::js_test_name).last();
+    let pkg: Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("package.json")).unwrap_or_default()).unwrap_or(Value::Null);
+    let has = |dep: &str| ["dependencies", "devDependencies"].iter().any(|k| pkg.get(k).and_then(|d| d.get(dep)).is_some());
+    let file = path.display().to_string();
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = test.clone().unwrap_or(file_name);
+    let (runner, script, mut args) = if has("vitest") {
+        ("vitest", root.join("node_modules/vitest/vitest.mjs"), vec!["run".to_owned(), file, "--no-file-parallelism".into()])
+    } else if has("jest") {
+        ("jest", root.join("node_modules/jest/bin/jest.js"), vec!["--runInBand".to_owned(), "--watchAll=false".into(), file])
+    } else {
+        return Ok(DebugTarget::Node { name, program: path.to_path_buf(), args: Vec::new(), cwd: Some(root.to_path_buf()) });
+    };
+    if !script.is_file() {
+        return Err(format!(
+            "{runner} is not installed in this project ({} is missing): install the project's packages first",
+            script.display()
+        ));
+    }
+    if let Some(t) = test {
+        args.push("-t".into());
+        args.push(t);
+    }
+    Ok(DebugTarget::Node { name, program: script, args, cwd: Some(root.to_path_buf()) })
 }
 
 // ---------------------------------------------------------------- breakpoints
@@ -1079,6 +1230,40 @@ mod tests {
         assert!(process_target("npm", &ProcessCommand::new("npm", &["start"], "/p")).is_none());
         assert!(process_target("sh", &ProcessCommand::shell("make", "/p")).is_none());
         assert!(process_target("py", &ProcessCommand::new("python3", &[], "/p")).is_none());
+    }
+
+    #[test]
+    fn js_tests_debug_through_their_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let file = root.join("math.test.ts");
+        let text = "import { test } from 'vitest';\n\ntest('adds', () => {\n  expect(1 + 1).toBe(2);\n});\n";
+        // No runner in package.json: the file runs under node.
+        let t = js_test_target(root, &file, text, 3).unwrap();
+        assert!(matches!(t, DebugTarget::Node { ref program, ref args, .. } if program == &file && args.is_empty()));
+        // vitest declared but not installed: say so.
+        std::fs::write(root.join("package.json"), r#"{"devDependencies":{"vitest":"^2"}}"#).unwrap();
+        let e = js_test_target(root, &file, text, 3).unwrap_err();
+        assert!(e.contains("vitest is not installed"), "{e}");
+        std::fs::create_dir_all(root.join("node_modules/vitest")).unwrap();
+        std::fs::write(root.join("node_modules/vitest/vitest.mjs"), "").unwrap();
+        let t = js_test_target(root, &file, text, 3).unwrap();
+        let DebugTarget::Node { name, program, args, cwd } = t else { panic!("not a node target") };
+        assert_eq!(name, "adds");
+        assert_eq!(program, root.join("node_modules/vitest/vitest.mjs"));
+        assert_eq!(args, ["run", &file.display().to_string(), "--no-file-parallelism", "-t", "adds"]);
+        assert_eq!(cwd.as_deref(), Some(root));
+        // Above every test: the whole file.
+        let DebugTarget::Node { args, .. } = js_test_target(root, &file, text, 0).unwrap() else { panic!() };
+        assert!(!args.contains(&"-t".to_owned()));
+        // jest runs in band.
+        std::fs::write(root.join("package.json"), r#"{"devDependencies":{"jest":"^29"}}"#).unwrap();
+        std::fs::create_dir_all(root.join("node_modules/jest/bin")).unwrap();
+        std::fs::write(root.join("node_modules/jest/bin/jest.js"), "").unwrap();
+        let DebugTarget::Node { program, args, .. } = js_test_target(root, &file, text, 4).unwrap() else { panic!() };
+        assert!(program.ends_with("node_modules/jest/bin/jest.js"));
+        assert_eq!(args.first().map(String::as_str), Some("--runInBand"));
+        assert_eq!(args.last().map(String::as_str), Some("adds"));
     }
 
     #[test]

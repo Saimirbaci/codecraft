@@ -23,8 +23,9 @@ const EXCERPT_RADIUS: usize = 3;
 
 #[derive(Clone, Debug)]
 enum OpKind {
-    /// Until the program stops (and its stack and locals are read) or the session ends.
-    Stop,
+    /// Until the session (or one of its subprocess sessions) stops with its stack and locals
+    /// read, or ends; `None`: until any session stops or every one ends.
+    Stop(Option<u64>),
     /// An adapter answer delivered by `deliver`.
     Answer,
 }
@@ -34,6 +35,8 @@ struct Op {
     kind: OpKind,
     deadline: Instant,
     result: Option<Result<Value, String>>,
+    /// The session the request went to.
+    session: Option<u64>,
 }
 
 /// Outstanding agent requests.
@@ -61,6 +64,7 @@ pub(crate) fn timeout_param(p: &Value) -> Result<Duration, CommandError> {
 }
 
 fn new_op(s: &mut Session, kind: OpKind, timeout: Duration) -> u64 {
+    let session = s.debug.selected_id();
     let agent = &mut s.debug.agent;
     while agent.ops.len() >= MAX_OPS {
         let Some(oldest) = agent.ops.keys().next().copied() else { break };
@@ -69,7 +73,7 @@ fn new_op(s: &mut Session, kind: OpKind, timeout: Duration) -> u64 {
     let token = agent.next;
     agent.next = agent.next.saturating_add(1);
     let deadline = Instant::now().checked_add(timeout).unwrap_or_else(Instant::now);
-    agent.ops.insert(token, Op { kind, deadline, result: None });
+    agent.ops.insert(token, Op { kind, deadline, result: None, session });
     token
 }
 
@@ -85,27 +89,92 @@ pub(crate) fn deliver(s: &mut Session, token: u64, result: Result<Value, String>
     }
 }
 
-/// `debug.waitForStop {timeoutMs}`: the stop summary now if the program is paused (with its
-/// stack read) or the session is over, else a token.
+/// `debug.waitForStop {timeoutMs}`: the stop summary now if the selected session (or one of its
+/// subprocess sessions) is paused (with its stack read) or over, else a token.
 pub(crate) fn wait_for_stop(s: &mut Session, timeout: Duration) -> Value {
-    if stop_ready(s) {
-        return done(stop_summary(s, 10, 40));
-    }
-    let token = new_op(s, OpKind::Stop, timeout);
-    json!({ "pending": true, "token": token, "state": state_name(s) })
+    let target = s.debug.selected_id();
+    wait_for(s, target, timeout)
 }
 
-/// Paused with everything read, or over (or never started). Before-launch tasks still running
-/// (the session starts after them) are waited for.
-fn stop_ready(s: &Session) -> bool {
-    if s.launch.pending.is_some() {
-        return false;
+/// `debug.waitForStop` without a `session`: with several sessions, the first one that stops (or
+/// the end of all of them); with one, that one.
+pub(crate) fn wait_for_any(s: &mut Session, timeout: Duration) -> Value {
+    let target = if s.debug.session_count() > 1 { None } else { s.debug.selected_id() };
+    wait_for(s, target, timeout)
+}
+
+fn wait_for(s: &mut Session, target: Option<u64>, timeout: Duration) -> Value {
+    if let Some(ready) = ready_session(s, target) {
+        return done(summary_of(s, ready, 10, 40));
     }
-    let Some(session) = &s.debug.session else { return true };
-    match session.status() {
-        DebugStatus::Exited { .. } | DebugStatus::Failed { .. } => true,
-        DebugStatus::Stopped { .. } => !s.debug.settling(),
-        _ => !s.debug.busy() && s.debug.rt.is_none(),
+    let token = new_op(s, OpKind::Stop(target), timeout);
+    json!({ "pending": true, "token": token, "state": state_name(s), "session": target })
+}
+
+/// The summary of session `id` (the selected one for `None`).
+fn summary_of(s: &mut Session, id: Option<u64>, frames: usize, locals: usize) -> Value {
+    match id {
+        Some(id) => super::with_session(s, id, |s| stop_summary(s, frames, locals)),
+        None => stop_summary(s, frames, locals),
+    }
+}
+
+/// Whether a wait for `target` (a session and its subprocess sessions; `None`: any session) is
+/// over, and with which session's summary: `Some(Some(id))` paused with everything read or
+/// over, `Some(None)` nothing to wait for, `None` still waiting. Before-launch tasks still
+/// running (the session starts after them) are waited for.
+pub(crate) fn ready_session(s: &Session, target: Option<u64>) -> Option<Option<u64>> {
+    if s.launch.pending.is_some() {
+        return None;
+    }
+    struct Seen {
+        id: u64,
+        status: DebugStatus,
+        live: bool,
+        settling: bool,
+        order: u64,
+    }
+    let d = &s.debug;
+    let all: Vec<Seen> = d
+        .all()
+        .map(|(x, rt)| Seen {
+            id: x.id,
+            status: x.status(),
+            live: rt.is_some(),
+            settling: super::settling_of(Some(x), rt),
+            order: x.stop_order,
+        })
+        .collect();
+    if all.is_empty() {
+        return Some(None);
+    }
+    let members: Vec<u64> = match target {
+        Some(id) => std::iter::once(id).chain(d.descendants(id)).collect(),
+        None => all.iter().map(|x| x.id).collect(),
+    };
+    let selected = d.selected_id();
+    let mut stopped: Vec<&Seen> = all
+        .iter()
+        .filter(|x| members.contains(&x.id) && x.live && matches!(x.status, DebugStatus::Stopped { .. }))
+        .collect();
+    if !stopped.is_empty() {
+        if stopped.iter().any(|x| x.settling) {
+            // A stop is still being read (stack, locals): its summary would be incomplete.
+            return None;
+        }
+        // The selected session first, then the latest stop.
+        stopped.sort_by_key(|x| (Some(x.id) == selected, x.order));
+        return stopped.last().map(|x| Some(x.id));
+    }
+    match target {
+        Some(id) => match all.iter().find(|x| x.id == id) {
+            None => Some(None),
+            // Over, or never started (no runtime and nothing will happen).
+            Some(x) if x.status.is_finished() || !x.live => Some(Some(id)),
+            Some(_) => None,
+        },
+        None if all.iter().all(|x| x.status.is_finished() || !x.live) => Some(selected),
+        None => None,
     }
 }
 
@@ -126,12 +195,11 @@ pub(crate) fn poll(s: &mut Session, token: u64) -> Result<Value, CommandError> {
         .cloned()
         .ok_or_else(|| CommandError::BadParams(format!("unknown or already answered token {token}")))?;
     let answer = match op.kind {
-        OpKind::Stop if stop_ready(s) => Some(done(stop_summary(s, 10, 40))),
-        OpKind::Stop => None,
+        OpKind::Stop(target) => ready_session(s, target).map(|id| done(summary_of(s, id, 10, 40))),
         OpKind::Answer => match op.result {
             Some(Ok(v)) => Some(done(v)),
             Some(Err(e)) => Some(json!({ "pending": false, "error": e })),
-            None if s.debug.rt.is_none() => {
+            None if op.session.map_or(s.debug.rt.is_none(), |id| s.debug.find(id).is_none_or(|(_, rt)| rt.is_none())) => {
                 Some(json!({ "pending": false, "error": "the debug session ended before the debugger answered" }))
             }
             None => None,
@@ -144,10 +212,11 @@ pub(crate) fn poll(s: &mut Session, token: u64) -> Result<Value, CommandError> {
     if Instant::now() >= op.deadline {
         s.debug.agent.ops.remove(&token);
         let mut v = json!({ "pending": false, "timedOut": true, "state": state_name(s) });
-        if matches!(op.kind, OpKind::Stop)
-            && let Some(map) = v.as_object_mut()
-        {
-            map.insert("summary".into(), stop_summary(s, 3, 0));
+        if let OpKind::Stop(target) = op.kind {
+            let summary = summary_of(s, target, 3, 0);
+            if let Some(map) = v.as_object_mut() {
+                map.insert("summary".into(), summary);
+            }
         }
         return Ok(v);
     }
@@ -157,12 +226,19 @@ pub(crate) fn poll(s: &mut Session, token: u64) -> Result<Value, CommandError> {
 fn state_name(s: &Session) -> &'static str {
     match s.debug.session.as_ref().map(DebugSession::status) {
         None => "idle",
-        Some(DebugStatus::Building) => "building",
-        Some(DebugStatus::Starting) => "starting",
-        Some(DebugStatus::Running) => "running",
-        Some(DebugStatus::Stopped { .. }) => "stopped",
-        Some(DebugStatus::Exited { .. }) => "exited",
-        Some(DebugStatus::Failed { .. }) => "failed",
+        Some(status) => status_name(&status),
+    }
+}
+
+/// `building`, `starting`, `running`, `stopped`, `exited` or `failed`.
+pub(crate) fn status_name(status: &DebugStatus) -> &'static str {
+    match status {
+        DebugStatus::Building => "building",
+        DebugStatus::Starting => "starting",
+        DebugStatus::Running => "running",
+        DebugStatus::Stopped { .. } => "stopped",
+        DebugStatus::Exited { .. } => "exited",
+        DebugStatus::Failed { .. } => "failed",
     }
 }
 
@@ -230,14 +306,20 @@ pub(crate) fn stop_summary(s: &Session, max_frames: usize, max_locals: usize) ->
         return Value::Object(out);
     };
     out.insert("session".into(), session.name.clone().into());
+    out.insert("sessionId".into(), session.id.into());
     if !session.adapter.is_empty() {
         out.insert("adapter".into(), session.adapter.clone().into());
     }
-    if let Some(label) = debug.rt.as_ref().and_then(super::children::focused_label) {
-        out.insert("process".into(), label.into());
+    if let Some(parent) = session.parent {
+        // A subprocess session: which process this is, and whose.
+        out.insert("process".into(), session.name.clone().into());
+        out.insert("parentSession".into(), parent.into());
     }
     if session.processes.len() > 1 {
         out.insert("processes".into(), json!(session.processes));
+    }
+    if let Some(list) = sessions_json(debug) {
+        out.insert("sessions".into(), list);
     }
     match session.status() {
         DebugStatus::Stopped { reason, description, thread } => {
@@ -355,6 +437,37 @@ pub(crate) fn stop_summary(s: &Session, max_frames: usize, max_locals: usize) ->
         out.insert("lastError".into(), e.clone().into());
     }
     Value::Object(out)
+}
+
+/// Every session as agents see it — `[{id, name, state, reason?, selected?, parent?}]` — when
+/// there is more than one (a single session's summary stays as it was).
+pub(crate) fn sessions_json(debug: &super::DebugState) -> Option<Value> {
+    let list = debug.sessions();
+    if list.len() < 2 {
+        return None;
+    }
+    Some(
+        list.iter()
+            .map(|x| {
+                let mut v = json!({ "id": x.id, "name": x.name, "state": status_name(&x.status) });
+                if let Some(map) = v.as_object_mut() {
+                    if let DebugStatus::Stopped { reason, .. } = &x.status {
+                        map.insert("reason".into(), reason.clone().into());
+                    }
+                    if let DebugStatus::Exited { code: Some(code) } = &x.status {
+                        map.insert("exitCode".into(), (*code).into());
+                    }
+                    if x.selected {
+                        map.insert("selected".into(), true.into());
+                    }
+                    if let Some(parent) = x.parent {
+                        map.insert("parent".into(), parent.into());
+                    }
+                }
+                v
+            })
+            .collect(),
+    )
 }
 
 /// The last Rust panic message in the program's output (`thread 'main' panicked at src/main.rs:3:5:`

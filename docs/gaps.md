@@ -888,13 +888,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     multi-line call is missed) and Jump to Line is `thread jump` (a breakpoint on the line jumped
     to doesn't trigger, side effects of skipped code don't happen); LLDB's hit count `N` means
     "stop from the N-th hit on" while debugpy's means "exactly the N-th" (`>= N`, `% N` work
-    there); Rust enum decoding reads the variant from LLDB's text (nested enums inside a variant
-    show `{…}` until expanded, `Box<u8>` still reads as a character) and `Rc`/`Arc` show
-    `strong=…, weak=…` without the value; DataFrame/object summaries evaluate small expressions
-    in the program (a property with side effects would run); subprocess debugging is debugpy
-    only (no lldb-dap `follow-fork`), the Debug tool window shows one process at a time (no
-    process picker; agents see the list), and a stopped parent stays paused in the background
-    while a child is shown; the `lldb-server platform` mode is unit-tested only (no lldb-server on
+    there); Rust enum decoding reads the variant from LLDB's text (~~nested enums inside a variant
+    show `{…}` until expanded, `Box<u8>` still reads as a character~~, M15 DM: item 58) and
+    `Rc`/`Arc` show `strong=…, weak=…` without the value; DataFrame/object summaries evaluate
+    small expressions in the program (a property with side effects would run); subprocess
+    debugging is debugpy only (no lldb-dap `follow-fork`), ~~the Debug tool window shows one
+    process at a time (no process picker; agents see the list), and a stopped parent stays paused
+    in the background while a child is shown~~ (M15 DM: every subprocess is a debug session with
+    its own tab, item 58); the `lldb-server platform` mode is unit-tested only (no lldb-server on
     macOS), and Python attach by pid could not run here (macOS refused the injection); Django and
     Flask arguments are unit-tested (not installed here; FastAPI/uvicorn ran end to end);
     completion in the console is a list of buttons (no keyboard navigation of the list); there
@@ -1030,13 +1031,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `pip install y` against the machine's Python and asking PyPI for outdated packages (it now
     skips `python.packages.*`). Remaining (Low): the Python Console's Stop waits for the process
     on the UI thread (seconds in the panic hunt); cargo-deny's
-    network fetch in the default Rust profile, LLDB's "no plugin for rust" line in Rust debug
-    output, C++ reference locals showing addresses, the JUnit temp path in `test_run`'s command
-    line and `command_line` in `inspect`'s tool list, no interpreter picker on Settings › Python
-    (the hotspot order following the IDE's method sort was fixed by M15 PP, item 59), absolute test locations in the Run window;
-    the gallery leaves out the Terminal, Python Console, Rust REPL, a Git repository and remote
-    windows. (M15 track EA, item 57, closed QA #21 — advisories opt-in —, #26 — the interpreter
-    picker on Settings › Python — and #27 — relative test locations in the Run window.)
+    network fetch in the default Rust profile, ~~LLDB's "no plugin for rust" line in Rust debug
+    output, C++ reference locals showing addresses~~ (M15 DM, item 58), the JUnit temp path in
+    `test_run`'s command line and `command_line` in `inspect`'s tool list, no interpreter picker on
+    Settings › Python (the hotspot order following the IDE's method sort was fixed by M15 PP, item
+    59), absolute test locations in the Run window; the gallery leaves out the Terminal, Python
+    Console, Rust REPL, a Git repository and remote windows. (M15 track EA, item 57, closed QA #21
+    — advisories opt-in —, #26 — the interpreter picker on Settings › Python — and #27 — relative
+    test locations in the Run window.)
 
 ## M15 (2026-10-15)
 
@@ -1104,6 +1106,74 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     only; the gutter mark is not clickable; the managed basedpyright language server was tested
     with a stand-in (no real basedpyright here); the type checking mode is not verified against
     a real pyright.
+
+58. Debugger, several sessions at once (track DM). `Session.debug` holds any number of debug
+    sessions (two configurations, a client and a server, a Python program and its subprocesses,
+    an attached process next to a launched one; at most 48), one of them selected: the Debug
+    tool window, the editor's execution point and inline values, Evaluate, the console and every
+    command without a `session` act on it, and the others are parked with their own threads,
+    frames, variables, watch values, console, Memory/Disassembly/Registers views and last target
+    (`engine/src/debug.rs`: `Parked`, `with_session`, `sessions()`). Every session is pumped each
+    frame; one that stops comes forward, as RustRover selects the session that hit a breakpoint;
+    when a selected subprocess session ends, its parent is selected again. Debugging a
+    configuration that is being debugged restarts it; other sessions keep running. Session tabs
+    at the top of the Debug tool window (state colour, `↳` for subprocesses, close ×, Stop All
+    while two or more run), a status bar widget (`Debugging app` / `2 debug sessions (1 paused)`,
+    click: the Debug tool window), Stop (the selected session and its subprocesses), Run ›
+    Debugging Actions › Stop/Pause/Resume All Programs (every session; with `session` only that
+    one), Stop Background Processes lists each session. Commands: `debug.sessions`,
+    `debug.selectSession`, `debug.closeSession`, `debug.stopAll`, `debug.pause`; every `debug.*`
+    and `run.debuggingActions.*` command takes `session` (id, or name) and runs with that session
+    selected, then restores the selection (`Session::execute` → `debug::session_scope`).
+    Breakpoints are shared and sent to every session of the matching language (Python/Django
+    templates to debugpy, Rust/C/C++/Zig to LLDB, JS/TS to js-debug, other files to all; a
+    breakpoint is verified when any session set it); exception settings go to every session.
+    Python subprocesses (debugpy `startDebugging`) are sessions of their own with `parent` set
+    (`debug/children.rs` now only makes the connection; the session machinery does `initialize` →
+    `attach` → configuration), never killed when their connection closes. Agents: `debug.start`
+    returns `session` (its id); stop summaries (`debug.stopSummary`, `debug.waitForStop`,
+    `debug_wait_for_stop`, `debug_control`, `debug_start`) carry `sessionId`, `parentSession`
+    and `process` for a subprocess, and with several sessions `sessions: [{id, name, state,
+    reason?, exitCode?, selected?, parent?}]`; `debug.waitForStop {session}` waits for that
+    session or one of its subprocess sessions, without `session` (several sessions) for the first
+    one that stops or the end of all; tokens remember their session. MCP: `debug_control`,
+    `debug_wait_for_stop`, `debug_stack`, `debug_variables`, `debug_evaluate` take `session`
+    (schemas in `crates/mcp/src/engine_tools.rs`; waits of a tool call with `session` stay on that
+    session, `Wait::InSession`); one session's results are unchanged apart from `sessionId`.
+    Values: C/C++ references read as what they refer to (`n = 3`, `it = {id=7, name="apple"}`,
+    expanding still shows the members; QA #23, `debug/cpp_values.rs`); LLDB's "This version of
+    LLDB has no plugin for the language rust" line is dropped from Rust sessions' output (QA #22);
+    Rust values nested in enum variants are decoded and the outer summary rebuilt from them, up to
+    three levels (`Some(Some(5))`, `Wrap(B { x: 9 })`, `Pair(Some(1), A(200))`, `Ok(Some(3))`);
+    `u8`/`i8` read as numbers (`65`, `-3`), `Box<u8>` as `7` and `[u8; 3]` as `[1, 2, 255]` (LLDB
+    shows them as C characters and strings), a `char` as `'z'` (LLDB: `U+0x0000007a U'z'`).
+    Watches: saved with the project's breakpoints (`.codecraft/breakpoints.json`, loaded before a
+    watch is added or removed) and restored; expressions are shared, values per session (a
+    session selected after a watch was added evaluates it). Debug at the caret: Rust and pytest
+    (as before), GoogleTest/Catch2/doctest/Boost.Test tests (the CMake target built, the test's
+    filter passed; verified with CMake + Homebrew's GoogleTest: only `MathTest.Subs` runs), jest
+    (`node_modules/jest/bin/jest.js --runInBand -t name file`) and vitest (`vitest.mjs run file
+    --no-file-parallelism -t name`) under js-debug, `node:test` files with `node`; without
+    js-debug the session fails at once with where to get it. Tested with the real lldb-dap
+    (two native programs at once, C++ references, Rust values, GoogleTest at the caret), debugpy
+    (two Python programs driven through the MCP tools with `session`, subprocess sessions),
+    scripted adapters (selection, per-session state, breakpoint routing, waits, Stop All, close)
+    and egui_kittest (session tabs, the status bar count, Stop All) —
+    `crates/engine/tests/debugger_dm.rs`, `crates/engine/src/debug/sessions_tests.rs`,
+    `crates/ui-egui/tests/debug_sessions_ui.rs`. Remaining: js-debug's child sessions
+    (`startDebugging` from js-debug, used by vitest's workers and Node child processes) are still
+    refused, so breakpoints in vitest workers don't bind (jest runs in band and is fine); js-debug
+    is not installed here, so jest/vitest debugging ran only up to the missing-adapter hint and in
+    unit tests of the launch arguments; debugpy sends a subprocess's output on its parent's
+    connection (they share stdout), so a subprocess session's console has only CodeCraft's own
+    lines; a session that stops always comes forward, even while another one is being inspected
+    (no "focus on breakpoint" option), and a configuration is always single-instance (no "allow
+    multiple instances"); ended sessions keep their tabs until a new session starts or they are
+    closed; Run › Stop (Cmd+F2) stops the selected session (no chooser listing every process);
+    the gutter shows one verification mark per breakpoint (not per session); an enum inside a
+    plain struct's field still reads `{…}` in the struct's summary until expanded, and a raw
+    `*const u8` reads its pointee's number like a `Box<u8>`; the `debug_breakpoint_*` tools
+    ignore `session` (breakpoints are shared).
 
 59. Profiling polish (track PP): **Profile the test at the caret** — the gutter ▶ menu has
     Profile and Profile Memory (`profiler.atCaret {path?, line? (0-based), kind?, tool?,

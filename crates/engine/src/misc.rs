@@ -318,8 +318,13 @@ pub fn processes(s: &Session) -> Vec<ProcessInfo> {
             detail: r.command_line.clone(),
         });
     }
-    if s.debug.is_active() {
-        v.push(ProcessInfo { kind: "debug".into(), id: "0".into(), title: "Debug session".into(), detail: String::new() });
+    for x in s.debug.sessions().into_iter().filter(|x| x.live) {
+        v.push(ProcessInfo {
+            kind: "debug".into(),
+            id: x.id.to_string(),
+            title: format!("Debug: {}", x.name),
+            detail: x.status.label(),
+        });
     }
     for (kind, l) in &s.servers {
         v.push(ProcessInfo {
@@ -358,7 +363,14 @@ pub(crate) fn stop_process(s: &mut Session, kind: &str, id: &str) -> bool {
             Ok(n) => crate::runs::stop(s, codecraft_workspace::RunTabId(n)),
             Err(_) => false,
         },
-        "debug" => s.debug.is_active() && crate::debug::stop(s),
+        "debug" => match id.parse::<u64>() {
+            Ok(n) if s.debug.sessions().iter().any(|x| x.id == n && x.live) => {
+                crate::debug::with_session(s, n, crate::debug::stop)
+            }
+            // `0`: the selected session (as before several sessions existed).
+            Ok(0) => s.debug.is_active() && crate::debug::stop(s),
+            _ => false,
+        },
         "languageServer" => {
             let Some(k) = s.servers.keys().copied().find(|k| format!("{k:?}") == id) else { return false };
             let Some(l) = s.servers.remove(&k) else { return false };

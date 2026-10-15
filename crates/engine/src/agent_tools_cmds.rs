@@ -724,7 +724,18 @@ pub(crate) fn stop_summary(s: &Session, frames: usize, context: usize) -> Value 
     // What the debugger's own summary knows beyond this one: the exception or panic (type and
     // message), the value a step out returned, the breakpoints hit, the exit code, the last error.
     if let Value::Object(more) = crate::debug::agent::stop_summary(s, 1, 0) {
-        for key in ["exception", "returnValue", "breakpoints", "exitCode", "lastError"] {
+        // And which debug session this is, with the others (M15 track DM).
+        for key in [
+            "exception",
+            "returnValue",
+            "breakpoints",
+            "exitCode",
+            "lastError",
+            "sessionId",
+            "sessions",
+            "process",
+            "parentSession",
+        ] {
             if let Some(v) = more.get(key).filter(|v| !v.is_null())
                 && !out.contains_key(key)
             {
