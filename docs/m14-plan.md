@@ -1,6 +1,6 @@
 # M14: debug, analyze and profile, for people and agents
 
-Status: in progress (2026-10-15). Goal: CodeCraft replaces PyCharm, CLion and RustRover (plus
+Status: done (2026-10-15; all five tracks landed; remaining depth is in `docs/gaps.md` items 52–56 and `docs/qa-m14.md`). Goal: CodeCraft replaces PyCharm, CLion and RustRover (plus
 DataGrip, M12/M13) for daily work. Not every feature of those IDEs matters; what must be
 first-class, for **both humans and AI agents**, is:
 

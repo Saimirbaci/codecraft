@@ -213,19 +213,40 @@ enum Msg {
 
 /// The running console process.
 pub struct ConsoleProcess {
-    child: Child,
+    /// `None` once killed (a reaper thread collects its exit).
+    child: Option<Child>,
     stdin: Sender<String>,
     rx: Receiver<Msg>,
 }
 
 impl ConsoleProcess {
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.as_ref().map_or(0, Child::id)
     }
 
+    /// Kill the process without waiting for it on this (the UI) thread.
     fn kill(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = self.end();
+    }
+
+    /// Kill the process and return its exit status if it is gone within ~100 ms; otherwise a
+    /// reaper thread waits for it, so the caller never blocks on a process that won't die.
+    fn end(&mut self) -> Option<std::process::ExitStatus> {
+        let mut child = self.child.take()?;
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        let _ = child.kill();
+        for _ in 0..20 {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let _ = std::thread::Builder::new().name("console-reaper".into()).spawn(move || {
+            let _ = child.wait();
+        });
+        None
     }
 }
 
@@ -237,7 +258,7 @@ impl Drop for ConsoleProcess {
 
 impl std::fmt::Debug for ConsoleProcess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConsoleProcess").field("pid", &self.child.id()).finish()
+        f.debug_struct("ConsoleProcess").field("pid", &self.pid()).finish()
     }
 }
 
@@ -328,7 +349,7 @@ impl Console {
                 }
             }
         });
-        self.process = Some(ConsoleProcess { child, stdin: in_tx, rx });
+        self.process = Some(ConsoleProcess { child: Some(child), stdin: in_tx, rx });
         self.interpreter = Some(python.to_path_buf());
         self.ready = false;
         self.version = None;
@@ -488,13 +509,7 @@ impl Console {
         // Without stdout the driver cannot answer: make sure the process is gone (killing first so
         // the wait cannot block when it closed stdout but kept running).
         let exit = if closed {
-            match p.child.try_wait() {
-                Ok(Some(status)) => Some(status),
-                _ => {
-                    let _ = p.child.kill();
-                    p.child.wait().ok()
-                }
-            }
+            p.end()
         } else {
             None
         };
@@ -726,6 +741,25 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(c.ready, "console did not start: {}", c.text());
+    }
+
+    /// Stop never waits on the caller's (UI) thread for a busy console (QA M14 #20).
+    #[test]
+    fn stop_returns_at_once_while_code_runs() {
+        let Some(py) = python3() else {
+            eprintln!("python3 not installed; skipping");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mut c = Console::default();
+        c.start(&py, Some(tmp.path())).unwrap();
+        wait_ready(&mut c);
+        c.execute("import time\nwhile True:\n    time.sleep(0.01)\n", true).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        c.stop();
+        assert!(start.elapsed() < Duration::from_millis(500), "stop took {:?}", start.elapsed());
+        assert!(c.process.is_none() && !c.ready);
     }
 
     #[test]

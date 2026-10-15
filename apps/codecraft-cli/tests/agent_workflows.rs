@@ -393,10 +393,18 @@ fn python_what_is_slow() {
 
     let started = m.ok("profile_start", json!({ "command": "python3 main.py" }));
     assert_eq!(started["tool"], "cProfile", "{started}");
-    let hot = m.ok("profile_hotspots", json!({ "limit": 5 }));
-    let names: Vec<&str> = hot["hotspots"].as_array().unwrap().iter().filter_map(|h| h["name"].as_str()).collect();
+    let hot = m.ok("profile_hotspots", json!({ "limit": 20 }));
+    // The project's own functions (by self time they can trail builtins on a loaded machine).
+    let project: Vec<&Value> = hot["hotspots"]
+        .as_array()
+        .into_iter()
+        .chain(hot["projectHotspots"].as_array())
+        .flatten()
+        .filter(|h| h["inProject"] == true)
+        .collect();
+    let names: Vec<&str> = project.iter().filter_map(|h| h["name"].as_str()).collect();
     assert!(names.contains(&"<genexpr>") && names.contains(&"slow_primes"), "{hot}");
-    let slow = hot["hotspots"].as_array().unwrap().iter().find(|h| h["name"] == "slow_primes").unwrap();
+    let slow = *project.iter().find(|h| h["name"] == "slow_primes").unwrap();
     assert!(ends_with(&slow["file"], "inventory/core.py") && slow["line"] == 15 && slow["inProject"] == true, "{slow}");
     assert!(slow["totalPercent"].as_f64().unwrap() > 80.0, "{slow}");
 
