@@ -27,6 +27,32 @@ pub struct PrefsUi {
     /// The Edit Configurations form being typed into.
     run_form: Option<RunForm>,
     run_error: Option<String>,
+    // ---- M13 track ST
+    /// Recording a two-stroke shortcut (the keymap editor's "Second stroke" toggle).
+    pub(crate) record_chord: bool,
+    /// The first stroke recorded while waiting for the second.
+    pub(crate) recorded_first: Option<String>,
+    /// The first stroke of a chord that was pressed; the next key completes it.
+    pub(crate) pending_chord: Option<keymap::Shortcut>,
+    /// The active keymap's two-stroke bindings.
+    pub(crate) chords: Vec<keymap::ChordBinding>,
+    /// The fonts installed at start (the editor font goes in front of their monospace family).
+    pub(crate) base_fonts: Option<egui::FontDefinitions>,
+    /// The engine's font generation the fonts were last built for.
+    pub(crate) font_generation: u64,
+    /// Settings › Editor › Font: list every family, not only monospaced ones.
+    pub(crate) all_fonts: bool,
+    /// The keymap name being typed in Rename….
+    pub(crate) keymap_rename: Option<String>,
+    /// Settings pages' own view state (live template form, TODO inputs).
+    pub(crate) pages: crate::settings_pages::PagesUi,
+}
+
+impl PrefsUi {
+    /// Commands rebuild the fonts on the next sync (tests).
+    pub fn font_generation(&self) -> u64 {
+        self.font_generation
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -44,8 +70,34 @@ struct RunForm {
 
 // ---------------------------------------------------------------- applying settings
 
+/// Rebuild the editor font when the engine loaded (or dropped) one.
+fn sync_fonts(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let generation = s.prefs_services.fonts.generation;
+    if generation == st.prefs.font_generation {
+        return;
+    }
+    st.prefs.font_generation = generation;
+    let base = st.prefs.base_fonts.clone().unwrap_or_default();
+    match &s.prefs_services.fonts.loaded {
+        Some(font) => match crate::fonts::with_editor_font(&base, font) {
+            Ok(defs) => {
+                ctx.set_fonts(defs);
+                st.mono_font_name = font.family.clone();
+            }
+            Err(e) => {
+                s.prefs_services.fonts.error = Some(e.clone());
+                s.status = e;
+                ctx.set_fonts(base);
+            }
+        },
+        None => ctx.set_fonts(base),
+    }
+    ctx.request_repaint();
+}
+
 /// Rebuild the theme, UI font size and key bindings when the settings they depend on change.
 pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    sync_fonts(ctx, s, st);
     let w = &s.ws.settings;
     let sig = serde_json::to_string(&(
         &w.theme,
@@ -54,6 +106,7 @@ pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         w.ui_font_size,
         &w.keymap,
         &w.keymap_overrides,
+        &w.user_keymaps,
         w.compact_mode,
     ))
     .unwrap_or_default();
@@ -69,6 +122,8 @@ pub(crate) fn sync(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     }
     keymap::set_active(w);
     st.bindings = keymap::bindings_for(w);
+    st.prefs.chords = keymap::chords_for(w);
+    st.prefs.pending_chord = None;
     s.terminal.set_palette(crate::terminal_panel::palette(&st.theme));
     // Widgets laid out this frame still use the old style.
     ctx.request_repaint();
@@ -109,11 +164,22 @@ pub(crate) fn handle_keys(ctx: &egui::Context, events: &[Event], s: &mut Session
         });
         consume_keys(ctx);
         if let Some((key, m)) = press {
-            st.prefs.recording = None;
-            if !(key == Key::Escape && m.is_none())
-                && let Some(sc) = keymap::from_event(key, &m)
-            {
-                add_shortcut(s, st, id, &sc, false);
+            if key == Key::Escape && m.is_none() {
+                st.prefs.recording = None;
+                st.prefs.recorded_first = None;
+            } else if let Some(sc) = keymap::from_event(key, &m) {
+                match (st.prefs.record_chord, st.prefs.recorded_first.take()) {
+                    // Two-stroke recording: the first key waits for the second.
+                    (true, None) => st.prefs.recorded_first = Some(sc),
+                    (_, Some(first)) => {
+                        st.prefs.recording = None;
+                        add_shortcut(s, st, id, &format!("{first} {sc}"), false);
+                    }
+                    (false, None) => {
+                        st.prefs.recording = None;
+                        add_shortcut(s, st, id, &sc, false);
+                    }
+                }
             }
         }
         return;
@@ -150,6 +216,57 @@ pub(crate) fn handle_keys(ctx: &egui::Context, events: &[Event], s: &mut Session
     // Everything else belongs to the dialog's own fields; no IDE shortcuts while it is open.
 }
 
+/// The status bar's pending-chord indicator ("⌘K was pressed. Waiting for the second key…").
+pub(crate) fn pending_chord_text(st: &UiState) -> Option<String> {
+    st.prefs
+        .pending_chord
+        .as_ref()
+        .map(|sc| format!("{} was pressed. Waiting for the second key of the chord…", keymap::stroke_text(sc)))
+}
+
+/// Two-stroke shortcuts: a key that starts a chord waits for the next one; the next key runs
+/// the chord's command (or ends the chord). Returns true when the key was taken.
+pub(crate) fn chord_key(
+    ctx: &egui::Context,
+    s: &mut Session,
+    st: &mut UiState,
+    key: Key,
+    m: &Modifiers,
+    editor_focused: bool,
+    text_field_focused: bool,
+) -> bool {
+    let applies = |c: &keymap::ChordBinding| match c.context {
+        codecraft_engine::Context::Editor => editor_focused,
+        codecraft_engine::Context::Global => !text_field_focused || c.first.has_command_modifier(),
+    };
+    if let Some(first) = st.prefs.pending_chord.take() {
+        ctx.input_mut(|i| i.consume_key(*m, key));
+        if key == Key::Escape && m.is_none() {
+            return true;
+        }
+        let hit = st.prefs.chords.iter().find(|c| c.first == first && c.second.matches(key, m) && applies(c)).map(|c| c.id);
+        match hit {
+            Some(id) => run_command(s, st, id, &crate::platform_params(id)),
+            None => {
+                let second = keymap::Shortcut { key, cmd: m.mac_cmd, ctrl: m.ctrl, alt: m.alt, shift: m.shift };
+                s.status = format!(
+                    "{}, {} is not a shortcut in this keymap",
+                    keymap::stroke_text(&first),
+                    keymap::stroke_text(&second)
+                );
+            }
+        }
+        return true;
+    }
+    let starts = st.prefs.chords.iter().any(|c| c.first.matches(key, m) && applies(c));
+    if starts {
+        ctx.input_mut(|i| i.consume_key(*m, key));
+        st.prefs.pending_chord = Some(keymap::Shortcut { key, cmd: m.mac_cmd, ctrl: m.ctrl, alt: m.alt, shift: m.shift });
+        ctx.request_repaint();
+    }
+    starts
+}
+
 // ---------------------------------------------------------------- windows
 
 pub(crate) fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
@@ -161,7 +278,9 @@ pub(crate) fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         settings_window(&ctx, s, st);
     } else {
         st.prefs.recording = None;
+        st.prefs.recorded_first = None;
         st.prefs.conflict = None;
+        st.prefs.keymap_rename = None;
     }
     if s.prefs.quick_switch.is_some() {
         quick_switch(&ctx, s, st);
@@ -175,7 +294,7 @@ pub(crate) fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 }
 
 /// Commands to run after a window is painted (`id`, params).
-type Cmds = Vec<(&'static str, Value)>;
+pub(crate) type Cmds = Vec<(&'static str, Value)>;
 
 fn settings_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let Some(dialog) = s.prefs.dialog.clone() else { return };
@@ -194,7 +313,7 @@ fn settings_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         ui.label(RichText::new(e).color(theme.error));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let changed = dialog.draft != s.ws.settings;
+                        let changed = dialog.draft != s.ws.settings || dialog.code_style.dirty();
                         if ui.add_enabled(changed, egui::Button::new("Apply")).clicked() {
                             cmds.push(("settings.dialog.apply", Value::Null));
                         }
@@ -266,27 +385,47 @@ fn page(
     query: &str,
     cmds: &mut Cmds,
 ) {
+    use crate::settings_pages as pages;
     match page {
         settings::PAGE_KEYMAP => keymap_page(ui, st, draft, cmds),
         settings::PAGE_COLOR_SCHEME => color_scheme_page(ui, st, draft, query, cmds),
-        settings::PAGE_LIVE_TEMPLATES => templates_page(ui, s, st),
+        settings::PAGE_LIVE_TEMPLATES => pages::templates_page(ui, s, st, cmds),
         settings::PAGE_TOOLS => tools_page(ui, s, st, cmds),
-        settings::PAGE_FONT => {
-            setting_grid(ui, st, page, draft, query, cmds);
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new(format!("Editor font: {}", st.mono_font_name)).color(st.theme.text_muted).size(11.0),
-            );
+        settings::PAGE_FONT => pages::font_page(ui, s, st, draft, cmds),
+        settings::PAGE_CODE_STYLE_RUST => pages::code_style_page(ui, s, st, "rust", cmds),
+        settings::PAGE_CODE_STYLE_CPP => pages::code_style_page(ui, s, st, "cpp", cmds),
+        settings::PAGE_CODE_STYLE_PYTHON => {
+            pages::code_style_page(ui, s, st, "python", cmds);
+            ui.add_space(8.0);
+            setting_grid_keys(ui, st, draft, &["python_formatter", "python_reformat_on_save"], cmds);
         }
+        settings::PAGE_CODE_STYLE_OTHER => pages::code_style_other_page(ui, st, draft, cmds),
+        settings::PAGE_TODO => pages::todo_page(ui, st, draft, cmds),
         _ => setting_grid(ui, st, page, draft, query, cmds),
     }
 }
 
+/// Some settings (by key) as a grid, wherever they are documented.
+pub(crate) fn setting_grid_keys(ui: &mut egui::Ui, st: &UiState, draft: &Settings, keys: &[&str], cmds: &mut Cmds) {
+    egui::Grid::new(("settings-grid-keys", keys.first().copied().unwrap_or(""))).num_columns(2).spacing([18.0, 8.0]).show(
+        ui,
+        |ui| {
+            for d in keys.iter().filter_map(|k| settings::find(k)) {
+                ui.label(d.label).on_hover_text(d.description);
+                if let Some(v) = widget(ui, st, d, draft) {
+                    cmds.push(("settings.set", json!({ "key": d.key, "value": v })));
+                }
+                ui.end_row();
+            }
+        },
+    );
+}
+
 /// The page's settings as a two-column grid (only those matching a search, when some do).
-fn setting_grid(ui: &mut egui::Ui, st: &UiState, page: &str, draft: &Settings, query: &str, cmds: &mut Cmds) {
+pub(crate) fn setting_grid(ui: &mut egui::Ui, st: &UiState, page: &str, draft: &Settings, query: &str, cmds: &mut Cmds) {
     let defs: Vec<&SettingDef> = settings::SETTINGS
         .iter()
-        .filter(|d| d.page == page && !matches!(d.kind, Kind::KeymapOverrides | Kind::UserSchemes))
+        .filter(|d| d.page == page && !d.kind.has_own_editor() && d.kind != Kind::FontFamily)
         // The global menu bar exists only on macOS.
         .filter(|d| d.key != "native_menu_bar" || cfg!(target_os = "macos"))
         .collect();
@@ -354,7 +493,16 @@ fn widget(ui: &mut egui::Ui, st: &UiState, d: &SettingDef, draft: &Settings) -> 
         Kind::Theme => choice(ui, d.key, current.as_str().unwrap_or("Dark"), &settings::THEMES.map(String::from)),
         Kind::Keymap => {
             let cur = keymaps::active(draft);
-            choice(ui, d.key, cur, &keymaps::NAMES.map(String::from))
+            choice(ui, d.key, &cur, &keymaps::all_names(draft))
+        }
+        Kind::Choice(options) => {
+            let cur = current.as_str().unwrap_or_default().to_string();
+            let options: Vec<String> = options.iter().map(|o| (*o).to_string()).collect();
+            choice(ui, d.key, &cur, &options)
+        }
+        Kind::FontFamily => {
+            let mut t = current.as_str().unwrap_or_default().to_string();
+            ui.add(TextEdit::singleline(&mut t).hint_text("default").desired_width(320.0)).changed().then(|| json!(t))
         }
         Kind::ColorScheme => {
             let cur = settings::effective_scheme(draft);
@@ -377,11 +525,16 @@ fn widget(ui: &mut egui::Ui, st: &UiState, d: &SettingDef, draft: &Settings) -> 
                 json!(keys)
             })
         }
-        Kind::KeymapOverrides | Kind::UserSchemes => None,
+        Kind::KeymapOverrides
+        | Kind::UserSchemes
+        | Kind::UserKeymaps
+        | Kind::TodoPatterns
+        | Kind::TodoFilters
+        | Kind::IndentByLanguage => None,
     }
 }
 
-fn choice(ui: &mut egui::Ui, key: &str, current: &str, options: &[String]) -> Option<Value> {
+pub(crate) fn choice(ui: &mut egui::Ui, key: &str, current: &str, options: &[String]) -> Option<Value> {
     let mut chosen = current.to_string();
     egui::ComboBox::from_id_salt(("setting", key)).selected_text(current).width(220.0).show_ui(ui, |ui| {
         for o in options {
@@ -410,12 +563,25 @@ fn add_shortcut(s: &mut Session, st: &mut UiState, id: &'static str, sc: &str, r
 fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut Cmds) {
     let theme = st.theme.clone();
     let active = keymaps::active(draft);
+    let is_user = keymaps::user_keymap(draft, &active).is_some();
     ui.horizontal(|ui| {
         ui.label("Keymap:");
-        if let Some(v) = choice(ui, "keymap", active, &keymaps::NAMES.map(String::from)) {
+        if let Some(v) = choice(ui, "keymap", &active, &keymaps::all_names(draft)) {
             cmds.push(("keymap.select", json!({ "name": v })));
+            st.prefs.keymap_rename = None;
         }
-        let changes = keymaps::overrides(draft, active).map(|o| o.len()).unwrap_or(0);
+        if ui.button("Duplicate…").on_hover_text("A copy of this keymap that inherits its shortcuts").clicked() {
+            cmds.push(("keymap.duplicate", json!({ "from": active })));
+        }
+        if is_user {
+            if ui.button("Rename…").clicked() {
+                st.prefs.keymap_rename = Some(active.clone());
+            }
+            if ui.button("Delete").on_hover_text("Keymaps based on it inherit from its parent").clicked() {
+                cmds.push(("keymap.delete", json!({ "name": active })));
+            }
+        }
+        let changes = keymaps::overrides(draft, &active).map(|o| o.len()).unwrap_or(0);
         if ui
             .add_enabled(changes > 0, egui::Button::new("Reset All"))
             .on_hover_text("Drop every shortcut change in this keymap")
@@ -426,6 +592,28 @@ fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut
         if changes > 0 {
             ui.label(RichText::new(format!("{changes} changed")).color(theme.text_muted));
         }
+    });
+    if let Some(parent) = keymaps::parent_of(draft, &active) {
+        ui.label(RichText::new(format!("Based on {parent}; changes here override it.")).color(theme.text_muted).size(11.5));
+    }
+    if let Some(mut name) = st.prefs.keymap_rename.clone() {
+        ui.horizontal(|ui| {
+            ui.label("New name:");
+            let resp = ui.add(TextEdit::singleline(&mut name).desired_width(220.0));
+            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            if ui.button("Rename").clicked() || enter {
+                cmds.push(("keymap.rename", json!({ "name": active, "newName": name })));
+                st.prefs.keymap_rename = None;
+            } else if ui.button("Cancel").clicked() {
+                st.prefs.keymap_rename = None;
+            } else {
+                st.prefs.keymap_rename = Some(name);
+            }
+        });
+    }
+    ui.horizontal(|ui| {
+        ui.checkbox(&mut st.prefs.record_chord, "Second stroke")
+            .on_hover_text("Record two-stroke shortcuts such as ⌘K, ⌘C (the first key waits for the second)");
     });
     ui.add(
         TextEdit::singleline(&mut st.prefs.keymap_filter)
@@ -452,7 +640,12 @@ fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut
     }
     if let Some(id) = st.prefs.recording {
         let label = registry().get(id).map(|c| c.label).unwrap_or(id);
-        ui.label(RichText::new(format!("Press the shortcut for “{label}” (Escape cancels)…")).color(theme.accent));
+        let text = match &st.prefs.recorded_first {
+            Some(first) => format!("{}, … press the second key for “{label}” (Escape cancels)", keymap::display(first)),
+            None if st.prefs.record_chord => format!("Press the first key of the chord for “{label}” (Escape cancels)…"),
+            None => format!("Press the shortcut for “{label}” (Escape cancels)…"),
+        };
+        ui.label(RichText::new(text).color(theme.accent));
     }
     ui.add_space(4.0);
     let q = st.prefs.keymap_filter.trim().to_lowercase();
@@ -529,6 +722,16 @@ fn color_scheme_page(ui: &mut egui::Ui, st: &UiState, draft: &Settings, query: &
         }
         if user.is_some() && ui.button("Delete").clicked() {
             cmds.push(("colorScheme.delete", json!({ "name": current })));
+        }
+        if ui.button("Export…").on_hover_text("Save this scheme as a CodeCraft JSON file").clicked() {
+            cmds.push(("colorScheme.export", json!({ "name": current })));
+        }
+        if ui
+            .button("Import…")
+            .on_hover_text("Add a scheme from a CodeCraft JSON file or an .icls file you have")
+            .clicked()
+        {
+            cmds.push(("colorScheme.import", Value::Null));
         }
     });
     let preview = Theme::from_settings(&Settings { color_scheme: current.clone(), ..draft.clone() });
@@ -607,41 +810,6 @@ fn color_scheme_page(ui: &mut egui::Ui, st: &UiState, draft: &Settings, query: &
 }
 
 // ---------------------------------------------------------------- live templates and tools
-
-fn templates_page(ui: &mut egui::Ui, s: &mut Session, st: &UiState) {
-    let theme = &st.theme;
-    let user = s.editing.templates.user_templates().to_vec();
-    let path = s.editing.templates.path();
-    ui.label(
-        RichText::new(match &path {
-            Some(p) => {
-                format!("User templates are stored in {}. Add one with Code › Save as Live Template.", p.display())
-            }
-            None => "User templates: set CODECRAFT_HOME to store them.".into(),
-        })
-        .color(theme.text_muted),
-    );
-    if let Some(e) = &s.editing.templates.error {
-        ui.label(RichText::new(e).color(theme.error));
-    }
-    ui.add_space(4.0);
-    let builtins = codecraft_engine::templates::builtins();
-    let rows: Vec<(bool, &codecraft_engine::templates::Template)> =
-        user.iter().map(|t| (true, t)).chain(builtins.iter().map(|t| (false, t))).collect();
-    egui::Grid::new("templates-grid").num_columns(3).spacing([14.0, 4.0]).striped(true).show(ui, |ui| {
-        ui.label(RichText::new("Abbreviation").strong());
-        ui.label(RichText::new("Description").strong());
-        ui.label(RichText::new("Languages").strong());
-        ui.end_row();
-        for (is_user, t) in rows {
-            let abbr = RichText::new(&t.abbreviation).monospace().color(if is_user { theme.link } else { theme.text });
-            ui.label(abbr).on_hover_text(&t.text);
-            ui.label(&t.description);
-            ui.label(RichText::new(t.languages.join(", ")).color(theme.text_muted));
-            ui.end_row();
-        }
-    });
-}
 
 fn tools_page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut Cmds) {
     let theme = &st.theme;

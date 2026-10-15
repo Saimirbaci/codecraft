@@ -6,12 +6,21 @@
 //! Apply/OK copy the draft to the live settings, Cancel drops it. Otherwise they change the live
 //! settings directly.
 
+pub mod code_style;
+pub mod fonts;
+pub mod keymap_copies;
+pub mod keymap_tables;
+pub mod scheme_io;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use codecraft_workspace::{ColorScheme, Settings};
+use codecraft_workspace::{ColorScheme, LanguageIndent, Settings, TodoFilter, TodoPattern, UserKeymap};
 
-use crate::keymaps;
+use crate::{Session, keymaps};
 
 /// What kind of value a setting holds (validation and the dialog's widget).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -42,7 +51,37 @@ pub enum Kind {
     KeymapOverrides,
     /// `[ColorScheme…]`.
     UserSchemes,
+    /// One of a fixed list of values.
+    Choice(&'static [&'static str]),
+    /// A font family name (Settings › Editor › Font lists the system's); empty = the default.
+    FontFamily,
+    /// `[{name, parent}]` user keymaps.
+    UserKeymaps,
+    /// `[{pattern, case_sensitive}]` TODO patterns.
+    TodoPatterns,
+    /// `[{name, patterns}]` TODO filters.
+    TodoFilters,
+    /// `{language id: {tab_size, indent_size, use_tab}}`.
+    IndentByLanguage,
 }
+
+impl Kind {
+    /// Kinds edited by a page's own editor rather than a row of the settings grid.
+    pub fn has_own_editor(self) -> bool {
+        matches!(
+            self,
+            Kind::KeymapOverrides
+                | Kind::UserSchemes
+                | Kind::UserKeymaps
+                | Kind::TodoPatterns
+                | Kind::TodoFilters
+                | Kind::IndentByLanguage
+        )
+    }
+}
+
+/// Settings › Languages & Frameworks › Python › Formatter.
+pub const PYTHON_FORMATTERS: &[&str] = &["auto", "ruff", "black", "none"];
 
 /// One documented setting.
 #[derive(Clone, Copy, Debug)]
@@ -64,7 +103,12 @@ pub const PAGE_CODE_COMPLETION: &str = "Editor › Code Completion";
 pub const PAGE_FONT: &str = "Editor › Font";
 pub const PAGE_COLOR_SCHEME: &str = "Editor › Color Scheme";
 pub const PAGE_CODE_STYLE: &str = "Editor › Code Style";
+pub const PAGE_CODE_STYLE_RUST: &str = "Editor › Code Style › Rust";
+pub const PAGE_CODE_STYLE_CPP: &str = "Editor › Code Style › C/C++";
+pub const PAGE_CODE_STYLE_PYTHON: &str = "Editor › Code Style › Python";
+pub const PAGE_CODE_STYLE_OTHER: &str = "Editor › Code Style › Other File Types";
 pub const PAGE_LIVE_TEMPLATES: &str = "Editor › Live Templates";
+pub const PAGE_TODO: &str = "Editor › TODO";
 pub const PAGE_RUN_CONFIGS: &str = "Build, Execution, Deployment › Run Configurations";
 pub const PAGE_RUST: &str = "Languages & Frameworks › Rust";
 pub const PAGE_PYTHON: &str = "Languages & Frameworks › Python";
@@ -83,7 +127,12 @@ pub const PAGES: &[&str] = &[
     PAGE_FONT,
     PAGE_COLOR_SCHEME,
     PAGE_CODE_STYLE,
+    PAGE_CODE_STYLE_RUST,
+    PAGE_CODE_STYLE_CPP,
+    PAGE_CODE_STYLE_PYTHON,
+    PAGE_CODE_STYLE_OTHER,
     PAGE_LIVE_TEMPLATES,
+    PAGE_TODO,
     PAGE_RUN_CONFIGS,
     PAGE_RUST,
     PAGE_PYTHON,
@@ -239,13 +288,26 @@ pub const SETTINGS: &[SettingDef] = &[
         "Reopen the last project(s) with their windows, tabs and splits when CodeCraft starts",
         Kind::Bool,
     ),
-    def("keymap", "Keymap", PAGE_KEYMAP, "macOS or Windows/Linux; empty = the platform default", Kind::Keymap),
+    def(
+        "keymap",
+        "Keymap",
+        PAGE_KEYMAP,
+        "macOS, Windows/Linux, VS Code (macOS), VS Code, Emacs or a user keymap; empty = the platform default",
+        Kind::Keymap,
+    ),
     def(
         "keymap_overrides",
         "Shortcut changes",
         PAGE_KEYMAP,
-        "{keymap: {command id: [shortcut…]}}",
+        "{keymap: {command id: [shortcut…]}}; a shortcut is one keystroke or a two-stroke chord (`Cmd+K Cmd+C`)",
         Kind::KeymapOverrides,
+    ),
+    def(
+        "user_keymaps",
+        "User keymaps",
+        PAGE_KEYMAP,
+        "[{name, parent}]: copies of a keymap that inherit its shortcuts (Duplicate…)",
+        Kind::UserKeymaps,
     ),
     def("soft_wrap", "Soft-wrap files", PAGE_EDITOR_GENERAL, "Wrap long lines at the editor width", Kind::Bool),
     def("show_whitespace", "Show whitespaces", PAGE_EDITOR_GENERAL, "Render spaces and tabs", Kind::Bool),
@@ -314,6 +376,13 @@ pub const SETTINGS: &[SettingDef] = &[
         "Complete functions as `name(a, b)` with Tab stops for the arguments; off = `name()` with the caret inside",
         Kind::Bool,
     ),
+    def(
+        "editor_font_family",
+        "Font",
+        PAGE_FONT,
+        "Editor font family (one of the system's fonts); empty = the default; missing glyphs fall back to the default fonts",
+        Kind::FontFamily,
+    ),
     def("editor_font_size", "Size", PAGE_FONT, "Editor font size", Kind::Float { min: 6.0, max: 72.0 }),
     def(
         "line_spacing",
@@ -330,7 +399,34 @@ pub const SETTINGS: &[SettingDef] = &[
         "[{name, base, colors: {token: #RRGGBB}}]",
         Kind::UserSchemes,
     ),
-    def("tab_size", "Tab size", PAGE_CODE_STYLE, "Columns per tab and indent", Kind::Int { min: 1, max: 16 }),
+    def(
+        "tab_size",
+        "Tab size",
+        PAGE_CODE_STYLE,
+        "Columns per tab and indent (languages without their own Code Style entry)",
+        Kind::Int { min: 1, max: 16 },
+    ),
+    def(
+        "indent_by_language",
+        "Indents per language",
+        PAGE_CODE_STYLE_OTHER,
+        "{language id: {tab_size, indent_size, use_tab}}",
+        Kind::IndentByLanguage,
+    ),
+    def(
+        "todo_patterns",
+        "Patterns",
+        PAGE_TODO,
+        "[{pattern, case_sensitive}]: regular expressions the TODO tool window finds in comments",
+        Kind::TodoPatterns,
+    ),
+    def(
+        "todo_filters",
+        "Filters",
+        PAGE_TODO,
+        "[{name, patterns: [pattern…]}]: each shows only some patterns' items",
+        Kind::TodoFilters,
+    ),
     def(
         "right_margin",
         "Hard wrap at",
@@ -361,6 +457,13 @@ pub const SETTINGS: &[SettingDef] = &[
     ),
     def("check_on_save", "Run external linter on save", PAGE_RUST, "cargo check (or Clippy) after saving", Kind::Bool),
     def(
+        "crates_io_lookups",
+        "Crates.io lookups",
+        PAGE_RUST,
+        "Ask crates.io for crate names and versions in Cargo.toml (completion and the newer-version inspection)",
+        Kind::Bool,
+    ),
+    def(
         "use_clippy",
         "External linter: Clippy",
         PAGE_RUST,
@@ -372,7 +475,7 @@ pub const SETTINGS: &[SettingDef] = &[
         "Formatter",
         PAGE_PYTHON,
         "Reformat Code for Python: auto (Ruff, else Black), ruff, black or none",
-        Kind::Text,
+        Kind::Choice(PYTHON_FORMATTERS),
     ),
     def(
         "python_reformat_on_save",
@@ -535,13 +638,48 @@ pub fn set_value(settings: &mut Settings, key: &str, value: &Value) -> Result<Ch
             if s.trim().is_empty() {
                 json!("")
             } else {
-                json!(
-                    keymaps::canonical_name(s).ok_or_else(|| bad(
-                        key,
-                        format!("unknown keymap `{s}`; use {}", keymaps::NAMES.join(" or "))
-                    ))?
-                )
+                json!(keymaps::resolve_name(settings, s).ok_or_else(|| bad(
+                    key,
+                    format!("unknown keymap `{s}`; use {}", keymaps::all_names(settings).join(", "))
+                ))?)
             }
+        }
+        Some(Kind::Choice(choices)) => {
+            let s = value.as_str().ok_or_else(|| bad(key, format!("expected one of {}", choices.join(", "))))?;
+            json!(
+                choices
+                    .iter()
+                    .find(|c| c.eq_ignore_ascii_case(s.trim()))
+                    .ok_or_else(|| bad(key, format!("`{s}` is not one of {}", choices.join(", "))))?
+            )
+        }
+        Some(Kind::FontFamily) => {
+            let s = value.as_str().ok_or_else(|| bad(key, format!("expected a font family name, got {value}")))?;
+            let s = s.trim();
+            if s.chars().count() > 200 || s.chars().any(char::is_control) {
+                return Err(bad(key, "not a font family name"));
+            }
+            json!(s)
+        }
+        Some(Kind::UserKeymaps) => {
+            let parsed: Vec<UserKeymap> = serde_json::from_value(value.clone()).map_err(|e| bad(key, e))?;
+            serde_json::to_value(keymap_copies::validate(&parsed).map_err(|e| bad(key, e))?).map_err(|e| bad(key, e))?
+        }
+        Some(Kind::TodoPatterns) => {
+            let parsed: Vec<TodoPattern> = serde_json::from_value(value.clone()).map_err(|e| bad(key, e))?;
+            serde_json::to_value(crate::todo::check_patterns(&parsed).map_err(|e| bad(key, e))?)
+                .map_err(|e| bad(key, e))?
+        }
+        Some(Kind::TodoFilters) => {
+            let parsed: Vec<TodoFilter> = serde_json::from_value(value.clone()).map_err(|e| bad(key, e))?;
+            serde_json::to_value(check_todo_filters(&parsed, &settings.todo_patterns).map_err(|e| bad(key, e))?)
+                .map_err(|e| bad(key, e))?
+        }
+        Some(Kind::IndentByLanguage) => {
+            let parsed: BTreeMap<String, LanguageIndent> =
+                serde_json::from_value(value.clone()).map_err(|e| bad(key, e))?;
+            serde_json::to_value(code_style::check_indents(&parsed).map_err(|e| bad(key, e))?)
+                .map_err(|e| bad(key, e))?
         }
         Some(Kind::ColorScheme) => {
             let s = value.as_str().ok_or_else(|| bad(key, format!("expected a scheme name, got {value}")))?;
@@ -567,7 +705,7 @@ pub fn set_value(settings: &mut Settings, key: &str, value: &Value) -> Result<Ch
         }
         Some(Kind::KeymapOverrides) => {
             let parsed = serde_json::from_value(value.clone()).map_err(|e| bad(key, e))?;
-            serde_json::to_value(keymaps::validate_overrides(&parsed).map_err(|e| bad(key, e))?)
+            serde_json::to_value(keymaps::validate_overrides(&parsed, &settings.user_keymaps).map_err(|e| bad(key, e))?)
                 .map_err(|e| bad(key, e))?
         }
         Some(Kind::UserSchemes) => {
@@ -583,9 +721,49 @@ pub fn set_value(settings: &mut Settings, key: &str, value: &Value) -> Result<Ch
     if !scheme_names(&next).contains(&next.color_scheme) {
         next.color_scheme.clear();
     }
+    // Removed user keymaps lose their changes; filters forget removed TODO patterns.
+    keymap_copies::tidy(&mut next);
+    tidy_todo_filters(&mut next);
     let change = diff(settings, &next);
     *settings = next;
     Ok(change)
+}
+
+/// Validate TODO filters: unique names of 1–80 characters, at most 50, each naming patterns of
+/// `patterns`.
+pub fn check_todo_filters(list: &[TodoFilter], patterns: &[TodoPattern]) -> Result<Vec<TodoFilter>, String> {
+    if list.len() > 50 {
+        return Err("at most 50 TODO filters".into());
+    }
+    let mut out: Vec<TodoFilter> = Vec::new();
+    for f in list {
+        let name = f.name.trim().to_string();
+        if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+            return Err("a TODO filter needs a name of 1–80 characters".into());
+        }
+        if out.iter().any(|o| o.name.eq_ignore_ascii_case(&name)) {
+            return Err(format!("a TODO filter named `{name}` already exists"));
+        }
+        let mut chosen: Vec<String> = Vec::new();
+        for p in &f.patterns {
+            let p = p.trim();
+            if !patterns.iter().any(|x| x.pattern == p) {
+                return Err(format!("filter `{name}`: `{p}` is not a TODO pattern"));
+            }
+            if !chosen.iter().any(|c| c == p) {
+                chosen.push(p.to_string());
+            }
+        }
+        out.push(TodoFilter { name, patterns: chosen });
+    }
+    Ok(out)
+}
+
+fn tidy_todo_filters(s: &mut Settings) {
+    let patterns: Vec<String> = s.todo_patterns.iter().map(|p| p.pattern.clone()).collect();
+    for f in &mut s.todo_filters {
+        f.patterns.retain(|p| patterns.contains(p));
+    }
 }
 
 /// Side effects of going from `old` to `new`.
@@ -666,6 +844,15 @@ pub fn matches(d: &SettingDef, query: &str) -> bool {
     q.is_empty() || [d.key, d.label, d.page, d.description].iter().any(|t| t.to_lowercase().contains(&q))
 }
 
+/// The formatter options a Code Style page edits.
+pub fn page_options(page: &str) -> &'static [code_style::StyleOption] {
+    match page {
+        PAGE_CODE_STYLE_RUST => code_style::RUSTFMT_OPTIONS,
+        PAGE_CODE_STYLE_CPP => code_style::CLANG_FORMAT_OPTIONS,
+        _ => &[],
+    }
+}
+
 /// Pages that match a search: by name, or because one of their settings does, then the Keymap
 /// page when only command names match (its list filters by the same query).
 pub fn matching_pages(query: &str) -> Vec<&'static str> {
@@ -674,7 +861,12 @@ pub fn matching_pages(query: &str) -> Vec<&'static str> {
         .iter()
         .copied()
         .filter(|p| {
-            q.is_empty() || p.to_lowercase().contains(&q) || SETTINGS.iter().any(|d| d.page == *p && matches(d, &q))
+            q.is_empty()
+                || p.to_lowercase().contains(&q)
+                || SETTINGS.iter().any(|d| d.page == *p && matches(d, &q))
+                || page_options(p).iter().any(|o| {
+                    [o.key, o.label, o.description].iter().any(|t| t.to_lowercase().contains(&q))
+                })
         })
         .collect();
     if !out.contains(&PAGE_KEYMAP) && crate::registry().all().iter().any(|c| c.label.to_lowercase().contains(&q)) {
@@ -694,11 +886,177 @@ pub struct SettingsDialog {
     pub query: String,
     /// The last error from Apply (shown in the dialog).
     pub error: Option<String>,
+    /// Code Style formatter options as edited (written to the project's files on Apply).
+    #[serde(default)]
+    pub code_style: CodeStyleDraft,
 }
 
 impl SettingsDialog {
     pub fn new(settings: &Settings) -> Self {
-        Self { draft: settings.clone(), page: PAGE_APPEARANCE.into(), query: String::new(), error: None }
+        Self {
+            draft: settings.clone(),
+            page: PAGE_APPEARANCE.into(),
+            query: String::new(),
+            error: None,
+            code_style: CodeStyleDraft::default(),
+        }
+    }
+}
+
+/// The Code Style pages' formatter options while the dialog is open: `None` until a page loads
+/// them from the project's file.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CodeStyleDraft {
+    pub rustfmt: Option<StyleDraft>,
+    pub clang_format: Option<StyleDraft>,
+}
+
+/// One formatter file's options: as in the file, and as edited.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct StyleDraft {
+    pub saved: code_style::StyleValues,
+    pub values: code_style::StyleValues,
+}
+
+impl CodeStyleDraft {
+    pub fn get(&self, kind: code_style::StyleFileKind) -> Option<&StyleDraft> {
+        match kind {
+            code_style::StyleFileKind::Rustfmt => self.rustfmt.as_ref(),
+            code_style::StyleFileKind::ClangFormat => self.clang_format.as_ref(),
+        }
+    }
+
+    pub fn slot(&mut self, kind: code_style::StyleFileKind) -> &mut Option<StyleDraft> {
+        match kind {
+            code_style::StyleFileKind::Rustfmt => &mut self.rustfmt,
+            code_style::StyleFileKind::ClangFormat => &mut self.clang_format,
+        }
+    }
+
+    /// Some option was changed and not yet written.
+    pub fn dirty(&self) -> bool {
+        [&self.rustfmt, &self.clang_format].iter().any(|d| d.as_ref().is_some_and(|d| d.saved != d.values))
+    }
+}
+
+/// Settings services that are not plain data: font listing and loading, the Code Style preview,
+/// per-project analysis levels.
+#[derive(Debug, Default)]
+pub struct PrefsServices {
+    pub fonts: fonts::FontsState,
+    pub preview: code_style::PreviewJob,
+    /// The host allows network lookups (the desktop app); `crates_io_lookups` turns them on
+    /// only then.
+    pub network_lookups: bool,
+    /// The project whose analysis levels were loaded (see `analysis_levels`).
+    pub analysis_project: Option<PathBuf>,
+}
+
+impl Session {
+    /// Columns a tab takes in a document (its language's Code Style, else `tab_size`).
+    pub fn tab_width_of(&self, doc: codecraft_workspace::DocId) -> usize {
+        let language = self.ws.doc(doc).map(|d| d.language).unwrap_or(codecraft_syntax::Language::PlainText);
+        code_style::indent(&self.ws.settings, language).tab_size.max(1)
+    }
+
+    /// Allow network lookups (the desktop app): crates.io lookups then follow
+    /// Settings › Languages & Frameworks › Rust › Crates.io lookups.
+    pub fn allow_network_lookups(&mut self, allowed: bool) {
+        self.prefs_services.network_lookups = allowed;
+        crate::settings_cmds::apply_crates_io_lookups(self);
+    }
+
+    /// [`Session::tab_width_of`] the active editor's document.
+    pub fn active_tab_width(&self) -> usize {
+        match self.ws.active() {
+            Some((e, _)) => self.tab_width_of(e.doc),
+            None => self.ws.settings.tab_size.max(1),
+        }
+    }
+}
+
+/// Drain the settings services and load per-project state for a newly opened project.
+pub(crate) fn pump(s: &mut Session) -> bool {
+    let mut changed = fonts::pump(&mut s.prefs_services.fonts, &s.ws.settings.editor_font_family);
+    changed |= code_style::pump_preview(&mut s.prefs_services.preview);
+    changed |= analysis_levels::pump(s);
+    changed
+}
+
+/// Configure Current File Analysis levels, persisted per project in
+/// `<project>/.codecraft/analysis.json` (paths relative to the project root).
+pub mod analysis_levels {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use codecraft_workspace::AnalysisLevel;
+
+    use crate::Session;
+
+    /// The file inside a project.
+    pub const FILE: &str = ".codecraft/analysis.json";
+
+    fn file(root: &Path) -> PathBuf {
+        root.join(FILE)
+    }
+
+    /// Read a project's levels (absolute paths); a missing or corrupt file gives none.
+    pub fn load(root: &Path) -> BTreeMap<PathBuf, AnalysisLevel> {
+        let Ok(text) = std::fs::read_to_string(file(root)) else { return BTreeMap::new() };
+        let Ok(map) = serde_json::from_str::<BTreeMap<String, AnalysisLevel>>(&text) else {
+            log::warn!("ignoring corrupt {}", file(root).display());
+            return BTreeMap::new();
+        };
+        map.into_iter()
+            .take(10_000)
+            .filter(|(rel, _)| !rel.is_empty() && !Path::new(rel).is_absolute() && !rel.split(['/', '\\']).any(|c| c == ".."))
+            .map(|(rel, l)| (root.join(rel), l))
+            .collect()
+    }
+
+    /// Save the levels of files inside `root` (others are dropped); an empty map removes the file.
+    pub fn save(root: &Path, levels: &BTreeMap<PathBuf, AnalysisLevel>) -> Result<(), String> {
+        let rel: BTreeMap<String, AnalysisLevel> = levels
+            .iter()
+            .filter_map(|(p, l)| Some((p.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/"), *l)))
+            .collect();
+        let path = file(root);
+        if rel.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("cannot remove {}: {e}", path.display())),
+                _ => Ok(()),
+            };
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let text = serde_json::to_string_pretty(&rel).map_err(|e| e.to_string())?;
+        codecraft_fs::write_text_file_atomic(&path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    /// Save the open project's levels (after Configure Current File Analysis changed one).
+    pub(crate) fn persist(s: &mut Session) {
+        let Some(root) = s.ws.project.as_ref().map(|p| p.root.clone()) else { return };
+        if let Err(e) = save(&root, &s.ws.analysis_levels) {
+            s.status = e;
+        }
+    }
+
+    /// Load the levels when another project opened.
+    pub(crate) fn pump(s: &mut Session) -> bool {
+        let root = s.ws.project.as_ref().map(|p| p.root.clone());
+        if root == s.prefs_services.analysis_project {
+            return false;
+        }
+        // The previous project's levels go (they are in its file); others stay.
+        if let Some(old) = s.prefs_services.analysis_project.take() {
+            s.ws.analysis_levels.retain(|p, _| !p.starts_with(&old));
+        }
+        s.prefs_services.analysis_project = root.clone();
+        if let Some(root) = root {
+            s.ws.analysis_levels.extend(load(&root));
+        }
+        true
     }
 }
 
@@ -737,7 +1095,7 @@ pub fn quick_items(settings: &Settings, level: QuickLevel) -> Vec<QuickItem> {
         }
         QuickLevel::Keymap => {
             let cur = keymaps::active(settings);
-            keymaps::NAMES.iter().map(|n| item(n, *n == cur)).collect()
+            keymaps::all_names(settings).iter().map(|n| item(n, *n == cur)).collect()
         }
         QuickLevel::Theme => {
             let cur = canonical_theme(&settings.theme).unwrap_or("Dark");
@@ -776,7 +1134,8 @@ mod tests {
         assert!(set_value(&mut s, "editor_font_size", &json!(500)).is_err());
         assert!(set_value(&mut s, "soft_wrap", &json!(1)).is_err());
         assert!(set_value(&mut s, "theme", &json!("Neon")).is_err());
-        assert!(set_value(&mut s, "keymap", &json!("emacs")).is_err());
+        assert!(set_value(&mut s, "keymap", &json!("teco")).is_err());
+        assert!(set_value(&mut s, "python_formatter", &json!("yapf")).is_err());
         assert!(set_value(&mut s, "color_scheme", &json!("Nope")).is_err());
         assert_eq!(s, Settings::default(), "failed sets change nothing");
 

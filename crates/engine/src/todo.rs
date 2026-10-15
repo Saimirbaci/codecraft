@@ -1,6 +1,10 @@
 //! The TODO tool window: `TODO` and `FIXME` in comments across the project (RustRover's default
 //! patterns `\btodo\b.*` and `\bfixme\b.*`, case-insensitive), grouped by file.
 //!
+//! The patterns are configurable (Settings › Editor › TODO, [`Settings::todo_patterns`]): each a
+//! regular expression, case-sensitive or not. Named filters ([`Settings::todo_filters`]) show only
+//! some patterns' items (`todo.setFilter`); changing the patterns rescans the project.
+//!
 //! The project is scanned on a worker thread (ignore rules respected, `find_in_files` prefilters
 //! candidate lines, the language's lexer decides what is a comment). Open documents are
 //! re-read from memory as they change while the tool window is shown, and files changed on disk
@@ -18,11 +22,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use codecraft_syntax::{HighlightKind, Language};
-use codecraft_workspace::ToolWindowId;
+use codecraft_workspace::{Settings, TodoPattern, ToolWindowId};
 
-use crate::Session;
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_project, ok, spec};
-use crate::params::{opt_usize, req_path, req_usize};
+use crate::params::{opt_str, opt_usize, req_path, req_usize};
+use crate::{CommandError, Session};
+
+/// Most TODO patterns.
+pub const MAX_PATTERNS: usize = 50;
+/// Longest TODO pattern.
+pub const MAX_PATTERN_LEN: usize = 500;
+/// Compiled size limit of one pattern (a hostile regex cannot take the scan down).
+const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// Items kept per scan (a generated file full of TODOs cannot flood the tool window).
 pub const MAX_ITEMS: usize = 5000;
@@ -47,6 +58,77 @@ pub struct TodoItem {
     pub kind: TodoKind,
     /// From the keyword to the end of the line (comment closers trimmed).
     pub text: String,
+    /// The pattern that matched (its text, as in Settings › Editor › TODO).
+    #[serde(default)]
+    pub pattern: String,
+}
+
+/// Compiled TODO patterns.
+#[derive(Debug)]
+pub struct Patterns {
+    /// Any of them (prefilter and first match on a line); `None` matches nothing.
+    any: Option<Regex>,
+    each: Vec<(String, Regex)>,
+}
+
+fn build(p: &TodoPattern) -> Result<Regex, String> {
+    regex::RegexBuilder::new(&p.pattern)
+        .case_insensitive(!p.case_sensitive)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
+        .map_err(|e| format!("pattern `{}`: {e}", p.pattern))
+}
+
+/// Validate TODO patterns: 1–[`MAX_PATTERNS`] unique, non-empty regular expressions that
+/// compile and cannot match an empty string (they would match every line).
+pub fn check_patterns(list: &[TodoPattern]) -> Result<Vec<TodoPattern>, String> {
+    if list.len() > MAX_PATTERNS {
+        return Err(format!("at most {MAX_PATTERNS} TODO patterns"));
+    }
+    let mut out: Vec<TodoPattern> = Vec::new();
+    for p in list {
+        let pattern = p.pattern.trim().to_string();
+        if pattern.is_empty() || pattern.chars().count() > MAX_PATTERN_LEN {
+            return Err(format!("a TODO pattern needs 1–{MAX_PATTERN_LEN} characters"));
+        }
+        if out.iter().any(|o| o.pattern == pattern) {
+            return Err(format!("the TODO pattern `{pattern}` is listed twice"));
+        }
+        let p = TodoPattern { pattern, case_sensitive: p.case_sensitive };
+        if build(&p)?.is_match("") {
+            return Err(format!("the TODO pattern `{}` matches empty text", p.pattern));
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+/// Compile patterns (invalid ones are left out; with none left, nothing matches).
+pub fn compile(list: &[TodoPattern]) -> Patterns {
+    let mut each: Vec<(String, Regex)> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
+    for p in list.iter().take(MAX_PATTERNS) {
+        let Some(r) = build(p).ok().filter(|r| !r.is_match("")) else { continue };
+        parts.push(format!("(?{}:{})", if p.case_sensitive { "-i" } else { "i" }, p.pattern));
+        each.push((p.pattern.clone(), r));
+    }
+    let any = (!parts.is_empty())
+        .then(|| regex::RegexBuilder::new(&parts.join("|")).size_limit(REGEX_SIZE_LIMIT * 4).build().ok())
+        .flatten();
+    Patterns { any, each }
+}
+
+impl Patterns {
+    /// The pattern texts, in order.
+    pub fn names(&self) -> Vec<&str> {
+        self.each.iter().map(|(p, _)| p.as_str()).collect()
+    }
+}
+
+/// The default patterns, compiled once.
+fn default_patterns() -> &'static Patterns {
+    static P: OnceLock<Patterns> = OnceLock::new();
+    P.get_or_init(|| compile(&codecraft_workspace::default_todo_patterns()))
 }
 
 enum Msg {
@@ -62,6 +144,8 @@ pub struct TodoState {
     pub scanning: bool,
     /// The scan stopped at [`MAX_ITEMS`].
     pub truncated: bool,
+    /// The TODO filter shown (a [`Settings::todo_filters`] name); `None` = every pattern.
+    pub filter: Option<String>,
     /// The project root the results belong to.
     project: Option<PathBuf>,
     /// A full scan was started for `project`.
@@ -71,6 +155,8 @@ pub struct TodoState {
     cancel: Option<Arc<AtomicBool>>,
     /// Revision of each open document the results were taken from.
     doc_revs: HashMap<PathBuf, u64>,
+    /// The patterns the results were found with (and their source in the settings).
+    patterns: Option<(Vec<TodoPattern>, Arc<Patterns>)>,
 }
 
 impl TodoState {
@@ -81,16 +167,47 @@ impl TodoState {
     pub fn busy(&self) -> bool {
         self.scanning || !self.rescans.is_empty()
     }
+
+    /// The items the current filter shows, by file (files without any are left out).
+    pub fn visible(&self, settings: &Settings) -> Vec<(&PathBuf, Vec<&TodoItem>)> {
+        let allowed = self.filter_patterns(settings);
+        self.files
+            .iter()
+            .filter_map(|(p, items)| {
+                let shown: Vec<&TodoItem> =
+                    items.iter().filter(|i| allowed.as_ref().is_none_or(|a| a.contains(&i.pattern))).collect();
+                (!shown.is_empty()).then_some((p, shown))
+            })
+            .collect()
+    }
+
+    /// The patterns of the current filter (`None` = all).
+    fn filter_patterns(&self, settings: &Settings) -> Option<Vec<String>> {
+        let name = self.filter.as_ref()?;
+        settings.todo_filters.iter().find(|f| f.name == *name).map(|f| f.patterns.clone())
+    }
 }
 
-fn keyword() -> Option<&'static Regex> {
-    static RE: OnceLock<Option<Regex>> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)\b(todo|fixme)\b").ok()).as_ref()
+/// The compiled patterns of `settings` (cached in the state until the settings change).
+fn patterns_for(st: &mut TodoState, settings: &Settings) -> Arc<Patterns> {
+    match &st.patterns {
+        Some((src, p)) if *src == settings.todo_patterns => Arc::clone(p),
+        _ => {
+            let p = Arc::new(compile(&settings.todo_patterns));
+            st.patterns = Some((settings.todo_patterns.clone(), Arc::clone(&p)));
+            p
+        }
+    }
 }
 
-/// TODO items of a text in `language`: keyword matches inside comments (anywhere in plain text).
+/// TODO items of a text in `language` with the default patterns.
 pub fn scan_text(language: Language, text: &str) -> Vec<TodoItem> {
-    let Some(re) = keyword() else { return Vec::new() };
+    scan_text_with(language, text, default_patterns())
+}
+
+/// TODO items of a text in `language`: pattern matches inside comments (anywhere in plain text).
+pub fn scan_text_with(language: Language, text: &str, pats: &Patterns) -> Vec<TodoItem> {
+    let Some(re) = &pats.any else { return Vec::new() };
     if !re.is_match(text) {
         return Vec::new();
     }
@@ -98,24 +215,36 @@ pub fn scan_text(language: Language, text: &str) -> Vec<TodoItem> {
     let hl = (!anywhere).then(|| codecraft_syntax::highlight(language, text));
     let mut out = Vec::new();
     for (line_no, line) in text.split('\n').enumerate() {
-        let Some(m) = re.find(line) else { continue };
-        // Later matches on the line may be in a comment even if the first is not (`s = "todo" // TODO`).
-        let found = re.find_iter(line).find(|m| {
+        if !re.is_match(line) {
+            continue;
+        }
+        let in_comment = |start: usize| {
             anywhere
                 || hl.as_ref().is_some_and(|h| {
-                    let col = line.get(..m.start()).map(|p| p.chars().count()).unwrap_or(0);
+                    let col = line.get(..start).map(|p| p.chars().count()).unwrap_or(0);
                     h.line(line_no).iter().any(|sp| {
                         sp.start <= col
                             && col < sp.end
                             && matches!(sp.kind, HighlightKind::Comment | HighlightKind::DocComment)
                     })
                 })
-        });
-        let Some(found) = found.or(anywhere.then_some(m)) else { continue };
-        let column = line.get(..found.start()).map(|p| p.chars().count()).unwrap_or(0);
-        let rest = line.get(found.start()..).unwrap_or("");
-        let kind = if found.as_str().eq_ignore_ascii_case("fixme") { TodoKind::Fixme } else { TodoKind::Todo };
-        out.push(TodoItem { line: line_no, column, kind, text: clean(rest) });
+        };
+        // The leftmost match in a comment of any pattern (a later match on the line may be in a
+        // comment even if the first is not: `s = "todo" // TODO`).
+        let found = pats
+            .each
+            .iter()
+            .filter_map(|(name, r)| r.find_iter(line).find(|m| in_comment(m.start())).map(|m| (m.start(), name)))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, name)) = found else { continue };
+        let column = line.get(..start).map(|p| p.chars().count()).unwrap_or(0);
+        let rest = line.get(start..).unwrap_or("");
+        let kind = if rest.get(..5).is_some_and(|k| k.eq_ignore_ascii_case("fixme")) {
+            TodoKind::Fixme
+        } else {
+            TodoKind::Todo
+        };
+        out.push(TodoItem { line: line_no, column, kind, text: clean(rest), pattern: name.clone() });
         if out.len() >= MAX_ITEMS {
             break;
         }
@@ -131,12 +260,12 @@ fn clean(rest: &str) -> String {
     t.chars().take(MAX_TEXT).collect()
 }
 
-fn scan_file(path: &Path) -> Vec<TodoItem> {
+fn scan_file(path: &Path, pats: &Patterns) -> Vec<TodoItem> {
     if std::fs::metadata(path).map(|m| !m.is_file() || m.len() > MAX_FILE_BYTES).unwrap_or(true) {
         return Vec::new();
     }
     match codecraft_fs::read_text_file(path) {
-        Ok(text) => scan_text(Language::from_path(path), &text),
+        Ok(text) => scan_text_with(Language::from_path(path), &text, pats),
         Err(_) => Vec::new(),
     }
 }
@@ -145,10 +274,19 @@ fn in_private_dir(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).is_ok_and(|rel| rel.starts_with(".codecraft"))
 }
 
-/// Scan the whole project (blocking; runs on a worker thread).
+/// Scan the whole project with the default patterns (blocking).
 pub fn scan_project(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<TodoItem>>, bool) {
+    scan_project_with(root, default_patterns(), cancel)
+}
+
+/// Scan the whole project (blocking; runs on a worker thread).
+pub fn scan_project_with(
+    root: &Path,
+    pats: &Patterns,
+    cancel: &AtomicBool,
+) -> (BTreeMap<PathBuf, Vec<TodoItem>>, bool) {
     let mut out = BTreeMap::new();
-    let Some(re) = keyword() else { return (out, false) };
+    let Some(re) = &pats.any else { return (out, false) };
     let mut opts = codecraft_fs::FindOptions { max_results: MAX_ITEMS * 4, max_file_size: MAX_FILE_BYTES, ..Default::default() };
     opts.scan.exclude_dirs.push(".codecraft".into());
     let Ok(matches) = codecraft_fs::find_in_files(root, re, &opts, cancel) else { return (out, false) };
@@ -160,7 +298,7 @@ pub fn scan_project(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let items = scan_file(&p);
+        let items = scan_file(&p, pats);
         if items.is_empty() {
             continue;
         }
@@ -178,16 +316,18 @@ pub fn scan_project(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<
 pub(crate) fn refresh(s: &mut Session) {
     let Some(root) = s.ws.project.as_ref().map(|p| p.root.clone()) else { return };
     if s.todo.project.as_ref() != Some(&root) {
-        s.todo = TodoState { project: Some(root.clone()), ..TodoState::default() };
+        let filter = s.todo.filter.take();
+        s.todo = TodoState { project: Some(root.clone()), filter, ..TodoState::default() };
     }
     if let Some(c) = s.todo.cancel.take() {
         c.store(true, Ordering::Relaxed);
     }
+    let pats = patterns_for(&mut s.todo, &s.ws.settings);
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = crossbeam_channel::bounded(1);
     let flag = Arc::clone(&cancel);
     let spawned = std::thread::Builder::new().name("codecraft-todo".into()).spawn(move || {
-        let (files, truncated) = scan_project(&root, &flag);
+        let (files, truncated) = scan_project_with(&root, &pats, &flag);
         if !flag.load(Ordering::Relaxed) {
             let _ = tx.send(Msg::Full(files, truncated));
         }
@@ -233,10 +373,11 @@ pub(crate) fn files_changed(s: &mut Session, paths: &[PathBuf]) {
     for p in &paths {
         s.todo.doc_revs.remove(p);
     }
+    let pats = patterns_for(&mut s.todo, &s.ws.settings);
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new().name("codecraft-todo-files".into()).spawn(move || {
         let out: Vec<(PathBuf, Vec<TodoItem>)> = paths.into_iter().map(|p| {
-            let items = scan_file(&p);
+            let items = scan_file(&p, &pats);
             (p, items)
         }).collect();
         let _ = tx.send(Msg::Files(out));
@@ -265,11 +406,17 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         if let Some(c) = s.todo.cancel.take() {
             c.store(true, Ordering::Relaxed);
         }
-        s.todo = TodoState { project: root.clone(), ..TodoState::default() };
+        let filter = s.todo.filter.take();
+        s.todo = TodoState { project: root.clone(), filter, ..TodoState::default() };
         changed = true;
     }
     if root.is_some() && !s.todo.started && s.ws.layout.is_visible(ToolWindowId::Todo) {
         // First time the tool window is shown for this project.
+        refresh(s);
+        changed = true;
+    }
+    // Settings › Editor › TODO changed the patterns: scan again with the new ones.
+    if s.todo.started && s.todo.patterns.as_ref().is_some_and(|(src, _)| *src != s.ws.settings.todo_patterns) {
         refresh(s);
         changed = true;
     }
@@ -310,6 +457,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     }
     // Open documents (unsaved edits included) while the tool window is shown.
     if let Some(root) = root.filter(|_| !s.todo.scanning && !s.power_save() && s.ws.layout.is_visible(ToolWindowId::Todo)) {
+        let pats = patterns_for(&mut s.todo, &s.ws.settings);
         let mut updates = Vec::new();
         for od in s.ws.docs() {
             let Some(p) = od.path.as_ref().filter(|p| p.starts_with(&root) && !in_private_dir(&root, p)) else {
@@ -319,7 +467,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             if s.todo.doc_revs.get(p) == Some(&rev) {
                 continue;
             }
-            updates.push((p.clone(), rev, scan_text(od.language, &od.doc.text())));
+            updates.push((p.clone(), rev, scan_text_with(od.language, &od.doc.text(), &pats)));
         }
         for (p, rev, items) in updates {
             s.todo.doc_revs.insert(p.clone(), rev);
@@ -330,13 +478,25 @@ pub(crate) fn pump(s: &mut Session) -> bool {
 }
 
 fn list_json(s: &Session) -> Value {
-    let files: Vec<Value> = s
-        .todo
-        .files
-        .iter()
-        .map(|(p, items)| json!({ "path": p, "items": items }))
-        .collect();
-    json!({ "scanning": s.todo.busy(), "truncated": s.todo.truncated, "count": s.todo.count(), "files": files })
+    let visible = s.todo.visible(&s.ws.settings);
+    let count: usize = visible.iter().map(|(_, items)| items.len()).sum();
+    let files: Vec<Value> = visible.iter().map(|(p, items)| json!({ "path": p, "items": items })).collect();
+    json!({
+        "scanning": s.todo.busy(),
+        "truncated": s.todo.truncated,
+        "count": count,
+        "total": s.todo.count(),
+        "filter": s.todo.filter,
+        "files": files,
+    })
+}
+
+fn filters_json(s: &Session) -> Value {
+    json!({
+        "filter": s.todo.filter,
+        "filters": s.ws.settings.todo_filters,
+        "patterns": s.ws.settings.todo_patterns,
+    })
 }
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
@@ -349,7 +509,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "todo.list",
             "List TODO Items",
             None,
-            "Returns {scanning, truncated, count, files: [{path, items: [{line, column, kind, text}]}]}; starts a scan if none ran yet",
+            "Returns {scanning, truncated, count, total, filter, files: [{path, items: [{line, column, kind, text, pattern}]}]} (only the current filter's items; `total` counts all); starts a scan if none ran yet",
             Context::Global,
             always,
             |s, _| -> CmdResult {
@@ -367,6 +527,39 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             s.navigate_to_position(&path, line, column)?;
             ok()
         }),
+        spec(
+            "todo.filters",
+            "TODO Filters",
+            None,
+            "→ {filter, filters: [{name, patterns}], patterns: [{pattern, case_sensitive}]} (edit them with settings.set todo_patterns / todo_filters)",
+            Context::Global,
+            always,
+            |s, _| Ok(filters_json(s)),
+        ),
+        spec(
+            "todo.setFilter",
+            "Filter TODO Items",
+            None,
+            "{name?: string} — show only the items of a TODO filter's patterns (no name: every pattern)",
+            Context::Global,
+            always,
+            |s, p| {
+                match opt_str(p, "name").map(str::trim).filter(|n| !n.is_empty()) {
+                    Some(name) => {
+                        let f = s
+                            .ws
+                            .settings
+                            .todo_filters
+                            .iter()
+                            .find(|f| f.name.eq_ignore_ascii_case(name))
+                            .ok_or_else(|| CommandError::BadParams(format!("no TODO filter `{name}`")))?;
+                        s.todo.filter = Some(f.name.clone());
+                    }
+                    None => s.todo.filter = None,
+                }
+                Ok(filters_json(s))
+            },
+        ),
     ]
 }
 
@@ -456,5 +649,78 @@ mod tests {
         let v = s.execute("todo.list", &json!({})).unwrap();
         assert_eq!(v["count"], 1);
         assert!(s.execute("todo.open", &json!({ "path": root.join("missing.rs"), "line": 0 })).is_err());
+    }
+
+    fn pat(p: &str, case_sensitive: bool) -> TodoPattern {
+        TodoPattern { pattern: p.into(), case_sensitive }
+    }
+
+    #[test]
+    fn custom_patterns_and_case_sensitivity() {
+        let pats = compile(&[pat(r"\bHACK\b.*", true), pat(r"\bnote\b.*", false), pat("(", false)]);
+        assert_eq!(pats.names(), vec![r"\bHACK\b.*", r"\bnote\b.*"], "invalid patterns are left out");
+        let src = "// HACK: one\n// hack: not (case-sensitive)\n// NOTE two\n// TODO not a pattern now\n";
+        let items = scan_text_with(Language::Rust, src, &pats);
+        let got: Vec<(usize, &str, &str)> = items.iter().map(|i| (i.line, i.text.as_str(), i.pattern.as_str())).collect();
+        assert_eq!(got, vec![(0, "HACK: one", r"\bHACK\b.*"), (2, "NOTE two", r"\bnote\b.*")]);
+        // No usable pattern: nothing matches.
+        assert!(scan_text_with(Language::Rust, src, &compile(&[])).is_empty());
+        // Validation.
+        assert!(check_patterns(&[pat(r"\btodo\b.*", false)]).is_ok());
+        for bad in [vec![pat("", false)], vec![pat("(", false)], vec![pat("a*", false)], vec![pat("x", false), pat("x", true)]] {
+            assert!(check_patterns(&bad).is_err(), "{bad:?}");
+        }
+        let many: Vec<TodoPattern> = (0..=MAX_PATTERNS).map(|i| pat(&format!("x{i}"), false)).collect();
+        assert!(check_patterns(&many).is_err());
+    }
+
+    #[test]
+    fn filters_select_patterns_and_settings_changes_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::write(root.join("a.rs"), "// TODO one\n// FIXME two\n// HACK three\n").unwrap();
+        let mut s = Session::new();
+        s.lsp_enabled = false;
+        s.execute("file.open", &json!({ "path": root })).unwrap();
+        s.execute(
+            "settings.set",
+            &json!({ "key": "todo_filters", "value": [{ "name": "Only FIXME", "patterns": [r"\bfixme\b.*"] }] }),
+        )
+        .unwrap();
+        s.execute("todo.list", &json!({})).unwrap();
+        let wait = |s: &mut Session, f: &dyn Fn(&Session) -> bool| {
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(15) {
+                s.pump();
+                if f(s) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(wait(&mut s, &|s| !s.todo.busy() && s.todo.count() == 2));
+        s.execute("todo.setFilter", &json!({ "name": "only fixme" })).unwrap();
+        let v = s.execute("todo.list", &json!({})).unwrap();
+        assert_eq!((v["count"].as_u64(), v["total"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(v["files"][0]["items"][0]["text"], "FIXME two");
+        assert!(s.execute("todo.setFilter", &json!({ "name": "nope" })).is_err());
+        // A new pattern rescans the project.
+        let patterns = json!([
+            { "pattern": r"\btodo\b.*", "case_sensitive": false },
+            { "pattern": r"\bfixme\b.*", "case_sensitive": false },
+            { "pattern": r"\bHACK\b.*", "case_sensitive": true },
+        ]);
+        s.execute("settings.set", &json!({ "key": "todo_patterns", "value": patterns })).unwrap();
+        assert!(wait(&mut s, &|s| !s.todo.busy() && s.todo.count() == 3));
+        s.execute("todo.setFilter", &json!({})).unwrap();
+        assert_eq!(s.execute("todo.list", &json!({})).unwrap()["count"], 3);
+        // Removing a pattern drops it from the filters that used it.
+        s.execute("settings.set", &json!({ "key": "todo_patterns", "value": [{ "pattern": r"\btodo\b.*" }] })).unwrap();
+        assert!(s.ws.settings.todo_filters[0].patterns.is_empty());
+        assert!(
+            s.execute("settings.set", &json!({ "key": "todo_patterns", "value": [{ "pattern": "(" }] })).is_err(),
+            "bad regexes are rejected"
+        );
     }
 }

@@ -744,7 +744,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         whitespace: settings.show_whitespace.then_some(settings.whitespace_mode),
     };
     let folds = od.cached_folds();
-    let tab = settings.tab_size.max(1);
+    // Settings › Editor › Code Style: the language's tab size.
+    let tab = codecraft_engine::settings::code_style::indent(&settings, od.language).tab_size.max(1);
 
     let font = FontId::monospace(settings.editor_font_size);
     let inline_font = FontId::proportional((settings.editor_font_size - 1.0).max(8.0));
@@ -1311,6 +1312,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     if let (true, Some(pos)) = (pointer.0, pointer.1)
         && rect.contains(pos)
         && !stripe.contains(pos)
+        // Not a click on a window above the editor (Settings, dialogs).
+        && ui.ctx().layer_id_at(pos).is_none_or(|l| l == ui.layer_id())
     {
         ui.memory_mut(|m| m.request_focus(id));
         if ann_w > 0.0 && pos.x < gutter.left() {

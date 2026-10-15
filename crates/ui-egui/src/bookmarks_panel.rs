@@ -134,8 +134,26 @@ pub fn show_todo(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         if ui.add_enabled(s.ws.project.is_some(), egui::Button::new("⟳").small()).on_hover_text("Refresh").clicked() {
             cmds.push(("todo.refresh", Value::Null));
         }
-        let files = s.todo.files.len();
-        let mut text = format!("Found {} TODO item(s) in {files} file(s)", s.todo.count());
+        // Settings › Editor › TODO filters: show only some patterns' items.
+        let current = s.todo.filter.clone();
+        let label = current.clone().unwrap_or_else(|| "All patterns".into());
+        egui::ComboBox::from_id_salt("todo-filter").selected_text(format!("Filter: {label}")).show_ui(ui, |ui| {
+            if ui.selectable_label(current.is_none(), "All patterns").clicked() {
+                cmds.push(("todo.setFilter", Value::Null));
+            }
+            for f in &s.ws.settings.todo_filters {
+                if ui.selectable_label(current.as_deref() == Some(f.name.as_str()), &f.name).clicked() {
+                    cmds.push(("todo.setFilter", json!({ "name": f.name })));
+                }
+            }
+            ui.separator();
+            if ui.button("Edit Filters…").clicked() {
+                cmds.push(("app.settings", json!({ "page": codecraft_engine::settings::PAGE_TODO })));
+            }
+        });
+        let visible = s.todo.visible(&s.ws.settings);
+        let count: usize = visible.iter().map(|(_, items)| items.len()).sum();
+        let mut text = format!("Found {count} TODO item(s) in {} file(s)", visible.len());
         if s.todo.truncated {
             text.push_str(" (stopped at the limit)");
         }
@@ -144,13 +162,19 @@ pub fn show_todo(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             ui.spinner();
         }
     });
+    let visible: Vec<(std::path::PathBuf, Vec<codecraft_engine::todo::TodoItem>)> = s
+        .todo
+        .visible(&s.ws.settings)
+        .into_iter()
+        .map(|(p, items)| (p.clone(), items.into_iter().cloned().collect()))
+        .collect();
     if s.ws.project.is_none() {
         ui.label(RichText::new("Open a project to see its TODO items.").color(theme.text_muted));
-    } else if s.todo.files.is_empty() && !s.todo.busy() {
+    } else if visible.is_empty() && !s.todo.busy() {
         ui.label(RichText::new("No TODO items found.").color(theme.text_muted));
     }
     ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-        for (path, items) in &s.todo.files {
+        for (path, items) in &visible {
             let header = RichText::new(format!("{}  ({})", file_name(path), items.len())).strong();
             egui::CollapsingHeader::new(header)
                 .id_salt(("todo-file", path))

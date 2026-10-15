@@ -44,9 +44,11 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    the platform's keymap by default); the keymap editor adds shortcuts by recording a key press,
    removes them, warns about conflicts (Remove Other Assignments / Leave) and resets; dispatch,
    menus, tooltips and Find Action follow the active keymap and the user's overrides).
-   Remaining: no keymap copies/inheritance (overrides are per built-in keymap); no two-stroke
-   (chord) shortcuts or mouse shortcuts; RustRover's other keymaps (Emacs, VS Code…) are not
-   provided.
+   ~~No keymap copies/inheritance; no two-stroke (chord) shortcuts; RustRover's other keymaps
+   are not provided~~ (M13 track ST, 2026-10-14: user keymaps duplicated from any keymap inherit
+   its shortcuts; `Cmd+K Cmd+C` chords with a pending-chord indicator; VS Code (macOS), VS Code
+   and Emacs keymaps; see 50 and `docs/keymaps.md`). Remaining: no mouse shortcuts; Eclipse,
+   NetBeans, Sublime Text, Xcode and Visual Studio keymaps are not provided.
 
 ## Medium
 
@@ -132,11 +134,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Templates list), Languages & Frameworks › Rust, Version Control › Commit Message Generation
     and Tools › AI Agents; Apply/OK/Cancel over an engine-side draft; `settings.get/set/list/
     reset` validate keys and values; View › Quick Switch Scheme (Ctrl+`) switches scheme, keymap
-    and theme). Remaining: Code Style has only the tab size; no font family choice; Live
-    Templates are read-only in Settings; ~~show-whitespace is a setting the editor does not paint
-    yet~~ (M10, 2026-10-13: spaces as dots and tabs as arrows in the `whitespace` colour token;
-    `whitespace_mode` all / leading_trailing / trailing; View › Active Editor › Show
-    Whitespaces); colour schemes cannot be imported/exported as files.
+    and theme). ~~Code Style has only the tab size; no font family choice; Live Templates are
+    read-only in Settings~~ (M13 track ST, 2026-10-14: Code Style per language with
+    `rustfmt.toml` and `.clang-format` options and a formatter preview, editor font family from
+    the system's fonts, editable live templates; see 50); ~~show-whitespace is a setting the
+    editor does not paint yet~~ (M10, 2026-10-13: spaces as dots and tabs as arrows in the
+    `whitespace` colour token; `whitespace_mode` all / leading_trailing / trailing; View › Active
+    Editor › Show Whitespaces); ~~colour schemes cannot be imported/exported as files~~ (ST:
+    CodeCraft JSON export/import and `.icls` import). Remaining: see 50.
 14. ~~No file watching~~ (M3: FSEvents/inotify watcher reloads unmodified files and refreshes the tree and Git).
 15. ~~Reformat with rustfmt replaces the whole document~~ (M4, 2026-10-13: only changed lines are
     replaced and carets keep their token through whitespace changes).
@@ -166,8 +171,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     History, Recent Changes, Put Label…) with snapshots on save and on external change in
     `.codecraft/local-history` (5 days, 64 MB, 2 MB per file), a diff view and Revert (undoable
     when the file is open); scratch files (Shift+Cmd+N, language chooser, File › Scratches) in
-    `$CODECRAFT_HOME/scratches`). Remaining: the TODO patterns and filters are not configurable;
-    bookmarks are lines only (no file/folder bookmarks, groups or drag-and-drop ordering);
+    `$CODECRAFT_HOME/scratches`). ~~The TODO patterns and filters are not configurable~~ (M13
+    track ST, 2026-10-14: Settings › Editor › TODO patterns (regex, case sensitivity) and
+    filters, a Filter dropdown in the TODO tool window; live templates editable with variable
+    expressions). Remaining: bookmarks are lines only (no file/folder bookmarks, groups or drag-and-drop ordering);
     bookmarks of files renamed outside CodeCraft are lost; local history does not track
     renames/deletions or directory-level history, and times show as relative or UTC; scratch
     files are not shown in the Project view (Scratches and Consoles).
@@ -489,8 +496,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     REPL on evcxr, cargo audit / cargo deny in Inspect Code; rust-analyzer's postfix completion
     verified. Remaining: no single-step expansion (rust-analyzer only expands recursively); the
     installed rust-analyzer returns nothing for built-in derives; offline crate-name completion
-    only knows crates seen before (no `~/.cargo/registry` scan); no Settings page for lookups
-    (`rust.cargo.setCratesIoLookups`); multi-line inline tables aren't recognised; the REPL has no
+    only knows crates seen before (no `~/.cargo/registry` scan); ~~no Settings page for lookups
+    (`rust.cargo.setCratesIoLookups`)~~ (M13 track ST: Languages & Frameworks › Rust ›
+    Crates.io lookups, persisted; the command updates it); multi-line inline tables aren't recognised; the REPL has no
     interrupt and no variables view, and `rust.repl.sendSelection` has no shortcut; advisories
     can't be suppressed from the IDE (use audit.toml / deny.toml).
 43. PyCharm (track PY): `.ipynb` notebooks in a notebook editor on a built-in kernel driver for
@@ -503,9 +511,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     split/merge or collapsed outputs; HTML output shown as text, no widgets; every cell is laid
     out each frame (slow for very long notebooks); no language-server features inside cells; no
     DataFrame view from the debugger; DataFrame filter is substring-only, no export; formatting
-    after save writes the file twice; the formatter setting is free text; templates have no
-    automatic completion popup, `{% url %}`/`{% static %}` or variable resolution, and Django
-    Template is missing from Associate with File Type.
+    after save writes the file twice; ~~the formatter setting is free text~~ (M13 track ST: a
+    Ruff / Black / auto / none chooser, also on Code Style › Python); templates have no
+    automatic completion popup, `{% url %}`/`{% static %}` or variable resolution. ~~Django
+    Template is missing from Associate with File Type~~ (ST, 2026-10-14).
 44. Editor and IDE (track ED): Search/Replace Structurally (token templates with `$var$`,
     constraints, saved templates), Edit › Macros, Run Inspection by Name, Silent Code Cleanup,
     Configure Current File Analysis, Locate Duplicates, Data Flow to/from Here, offline
@@ -515,7 +524,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Remaining: structural search works on tokens (no operator precedence, type or reference
     constraints, no variables inside strings); data flow is lexical (misses shadowing, closures,
     trait dispatch, most pattern bindings); Locate Duplicates compares within one language and
-    caps each hash bucket at 64; file analysis levels aren't persisted; tasks have no
+    caps each hash bucket at 64; ~~file analysis levels aren't persisted~~ (M13 track ST:
+    `<project>/.codecraft/analysis.json`); tasks have no
     issue-tracker servers or changelists (a branch per task instead); macro shortcuts bypass the
     keymap editor; inline completion only on request, multi-line proposals shown as one line;
     Markdown export is HTML only; no Zig / TypeScript tool windows; the "Edit 'Default task'"
@@ -551,3 +561,52 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     groups, at most 100,000 keys in the browser, Redis consoles still get SQL completion; DuckDB
     needs its CLI, runs each statement in its own process (no transactions or session state),
     may lose HUGEINT/DECIMAL precision, no Explain Plan; no Dump for the four new kinds.
+
+## M13 (2026-10-14)
+
+50. Settings and keymaps (track ST): Code Style per language: Rust edits the project's
+    `rustfmt.toml` / `.rustfmt.toml` (max_width, hard_tabs, tab_spaces, edition, newline_style,
+    use_small_heuristics, reorder_imports/modules, shorthand options, merge_derives and the
+    nightly imports_granularity, group_imports, wrap_comments, …) line by line (comments and
+    other keys kept), C/C++ the `.clang-format` basics (BasedOnStyle, IndentWidth, TabWidth,
+    ColumnLimit, UseTab, BreakBeforeBraces), both written on Apply/OK with a preview formatted
+    by rustfmt / clang-format on a worker; tab, indent and "use tab" per language used by the
+    editor (Tab, Reformat over LSP, box selection, the status bar); Python's formatter as a
+    Ruff / Black / auto / none chooser. Editor › Font lists the system's font families (font
+    directories scanned on a worker reading only the `name`/`post`/`OS/2` tables; monospaced
+    only unless asked), loads the chosen family's file on a worker, checks it with the
+    renderer's own parser (`skrifa`, already in the tree through epaint, now a direct
+    dependency of ui-egui) and puts it first in the monospace family with the defaults as
+    fallbacks; broken or missing fonts fall back with a note. Live Templates are editable:
+    add/edit/delete, enable/disable, contexts per language, variables with expressions
+    (`fileNameWithoutExtension()`, `snakeCase(NAME)`, `date()`, …), defaults and "skip if
+    defined", built-ins changed through user copies with Restore Defaults, saved to
+    `$CODECRAFT_HOME/templates.json`. Colour schemes export/import as CodeCraft JSON and import
+    an `.icls` file the user has (known attribute keys mapped to our tokens, the base from the
+    parent scheme or the background). Keymaps: user copies with a parent (overrides inherit),
+    two-stroke chords (`Cmd+K Cmd+C`) recorded with "Second stroke" and dispatched with a
+    pending-chord indicator in the status bar, VS Code (macOS), VS Code and Emacs keymaps from
+    their public references (`docs/keymaps.md`). Settings › Editor › TODO patterns (regex, case
+    sensitivity) and filters, with a Filter dropdown in the TODO tool window and a rescan when
+    patterns change. Languages & Frameworks › Rust › Crates.io lookups; Configure Current File
+    Analysis levels kept in `<project>/.codecraft/analysis.json`; Django Template in Associate
+    with File Type. A click on a window over the editor (Settings, dialogs) no longer reaches
+    the editor and closed the window. Remaining: the font list shows one regular face per family
+    (no weight/italic choice, no ligatures, no separate console font), a font not on disk any
+    more stays listed until Rescan, and each project window loads the editor font for itself;
+    Code Style options are the common ones (no full rustfmt/clang-format option list, no
+    `.editorconfig`, no "Set from…", no per-language wrapping or blank-line options, no Python
+    formatter options such as line length); only the first `.clang-format` document is edited
+    and `rustfmt.toml` files above the project root are not looked at; the preview needs
+    rustfmt/clang-format on PATH and nightly options only take effect with a nightly rustfmt;
+    live template contexts are per language (no statement/expression contexts), expressions
+    are evaluated once at expansion (they do not follow later edits of other variables), dates
+    are UTC, `clipboard()` and `completeSmart()`-style functions are missing, and template
+    edits apply at once rather than on Apply; `.icls` import maps about 50 attribute keys
+    (font styles, effects other than colours, and per-language keys we have no token for are
+    dropped), and schemes cannot be exported as `.icls`; chords are keyboard-only (no mouse
+    shortcuts), a pending chord waits until the next key (no timeout) and the terminal does not
+    take chords; VS Code/Emacs keymaps cover the actions we have (no Emacs mark/region,
+    kill-ring or prefix arguments) and Eclipse, NetBeans, Sublime Text, Xcode and Visual Studio
+    keymaps are not provided; TODO filters are global, not per project, and TODO colours/icons
+    per pattern are not configurable.

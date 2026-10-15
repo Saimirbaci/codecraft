@@ -51,6 +51,7 @@ mod refactor_ui;
 mod remote_ui;
 mod rust_ui;
 mod services_panel;
+mod settings_pages;
 mod settings_ui;
 mod state;
 mod terminal_panel;
@@ -224,9 +225,9 @@ impl App {
         let mut session = Session::new();
         session.session_store.enable();
         session.run_store.generate.auto = true;
-        // Cargo.toml completion and the newer-version inspection ask crates.io (M12 track RS).
-        session.rust.deps.online = true;
-        session.rust.deps.auto = true;
+        // Cargo.toml completion and the newer-version inspection ask crates.io (M12 track RS),
+        // unless Settings › Languages & Frameworks › Rust › Crates.io lookups is off.
+        session.prefs_services.network_lookups = true;
         Self::build(open, PersistedState::load(), true, true, session)
     }
 
@@ -235,6 +236,9 @@ impl App {
     pub fn ephemeral(open: Option<PathBuf>) -> Self {
         let mut app = Self::build(None, PersistedState::default(), false, false, Session::new());
         app.session.lsp_enabled = false;
+        // Settings › Editor › Font never scans the machine's fonts here (tests use fixture dirs
+        // through `Session::isolate_home`).
+        app.session.prefs_services.fonts.dirs_override = Some(Vec::new());
         if let Some(path) = open {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
         }
@@ -260,6 +264,7 @@ impl App {
         session.lsp_enabled = false;
         session.session_store.enable();
         session.session_store.fallback_dir = Some(fallback_dir);
+        session.prefs_services.fonts.dirs_override = Some(Vec::new());
         Self::build(None, persisted, false, true, session)
     }
 
@@ -281,6 +286,9 @@ impl App {
     fn build(open: Option<PathBuf>, persisted: PersistedState, persist: bool, reopen: bool, session: Session) -> Self {
         let mut session = session;
         persisted.apply(&mut session);
+        // crates.io lookups follow their setting where the host allows the network.
+        let network = session.prefs_services.network_lookups;
+        session.allow_network_lookups(network);
         let mut ui = UiState::new();
         ui.window_sizes = persisted.window_sizes.clone();
         let mut app = Self {
@@ -443,6 +451,11 @@ impl App {
                     run_command(s, st, id, &Value::Null);
                     continue;
                 }
+            }
+            // Two-stroke shortcuts (`Cmd+K Cmd+C`): a first stroke waits for the second.
+            if settings_ui::chord_key(ctx, s, st, *key, modifiers, editor_focused, text_field_focused) {
+                consumed_text = true;
+                continue;
             }
             let found = st
                 .bindings
@@ -689,7 +702,9 @@ fn is_function_key(k: Key) -> bool {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.fonts_installed {
-            self.ui.mono_font_name = fonts::install(ctx);
+            let (defs, name) = fonts::install(ctx);
+            self.ui.mono_font_name = name;
+            self.ui.prefs.base_fonts = Some(defs);
             self.ui.theme.apply(ctx);
             self.fonts_installed = true;
         }
@@ -789,6 +804,7 @@ pub fn launch(launch: Launch) -> eframe::Result {
             session.session_store.autosave = true;
             session.run_store.generate.auto = true;
             session.session_store.restore_on_open = !no_restore;
+            session.prefs_services.network_lookups = true;
             let mut app = App::build(open, persisted, true, !no_restore, session);
             app.native_menu.allowed = true;
             Ok(Box::new(app))

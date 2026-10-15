@@ -508,8 +508,11 @@ impl Session {
         let (_, path, _, _) = self.caret_for_lsp()?;
         let (_, did) = self.active_ids().ok_or_else(|| CommandError::Disabled("no editor".into()))?;
         let revision = self.ws.doc(did).map(|d| d.doc.revision()).unwrap_or(0);
-        let tab = u32::try_from(self.ws.settings.tab_size).unwrap_or(4);
-        self.lsp_send(|c| c.formatting(&path, tab, true), Pending::Formatting { doc: did, revision })
+        let language = self.ws.doc(did).map(|d| d.language).unwrap_or(codecraft_syntax::Language::PlainText);
+        let indent = crate::settings::code_style::indent(&self.ws.settings, language);
+        let tab = u32::try_from(indent.indent_size).unwrap_or(4);
+        let spaces = !indent.use_tab;
+        self.lsp_send(|c| c.formatting(&path, tab, spaces), Pending::Formatting { doc: did, revision })
     }
 
     pub(crate) fn lsp_document_symbols(&mut self) -> Result<(), CommandError> {

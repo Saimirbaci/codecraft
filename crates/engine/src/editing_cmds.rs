@@ -308,19 +308,27 @@ fn word_before_caret(s: &Session) -> Option<(usize, String)> {
 fn apply_template(s: &mut Session, t: &Template, range: std::ops::Range<usize>, selection: Option<String>) -> CmdResult {
     let Some((eid, did)) = s.active_ids() else { return ok() };
     let indent_unit = s.ops_config(did).indent_unit;
-    let indent = s
+    let (indent, line, file_name) = s
         .ws
         .doc(did)
         .map(|d| {
             let line = d.doc.char_to_line(range.start.min(d.doc.len_chars()));
-            d.doc.indent_of_line(line)
+            let name = d.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned());
+            (d.doc.indent_of_line(line), line, name)
         })
         .unwrap_or_default();
-    let exp = templates::expand(t, &ExpandContext { indent, indent_unit, selection });
+    let ctx = ExpandContext { indent, indent_unit, selection, file_name, line, now: None };
+    let exp = templates::expand(t, &ctx);
     let start = range.start;
     let len = exp.text.chars().count();
-    let vars: Vec<Vec<std::ops::Range<usize>>> =
-        exp.vars.iter().map(|occ| occ.iter().map(|r| start + r.start..start + r.end).collect()).collect();
+    // Variables with `skip_if_defined` and a value get no Tab stop.
+    let vars: Vec<Vec<std::ops::Range<usize>>> = exp
+        .vars
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !exp.skip.get(*i).copied().unwrap_or(false))
+        .map(|(_, occ)| occ.iter().map(|r| start + r.start..start + r.end).collect())
+        .collect();
     let end = start + exp.end.unwrap_or(len);
     let first_sel = selection_for(vars.first().map(Vec::as_slice), end);
     let text = exp.text.clone();
@@ -672,7 +680,7 @@ fn point(p: &Value, key: &str) -> Result<BoxPoint, CommandError> {
 }
 
 fn set_block(s: &mut Session, anchor: BoxPoint, head: BoxPoint) {
-    let tab = s.ws.settings.tab_size.max(1);
+    let tab = s.active_tab_width();
     s.select_active(|d, _| box_selection(d, anchor, head, tab));
     if let Some((eid, revision)) = active_revision(s) {
         s.editing.block = Some(ColumnBlock { editor: eid, anchor, head, revision });
@@ -692,7 +700,7 @@ fn box_select(s: &mut Session, p: &Value) -> CmdResult {
 /// Up/Down move by visual row. `None` = not handled.
 pub(crate) fn motion_hook(s: &mut Session, motion: Motion, extend: bool) -> Option<CmdResult> {
     let (eid, revision) = active_revision(s)?;
-    let tab = s.ws.settings.tab_size.max(1);
+    let tab = s.active_tab_width();
     if extend
         && s.editing.column_mode.contains(&eid)
         && matches!(motion, Motion::Left | Motion::Right | Motion::Up | Motion::Down)
