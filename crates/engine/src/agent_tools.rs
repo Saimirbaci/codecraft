@@ -827,7 +827,17 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 return None;
             }
             Some(match s.execute("profiler.hotspots", &json!({ "limit": limit })) {
-                Ok(v) => done_json(v),
+                Ok(mut v) => {
+                    // The full report adds the hottest lines with their code, a total-time
+                    // ranking and notes (missing symbols, debug builds); skipped while it loads.
+                    if let Ok(report) = s.execute("profiler.report", &json!({ "top": limit }))
+                        && report.get("pending").is_none()
+                        && let Some(o) = v.as_object_mut()
+                    {
+                        o.insert("report".into(), report);
+                    }
+                    done_json(v)
+                }
                 Err(e) => cmd_err(e),
             })
         }
@@ -1045,7 +1055,30 @@ fn start_inspection(s: &mut Session, args: &Value) -> Step {
             o.insert("tools".into(), tools.clone());
         }
     }
-    if let Err(step) = exec(s, "code.inspectCode", p) {
+    // A glob scope or a named inspection profile goes through the analysis jobs (same runner).
+    let profile = args.get("profile").and_then(Value::as_str);
+    if scope == "glob" || profile.is_some() {
+        let Some(pattern) = args.get("pattern").and_then(Value::as_str).or((scope != "glob").then_some("")) else {
+            return done_err("scope `glob` needs `pattern` (e.g. \"src/**/*.rs, !**/gen/**\")");
+        };
+        let mut q = json!({ "scope": scope, "show": true });
+        if let Some(o) = q.as_object_mut() {
+            for key in ["path", "analyzers"] {
+                if let Some(x) = p.get(key).or_else(|| args.get(key)) {
+                    o.insert(key.into(), x.clone());
+                }
+            }
+            if !pattern.is_empty() {
+                o.insert("pattern".into(), json!(pattern));
+            }
+            if let Some(name) = profile {
+                o.insert("profile".into(), json!(name));
+            }
+        }
+        if let Err(step) = exec(s, "analysis.run", q) {
+            return step;
+        }
+    } else if let Err(step) = exec(s, "code.inspectCode", p) {
         return step;
     }
     Step::Wait(Wait::Inspection { limit: usize_arg(args, "limit", 200, 2000) }, timeout_arg(args, 300_000))

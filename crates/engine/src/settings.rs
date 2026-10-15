@@ -109,6 +109,8 @@ pub const PAGE_CODE_STYLE_PYTHON: &str = "Editor › Code Style › Python";
 pub const PAGE_CODE_STYLE_OTHER: &str = "Editor › Code Style › Other File Types";
 pub const PAGE_LIVE_TEMPLATES: &str = "Editor › Live Templates";
 pub const PAGE_TODO: &str = "Editor › TODO";
+/// Inspection profiles: analyzers and rules, on/off and severity (M14 track CA).
+pub const PAGE_INSPECTIONS: &str = "Editor › Inspections";
 pub const PAGE_RUN_CONFIGS: &str = "Build, Execution, Deployment › Run Configurations";
 pub const PAGE_RUST: &str = "Languages & Frameworks › Rust";
 pub const PAGE_PYTHON: &str = "Languages & Frameworks › Python";
@@ -137,6 +139,7 @@ pub const PAGES: &[&str] = &[
     PAGE_CODE_STYLE_OTHER,
     PAGE_LIVE_TEMPLATES,
     PAGE_TODO,
+    PAGE_INSPECTIONS,
     PAGE_RUN_CONFIGS,
     PAGE_RUST,
     PAGE_PYTHON,

@@ -29,11 +29,33 @@ const MAX_FORMAT_BYTES: usize = 8 << 20;
 /// Arguments for a linter run over `paths`.
 pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) -> Vec<String> {
     let mut a: Vec<String> = match tool {
-        Tool::Ruff => vec!["check".into(), "--output-format=json".into(), "--no-cache".into(), "--exit-zero".into()],
+        Tool::Ruff => {
+            let mut a: Vec<String> =
+                vec!["check".into(), "--output-format=json".into(), "--no-cache".into(), "--exit-zero".into()];
+            // The inspection profile's rule selection (M14 CA).
+            a.extend(spec.profile.ruff_args());
+            a
+        }
         Tool::Eslint => vec!["--format".into(), "json".into(), "--no-error-on-unmatched-pattern".into()],
-        Tool::ClangTidy => Vec::new(),
+        Tool::ClangTidy => {
+            let mut a = Vec::new();
+            if let Some(checks) = spec.profile.clang_tidy_checks() {
+                a.push(format!("--checks={checks}"));
+            }
+            // Its fixes, read back by `parse` (M14 CA).
+            a.push(format!("--export-fixes={}", tidy_fixes_file(spec).display()));
+            a
+        }
         Tool::ZigFmt => vec!["fmt".into(), "--check".into()],
-        Tool::Clippy | Tool::CargoCheck | Tool::CargoAudit | Tool::CargoDeny => Vec::new(),
+        Tool::Clippy
+        | Tool::CargoCheck
+        | Tool::CargoAudit
+        | Tool::CargoDeny
+        | Tool::RustAnalyzer
+        | Tool::ClangAnalyzer
+        | Tool::Clangd
+        | Tool::Cppcheck
+        | Tool::Sql => Vec::new(),
         Tool::Mypy | Tool::Pyright => {
             return crate::python_lint::args(tool, paths, crate::python_env::project_python(&spec.root).as_deref());
         }
@@ -49,7 +71,7 @@ pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) 
             .map(|p| p.display().to_string())
             .collect();
         a.extend(files);
-        match compile_db_dir(&spec.root) {
+        match crate::analysis::analyzers::compile_db_dir(spec) {
             Some(dir) => a.extend(["-p".into(), dir.display().to_string()]),
             // No compilation database: compile with defaults instead of complaining.
             None => a.push("--".into()),
@@ -60,11 +82,9 @@ pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) 
     a
 }
 
-fn compile_db_dir(root: &Path) -> Option<PathBuf> {
-    ["", "build", "cmake-build-debug", "out"]
-        .iter()
-        .map(|d| if d.is_empty() { root.to_path_buf() } else { root.join(d) })
-        .find(|d| d.join("compile_commands.json").is_file())
+/// Where clang-tidy exports its fixes for a run (removed once read).
+fn tidy_fixes_file(spec: &JobSpec) -> PathBuf {
+    std::env::temp_dir().join(format!("codecraft-clang-tidy-{}-{}.yaml", std::process::id(), spec.job))
 }
 
 /// Findings from a finished linter, and why the run failed (when it did).
@@ -92,7 +112,16 @@ pub(crate) fn parse(
             let mut text = stdout.clone();
             text.push('\n');
             text.push_str(&out.stderr.join("\n"));
-            let f = parse_clang_tidy(&text, &spec.root, &read);
+            let mut f = parse_clang_tidy(&text, &spec.root, &read);
+            // `--export-fixes` YAML → quick-fixes on the matching findings (M14 CA).
+            let file = tidy_fixes_file(spec);
+            if let Ok(meta) = std::fs::metadata(&file)
+                && meta.len() <= 32 << 20
+                && let Ok(yaml) = std::fs::read_to_string(&file)
+            {
+                crate::analysis::cpp::attach_tidy_fixes(&mut f, &yaml, &read);
+            }
+            let _ = std::fs::remove_file(&file);
             let failed = f.is_empty() && !out.success && out.code != Some(1);
             (f, failed.then(|| out.stderr_summary()))
         }
@@ -117,7 +146,15 @@ pub(crate) fn parse(
             }
             (f, None)
         }
-        Tool::Clippy | Tool::CargoCheck | Tool::CargoAudit | Tool::CargoDeny => (Vec::new(), None),
+        Tool::Clippy
+        | Tool::CargoCheck
+        | Tool::CargoAudit
+        | Tool::CargoDeny
+        | Tool::RustAnalyzer
+        | Tool::ClangAnalyzer
+        | Tool::Clangd
+        | Tool::Cppcheck
+        | Tool::Sql => (Vec::new(), None),
         Tool::Mypy | Tool::Pyright => {
             crate::python_lint::parse(tool, &spec.root, &stdout, out.code, out.success, &|| out.stderr_summary())
         }
@@ -357,7 +394,12 @@ fn byte_col_to_char(text: Option<&str>, line: usize, col: usize) -> usize {
 
 /// `file:line:col: severity: message [check]` lines (clang-tidy, zig). Notes become part of the
 /// preceding finding's description; source excerpts and carets are skipped.
-fn parse_diagnostic_lines(text: &str, base: &Path, tool: Tool, read: &dyn Fn(&Path) -> Option<String>) -> Vec<Finding> {
+pub(crate) fn parse_diagnostic_lines(
+    text: &str,
+    base: &Path,
+    tool: Tool,
+    read: &dyn Fn(&Path) -> Option<String>,
+) -> Vec<Finding> {
     let Some(re) = diag_re() else { return Vec::new() };
     let mut out: Vec<Finding> = Vec::new();
     let mut cache: std::collections::HashMap<PathBuf, Option<String>> = std::collections::HashMap::new();
@@ -545,7 +587,7 @@ mod tests {
         JobSpec {
             kind: JobKind::Inspect,
             scope: ResolvedScope {
-                scope: Scope { kind: ScopeKind::Project, path: None },
+                scope: Scope::new(ScopeKind::Project, None),
                 label: String::new(),
                 files: Vec::new(),
                 only: None,
@@ -558,6 +600,10 @@ mod tests {
             programs: std::collections::HashMap::new(),
             format: false,
             only: None,
+            job: 1,
+            profile: std::sync::Arc::new(crate::analysis::profiles::InspectionProfile::default_profile()),
+            env: crate::analysis::analyzers::AnalyzerEnv::default(),
+            baseline: None,
         }
     }
 

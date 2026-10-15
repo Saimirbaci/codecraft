@@ -458,6 +458,7 @@ fn page(
         }
         settings::PAGE_CODE_STYLE_OTHER => pages::code_style_other_page(ui, st, draft, cmds),
         settings::PAGE_TODO => pages::todo_page(ui, st, draft, cmds),
+        settings::PAGE_INSPECTIONS => crate::inspect_ui::settings_page(ui, s, st, cmds),
         _ => setting_grid(ui, st, page, draft, query, cmds),
     }
 }

@@ -36,6 +36,7 @@ mod fonts;
 mod history_ui;
 mod hot_exit_ui;
 mod http_ui;
+mod inspect_ui;
 mod inspections_ui;
 pub mod keymap;
 mod markdown;

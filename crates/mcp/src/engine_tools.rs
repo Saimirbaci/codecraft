@@ -175,8 +175,11 @@ pub fn engine_tools() -> Vec<ToolDef> {
              installed) on a scope and wait for the findings: [{id, file, line, column, severity, inspection, message, \
              fixes}]",
             json!({
-                "scope": { "type": "string", "enum": ["file", "directory", "project", "uncommitted"], "default": "project" },
+                "scope": { "type": "string", "enum": ["file", "directory", "project", "uncommitted", "glob"], "default": "project" },
                 "path": path("The file or directory for those scopes"),
+                "pattern": { "type": "string", "description": "For scope glob: comma-separated globs, `!` excludes (\"src/**/*.rs, !**/gen/**\")" },
+                "profile": { "type": "string", "description": "An inspection profile (Default, Strict or a user profile; see codecraft_execute analysis.profiles)" },
+                "analyzers": { "type": "array", "items": { "type": "string" }, "description": "With profile/glob: analyzer ids (clippy, rust_analyzer, ruff, mypy, pyright, clangd, clang_analyzer, clang_tidy, cppcheck, sql) or languages (rust, python, cpp)" },
                 "tools": { "type": "array", "items": { "type": "string" }, "description": "Limit to these analyzers (clippy, check, ruff, mypy, pyright, eslint, clang-tidy, zig, cargo-audit, cargo-deny)" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 2000, "default": 200 },
                 "timeoutMs": timeout(300_000),
@@ -350,8 +353,9 @@ pub fn engine_tools() -> Vec<ToolDef> {
         ),
         tool(
             PROFILE_HOTSPOTS,
-            "The open profiler snapshot's hottest functions: [{name, selfPercent, totalPercent, self, total, file, line}]. \
-             Waits for a recording that is still running or loading",
+            "The open profiler snapshot's hottest functions: [{name, selfPercent, totalPercent, self, total, file, line}], \
+             plus `report` (hottest lines with their code, top functions by total time, notes on missing symbols \
+             or debug builds). Waits for a recording that is still running or loading",
             json!({ "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }, "timeoutMs": timeout(120_000) }),
             &[],
         ),

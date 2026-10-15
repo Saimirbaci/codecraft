@@ -1237,6 +1237,10 @@ fn run_commit(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(so) = p.get("signOff").and_then(Value::as_bool) {
         s.vcs.commit.sign_off = so;
     }
+    // The commit check: analyze the files first when "Analyze code" is on (M14 track CA).
+    if let Some(held) = crate::analysis::commit_check::before_commit(s, p)? {
+        return Ok(held);
+    }
     let files = str_list(p, "files").map(|f| rel_paths(s, f));
     vcs::commit(s, files, bool_or(p, "push", false))?;
     ok()

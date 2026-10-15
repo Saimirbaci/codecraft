@@ -870,3 +870,34 @@ fn profiling_through_tools_with_a_fake_profiler() {
     assert!(err(&mut s, "profile_start", json!({})).contains("--allow profile"));
     s.shutdown();
 }
+
+/// `inspect` with a glob scope or a named profile goes through the analysis jobs (real ruff when
+/// installed).
+#[test]
+fn inspect_with_glob_scope_and_profile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::create_dir_all(root.join("gen")).unwrap();
+    std::fs::write(root.join("app/main.py"), "import os\n").unwrap();
+    std::fs::write(root.join("gen/out.py"), "import sys\n").unwrap();
+    let mut s = session(&root.join(".home"));
+    s.agent_access = AgentAccess::headless(&[Capability::Run]);
+    open(&mut s, &root);
+    assert!(err(&mut s, "inspect", json!({ "scope": "glob" })).contains("pattern"));
+    let ruff = std::process::Command::new("ruff").arg("--version").output().is_ok_and(|o| o.status.success());
+    if !ruff {
+        eprintln!("skipping the ruff part: ruff not found");
+        return;
+    }
+    let v = ok(
+        &mut s,
+        "inspect",
+        json!({ "scope": "glob", "pattern": "**/*.py, !gen/**", "analyzers": ["ruff"], "timeoutMs": 120_000 }),
+    );
+    let files: Vec<&str> = v["findings"].as_array().unwrap().iter().filter_map(|f| f["file"].as_str()).collect();
+    assert!(files.iter().any(|f| f.ends_with("main.py")), "{v}");
+    assert!(!files.iter().any(|f| f.ends_with("out.py")), "{v}");
+    let v = ok(&mut s, "inspect", json!({ "profile": "Default", "analyzers": ["ruff"], "timeoutMs": 120_000 }));
+    assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"].as_str().is_some_and(|p| p.ends_with("out.py"))), "{v}");
+}

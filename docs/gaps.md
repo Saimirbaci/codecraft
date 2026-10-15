@@ -204,7 +204,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     scan.
 22. Python and TypeScript language servers are not installed on this machine
     (`pip install basedpyright`, `npm i -g typescript-language-server typescript`); CodeCraft
-    shows install hints and keeps highlighting/run working.
+    shows install hints and keeps highlighting/run working. (M14 track CA, item 54: Install
+    basedpyright — `analysis.installTool {tool: "basedpyright", confirm: true}`, a button in the
+    Inspection Results and on Settings › Editor › Inspections — runs `uv tool install` into
+    `$CODECRAFT_HOME/tools`, never globally, and Inspect Code uses that copy after the project's
+    and `PATH`'s.) Remaining: the Python language server does not pick up the managed
+    `basedpyright-langserver` yet; TypeScript is unchanged.
 23. ~~Database: no in-grid editing yet; TLS for PostgreSQL is not supported~~ (2026-10-13: tables
     with a primary key are editable in the grid: edit a cell in place (double-click/Enter/F2, Set
     NULL), add and delete rows, pending changes highlighted, Revert, Preview SQL, Submit as one
@@ -288,12 +293,16 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     backtraces, Python tracebacks, Zig and sanitizer traces and JavaScript stacks; file locations
     are links resolved against the project, library frames dimmed. Rearrange Code sorts a Rust
     file's top-level items (use, mod declarations, macro_rules!, consts, statics, types, traits,
-    impls, fns, inline mods) in the preview. Remaining: RustRover's own inspections (its
-    inspection profiles, severities editor, "Inspect Code" for a custom scope, offline/exported
-    results) are not reproduced: only external linters run; clippy always checks the whole
-    workspace (results are filtered to the scope); the Rust suppression is a line-based heuristic
-    (innermost item by indentation); clang-tidy fixes (`--export-fixes`) are not read; findings
-    are not shown as editor highlights; Code Cleanup has no profile of what to apply; Rearrange
+    impls, fns, inline mods) in the preview. ~~RustRover's own inspections (its inspection
+    profiles, severities editor, "Inspect Code" for a custom scope, offline/exported results) are
+    not reproduced; clang-tidy fixes (`--export-fixes`) are not read~~ (M14 track CA, item 54:
+    inspection profiles with per-analyzer and per-rule switches and severities on Settings ›
+    Editor › Inspections, custom glob scopes, JSON/SARIF/HTML export and JSON/SARIF import,
+    clang-tidy's exported fixes as quick-fixes, rust-analyzer's own diagnostics as an analyzer).
+    Remaining: no RustRover-native inspections beyond rust-analyzer's and the external tools';
+    clippy always checks the whole workspace (results are filtered to the scope); the Rust
+    suppression is a line-based heuristic (innermost item by indentation); findings are not shown
+    as editor highlights; Code Cleanup has no profile of what to apply; Rearrange
     Code does not reorder items inside `impl`/`mod` bodies and refuses files with item-level
     macro invocations; Analyze Stack Trace has no thread-dump view (Java-style dumps are plain
     text) and opens in its own window instead of a Run tool window tab.
@@ -822,6 +831,61 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     metadata or fixes); `test_run` without arguments covers Cargo and Python projects only (C++
     and JS through `path`); `profile_*` were tested with a fake profiler only (no samply/py-spy
     here; PF adds xctrace); headless `db_query` never writes to a confirm-writes data source.
+
+54. Code analysis (track CA): Inspect Code runs the analyzers the active **inspection profile**
+    turns on, per language — Rust: Clippy (when asked for, when Settings › Rust turns it on or
+    when the profile turns on lint groups; else cargo check) with lint groups (pedantic, nursery,
+    cargo, restriction as `-W clippy::<group>`) and rule switches passed to Clippy (`-A`/`-W`),
+    `rust-analyzer diagnostics` for the whole workspace (its native diagnostics, filtered to the
+    scope; a problem Clippy also reports is shown once); Python: ruff with the profile's
+    `--extend-select`/`--ignore`, mypy and basedpyright/pyright when present, and Install
+    basedpyright (`uv tool install` into `$CODECRAFT_HOME/tools`, only on an explicit request);
+    C/C++: a background clangd that opens each file (compiler warnings and its built-in
+    clang-tidy, quick-fixes from its code actions), the Clang Static Analyzer (`clang --analyze`
+    per translation unit with the flags from `compile_commands.json`, the path to the bug in the
+    description, extra or disabled checkers from the profile), clang-tidy (its `--export-fixes`
+    YAML read back as quick-fixes) and cppcheck when installed; CMake projects without a
+    compilation database get one from a configure of the active profile with
+    `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`; SQL: CodeCraft's SQL inspections over `.sql` files.
+    Scopes: file, directory, uncommitted (Git), project and a custom glob (`src/**/*.rs,
+    !**/gen/**`), on a worker with progress and Stop. Profiles (`Default`, `Strict` built in;
+    copies in the project's `.codecraft/inspection-profiles.json` or the IDE's
+    `$CODECRAFT_HOME/inspection-profiles.json`; changing a built-in makes a project copy, Reset
+    drops it): per analyzer and per rule on/off and Error / Warning / Weak Warning / Info, with a
+    searchable analyzer → rule tree on Settings › Editor › Inspections. The Inspection Results
+    tool window groups by inspection, severity, analyzer or file, previews the source around the
+    selected problem, fixes one or all of a rule, suppresses (`#[allow(lint)]`, `# noqa: X`,
+    `# type: ignore[x]`, `# pyright: ignore[x]`, `// NOLINT(check)` — honoured by every C/C++
+    analyzer —, `// cppcheck-suppress id`, `-- noinspection Id`), saves and loads baselines
+    (`.codecraft/inspection-baseline.json`; fingerprints by rule, file and line text, so moved
+    code stays known) with "Only new", and exports JSON, SARIF 2.1.0 (rules, regions, fixes,
+    `baselineState`) and HTML; View Offline Inspection Results imports JSON or SARIF. The
+    Problems tool window has File and Project tabs (live language-server and build problems plus
+    the last analysis). The Commit tool window's "Analyze code" check inspects the files being
+    committed and holds the commit on errors or warnings that are not in the baseline (Review /
+    Commit Anyway / Cancel). For agents: `analysis.run {scope, path?, pattern?, profile?,
+    analyzers?, format?}` → a job id; `analysis.results {job, filter?: {severity, analyzer, rule,
+    path, onlyNew, fixable, query}, page?, pageSize?, format?}` with compact problems (relative
+    path, 1-based line/column, analyzer, rule, severity, message, fix title and safety,
+    suppressible, new, source line); `analysis.fix`, `analysis.suppress`, `analysis.export`,
+    `analysis.baseline.save/load/clear`, `analysis.tools`, `analysis.projectProblems`,
+    `analysis.cancel`, `analysis.profile*`, `analysis.installTool`, `analysis.commitCheck.*`.
+    Remaining: rust-analyzer's diagnostics come from its `diagnostics` subcommand (an unstable
+    debug format, parsed leniently; it loads the whole workspace each run and has no fixes);
+    clangd is started per run (no index is kept between runs), opens at most 300 files four at a
+    time and asks for code actions for at most 200 diagnostics; the Clang Static Analyzer runs
+    translation units one after another (at most 400) and has no cross-file analysis (no CTU);
+    clangd and clang share the profile's rules but clangd's clang-tidy checks come only from the
+    project's `.clang-tidy`; Fix All uses the analyzers' own suggestions (the same edits as
+    `clippy --fix` / `ruff --fix`), not the tools' `--fix` modes; SQL inspections run without a
+    data source (no unresolved-name checks); profile changes on the settings page apply at once
+    (not on OK/Cancel) and the page lists well-known rules plus those of the profile and the last
+    results (no complete catalogue of Clippy/Ruff rules); the commit check runs the whole active
+    profile on the committed files (no separate commit profile) and its warning does not list
+    the problems (Review opens them); baselines match problems by line text, so an edit on the
+    problem's own line makes it new again; cppcheck, clang-tidy, basedpyright, mypy and uv were
+    exercised only through fakes here (clang, clangd, rust-analyzer, Clippy, ruff and git for
+    real).
 
 55. Profiling for people and agents (track PF): Run › Profile plans the configuration first
     (`engine/src/profiler_plan.rs`): Cargo run/test/bench configurations are built with
