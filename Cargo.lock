@@ -857,8 +857,10 @@ version = "0.1.0"
 dependencies = [
  "codecraft-engine",
  "codecraft-workspace",
+ "crossbeam-channel",
  "env_logger",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

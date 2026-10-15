@@ -12,6 +12,16 @@
 //! codecraft-cli configs <project> generate [--add] [--agent claude|codex|grok|gemini [--mode ask|auto]]
 //!                                              propose configurations for the entry points
 //!                                              (`--add` saves the new ones)
+//!
+//! For agents (M14 track AX; see docs/agents.md):
+//! codecraft-cli mcp <project> [--allow run,debug,profile,write,db-write] [--no-lsp]
+//!                                              MCP server over stdio with CodeCraft's engine tools
+//! codecraft-cli mcp --connect <port>           stdio bridge to a running CodeCraft IDE
+//! codecraft-cli debug <project> <config|file> --break file:line [--eval expr]… [--json] [--timeout secs]
+//!                                              run to the first stop, print it, evaluate, stop
+//! codecraft-cli analyze <project> [--scope path] [--format json|sarif|text] [--tools a,b]
+//! codecraft-cli profile <project> <config> [--seconds N] [--json]
+//! codecraft-cli test <project> [filter] [--json]
 //! ```
 
 use std::path::PathBuf;
@@ -20,20 +30,31 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use codecraft_engine::agent_mcp;
 use codecraft_engine::catalog::CATALOG;
 use codecraft_engine::{Session, registry};
 use codecraft_workspace::Severity;
 
+mod agent;
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(agent_mcp::BRIDGE_FLAG) {
+        return exit_code(agent_mcp::bridge_main(&args));
+    }
     let result = match args.first().map(String::as_str) {
+        Some("mcp") => agent::mcp(args.get(1..).unwrap_or_default()),
+        Some("debug") => agent::debug(args.get(1..).unwrap_or_default()),
+        Some("analyze") => agent::analyze(args.get(1..).unwrap_or_default()),
+        Some("profile") => agent::profile(args.get(1..).unwrap_or_default()),
+        Some("test") => agent::test(args.get(1..).unwrap_or_default()),
         Some("commands") => commands(args.iter().any(|a| a == "--json")),
         Some("catalog") => catalog(),
         Some("check") => check(args.get(1), args.iter().any(|a| a == "--clippy")),
         Some("run") => run(args.get(1), args.get(2), args.get(3)),
         Some("configs") => configs(args.get(1), args.get(2..).unwrap_or_default()),
-        _ => Err("usage: codecraft-cli <commands [--json] | catalog --json | check <project> [--clippy] | run <project> <command-id> [json-params] | configs <project> <list|add|update|copy|delete|run> [flags]>".into()),
+        _ => Err("usage: codecraft-cli <commands [--json] | catalog --json | check <project> [--clippy] | run <project> <command-id> [json-params] | configs <project> <list|add|update|copy|delete|run> [flags] | mcp <project> [--allow caps] | debug <project> <config> --break file:line | analyze <project> | profile <project> <config> | test <project> [filter]>".into()),
     };
     match result {
         Ok(code) => code,
@@ -42,6 +63,10 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn exit_code(code: i32) -> ExitCode {
+    ExitCode::from(u8::try_from(code).unwrap_or(1))
 }
 
 fn commands(as_json: bool) -> Result<ExitCode, String> {
@@ -91,7 +116,7 @@ fn catalog() -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn pump_until(s: &mut Session, timeout: Duration, mut done: impl FnMut(&Session) -> bool) -> bool {
+pub(crate) fn pump_until(s: &mut Session, timeout: Duration, mut done: impl FnMut(&Session) -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
         s.pump();
@@ -103,7 +128,7 @@ fn pump_until(s: &mut Session, timeout: Duration, mut done: impl FnMut(&Session)
     false
 }
 
-fn open_project(path: Option<&String>) -> Result<Session, String> {
+pub(crate) fn open_project(path: Option<&String>) -> Result<Session, String> {
     let path = PathBuf::from(path.ok_or("missing project path")?);
     let mut s = Session::new();
     s.lsp_enabled = false;

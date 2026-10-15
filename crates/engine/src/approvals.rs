@@ -153,6 +153,11 @@ impl Approvals {
         true
     }
 
+    /// Forget "allow always" for the sources matching `f` (their next requests ask again).
+    pub fn forget_always(&mut self, f: impl Fn(&str) -> bool) {
+        self.always.retain(|s| !f(s));
+    }
+
     /// Deny everything still pending (e.g. on shutdown).
     pub fn deny_all(&mut self) {
         for (_, tx) in self.pending.drain(..) {

@@ -54,6 +54,8 @@ pub(crate) enum Pending {
     Usages(crate::usages::UsagesPending),
     /// Macro expansion (M12 RS); errors are routed too.
     Rust(crate::rust_tools::RustPending),
+    /// A query from an agent tool (M14 AX): the raw answer is kept as data; errors are routed too.
+    Agent(u64),
 }
 
 /// One running language server.
@@ -816,6 +818,7 @@ impl Session {
             Pending::Lookup(p) => return crate::completion::on_response(self, p, result),
             Pending::Usages(p) => return crate::usages::on_response(self, p, result),
             Pending::Rust(p) => return crate::rust_tools::on_response(self, p, result),
+            Pending::Agent(token) => return crate::agent_tools::on_lsp_response(self, token, result),
             _ => {}
         }
         let value = match result {
@@ -887,7 +890,8 @@ impl Session {
             | Pending::Refactor(_)
             | Pending::Lookup(_)
             | Pending::Usages(_)
-            | Pending::Rust(_) => {}
+            | Pending::Rust(_)
+            | Pending::Agent(_) => {}
         }
     }
 

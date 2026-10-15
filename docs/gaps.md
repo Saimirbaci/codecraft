@@ -764,3 +764,59 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     directory (no per-configuration profile); the gutter run menu has no "Run with Coverage";
     `zig`, `tsc`, jest and the AI provider were exercised only through fakes (fake
     scripts, a 127.0.0.1 server).
+
+## M14 (2026-10-15)
+
+52. Agent control plane (track AX): 35 MCP engine tools (`crates/mcp/src/engine_tools.rs`) built
+    on registered commands: `codecraft_commands` (search the registry with each command's
+    capability) and `codecraft_execute` (any command by id); `project_info`; files with the
+    editor's unsaved text (`file_read` numbered and paged, `file_write`, `file_edit`,
+    `editor_open`); analysis (`problems` for a file/directory/project, `inspect` waiting for the
+    findings, `definition`, `references`, `hover`, `document_symbols`, `workspace_symbols`,
+    `call_hierarchy` through a new `lsp.query` path whose answers are kept as data instead of
+    popups, positions by column or by symbol name); debugging (`run_configurations`,
+    `debug_start` of a configuration, a file/test/main, an executable or a pid,
+    `debug_breakpoint_set/remove` with condition, hit count, log message, temporary,
+    `debug_breakpoints`, `debug_control` continue/step/pause/stop/run-to-line that waits for the
+    next stop, `debug_wait_for_stop` returning a stop summary — reason, thread, top frames with
+    file:line and a 3-line excerpt, the top frame's locals with readable values, watches —,
+    `debug_stack`, `debug_variables` by frame or reference, `debug_evaluate` in any frame);
+    profiling (`profile_start`, `profile_stop`, `profile_hotspots` with self/total % and
+    file:line); tests (`test_run` of everything, a file, the test at a line or a name filter,
+    waiting for the results; `test_results` with failure messages, locations and output); runs
+    (`run_start`, `run_output` with tail/offset/wait, `run_stop`); databases (`db_sources`,
+    `db_query`: read-only SQL needs Read, modifying SQL needs db-write, production confirmation
+    respected). New commands under them: `debug.stopSummary`, `debug.variablesOf`,
+    `files.read/write/edit`, `analysis.problems`, `lsp.query`, `lsp.queryResult`, `run.output`,
+    `run.stopTab`, `run.configurations`, `test.summary`, `test.runFiltered`,
+    `profiler.hotspots`, `commands.search`, `project.info`. Access policy (Settings › Tools ›
+    Agent Access, `agentAccess.*`, `$CODECRAFT_HOME/agent-access.json`): read / run / debug /
+    profile / write / db-write, each Off / Ask / Allow (read Allow, others Ask); Ask is an
+    approval card (Allow once / Always for this session per caller and capability / Deny) the
+    call waits on for up to 2 minutes; agents can't change the policy, approve, start agents or
+    touch the IDE integration through `codecraft_execute`. Transports: the IDE's MCP server lists
+    the engine tools after Claude Code's (unchanged); `codecraft-cli mcp <project> [--allow …]
+    [--no-lsp]` is a stdio MCP server with a long-lived, continuously pumped session (Ask is
+    denied with the flag to pass; `--help` prints `claude mcp add`/Codex/JSON snippets);
+    `codecraft-cli mcp --connect <port>` and `codecraft --mcp-bridge` bridge stdio to the running
+    IDE (token from the lock file). Built-in agent jobs get the bridge automatically (Claude
+    `--mcp-config`, Codex `-c mcp_servers.…`, ACP `mcpServers`), tagged with the job: Auto jobs
+    aren't asked, Ask jobs see cards, Review jobs never write. One-shot `codecraft-cli debug
+    <project> <config|file> --break file:line [--eval …] [--json]`, `analyze [--scope]
+    [--format json|sarif|text]`, `profile [--seconds N]`, `test [filter]`. `docs/agents.md`
+    documents every tool with an example call and result. Tested with the real debugpy,
+    lldb-dap, rust-analyzer, cargo and ruff here, a fake samply, SQLite, the built CLI binary
+    over stdio, and a fake agent CLI that receives the bridge. Remaining: Claude Code connected
+    over `/ide` filters which IDE-server tools its model sees, so the engine tools may only reach
+    it through the bridge or `claude mcp add` (not verified against a real `claude`, which tests
+    never run); headless Gemini and Grok jobs (Auto/Review) get no MCP server (their CLIs only
+    read MCP servers from settings files); the bridge's job tag is trusted from any client that
+    has the lock file's token; a Review job's tool calls act on the open project, not its
+    worktree; approval cards of a client that disconnects stay until they time
+    out; MCP `notifications/cancelled` does not cancel a waiting engine tool; one evaluation at a
+    time (`debug_evaluate` shares the Evaluate Expression slot with the user); no MCP resources or
+    progress notifications for long waits; `inspect` returns the open findings of the last run
+    (no baseline/diff), and `analyze --format sarif` is CodeCraft's own minimal SARIF (no rule
+    metadata or fixes); `test_run` without arguments covers Cargo and Python projects only (C++
+    and JS through `path`); `profile_*` were tested with a fake profiler only (no samply/py-spy
+    here; PF adds xctrace); headless `db_query` never writes to a confirm-writes data source.

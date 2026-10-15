@@ -368,6 +368,7 @@ mod tests {
             resume: None,
             continue_last: false,
             scrub_api_keys: true,
+            mcp_servers: Vec::new(),
         }
     }
 

@@ -173,7 +173,11 @@ fn resume_loads_the_session_when_offered() {
     let (htx, _hrx) = unbounded();
     let args = [script.display().to_string(), "--load".into(), "--log".into(), log.display().to_string()];
     let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
-    let resume = acp::Resume { session_id: Some("old-1".into()), fallback_preamble: Some("TRANSCRIPT\n".into()) };
+    let resume = acp::Resume {
+        session_id: Some("old-1".into()),
+        fallback_preamble: Some("TRANSCRIPT\n".into()),
+        ..Default::default()
+    };
     let client = acp::start_resumed(cmd, &dir, "chat again".into(), resume, etx, htx).unwrap();
     let ev = chat_turn(&erx);
     assert!(ev.contains(&AgentEvent::Session { id: "old-1".into() }), "{ev:?}");
@@ -201,7 +205,11 @@ fn resume_falls_back_to_a_transcript() {
     let (htx, _hrx) = unbounded();
     let args = [script.display().to_string(), "--log".into(), log.display().to_string()];
     let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
-    let resume = acp::Resume { session_id: Some("old-1".into()), fallback_preamble: Some("TRANSCRIPT\n".into()) };
+    let resume = acp::Resume {
+        session_id: Some("old-1".into()),
+        fallback_preamble: Some("TRANSCRIPT\n".into()),
+        ..Default::default()
+    };
     let client = acp::start_resumed(cmd, &dir, "chat again".into(), resume, etx, htx).unwrap();
     let ev = chat_turn(&erx);
     assert!(ev.contains(&AgentEvent::Session { id: "fake-session".into() }), "{ev:?}");

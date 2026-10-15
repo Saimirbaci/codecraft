@@ -446,6 +446,7 @@ fn page(
         settings::PAGE_COLOR_SCHEME => color_scheme_page(ui, st, draft, query, cmds),
         settings::PAGE_LIVE_TEMPLATES => pages::templates_page(ui, s, st, cmds),
         settings::PAGE_TOOLS => tools_page(ui, s, st, cmds),
+        settings::PAGE_AGENT_ACCESS => crate::agent_access_ui::page(ui, s, st, cmds),
         settings::PAGE_SQL => crate::database_settings_ui::page(ui, s, st, cmds),
         settings::PAGE_FONT => pages::font_page(ui, s, st, draft, cmds),
         settings::PAGE_CODE_STYLE_RUST => pages::code_style_page(ui, s, st, "rust", cmds),

@@ -9,6 +9,7 @@
     clippy::unreachable
 )]
 
+mod agent_access_ui;
 mod agent_panel;
 mod appearance_ui;
 mod approvals_ui;

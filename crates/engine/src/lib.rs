@@ -13,6 +13,11 @@
 )]
 
 mod agent_cmds;
+// M14 track AX: the agent control plane (MCP tools over the engine, access policy).
+pub mod agent_access;
+pub mod agent_mcp;
+pub mod agent_tools;
+mod agent_tools_cmds;
 pub mod agent_sessions;
 pub mod appearance;
 mod bookmark_cmds;
@@ -237,6 +242,10 @@ pub struct Session {
     pub lsp_enabled: bool,
     /// Pending human approvals for agent actions (shared by every agent integration).
     pub approvals: approvals::Approvals,
+    /// What agents connected over MCP may do (M14 track AX).
+    pub agent_access: agent_access::AgentAccess,
+    /// Engine tool calls from agents that are waiting (M14 track AX).
+    pub agent_tools: agent_tools::AgentToolsState,
     pub debug: debug::DebugState,
     pub db: database::DbState,
     pub agents: agents::AgentsState,
@@ -371,6 +380,8 @@ impl Session {
             page_lines: 40,
             lsp_enabled: true,
             approvals: approvals::Approvals::default(),
+            agent_access: agent_access::AgentAccess::default(),
+            agent_tools: agent_tools::AgentToolsState::default(),
             debug: debug::DebugState::default(),
             db: database::DbState::default(),
             agents: agents::AgentsState::default(),
@@ -506,6 +517,7 @@ impl Session {
         self.layouts.set_home(dir.to_path_buf());
         self.file_templates.set_home(dir.to_path_buf());
         self.copyright.set_home(dir.to_path_buf());
+        self.agent_access.path_override = Some(dir.join("agent-access.json"));
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
         self.cpp.isolated = true;
         // zig and tsc too (M13 track RC).
@@ -529,6 +541,7 @@ impl Session {
         changed |= database::pump(self);
         changed |= agents::pump(self);
         changed |= ide_server::pump(self);
+        changed |= agent_tools::pump(self);
         changed |= terminal::pump(self);
         changed |= vcs::pump(self);
         changed |= watch::pump(self);
@@ -575,6 +588,7 @@ impl Session {
             || self.jobs.any_running()
             || self.agents.any_active()
             || self.ide.busy()
+            || self.agent_tools.busy()
             || self.db.busy()
             || self.debug.busy()
             || self.vcs.busy()
@@ -623,6 +637,7 @@ impl Session {
         debug::shutdown(self);
         database::shutdown(self);
         agents::shutdown(self);
+        agent_tools::shutdown(self);
         ide_server::shutdown(self);
         terminal::shutdown(self);
         vcs::shutdown(self);
