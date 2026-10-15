@@ -631,6 +631,10 @@ fn char_triggers(typed: char, prev: Option<char>, run_start: Option<char>) -> bo
 
 /// After a typed char: re-request an incomplete list, or schedule the auto-popup.
 pub(crate) fn after_typed(s: &mut Session, typed: char) {
+    // `..` lists IDE actions when command completion is on (M13 track RC).
+    if crate::command_completion::after_typed(s, typed) {
+        return;
+    }
     // Cargo.toml: crate names and versions from crates.io (M12 track RS).
     if crate::cargo_deps::after_typed(s, typed) {
         return;
@@ -892,6 +896,10 @@ pub(crate) fn accept(s: &mut Session, p: &Value) -> CmdResult {
     let Some(Popup::Completion(c)) = s.popup.take() else { return ok() };
     let idx = crate::params::opt_usize(p, "index")?.unwrap_or(c.selected);
     let Some(item) = c.visible.get(idx).and_then(|i| c.items.get(*i)).cloned() else { return ok() };
+    // A command completion item runs its action (M13 track RC).
+    if let Some(result) = crate::command_completion::accept(s, &c, &item) {
+        return result;
+    }
     let Some((eid, did)) = s.active_ids() else { return ok() };
     if eid != c.editor {
         return ok();

@@ -29,7 +29,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.run",
             "Run",
             None,
-            "{config?: int} — run the selected (or given) run configuration",
+            "{config?: int, beforeLaunch?: bool (default true: run the configuration's before-launch tasks first)} — run the selected (or given) run configuration",
             Context::Global,
             has_project,
             run_selected,
@@ -114,7 +114,7 @@ fn build_project(s: &mut Session, p: &Value) -> CmdResult {
     }
 }
 
-fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(i) = opt_usize(p, "config")? {
         if i >= s.run_configs.len() {
             return Err(CommandError::BadParams(format!("no run configuration {i}")));
@@ -124,6 +124,12 @@ fn run_selected(s: &mut Session, p: &Value) -> CmdResult {
     s.popup = None;
     if let Some(name) = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()) {
         crate::run_config_store::prepare_run(s, &name).map_err(CommandError::Failed)?;
+        // Before-launch tasks first (M13 track RC); the configuration starts when they succeed.
+        if crate::params::bool_or(p, "beforeLaunch", true)
+            && let Some(v) = crate::before_launch::begin(s, &name, crate::before_launch::LaunchMode::Run)?
+        {
+            return Ok(v);
+        }
     }
     let config = match s.run_configs.get(s.selected_run_config) {
         Some(c) => c.clone(),

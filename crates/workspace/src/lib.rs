@@ -237,6 +237,8 @@ pub struct Settings {
     pub python_reformat_on_save: bool,
     /// Optimize imports (Ruff's isort rules, or isort) of Python files when they are saved.
     pub python_optimize_imports_on_save: bool,
+    /// Code › Code Completion › Enable Command Completion: typing `..` lists IDE actions.
+    pub command_completion: bool,
 }
 
 /// Where View › Appearance › Navigation Bar shows the path of the active file.
@@ -353,6 +355,7 @@ impl Default for Settings {
             python_formatter: "auto".into(),
             python_reformat_on_save: false,
             python_optimize_imports_on_save: false,
+            command_completion: false,
         }
     }
 }

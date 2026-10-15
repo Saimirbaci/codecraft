@@ -60,6 +60,78 @@ pub struct CoverageRow {
     pub functions_found: usize,
 }
 
+/// A column of the Coverage tool window's table (M13 track RC).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CoverageColumn {
+    /// Element: by name (the tree's order).
+    #[default]
+    Name,
+    /// Line, %.
+    Line,
+    /// Function, %.
+    Function,
+}
+
+impl CoverageColumn {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "name" | "element" => Some(Self::Name),
+            "line" | "lines" | "line%" => Some(Self::Line),
+            "function" | "functions" | "function%" => Some(Self::Function),
+            _ => None,
+        }
+    }
+}
+
+/// The Coverage table's order: a column, ascending or descending. Siblings are sorted within
+/// each directory; directories stay before files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoverageSort {
+    pub column: CoverageColumn,
+    pub descending: bool,
+}
+
+/// `rows` (a pre-order tree as [`CoverageReport::rows`] returns it) re-ordered by `sort`.
+pub fn sort_rows(rows: Vec<CoverageRow>, sort: CoverageSort) -> Vec<CoverageRow> {
+    if sort == CoverageSort::default() {
+        return rows;
+    }
+    fn blocks(rows: &[CoverageRow]) -> Vec<&[CoverageRow]> {
+        let mut out = Vec::new();
+        let mut rest = rows;
+        while let Some((first, tail)) = rest.split_first() {
+            let len = 1 + tail.iter().take_while(|r| r.depth > first.depth).count();
+            let (block, after) = rest.split_at(len.min(rest.len()));
+            out.push(block);
+            rest = after;
+        }
+        out
+    }
+    fn level(rows: &[CoverageRow], sort: CoverageSort, out: &mut Vec<CoverageRow>) {
+        let mut bs = blocks(rows);
+        bs.sort_by(|a, b| {
+            let (Some(x), Some(y)) = (a.first(), b.first()) else { return std::cmp::Ordering::Equal };
+            let key = match sort.column {
+                CoverageColumn::Name => x.name.to_lowercase().cmp(&y.name.to_lowercase()),
+                CoverageColumn::Line => x.line_percent().total_cmp(&y.line_percent()),
+                CoverageColumn::Function => x.function_percent().total_cmp(&y.function_percent()),
+            };
+            let key = if sort.descending { key.reverse() } else { key };
+            y.is_dir.cmp(&x.is_dir).then(key).then_with(|| x.name.cmp(&y.name))
+        });
+        for b in bs {
+            if let Some((head, children)) = b.split_first() {
+                out.push(head.clone());
+                level(children, sort, out);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    level(&rows, sort, &mut out);
+    out
+}
+
 impl CoverageRow {
     /// Line coverage in percent (100 when nothing is instrumented).
     pub fn line_percent(&self) -> f64 {
@@ -341,6 +413,39 @@ SF:src/util/mod.rs\nDA:1,1\nDA:2,1\nend_of_record\nSF:/elsewhere/gen.rs\nDA:1,0\
         );
         assert!((rows[3].line_percent() - 50.0).abs() < 1e-9);
         assert!((CoverageRow { lines_found: 0, ..rows[0].clone() }.line_percent() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn rows_sort_by_column_within_each_directory() {
+        let r = CoverageReport::parse_lcov(LCOV, Path::new("/w"));
+        let rows = r.rows(Path::new("/w"));
+        let names = |rows: &[CoverageRow]| rows.iter().map(|r| (r.depth, r.name.clone())).collect::<Vec<_>>();
+        assert_eq!(sort_rows(rows.clone(), CoverageSort::default()), rows);
+        // Line % ascending: lib.rs (50%) before nothing else at its level; util (100%) after it
+        // would mean files before directories, so directories stay first.
+        let by_line = sort_rows(rows.clone(), CoverageSort { column: CoverageColumn::Line, descending: false });
+        assert_eq!(
+            names(&by_line),
+            [
+                (0, "src".into()),
+                (1, "util".into()),
+                (2, "mod.rs".into()),
+                (1, "lib.rs".into()),
+                (0, "/elsewhere/gen.rs".into())
+            ]
+        );
+        // Name descending: the outside file (`/…`) sorts after `src` descending.
+        let by_name = sort_rows(rows.clone(), CoverageSort { column: CoverageColumn::Name, descending: true });
+        assert_eq!(by_name.len(), rows.len());
+        assert_eq!(by_name[0].name, "src");
+        let mut two = rows.clone();
+        // Two files at the top level: sorted by line % descending.
+        two.retain(|r| r.depth == 0);
+        two[0].is_dir = false;
+        let sorted = sort_rows(two, CoverageSort { column: CoverageColumn::Line, descending: true });
+        assert_eq!(sorted[0].name, "src", "{:?}", names(&sorted));
+        assert_eq!(CoverageColumn::parse("Function"), Some(CoverageColumn::Function));
+        assert_eq!(CoverageColumn::parse("x"), None);
     }
 
     #[test]

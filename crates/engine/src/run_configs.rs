@@ -305,7 +305,7 @@ pub fn gutter_run_lines(path: &Path, text: &str) -> Vec<usize> {
 
 /// The JavaScript test runner a project uses (from `package.json` dependencies): vitest, jest,
 /// else Node's built-in `node --test`.
-fn js_test_command(root: &Path, file: &str, test: Option<&str>) -> (String, ProcessCommand) {
+pub(crate) fn js_test_command(root: &Path, file: &str, test: Option<&str>) -> (String, ProcessCommand) {
     let pkg = std::fs::read_to_string(root.join("package.json")).unwrap_or_default();
     let pkg: Value = serde_json::from_str(&pkg).unwrap_or(Value::Null);
     let has = |dep: &str| {

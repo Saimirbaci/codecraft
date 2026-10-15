@@ -37,6 +37,10 @@ pub enum ToolWindowId {
     PythonProcessOutput,
     /// CLion's CMake tool window (M12 track CL).
     CMake,
+    /// Zig build steps (M13 track RC).
+    Zig,
+    /// TypeScript compiler errors and tsconfig files (M13 track RC).
+    TypeScript,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,7 +51,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 29] = [
+    pub const ALL: [ToolWindowId; 31] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -77,6 +81,8 @@ impl ToolWindowId {
         Self::RustRepl,
         Self::PythonProcessOutput,
         Self::CMake,
+        Self::Zig,
+        Self::TypeScript,
     ];
 
     pub fn title(self) -> &'static str {
@@ -110,6 +116,8 @@ impl ToolWindowId {
             Self::RustRepl => "Rust REPL",
             Self::PythonProcessOutput => "Python Process Output",
             Self::CMake => "CMake",
+            Self::Zig => "Zig",
+            Self::TypeScript => "TypeScript",
         }
     }
 
@@ -177,6 +185,8 @@ impl ToolWindowId {
             Self::RustRepl => "rustRepl",
             Self::PythonProcessOutput => "pythonProcessOutput",
             Self::CMake => "cmake",
+            Self::Zig => "zig",
+            Self::TypeScript => "typeScript",
         }
     }
 

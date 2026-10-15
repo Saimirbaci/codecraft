@@ -43,6 +43,8 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::RustRepl => "🦀",
         ToolWindowId::PythonProcessOutput => "🐍",
         ToolWindowId::CMake => "△",
+        ToolWindowId::Zig => "Ƶ",
+        ToolWindowId::TypeScript => "TS",
     }
 }
 
@@ -83,6 +85,13 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 // CMake projects get the CMake tool window (track CL).
                 if s.cpp.cmake.is_cmake {
                     stripe_button(ui, s, st, ToolWindowId::CMake);
+                }
+                // Zig and TypeScript projects get their tool windows (M13 track RC).
+                if is_project_of(ui, s, "zig", codecraft_engine::zig_tool::is_zig_project) {
+                    stripe_button(ui, s, st, ToolWindowId::Zig);
+                }
+                if is_project_of(ui, s, "typescript", codecraft_engine::typescript_tool::is_typescript_project) {
+                    stripe_button(ui, s, st, ToolWindowId::TypeScript);
                 }
             });
         });
@@ -220,7 +229,22 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::RustRepl => crate::rust_ui::show_repl(ui, s, st),
         ToolWindowId::PythonProcessOutput => crate::python_ui::show_process_output(ui, s, st),
         ToolWindowId::CMake => crate::cmake_ui::show(ui, s, st),
+        ToolWindowId::Zig => crate::rc_ui::show_zig(ui, s, st),
+        ToolWindowId::TypeScript => crate::rc_ui::show_typescript(ui, s, st),
     }
+}
+
+/// Whether the project is of a kind (checked on disk once per project and kind, cached in egui
+/// memory), or its tool window is open anyway.
+fn is_project_of(ui: &egui::Ui, s: &Session, kind: &str, check: fn(&Session) -> bool) -> bool {
+    let Some(root) = s.project_root() else { return false };
+    let id = egui::Id::new(("project-kind", kind, root.clone()));
+    if let Some(v) = ui.data(|d| d.get_temp::<bool>(id)) {
+        return v;
+    }
+    let v = check(s);
+    ui.data_mut(|d| d.insert_temp(id, v));
+    v
 }
 
 // ---------------------------------------------------------------- Project

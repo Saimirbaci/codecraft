@@ -214,6 +214,14 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::markdown_export::specs());
         specs.extend(crate::inline_completion::specs());
         specs.extend(crate::cpp::specs());
+        // M13 track RC: before-launch tasks, all tests in a file.
+        specs.extend(crate::before_launch::specs());
+        specs.extend(crate::test_file::specs());
+        // M13 track RC: the last menu items.
+        specs.extend(crate::zig_tool::specs());
+        specs.extend(crate::typescript_tool::specs());
+        specs.extend(crate::modify_code::specs());
+        specs.extend(crate::command_completion::specs());
         // Routes come last so they wrap every registered command. SQL files and SQL in strings:
         // navigation commands handle SQL (track DC).
         crate::database_cmds::sql_editor::route(&mut specs);

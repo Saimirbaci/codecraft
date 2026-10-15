@@ -27,7 +27,16 @@ impl RustState {
 
 /// Language server requests of the Rust tools.
 pub(crate) enum RustPending {
-    ExpandMacro { request: u64, path: PathBuf, line: usize },
+    ExpandMacro {
+        request: u64,
+        path: PathBuf,
+        line: usize,
+    },
+    /// `experimental/runnables` for a test run's file (M13 track RC).
+    Runnables {
+        tab: codecraft_workspace::RunTabId,
+        path: PathBuf,
+    },
 }
 
 pub(crate) fn on_response(s: &mut Session, pending: RustPending, result: Result<Value, ResponseError>) {
@@ -35,6 +44,7 @@ pub(crate) fn on_response(s: &mut Session, pending: RustPending, result: Result<
         RustPending::ExpandMacro { request, path, line } => {
             crate::macro_expand::on_response(s, request, path, line, result)
         }
+        RustPending::Runnables { tab, path } => crate::testing::ra::on_response(s, tab, path, result),
     }
 }
 

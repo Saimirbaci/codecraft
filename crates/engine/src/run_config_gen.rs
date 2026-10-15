@@ -977,19 +977,7 @@ Reply with only a JSON array, in a ```json code block, of objects \
 
 /// The id `RunKind::parse` accepts.
 pub fn kind_id(kind: RunKind) -> &'static str {
-    match kind {
-        RunKind::Cargo => "cargo",
-        RunKind::Command => "command",
-        RunKind::Python => "python",
-        RunKind::Cpp => "cpp",
-        RunKind::Zig => "zig",
-        RunKind::Npm => "npm",
-        RunKind::Django => "django",
-        RunKind::FastApi => "fastapi",
-        RunKind::Flask => "flask",
-        RunKind::Dockerfile => "dockerfile",
-        RunKind::DockerCompose => "compose",
-    }
+    kind.id()
 }
 
 /// The first JSON array in `text`: a ```json block's, else the first `[` that parses.

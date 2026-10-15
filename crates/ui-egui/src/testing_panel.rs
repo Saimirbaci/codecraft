@@ -431,7 +431,8 @@ pub fn show_coverage(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         return;
     };
     let root = s.project_root().unwrap_or_default();
-    let rows = report.rows(&root);
+    let sort = s.testing.coverage_sort;
+    let rows = testing::sort_rows(report.rows(&root), sort);
     let pct = report.line_percent();
     let (hit, found) = report.totals();
     let mut in_editor = s.testing.coverage_in_editor;
@@ -471,10 +472,36 @@ pub fn show_coverage(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     };
     let row_h = 20.0;
     let name_w = (ui.available_width() - 240.0).max(160.0);
+    // Column headers sort the table (click again to reverse), M13 track RC.
     ui.horizontal(|ui| {
-        ui.add_sized([name_w, row_h], egui::Label::new(RichText::new("Element").color(theme.text_muted)));
-        ui.add_sized([110.0, row_h], egui::Label::new(RichText::new("Line, %").color(theme.text_muted)));
-        ui.add_sized([110.0, row_h], egui::Label::new(RichText::new("Function, %").color(theme.text_muted)));
+        for (column, label, width) in [
+            (testing::CoverageColumn::Name, "Element", name_w),
+            (testing::CoverageColumn::Line, "Line, %", 110.0),
+            (testing::CoverageColumn::Function, "Function, %", 110.0),
+        ] {
+            let arrow = match (sort.column == column, sort.descending) {
+                (true, false) => " ▲",
+                (true, true) => " ▼",
+                _ => "",
+            };
+            let text = RichText::new(format!("{label}{arrow}")).color(if sort.column == column {
+                theme.text
+            } else {
+                theme.text_muted
+            });
+            if ui
+                .add_sized([width, row_h], egui::Button::new(text).frame(false))
+                .on_hover_text(format!("Sort by {label}"))
+                .clicked()
+            {
+                let key = match column {
+                    testing::CoverageColumn::Name => "name",
+                    testing::CoverageColumn::Line => "line",
+                    testing::CoverageColumn::Function => "function",
+                };
+                cmds.push(("coverage.sort", json!({ "column": key })));
+            }
+        }
     });
     let mut toggle: Option<PathBuf> = None;
     ScrollArea::vertical().id_salt("coverage-rows").auto_shrink([false, false]).show_rows(

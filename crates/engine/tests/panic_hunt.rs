@@ -59,6 +59,11 @@ fn skip(id: &str, params: &Value) -> bool {
     if id == "code.codeCompletion.callInlineCompletion" {
         return true;
     }
+    // Modify Selected Code sends the selection to the AI provider too (run_config_rc tests use a
+    // 127.0.0.1 fake); opening the prompt without an instruction is fine.
+    if id == "editor.modifyCode.submit" || (id == "code.modifySelectedCode" && params.get("instruction").is_some()) {
+        return true;
+    }
     // Manage Accounts runs the real `gh`/`glab auth status` (misc_cmds tests use a fake one).
     if matches!(id, "git.gitHub.manageAccounts" | "git.gitLab.manageAccounts") {
         return true;
@@ -97,6 +102,10 @@ fn skip(id: &str, params: &Value) -> bool {
                 | "run.runWithCoverage"
                 | "test.rerun"
                 | "test.rerunFailed"
+                | "run.testsInFile"
+                | "debug.testsInFile"
+                | "zig.runStep"
+                | "zig.debugStep"
         );
     spawns && !params.is_null()
 }
