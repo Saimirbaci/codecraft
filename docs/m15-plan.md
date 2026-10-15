@@ -1,6 +1,6 @@
 # M15: the daily loop, polished
 
-Status: in progress (2026-10-15). Goal: same as M14 (CodeCraft replaces PyCharm, CLion, RustRover
+Status: done (2026-10-15; all five tracks landed; remaining depth is in `docs/gaps.md` items 57–61 and `docs/qa-m15.md`). Goal: same as M14 (CodeCraft replaces PyCharm, CLion, RustRover
 and DataGrip; debugging, code analysis and profiling first-class for people and AI agents), now
 closing the "Remaining" lists of gaps 52–56 and `docs/qa-m14.md` that a daily user or an agent
 hits: analysis visible while editing, several debug sessions at once, profiling a single test,
