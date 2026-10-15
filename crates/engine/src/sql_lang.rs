@@ -534,6 +534,11 @@ fn diagnose(s: &mut Session, doc: DocId, force: bool) -> bool {
     if !matches!(language, Language::Rust | Language::Sql) {
         return false;
     }
+    // Redis consoles hold Redis commands: no SQL inspections (track DX).
+    if language == Language::Sql && s.db.is_redis_path(Some(&path)) {
+        s.sql_lang.checked.insert(doc, (revision, 0));
+        return publish(s, path, Vec::new());
+    }
     // Nothing to check (no SQL, no connected data source) and nothing shown: done, without
     // waiting for the text to settle.
     let has_sql = language == Language::Sql || s.sql_lang.injections_for(doc, revision).is_some_and(|i| !i.is_empty());

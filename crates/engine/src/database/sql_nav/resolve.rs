@@ -190,10 +190,11 @@ pub struct RenamePlan {
 /// The alias or CTE at `offset` and its occurrences in its statement; `None` elsewhere.
 pub fn rename_plan(sql: &str, offset: usize) -> Option<RenamePlan> {
     let a = Analysis::new(sql);
-    let (kind, old, def) = match target_in(&a, offset)? {
-        SqlTarget::Alias { name, def, .. } => ("alias", name, def),
-        SqlTarget::Cte { name, def } => ("cte", name, def),
-        _ => return None,
+    let (kind, old, def) = match target_in(&a, offset) {
+        Some(SqlTarget::Alias { name, def, .. }) => ("alias", name, def),
+        Some(SqlTarget::Cte { name, def }) => ("cte", name, def),
+        // A column alias (`expr AS total`) and its uses (track DX).
+        _ => return column_alias_plan(&a, offset),
     };
     let st = a.statement_at(def.0)?;
     let mut spans = vec![def];
@@ -219,6 +220,176 @@ pub fn rename_plan(sql: &str, offset: usize) -> Option<RenamePlan> {
     spans.sort_unstable();
     spans.dedup();
     Some(RenamePlan { old, kind, spans })
+}
+
+/// Words that start a clause of a query (the select list ends at the first one).
+const CLAUSES: &[&str] = &[
+    "select", "from", "where", "group", "order", "having", "limit", "offset", "union", "intersect", "except",
+    "window", "qualify", "fetch", "for", "into", "join", "on", "values", "set", "returning", "with",
+];
+
+/// A column alias defined in a select list (`expr AS name`, `expr name`), at `offset` or used
+/// there (ORDER BY, GROUP BY, HAVING of the same query; `cte.name` / `sub.name` outside a CTE
+/// or derived table), and every place it is written.
+fn column_alias_plan(a: &Analysis, offset: usize) -> Option<RenamePlan> {
+    let i = a.token_at(offset)?;
+    let tok = a.tokens.get(i)?;
+    let name = tok.name(true)?;
+    let st = a.statement_at(tok.start)?;
+    if !st.aliases.iter().any(|al| eq(al, &name)) {
+        return None;
+    }
+    // Token indexes of the statement and their paren depth.
+    let range: Vec<usize> =
+        (0..a.tokens.len()).filter(|&k| a.tokens.get(k).is_some_and(|t| t.start >= st.start && t.end <= st.end)).collect();
+    let first = *range.first()?;
+    let last = *range.last()?;
+    let mut depth = vec![0usize; a.tokens.len()];
+    let mut d = 0usize;
+    for &k in &range {
+        let t = a.tokens.get(k)?;
+        if t.is_sym(')') {
+            d = d.saturating_sub(1);
+        }
+        if let Some(slot) = depth.get_mut(k) {
+            *slot = d;
+        }
+        if t.is_sym('(') {
+            d += 1;
+        }
+    }
+    let dep = |k: usize| depth.get(k).copied().unwrap_or(0);
+    let is_word = |k: usize, w: &str| a.tokens.get(k).is_some_and(|t| t.is_word(w));
+    let clause_of = |k: usize| a.tokens.get(k).and_then(|t| CLAUSES.iter().find(|c| t.is_word(c)).copied());
+    // The clause a token is in, at its own depth (`None` past the scope's opening paren).
+    let clause_at = |k: usize| -> Option<&'static str> {
+        let mut j = k;
+        while j > first {
+            j -= 1;
+            if dep(j) < dep(k) {
+                return None;
+            }
+            if dep(j) == dep(k)
+                && let Some(c) = clause_of(j)
+            {
+                return Some(c);
+            }
+        }
+        None
+    };
+    let named = |k: usize| a.tokens.get(k).and_then(|t| t.name(true)).is_some_and(|n| eq(&n, &name));
+    let sym = |k: usize, c: char| a.sym(Some(k), c);
+    let is_def = |k: usize| -> bool {
+        if !named(k) || clause_at(k) != Some("select") || k == first {
+            return false;
+        }
+        let prev = k - 1;
+        if is_word(prev, "as") {
+            return true;
+        }
+        // `expr name`: after a value, before `,`, FROM or the end of the list.
+        let after_value = a.tokens.get(prev).is_some_and(|t| {
+            matches!(t.kind, SqlTokenKind::Name | SqlTokenKind::QuotedName | SqlTokenKind::Literal) || t.is_sym(')')
+        }) && !sym(prev, '.')
+            && clause_of(prev).is_none();
+        let next_ends = k == last || sym(k + 1, ',') || sym(k + 1, ')') || is_word(k + 1, "from");
+        after_value && next_ends && dep(prev) == dep(k)
+    };
+    // The scope of a token: the tokens between its enclosing parens (or the statement).
+    let scope_of = |k: usize| -> (usize, usize) {
+        let mut open = first;
+        let mut j = k;
+        while j > first {
+            j -= 1;
+            if dep(j) < dep(k) {
+                open = j;
+                break;
+            }
+        }
+        let mut close = last;
+        for &j in range.iter().filter(|&&j| j > k) {
+            if dep(j) < dep(k) {
+                close = j;
+                break;
+            }
+        }
+        (open, close)
+    };
+    // The definition: the alias at the caret, else the one of the query the caret is in.
+    let def = if is_def(i) {
+        i
+    } else {
+        let (o, c) = scope_of(i);
+        range.iter().copied().find(|&k| k >= o && k <= c && dep(k) == dep(i) && is_def(k))?
+    };
+    let def_tok = a.tokens.get(def)?;
+    let old = def_tok.name(true)?;
+    let mut spans = vec![(def_tok.start, def_tok.end)];
+    let (open, close) = scope_of(def);
+    // Uses in ORDER BY / GROUP BY / HAVING of the same query (not in nested subqueries).
+    let mut in_ref = false;
+    let mut k = open;
+    while k <= close {
+        if dep(k) == dep(def) {
+            if let Some(c) = clause_of(k) {
+                in_ref = matches!(c, "order" | "group" | "having");
+            }
+        } else if dep(k) > dep(def) && sym(k, '(') && (is_word(k + 1, "select") || is_word(k + 1, "with")) {
+            // Skip a nested subquery.
+            let inner = dep(k) + 1;
+            k += 1;
+            while k <= close && dep(k) >= inner {
+                k += 1;
+            }
+            continue;
+        }
+        let plain = !sym(k.wrapping_sub(1), '.') && !sym(k + 1, '.') && !sym(k + 1, '(');
+        if in_ref
+            && k != def
+            && named(k)
+            && plain
+            && let Some(t) = a.tokens.get(k)
+        {
+            spans.push((t.start, t.end));
+        }
+        k += 1;
+    }
+    // Outside the query: `cte.name` for a CTE body, `sub.name` for a derived table.
+    if open != first && sym(open, '(') {
+        let mut qualifiers: Vec<String> = Vec::new();
+        if open >= 2
+            && is_word(open - 1, "as")
+            && let Some(cte) = open.checked_sub(2).and_then(|k| a.name(k))
+            && st.ctes.iter().any(|c| eq(c, &cte))
+        {
+            let aliases = st.tables.iter().filter(|t| t.schema.is_none() && eq(&t.name, &cte));
+            qualifiers.extend(aliases.filter_map(|t| t.alias.clone()));
+            qualifiers.push(cte);
+        }
+        let after = if is_word(close + 1, "as") { close + 2 } else { close + 1 };
+        if sym(close, ')')
+            && let Some(alias) = a.tokens.get(after).filter(|t| t.end <= st.end).and_then(|t| t.name(false))
+            && st.derived.iter().any(|dname| eq(dname, &alias))
+        {
+            qualifiers.push(alias);
+        }
+        for &k in &range {
+            if k >= open && k <= close {
+                continue;
+            }
+            let q = k.checked_sub(2).filter(|&p| sym(p + 1, '.')).and_then(|p| a.name(p));
+            if named(k)
+                && q.is_some_and(|q| qualifiers.iter().any(|x| eq(x, &q)))
+                && !sym(k + 1, '.')
+                && let Some(t) = a.tokens.get(k)
+            {
+                spans.push((t.start, t.end));
+            }
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    Some(RenamePlan { old, kind: "column alias", spans })
 }
 
 /// `name` as an SQL identifier: bare when it is a plain lower-case-safe word, else quoted.
@@ -296,6 +467,36 @@ mod tests {
         assert_eq!(identifier("ok_1", false), "ok_1");
         assert_eq!(identifier("Odd name", false), "\"Odd name\"");
         assert_eq!(identifier("x`y", true), "`x``y`");
+    }
+
+    #[test]
+    fn rename_column_aliases() {
+        let sql = "SELECT price * qty AS total, name n FROM items WHERE total > 0 ORDER BY total DESC, n";
+        let p = rename_plan(sql, at(sql, "total,")).unwrap();
+        assert_eq!((p.kind, p.old.as_str()), ("column alias", "total"));
+        // The definition and ORDER BY; WHERE cannot use the alias, so it is a column there.
+        assert_eq!(p.spans, vec![(at(sql, "total,"), at(sql, "total,") + 5), (at(sql, "total DESC"), at(sql, "total DESC") + 5)]);
+        // From a use, and a bare alias (`name n`).
+        let q = rename_plan(sql, at(sql, "total DESC") + 1).unwrap();
+        assert_eq!(q.spans, p.spans);
+        let n = rename_plan(sql, at(sql, " n FROM") + 1).unwrap();
+        assert_eq!(n.spans.len(), 2, "{n:?}");
+
+        // A CTE's column alias is renamed where the CTE is used with a qualifier.
+        let sql = "WITH t AS (SELECT count(*) AS c FROM x GROUP BY y HAVING c > 1) SELECT t.c, u.c FROM t, u";
+        let p = rename_plan(sql, at(sql, "c FROM")).unwrap();
+        assert_eq!(p.spans.len(), 3, "{p:?}");
+        assert!(p.spans.contains(&(at(sql, "c, u.c"), at(sql, "c, u.c") + 1)));
+        assert!(!p.spans.contains(&(at(sql, "c FROM t"), at(sql, "c FROM t") + 1)));
+
+        // A nested query's alias of the same name stays.
+        let sql = "SELECT a AS v FROM t WHERE id IN (SELECT b AS v FROM s ORDER BY v) ORDER BY v";
+        let p = rename_plan(sql, at(sql, "v FROM t")).unwrap();
+        assert_eq!(p.spans.len(), 2, "{p:?}");
+        assert!(p.spans.iter().all(|&(s, _)| s < at(sql, "(SELECT") || s > at(sql, ") ORDER")));
+        // CAST(x AS int) is no alias; plain columns are not renamed here.
+        assert!(rename_plan("SELECT CAST(a AS int) FROM t", 17).is_none());
+        assert!(rename_plan("SELECT a FROM t ORDER BY a", 7).is_none());
     }
 
     #[test]

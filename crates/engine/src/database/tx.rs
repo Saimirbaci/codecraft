@@ -10,8 +10,16 @@
 //!   how many statements it ran and since when; per console the transaction mode (Auto/Manual)
 //!   and isolation level; the pending-transaction guard.
 //! - The guard ([`intercept`]): disconnecting, removing or editing a data source, closing a
-//!   console, closing the project and quitting ask Commit / Rollback / Cancel while a
-//!   transaction is open, and only go ahead once every transaction ended.
+//!   console, closing the project, opening another project in the window, closing a project
+//!   window and quitting ask Commit / Rollback / Cancel while a transaction is open, and only go
+//!   ahead once every transaction ended.
+//! - Savepoints (track DX): Set / Rollback to / Release on the open transaction
+//!   ([`LinkReq::Savepoint`]), and savepoints typed in the console, kept as a stack the
+//!   transaction indicator shows; ending the transaction or losing the connection clears it.
+//! - Server-side statement timeout (track DX): with a query timeout set, the session also gets
+//!   the server's own limit ([`codecraft_db::savepoint::server_timeout_sql`]) so a statement
+//!   stops even when the client cannot cancel it; clearing the timeout restores the default.
+//!   PostgreSQL's `SET` is undone by a rollback, so it is applied again after each transaction.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -21,6 +29,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use codecraft_db::savepoint::{SavepointOp, SavepointStack, server_timeout_sql};
 use codecraft_db::tx::{Isolation, TxStatus, Watchdog, execute_timed, option_secs, session_isolation_sql};
 use codecraft_db::{
     Canceller, Connection, DataSourceConfig, DbError, DbKind, ExecSummary, Page, ResultSink, SecretStore,
@@ -40,6 +49,8 @@ pub(crate) struct LinkOpts {
     pub isolation: Option<Isolation>,
     pub timeout: Option<Duration>,
     pub keepalive: Option<Duration>,
+    /// Also set the server's own statement timeout (option `server_timeout`, on by default).
+    pub server_timeout: bool,
 }
 
 impl LinkOpts {
@@ -51,10 +62,15 @@ impl LinkOpts {
             _ if cfg.kind.is_file_based() => None,
             _ => option_secs(&cfg.options, "keepalive").or(Some(DEFAULT_KEEPALIVE)),
         };
+        let server_timeout = !matches!(
+            cfg.options.get("server_timeout").map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+            Some("0" | "off" | "false" | "no")
+        );
         Self {
             isolation: cfg.options.get("isolation").and_then(|v| Isolation::parse(v)),
             timeout: option_secs(&cfg.options, "query_timeout"),
             keepalive,
+            server_timeout,
         }
     }
 }
@@ -64,6 +80,8 @@ pub(crate) enum LinkReq {
     /// The session isolation level (`None`: the server default).
     SetIsolation(Option<Isolation>),
     SetTimeout(Option<Duration>),
+    /// Set, roll back to or release a savepoint of the open transaction.
+    Savepoint { op: SavepointOp, name: String, manual: bool },
 }
 
 /// What a worker reports about its connection and transaction.
@@ -74,6 +92,7 @@ pub(crate) enum TxEvent {
         failed: bool,
         statements: usize,
         isolation: Option<Isolation>,
+        savepoints: Vec<String>,
     },
     /// The connection dropped. `in_tx`: a transaction was open (the server rolled it back).
     Lost {
@@ -115,6 +134,13 @@ pub(crate) struct Link {
     last_used: Instant,
     /// The connection dropped with a transaction open and no request has been told yet.
     lost_tx: bool,
+    /// Savepoints of the open transaction.
+    pub savepoints: SavepointStack,
+    /// The server-side timeout the session has (`None`: unknown, set it before the next
+    /// statement).
+    server_timeout: Option<Option<Duration>>,
+    /// A server-side timeout was set on this session at some point.
+    server_timeout_touched: bool,
 }
 
 impl Link {
@@ -140,6 +166,9 @@ impl Link {
             events,
             last_used: Instant::now(),
             lost_tx: false,
+            savepoints: SavepointStack::new(),
+            server_timeout: Some(None),
+            server_timeout_touched: false,
         }
     }
 
@@ -175,8 +204,53 @@ impl Link {
         self.in_tx = false;
         self.failed = false;
         self.statements = 0;
+        self.savepoints.clear();
         self.last_used = Instant::now();
+        // A new session has the server's default timeout.
+        self.server_timeout = Some(None);
+        self.server_timeout_touched = false;
+        self.sync_server_timeout(false);
         Ok(version)
+    }
+
+    /// Give the session the server-side timeout the options ask for, if it does not have it.
+    /// `say`: log the change (the user changed the timeout).
+    pub(crate) fn sync_server_timeout(&mut self, say: bool) {
+        let desired = self.opts.timeout.filter(|_| self.opts.server_timeout);
+        if self.server_timeout == Some(desired) || self.failed {
+            return;
+        }
+        let kind = self.cfg.kind;
+        let Some(sql) = server_timeout_sql(kind, desired) else {
+            self.server_timeout = Some(desired);
+            return;
+        };
+        let Some(conn) = self.conn.as_mut() else { return };
+        let r = codecraft_db::tx::run(conn.as_mut(), &sql);
+        // Applied or not, do not retry every statement; a failure is said once.
+        self.server_timeout = Some(desired);
+        self.server_timeout_touched = true;
+        match r {
+            Ok(()) if say => self.send(TxEvent::Note {
+                worker: self.key.clone(),
+                error: false,
+                text: format!("Server-side timeout: {sql}"),
+            }),
+            Ok(()) => {}
+            Err(e) => self.send(TxEvent::Note {
+                worker: self.key.clone(),
+                error: true,
+                text: format!("cannot set the server-side timeout ({sql}): {e}; the client-side timeout still applies"),
+            }),
+        }
+    }
+
+    /// The transaction is over: no savepoints; PostgreSQL may have undone a `SET` made in it.
+    fn tx_closed(&mut self) {
+        self.savepoints.clear();
+        if self.cfg.kind == DbKind::Postgres && self.server_timeout_touched {
+            self.server_timeout = None;
+        }
     }
 
     pub(crate) fn canceller(&self) -> Option<Arc<dyn Canceller>> {
@@ -196,6 +270,7 @@ impl Link {
         self.in_tx = false;
         self.failed = false;
         self.statements = 0;
+        self.savepoints.clear();
         self.send(TxEvent::Lost { worker: self.key.clone(), in_tx, error: error.to_string() });
         self.report_state();
     }
@@ -278,6 +353,7 @@ impl Link {
     ) -> Result<ExecSummary, DbError> {
         for attempt in 0..2 {
             self.ready().map_err(DbError::Connect)?;
+            self.sync_server_timeout(false);
             let (Some(conn), Some(watchdog)) = (self.conn.as_mut(), self.watchdog.as_ref()) else {
                 return Err(DbError::Connect("not connected".into()));
             };
@@ -340,18 +416,39 @@ impl Link {
     /// Note a statement's effect on the transaction (statement tracking for drivers that cannot
     /// tell, e.g. MySQL).
     pub(crate) fn track(&mut self, sql: &str, ok: bool) {
-        let effect = codecraft_db::transaction_effect(sql, self.cfg.kind.dialect());
+        let dialect = self.cfg.kind.dialect();
+        // A savepoint typed in the console (T-SQL `ROLLBACK TRAN x` only when `x` is one).
+        if let Some((op, name)) = codecraft_db::savepoint::effect(sql, dialect)
+            && (dialect != codecraft_db::Dialect::TSql || op != SavepointOp::RollbackTo || self.savepoints.contains(&name))
+        {
+            if ok {
+                // SQLite: SAVEPOINT outside a transaction starts one.
+                if op == SavepointOp::Set && !self.in_tx {
+                    self.in_tx = true;
+                    self.failed = false;
+                    self.statements = 0;
+                }
+                self.savepoints.apply(op, &name, codecraft_db::savepoint::replaces(self.cfg.kind));
+            }
+            if self.in_tx {
+                self.statements += 1;
+            }
+            return;
+        }
+        let effect = codecraft_db::transaction_effect(sql, dialect);
         if ok {
             match effect {
                 codecraft_db::TxEffect::Begin => {
                     self.in_tx = true;
                     self.failed = false;
                     self.statements = 0;
+                    self.savepoints.clear();
                 }
                 codecraft_db::TxEffect::End => {
                     self.in_tx = false;
                     self.failed = false;
                     self.statements = 0;
+                    self.tx_closed();
                 }
                 codecraft_db::TxEffect::None if self.in_tx => self.statements += 1,
                 codecraft_db::TxEffect::None => {}
@@ -376,9 +473,11 @@ impl Link {
                             text: "The server rolled back the transaction (e.g. a deadlock); its changes are lost"
                                 .into(),
                         });
+                        self.tx_closed();
                     }
                     self.in_tx = false;
                     self.failed = false;
+                    self.savepoints.clear();
                 }
                 TxStatus::Active => {
                     self.in_tx = true;
@@ -402,6 +501,7 @@ impl Link {
             failed: self.failed,
             statements: self.statements,
             isolation: self.opts.isolation,
+            savepoints: self.savepoints.names().to_vec(),
         });
     }
 
@@ -416,6 +516,7 @@ impl Link {
         self.in_tx = true;
         self.failed = false;
         self.statements = 0;
+        self.savepoints.clear();
         Ok(())
     }
 
@@ -441,7 +542,33 @@ impl Link {
         self.in_tx = false;
         self.failed = false;
         self.statements = 0;
+        self.tx_closed();
         r
+    }
+
+    /// Set, roll back to or release a savepoint of the open transaction (manual-commit mode
+    /// opens one first).
+    pub(crate) fn savepoint(&mut self, op: SavepointOp, name: &str, manual: bool) -> Result<String, String> {
+        let kind = self.cfg.kind;
+        let sql = codecraft_db::savepoint::statement(kind, op, name).map_err(|e| e.to_string())?;
+        if op == SavepointOp::Set {
+            self.begin_if_manual(manual)?;
+        }
+        if !self.in_tx {
+            return Err("no transaction is open: switch the console to manual commit or run BEGIN first".into());
+        }
+        self.savepoints.check(op, name)?;
+        if self.failed && op != SavepointOp::RollbackTo {
+            return Err("the transaction failed: only Rollback or Rollback to Savepoint work".into());
+        }
+        self.ready()?;
+        if let Some(sql) = &sql {
+            let conn = self.conn()?;
+            codecraft_db::tx::run(conn, sql).map_err(|e| e.to_string())?;
+            self.statements += 1;
+        }
+        self.savepoints.apply(op, name, codecraft_db::savepoint::replaces(kind));
+        Ok(sql.unwrap_or_else(|| format!("{} {name} (SQL Server keeps it until the transaction ends)", op.label())))
     }
 
     pub(crate) fn handle(&mut self, req: LinkReq) {
@@ -469,6 +596,18 @@ impl Link {
                 if let Some(c) = self.canceller() {
                     self.watchdog = Some(Watchdog::new(c, t));
                 }
+                if self.conn.is_some() {
+                    self.sync_server_timeout(true);
+                }
+            }
+            LinkReq::Savepoint { op, name, manual } => {
+                let (error, text) = match self.savepoint(op, &name, manual) {
+                    Ok(sql) => (false, sql),
+                    Err(e) => (true, format!("{} `{name}` failed: {e}", op.label())),
+                };
+                self.check_broken();
+                self.refresh();
+                self.send(TxEvent::Note { worker: self.key.clone(), error, text });
             }
         }
     }
@@ -521,6 +660,8 @@ pub struct ConnTx {
     /// Statements run in it.
     pub statements: usize,
     pub isolation: Option<Isolation>,
+    /// Savepoints of the open transaction, oldest first.
+    pub savepoints: Vec<String>,
     /// The connection dropped (what happened); cleared when it reconnects.
     pub lost: Option<String>,
     #[serde(skip)]
@@ -590,6 +731,8 @@ pub struct TxBook {
     pub guard: Option<TxGuard>,
     /// Run the guarded command for real (the guard resolved it).
     bypass: bool,
+    /// The guard of a window close resolved: the window may close now.
+    close_window: bool,
 }
 
 impl TxBook {
@@ -599,6 +742,16 @@ impl TxBook {
 
     pub fn console(&self, worker: &str) -> ConsoleTx {
         self.consoles.get(worker).copied().unwrap_or_default()
+    }
+
+    /// Whether the project window may close now (its transactions were resolved); reading it
+    /// resets it.
+    pub fn take_close_window(&mut self) -> bool {
+        std::mem::take(&mut self.close_window)
+    }
+
+    pub(crate) fn allow_close_window(&mut self) {
+        self.close_window = true;
     }
 }
 
@@ -691,7 +844,7 @@ pub(crate) fn fallback_schema(cfg: &DataSourceConfig) -> String {
 pub(crate) fn on_event(s: &mut Session, ev: TxEvent) {
     let db = &mut s.db;
     match ev {
-        TxEvent::State { worker, open, failed, statements, isolation } => {
+        TxEvent::State { worker, open, failed, statements, isolation, savepoints } => {
             let source = db.workers.get(&worker).map(|w| w.source.clone()).unwrap_or_default();
             if let Some(w) = db.workers.get_mut(&worker) {
                 w.in_tx = open;
@@ -708,6 +861,7 @@ pub(crate) fn on_event(s: &mut Session, ev: TxEvent) {
             c.failed = failed;
             c.statements = statements;
             c.isolation = isolation;
+            c.savepoints = if open { savepoints } else { Vec::new() };
         }
         TxEvent::Lost { worker, in_tx, error } => {
             let source = db.workers.get(&worker).map(|w| w.source.clone()).unwrap_or_default();
@@ -724,6 +878,7 @@ pub(crate) fn on_event(s: &mut Session, ev: TxEvent) {
             c.open = false;
             c.failed = false;
             c.since = None;
+            c.savepoints.clear();
             c.lost = Some(msg.clone());
             db.log(OutputLevel::Error, &source, format!("{worker}: {msg}"));
             if worker.starts_with("meta:")
@@ -761,6 +916,22 @@ pub(crate) fn on_event(s: &mut Session, ev: TxEvent) {
 
 /// Commands that end connections, closing them with a transaction open.
 const QUIT: [&str; 2] = ["app.quitRustRover", "app.quitAndKeepWindows"];
+/// Closing a project window (not a menu item: the window's close button runs it through
+/// [`close_window_blocked`]).
+pub const CLOSE_WINDOW: &str = "db.tx.closeWindow";
+
+/// Whether `file.open` / `file.new.project` with these params would replace the window's
+/// project (open transactions of this project would be closed).
+fn opens_other_project(s: &Session, id: &str, p: &Value) -> bool {
+    let Some(path) = crate::params::opt_path(p, "path") else { return false };
+    let path = crate::normalize_path(&path);
+    let current = s.ws.project.as_ref().map(|pr| pr.root.clone());
+    match id {
+        "file.open" => path.is_dir() && current.as_deref() != Some(path.as_path()),
+        "file.new.project" => current.as_deref() != Some(path.as_path()),
+        _ => false,
+    }
+}
 
 fn console_workers_of(s: &Session, editors: &[codecraft_workspace::EditorId]) -> Vec<String> {
     let mut out = Vec::new();
@@ -816,6 +987,10 @@ fn affected(s: &Session, id: &str, p: &Value) -> Option<(String, Vec<String>, Ve
             Some(("Change Data Source".into(), of_source(Some(src)), Vec::new()))
         }
         "file.closeProject" => Some(("Close Project".into(), all(), Vec::new())),
+        "file.open" | "file.new.project" if opens_other_project(s, id, p) => {
+            Some(("Open Project".into(), all(), Vec::new()))
+        }
+        CLOSE_WINDOW => Some(("Close Window".into(), all(), Vec::new())),
         q if QUIT.contains(&q) => Some(("Quit".into(), all(), Vec::new())),
         "window.editorTabs.closeTab" => Some(tabs_closing(s.ws.active_editor().into_iter().collect())),
         "window.editorTabs.close" => {
@@ -874,6 +1049,18 @@ pub(crate) fn intercept(s: &mut Session, id: &str, p: &Value) -> Option<Result<V
             Some(Ok(json!({ "pendingTransactions": transactions, "ask": true, "action": action })))
         }
     }
+}
+
+/// Closing a project window (not the main one): true while transactions must be resolved
+/// first (the guard asks; once they ended, [`TxBook::take_close_window`] says to close it).
+pub fn close_window_blocked(s: &mut Session) -> bool {
+    if s.db.txs.guard.is_some() {
+        return true;
+    }
+    if s.db.open_transactions(None).is_empty() {
+        return false;
+    }
+    matches!(intercept(s, CLOSE_WINDOW, &json!({})), Some(Ok(_)))
 }
 
 /// Closing the main window: true while transactions must be resolved first (the guard asks).
@@ -1020,6 +1207,9 @@ mod tests {
         cfg.kind = DbKind::Sqlite;
         cfg.options.clear();
         assert_eq!(LinkOpts::from_config(&cfg).keepalive, None);
+        assert!(o.server_timeout);
+        cfg.options.insert("server_timeout".into(), "off".into());
+        assert!(!LinkOpts::from_config(&cfg).server_timeout);
         assert_eq!(Choice::parse(" Commit"), Some(Choice::Commit));
         assert_eq!(Choice::parse("later"), None);
     }

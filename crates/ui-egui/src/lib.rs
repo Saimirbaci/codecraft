@@ -21,6 +21,7 @@ mod database_dialogs;
 mod database_editor_ui;
 mod database_panel;
 mod database_schema_ui;
+mod database_settings_ui;
 mod dataframe_ui;
 mod debug_panel;
 mod debug_views_ui;

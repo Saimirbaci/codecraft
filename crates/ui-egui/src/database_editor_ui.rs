@@ -452,6 +452,30 @@ pub(crate) fn file_toolbar(
             cmd = Some(("db.runFile", json!({ "path": path })));
         }
         ui.menu_button(RichText::new("⚙").size(12.0).color(st.theme.text_muted), |ui| {
+            // Part of the file as a script (track DX).
+            if ui.add_enabled(!running, egui::Button::new("Run from Caret")).clicked() {
+                cmd = Some(("db.runFromCaret", Value::Null));
+                ui.close();
+            }
+            if ui.add_enabled(!running, egui::Button::new("Run Selection as Script")).clicked() {
+                cmd = Some(("db.runSelectionAsScript", Value::Null));
+                ui.close();
+            }
+            ui.separator();
+            let (dialect, from) = s.db.dialect_info(Some(path), Some(&ds.config.id));
+            if ui
+                .button(format!("SQL Dialect: {}…", codecraft_engine::database::sql_settings::label(&dialect)))
+                .on_hover_text(format!("From the {from}; Settings › Languages & Frameworks › SQL lists every setting"))
+                .clicked()
+            {
+                cmd = Some(("db.setFileDialect", json!({ "path": path })));
+                ui.close();
+            }
+            if ui.button("Data Source for File…").clicked() {
+                cmd = Some(("db.chooseFileDataSource", json!({ "path": path })));
+                ui.close();
+            }
+            ui.separator();
             for m in ScriptMode::ALL {
                 if ui.radio(mode == m, m.label()).clicked() {
                     cmd = Some(("db.setScriptMode", json!({ "mode": m })));

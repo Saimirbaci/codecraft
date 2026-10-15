@@ -36,11 +36,12 @@ mod my;
 pub mod params;
 mod pg;
 pub mod redis;
+pub mod savepoint;
 pub mod schema_diff;
 pub mod secrets;
 pub mod split;
 pub mod sql;
-mod sqlite;
+pub mod sqlite;
 pub mod tx;
 pub mod value;
 
@@ -204,6 +205,12 @@ pub trait Canceller: Send + Sync {
 pub trait ResultSink {
     fn columns(&mut self, columns: &[Column]);
     fn page(&mut self, page: Page) -> bool;
+    /// A statement (a SQL Server batch) produced another result set after the previous one's
+    /// last page: return true to receive it (`columns` and pages follow, like the first), false
+    /// to stop reading. Sinks that keep one result answer false (the default).
+    fn next_result(&mut self) -> bool {
+        false
+    }
 }
 
 /// Kinds of schema objects.
@@ -384,20 +391,35 @@ impl<'a> Pager<'a> {
     }
 
     /// Flush the final page. `complete`: the driver reached the end of the rows.
-    pub(crate) fn finish(mut self, columns: Vec<Column>, rows_affected: Option<u64>) -> ExecSummary {
+    pub(crate) fn finish(self, columns: Vec<Column>, rows_affected: Option<u64>) -> ExecSummary {
+        self.finish_keep(columns, rows_affected).0
+    }
+
+    /// Like [`Pager::finish`], handing the sink back (for the next result set of a batch).
+    pub(crate) fn finish_keep(
+        mut self,
+        columns: Vec<Column>,
+        rows_affected: Option<u64>,
+    ) -> (ExecSummary, &'a mut dyn ResultSink) {
         let complete = !self.stopped;
         if !self.stopped {
             let rows = std::mem::take(&mut self.buf);
             self.fetched += rows.len();
             self.sink.page(Page { rows, last: true });
         }
-        ExecSummary {
+        let summary = ExecSummary {
             columns,
             rows_fetched: self.fetched,
             rows_affected,
             complete,
             elapsed_ms: elapsed_ms(self.started),
-        }
+        };
+        (summary, self.sink)
+    }
+
+    /// The sink stopped taking rows.
+    pub(crate) fn stopped(&self) -> bool {
+        self.stopped
     }
 }
 

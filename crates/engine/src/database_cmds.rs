@@ -23,6 +23,7 @@ use crate::{CommandError, Popup, Session};
 mod console;
 mod data;
 mod edit;
+mod files;
 mod grid;
 mod import;
 mod redis;
@@ -38,6 +39,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     v.extend(data::specs());
     v.extend(schema::specs());
     v.extend(redis::specs());
+    v.extend(files::specs());
     v.extend(vec![
         simple("view.toolWindows.services", "Services", always, |s, _| {
             s.ws.layout.toggle(ToolWindowId::Services);
@@ -509,11 +511,19 @@ fn edit_data_source(s: &mut Session, p: &Value) -> CmdResult {
         b.name.clear();
         a != b || password.is_some() || ssh_secret_typed
     };
+    let other_server = crate::database::meta_cache::fingerprint(&base) != crate::database::meta_cache::fingerprint(&cfg);
+    if other_server && let Some(ds) = s.db.source_mut(&id) {
+        // The metadata describes the old server: neither shown nor cached any more.
+        ds.tree = Default::default();
+    }
     if reconnect {
         s.db.disconnect(Some(&id));
     }
     if let Some(ds) = s.db.source_mut(&id) {
         ds.config = cfg;
+    }
+    if other_server {
+        s.db.forget_cache(&id);
     }
     if s.db.dialog.as_ref().is_some_and(|d| d.editing.as_deref() == Some(id.as_str())) {
         s.db.dialog = None;
@@ -525,7 +535,18 @@ fn edit_data_source(s: &mut Session, p: &Value) -> CmdResult {
 fn remove_data_source(s: &mut Session, p: &Value) -> CmdResult {
     sync_project(s);
     let id = target_source(s, p)?;
+    // Nothing to cache for a removed data source.
+    if let Some(ds) = s.db.source_mut(&id) {
+        ds.tree = Default::default();
+    }
     s.db.disconnect(Some(&id));
+    s.db.forget_cache(&id);
+    if s.db.sql_files.data_sources.values().any(|v| *v == id) {
+        s.db.sql_files.forget_source(&id);
+        if let Err(e) = s.db.save_sql_files() {
+            log::warn!("cannot save the SQL file settings: {e}");
+        }
+    }
     let had_password = s.db.source(&id).is_some_and(|d| d.config.password_saved);
     s.db.forget_password(&id, had_password);
     s.db.sources.retain(|d| d.config.id != id);
@@ -682,7 +703,10 @@ fn expand(s: &mut Session, p: &Value) -> CmdResult {
     s.db.expanded.insert(key);
     let Some(ds) = s.db.source(&id) else { return ok() };
     let connected = matches!(ds.status, ConnStatus::Connected(_));
+    let cached = ds.tree.stale && ds.tree.info.is_some();
     match (schema, table) {
+        // A cached tree opens offline; Connect (or Refresh) loads the live one.
+        (None, _) if cached && !connected => {}
         (None, _) => {
             if !connected {
                 ensure_connected(s, &id)?;
@@ -812,7 +836,7 @@ pub(super) fn console_run(
                 .ok_or_else(|| failed("choose a data source for this file (the console toolbar or db.setDataSource)"))?
         }
     };
-    let dialect = dialect_of(s, Some(&source));
+    let dialect = s.db.dialect_for(path.as_deref(), Some(&source));
     let text = d.doc.text();
     let sel = e.selections.primary();
     let stmts: Vec<String> = if all {
@@ -1356,6 +1380,10 @@ fn complete(s: &mut Session, p: &Value) -> CmdResult {
         s.db.source_for_path(d.path.as_deref())
             .ok_or_else(|| failed("choose a data source for this file to complete table names"))?;
     let kind = kind_of(s, &source);
+    // Redis consoles complete command names, not SQL (track DX).
+    if kind == DbKind::Redis {
+        return redis_complete(s);
+    }
     let caret = e.selections.primary().head.min(d.doc.len_chars());
     let text = d.doc.text();
     let chars: Vec<char> = text.chars().collect();
@@ -1487,11 +1515,13 @@ fn complete(s: &mut Session, p: &Value) -> CmdResult {
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert((i.label.clone(), i.detail.clone())));
     let connected = matches!(ds.status, ConnStatus::Connected(_));
+    // Cached metadata completes offline without connecting (track DX).
+    let cached = ds.tree.stale && ds.tree.info.is_some();
     if connected {
         for r in load {
             let _ = s.db.meta(&source, r);
         }
-    } else {
+    } else if !cached {
         let _ = ensure_connected(s, &source);
     }
     if items.is_empty() {
@@ -1510,6 +1540,49 @@ fn complete(s: &mut Session, p: &Value) -> CmdResult {
     }));
     s.refresh_completion_filter();
     Ok(json!({ "items": n }))
+}
+
+/// Completion in a Redis console: command names at the start of a line.
+fn redis_complete(s: &mut Session) -> CmdResult {
+    let Some((e, d)) = s.ws.active() else { return ok() };
+    let editor = e.id;
+    let caret = e.selections.primary().head.min(d.doc.len_chars());
+    let text = d.doc.text();
+    let chars: Vec<char> = text.chars().collect();
+    let mut anchor = caret;
+    while anchor > 0 && chars.get(anchor - 1).is_some_and(|c| is_ident(*c) || *c == '.') {
+        anchor -= 1;
+    }
+    let mut k = anchor;
+    while k > 0 && chars.get(k - 1).is_some_and(|c| *c == ' ' || *c == '\t') {
+        k -= 1;
+    }
+    if k > 0 && chars.get(k - 1) != Some(&'\n') {
+        s.status = "No suggestions (Redis: command names at the start of a line)".into();
+        return ok();
+    }
+    let prefix: String = chars.get(anchor..caret).unwrap_or(&[]).iter().collect::<String>().to_ascii_uppercase();
+    let items: Vec<CompletionItem> = codecraft_db::redis::command_names()
+        .into_iter()
+        .filter(|c| c.starts_with(&prefix))
+        .map(|c| item(c, c.to_string(), "keyword", Some("Redis".into()), 1, anchor))
+        .collect();
+    if items.is_empty() {
+        s.status = "No suggestions".into();
+        return ok();
+    }
+    let n = items.len();
+    s.popup = Some(Popup::Completion(CompletionPopup {
+        editor,
+        anchor,
+        items,
+        visible: Vec::new(),
+        selected: 0,
+        pending: false,
+        ..CompletionPopup::default()
+    }));
+    s.refresh_completion_filter();
+    Ok(json!({ "items": n, "redis": true }))
 }
 
 #[cfg(test)]

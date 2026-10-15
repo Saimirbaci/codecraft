@@ -13,8 +13,13 @@
 //! user types: they are checked to be one balanced expression (no `;`, no comments, quotes and
 //! parentheses closed) so they can never end the statement they are part of.
 //!
+//! SQL Server (track DX) alters in place: `sp_rename` for renames, `ALTER COLUMN` for type and
+//! nullability, named default constraints (an existing default's generated name is looked up
+//! in `sys.default_constraints` by the statement itself), and comments as `MS_Description`
+//! extended properties.
+//!
 //! [`run_script`] executes a [`DdlScript`]: in one transaction where the dialect has
-//! transactional DDL (PostgreSQL, SQLite) and rolled back on the first error; MySQL commits every
+//! transactional DDL (PostgreSQL, SQLite, SQL Server) and rolled back on the first error; MySQL commits every
 //! DDL statement, so there it runs statement by statement and reports exactly which statement
 //! failed and which ones were applied before it.
 
@@ -334,7 +339,7 @@ impl DdlScript {
 
 /// Whether DDL statements can be rolled back.
 pub fn transactional_ddl(kind: DbKind) -> bool {
-    matches!(kind, DbKind::Postgres | DbKind::Sqlite)
+    matches!(kind, DbKind::Postgres | DbKind::Sqlite | DbKind::SqlServer)
 }
 
 /// Common types for the dialect, for the type field's suggestions.
@@ -576,6 +581,15 @@ pub fn validate(kind: DbKind, t: &TableDef) -> DbResult<()> {
             )));
         }
     }
+    if kind == DbKind::SqlServer
+        && let Some(f) =
+            t.foreign_keys.iter().find(|f| f.on_delete == FkAction::Restrict || f.on_update == FkAction::Restrict)
+    {
+        return Err(DbError::Config(format!(
+            "foreign key `{}`: SQL Server has no RESTRICT (use NO ACTION, which also refuses the change)",
+            f.name
+        )));
+    }
     for ch in &t.checks {
         if ch.expression.trim().is_empty() {
             return Err(DbError::Config(format!("check `{}` needs a condition", ch.name)));
@@ -808,14 +822,24 @@ fn drop_index_sql(kind: DbKind, t: &TableDef, i: &IndexDef) -> String {
     let name = index_name(t, i);
     match kind {
         DbKind::Mysql | DbKind::Mariadb => format!("DROP INDEX {} ON {}", q(kind, &name), table_name(kind, t)),
-        DbKind::Postgres if i.constraint => {
+        DbKind::Postgres | DbKind::SqlServer if i.constraint => {
             format!("ALTER TABLE {} DROP CONSTRAINT {}", table_name(kind, t), q(kind, &name))
         }
+        DbKind::SqlServer => format!("DROP INDEX {} ON {}", q(kind, &name), table_name(kind, t)),
         _ => format!("DROP INDEX {}", qualified(kind, &t.schema, &name)),
     }
 }
 
 fn comment_statements(kind: DbKind, t: &TableDef, out: &mut Vec<String>) -> DbResult<()> {
+    if kind == DbKind::SqlServer {
+        if !t.comment.is_empty() {
+            out.push(mssql_comment(&t.schema, &t.name, None, Some(&t.comment)));
+        }
+        for c in t.columns.iter().filter(|c| !c.comment.is_empty()) {
+            out.push(mssql_comment(&t.schema, &t.name, Some(&c.name), Some(&c.comment)));
+        }
+        return Ok(());
+    }
     if kind != DbKind::Postgres {
         return Ok(());
     }
@@ -1026,7 +1050,8 @@ pub fn alter_table(kind: DbKind, old: &TableDef, new: &TableDef) -> DbResult<Ddl
         DbKind::Postgres => alter_pg(old, &ch)?,
         DbKind::Mysql | DbKind::Mariadb => alter_my(kind, old, &ch)?,
         DbKind::Sqlite => alter_sqlite(old, &ch)?,
-        DbKind::SqlServer | DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
+        DbKind::SqlServer => alter_mssql(old, &ch)?,
+        DbKind::ClickHouse | DbKind::Redis | DbKind::DuckDb => {
             return unsupported(kind, "be modified with this dialog yet (use ALTER TABLE in the console)");
         }
     };
@@ -1231,6 +1256,177 @@ fn alter_my(kind: DbKind, old: &TableDef, ch: &Changes<'_>) -> DbResult<DdlScrip
     }
     if old.comment != new.comment {
         out.push(format!("ALTER TABLE {name} COMMENT = {}", text(kind, &new.comment)?));
+    }
+    s.statements = out;
+    Ok(s)
+}
+
+/// An `N'…'` literal (T-SQL Unicode string).
+fn nlit(s: &str) -> String {
+    format!("N'{}'", s.replace('\'', "''"))
+}
+
+/// Set (or with `None` remove) the `MS_Description` extended property of a table or column:
+/// one batch that updates the property when it exists and adds it otherwise.
+fn mssql_comment(schema: &str, table: &str, column: Option<&str>, text: Option<&str>) -> String {
+    let k = DbKind::SqlServer;
+    let schema = if schema.is_empty() { "dbo" } else { schema };
+    let object = nlit(&format!("{}.{}", q(k, schema), q(k, table)));
+    let level = format!(
+        "@level0type = N'SCHEMA', @level0name = {}, @level1type = N'TABLE', @level1name = {}{}",
+        nlit(schema),
+        nlit(table),
+        column.map(|c| format!(", @level2type = N'COLUMN', @level2name = {}", nlit(c))).unwrap_or_default()
+    );
+    let minor = match column {
+        Some(c) => format!("COLUMNPROPERTY(OBJECT_ID({object}), {}, 'ColumnId')", nlit(c)),
+        None => "0".into(),
+    };
+    let exists = format!(
+        "EXISTS (SELECT 1 FROM sys.extended_properties WHERE name = N'MS_Description' \
+         AND major_id = OBJECT_ID({object}) AND minor_id = {minor})"
+    );
+    match text {
+        Some(t) => format!(
+            "IF {exists} EXEC sp_updateextendedproperty @name = N'MS_Description', @value = {v}, {level} \
+             ELSE EXEC sp_addextendedproperty @name = N'MS_Description', @value = {v}, {level}",
+            v = nlit(t)
+        ),
+        None => format!("IF {exists} EXEC sp_dropextendedproperty @name = N'MS_Description', {level}"),
+    }
+}
+
+/// Drop the default constraint of a column, whatever the server named it (one batch).
+fn mssql_drop_default(table: &str, column: &str) -> String {
+    format!(
+        "DECLARE @df sysname = (SELECT d.name FROM sys.default_constraints d JOIN sys.columns c \
+         ON c.object_id = d.parent_object_id AND c.column_id = d.parent_column_id \
+         WHERE d.parent_object_id = OBJECT_ID({}) AND c.name = {}); \
+         IF @df IS NOT NULL EXEC (N'ALTER TABLE {} DROP CONSTRAINT ' + QUOTENAME(@df))",
+        nlit(table),
+        nlit(column),
+        table.replace('\'', "''")
+    )
+}
+
+/// `<column> <type> [NOT] NULL` for `ALTER COLUMN` (no identity or default there).
+fn mssql_column_type(c: &ColumnDef) -> String {
+    format!("{} {} {}", q(DbKind::SqlServer, &c.name), c.data_type.trim(), if c.nullable { "NULL" } else { "NOT NULL" })
+}
+
+fn alter_mssql(old: &TableDef, ch: &Changes<'_>) -> DbResult<DdlScript> {
+    let kind = DbKind::SqlServer;
+    let new = &ch.new;
+    let mut s = DdlScript::new(kind);
+    let old_name = table_name(kind, old);
+    let mut out: Vec<String> = Vec::new();
+    // Identity can be neither added to nor removed from an existing column.
+    for c in &new.columns {
+        if let Some(o) = (!c.original.is_empty()).then(|| old.column(&c.original)).flatten()
+            && o.auto_increment != c.auto_increment
+        {
+            return Err(DbError::Unsupported(format!(
+                "SQL Server cannot {} IDENTITY on the existing column `{}`: add a new column and copy the data",
+                if c.auto_increment { "add" } else { "remove" },
+                o.name
+            )));
+        }
+    }
+    for f in &ch.dropped_fks {
+        out.push(format!("ALTER TABLE {old_name} DROP CONSTRAINT {}", q(kind, &fk_name(old, f))));
+    }
+    for c in &ch.dropped_checks {
+        if c.name.is_empty() {
+            s.warnings.push(format!("an unnamed check ({}) cannot be dropped by name", c.expression));
+            continue;
+        }
+        out.push(format!("ALTER TABLE {old_name} DROP CONSTRAINT {}", q(kind, &c.name)));
+    }
+    for i in &ch.dropped_indexes {
+        out.push(drop_index_sql(kind, old, i));
+    }
+    if ch.pk_changed && !old.primary_key.is_empty() {
+        if old.primary_key_name.is_empty() {
+            return Err(DbError::Unsupported(
+                "the primary key's constraint name is unknown; reload the table before changing the key".into(),
+            ));
+        }
+        out.push(format!("ALTER TABLE {old_name} DROP CONSTRAINT {}", q(kind, &old.primary_key_name)));
+    }
+    let schema_part = if old.schema.is_empty() { String::new() } else { format!("{}.", q(kind, &old.schema)) };
+    if old.name != new.name {
+        out.push(format!(
+            "EXEC sp_rename {}, {}",
+            nlit(&format!("{schema_part}{}", q(kind, &old.name))),
+            nlit(&new.name)
+        ));
+    }
+    let name = qualified(kind, &old.schema, &new.name);
+    for (from, to) in ch.map.iter().filter(|(a, b)| a != b) {
+        out.push(format!(
+            "EXEC sp_rename {}, {}, 'COLUMN'",
+            nlit(&format!("{schema_part}{}.{}", q(kind, &new.name), q(kind, from))),
+            nlit(to)
+        ));
+    }
+    for c in &ch.dropped_columns {
+        if !c.default.trim().is_empty() {
+            out.push(mssql_drop_default(&name, &c.name));
+        }
+        out.push(format!("ALTER TABLE {name} DROP COLUMN {}", q(kind, &c.name)));
+    }
+    for c in &new.columns {
+        let Some(o) = (!c.original.is_empty()).then(|| old.column(&c.original)).flatten() else {
+            out.push(format!("ALTER TABLE {name} ADD {}", column_sql(kind, c)?));
+            if !c.comment.is_empty() {
+                out.push(mssql_comment(&old.schema, &new.name, Some(&c.name), Some(&c.comment)));
+            }
+            continue;
+        };
+        check_type(c)?;
+        if norm_type(&o.data_type) != norm_type(&c.data_type) || o.nullable != c.nullable {
+            out.push(format!("ALTER TABLE {name} ALTER COLUMN {}", mssql_column_type(c)));
+        }
+        if o.default.trim() != c.default.trim() {
+            if !o.default.trim().is_empty() {
+                out.push(mssql_drop_default(&name, &c.name));
+            }
+            if !c.default.trim().is_empty() {
+                check_fragment(&format!("default of `{}`", c.name), &c.default)?;
+                let df = generated_name(&new.name, std::slice::from_ref(&c.name), "df");
+                out.push(format!(
+                    "ALTER TABLE {name} ADD CONSTRAINT {} DEFAULT {} FOR {}",
+                    q(kind, &df),
+                    c.default.trim(),
+                    q(kind, &c.name)
+                ));
+            }
+        }
+        if o.comment != c.comment {
+            let text = (!c.comment.is_empty()).then_some(c.comment.as_str());
+            out.push(mssql_comment(&old.schema, &new.name, Some(&c.name), text));
+        }
+    }
+    if ch.pk_changed && !new.primary_key.is_empty() {
+        out.push(format!("ALTER TABLE {name} ADD {}", pk_clause(kind, new)));
+    }
+    for c in &ch.added_checks {
+        out.push(format!("ALTER TABLE {name} ADD {}", check_clause(kind, c)?));
+    }
+    let t_new = TableDef { schema: old.schema.clone(), ..new.clone() };
+    for i in &ch.added_indexes {
+        if i.constraint {
+            out.push(format!("ALTER TABLE {name} ADD {}", unique_clause(kind, &t_new, i)));
+        } else {
+            out.push(create_index(kind, &t_new, i)?);
+        }
+    }
+    for f in &ch.added_fks {
+        out.push(format!("ALTER TABLE {name} ADD {}", fk_clause(kind, &t_new, f)?));
+    }
+    if old.comment != new.comment {
+        let text = (!new.comment.is_empty()).then_some(new.comment.as_str());
+        out.push(mssql_comment(&old.schema, &new.name, None, text));
     }
     s.statements = out;
     Ok(s)
@@ -1839,6 +2035,81 @@ mod tests {
             comment: "People".into(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn sql_server_create_and_alter() {
+        let k = DbKind::SqlServer;
+        let mut t = users("dbo");
+        t.columns[0].data_type = "int".into();
+        let c = create_table(k, &t).unwrap();
+        assert!(c.transactional);
+        let sql = c.to_sql();
+        assert!(sql.starts_with("BEGIN TRANSACTION;"), "{sql}");
+        assert!(sql.contains("CREATE TABLE [dbo].[users]"), "{sql}");
+        assert!(sql.contains("[id] int IDENTITY(1,1) NOT NULL"), "{sql}");
+        assert!(sql.contains("sp_addextendedproperty @name = N'MS_Description', @value = N'People'"), "{sql}");
+        assert!(sql.contains("@value = N'the user''s name'"), "{sql}");
+
+        let mut old = t.clone().for_modify();
+        old.primary_key_name = "PK_users".into();
+        let mut new = old.clone();
+        new.name = "people".into();
+        new.columns.retain(|c| c.name != "score");
+        if let Some(col) = new.columns.iter_mut().find(|c| c.name == "name") {
+            col.name = "full_name".into();
+            col.data_type = "nvarchar(200)".into();
+            col.nullable = true;
+            col.default = "N'y'".into();
+            col.comment = "Shown".into();
+        }
+        new.columns.push(ColumnDef { name: "age".into(), data_type: "int".into(), ..Default::default() });
+        new.checks.clear();
+        let a = alter_table(k, &old, &new).unwrap();
+        let all = a.statements.join("\n");
+        assert!(all.contains("EXEC sp_rename N'[dbo].[users]', N'people'"), "{all}");
+        assert!(all.contains("EXEC sp_rename N'[dbo].[people].[name]', N'full_name', 'COLUMN'"), "{all}");
+        assert!(all.contains("ALTER TABLE [dbo].[people] DROP COLUMN [score]"), "{all}");
+        // The dropped column had a default: its constraint goes first.
+        assert!(all.contains("sys.default_constraints"), "{all}");
+        assert!(all.contains("ALTER TABLE [dbo].[people] ALTER COLUMN [full_name] nvarchar(200) NULL"), "{all}");
+        assert!(all.contains("ADD CONSTRAINT [people_full_name_df] DEFAULT N'y' FOR [full_name]"), "{all}");
+        assert!(all.contains("ALTER TABLE [dbo].[people] ADD [age] int NULL"), "{all}");
+        assert!(all.contains("@level2name = N'full_name'"), "{all}");
+        assert!(all.contains("DROP CONSTRAINT [score_positive]"), "{all}");
+        let pos = |needle: &str| all.find(needle).unwrap();
+        assert!(pos("sp_rename N'[dbo].[users]'") < pos("ALTER COLUMN"));
+
+        // Identity cannot change in place; RESTRICT does not exist.
+        let mut ident = old.clone();
+        if let Some(col) = ident.columns.iter_mut().find(|c| c.name == "id") {
+            col.auto_increment = false;
+        }
+        assert!(alter_table(k, &old, &ident).is_err());
+        let mut fk = t.clone();
+        fk.foreign_keys.push(ForeignKeyDef {
+            columns: vec!["id".into()],
+            ref_table: "x".into(),
+            ref_columns: vec!["id".into()],
+            on_delete: FkAction::Restrict,
+            ..Default::default()
+        });
+        assert!(create_table(k, &fk).is_err());
+        // Indexes drop with `ON table`; a key change needs the key's name.
+        let mut idx = old.clone();
+        idx.indexes.clear();
+        let d = alter_table(k, &old, &idx).unwrap();
+        assert_eq!(d.statements, vec!["DROP INDEX [users_name] ON [dbo].[users]".to_string()]);
+        let mut nokey = old.clone();
+        nokey.primary_key_name.clear();
+        let mut moved = nokey.clone();
+        moved.primary_key = vec!["name".into()];
+        assert!(alter_table(k, &nokey, &moved).is_err());
+        let mut keyed = old.clone();
+        keyed.primary_key = vec!["name".into()];
+        let pk = alter_table(k, &old, &keyed).unwrap().statements.join("\n");
+        assert!(pk.contains("DROP CONSTRAINT [PK_users]") && pk.contains("PRIMARY KEY ([name])"), "{pk}");
+        assert!(alter_table(k, &old, &old).unwrap().is_empty());
     }
 
     #[test]

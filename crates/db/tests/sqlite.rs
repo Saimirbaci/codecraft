@@ -260,3 +260,42 @@ fn read_only_sqlite_rejects_writes() {
     assert!(query_all(conn.as_mut(), "insert into t values (1)").is_err());
     assert!(query_all(conn.as_mut(), "select * from t").is_ok());
 }
+
+#[test]
+fn attached_databases_are_schemas() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("archive.db");
+    {
+        let mut a = connect(&config(&archive), None).unwrap();
+        query_all(a.as_mut(), "create table old_orders (id integer primary key, total real)").unwrap();
+        query_all(a.as_mut(), "insert into old_orders values (1, 9.5)").unwrap();
+    }
+    let mut cfg = config(&dir.path().join("main.db"));
+    cfg.options.insert("attach.archive".into(), archive.display().to_string());
+    let mut conn = connect(&cfg, None).unwrap();
+    let info = conn.database_info().unwrap();
+    assert_eq!(info.schemas, vec!["main".to_string(), "archive".to_string()]);
+    let tables = conn.tables("archive").unwrap();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].name, "old_orders");
+    let d = conn.table_details("archive", "old_orders").unwrap();
+    assert_eq!(d.columns.len(), 2);
+    let (_, rows, _) = query_all(conn.as_mut(), "select total from archive.old_orders").unwrap();
+    assert_eq!(rows, vec![vec![Cell::Float(9.5)]]);
+
+    // Read-only data sources attach read-only.
+    cfg.read_only = true;
+    let mut ro = connect(&cfg, None).unwrap();
+    assert!(query_all(ro.as_mut(), "insert into archive.old_orders values (2, 1)").is_err());
+
+    // A missing file or a bad alias is a connection error, never a new empty file.
+    let mut bad = config(&dir.path().join("main.db"));
+    bad.options.insert("attach.gone".into(), dir.path().join("gone.db").display().to_string());
+    assert!(matches!(connect(&bad, None), Err(DbError::Connect(_))));
+    assert!(!dir.path().join("gone.db").exists());
+    let mut bad = config(&dir.path().join("main.db"));
+    bad.options.insert("attach.main".into(), archive.display().to_string());
+    assert!(connect(&bad, None).is_err());
+    assert!(codecraft_db::sqlite::check_alias("a b").is_err());
+    assert!(codecraft_db::sqlite::check_alias("arch_2").is_ok());
+}

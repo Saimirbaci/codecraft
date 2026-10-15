@@ -33,9 +33,11 @@ mod edit;
 pub mod exec;
 pub mod history;
 pub mod import;
+pub mod meta_cache;
 pub mod redis_browser;
 pub mod script;
 pub mod sql_nav;
+pub mod sql_settings;
 pub mod tx;
 pub mod schema_tools;
 
@@ -74,6 +76,10 @@ pub struct SchemaTree {
     pub loading: bool,
     pub error: Option<String>,
     pub schemas: BTreeMap<String, SchemaNode>,
+    /// Shown from the metadata cache ([`meta_cache`]): not connected or not refreshed yet.
+    pub stale: bool,
+    /// When the cached metadata was saved (seconds since the Unix epoch).
+    pub cached_unix: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -196,6 +202,9 @@ pub struct ResultSet {
     pub(crate) run: u64,
     #[serde(skip)]
     stmt: usize,
+    /// Which result set of the statement (a SQL Server batch can return several).
+    #[serde(skip)]
+    pub(crate) part: usize,
     #[serde(skip)]
     pub(crate) worker: String,
 }
@@ -495,11 +504,13 @@ enum Event {
     Columns {
         run: u64,
         stmt: usize,
+        part: usize,
         columns: Vec<Column>,
     },
     Page {
         run: u64,
         stmt: usize,
+        part: usize,
         rows: Vec<Vec<Cell>>,
         last: bool,
         waiting: bool,
@@ -551,6 +562,12 @@ enum Event {
     Tx(tx::TxEvent),
     /// Data tools jobs (`data_tools`).
     Data(data_tools::DataEvent),
+    /// A metadata cache file was read ([`meta_cache`]).
+    MetaCache {
+        source: String,
+        root: PathBuf,
+        tree: Option<meta_cache::CachedTree>,
+    },
 }
 
 struct Worker {
@@ -659,6 +676,10 @@ pub struct DbState {
     pub schema: schema_tools::SchemaTools,
     /// Redis key browsers (track DD).
     pub redis: redis_browser::RedisBrowsers,
+    /// Metadata cache across disconnects (track DX).
+    pub(crate) cache: meta_cache::MetaCache,
+    /// SQL dialect per file or folder and the default data source of files (track DX).
+    pub sql_files: sql_settings::SqlFileSettings,
 }
 
 impl Default for DbState {
@@ -697,6 +718,8 @@ impl Default for DbState {
             data: data_tools::DataTools::default(),
             schema: Default::default(),
             redis: Default::default(),
+            cache: Default::default(),
+            sql_files: Default::default(),
         }
     }
 }
@@ -758,6 +781,7 @@ impl DbState {
             || self.txs.guard.is_some()
             || self.schema.busy()
             || self.redis.busy()
+            || self.cache.is_loading()
     }
 
     /// Whether a query run is executing on a worker (for Cancel).
@@ -826,6 +850,10 @@ impl DbState {
             if let Some(id) = self.nav.ddl_source(p).filter(|id| self.source(id).is_some()) {
                 return Some(id.to_string());
             }
+            if let Some(id) = self.sql_files.default_source(self.root.as_deref(), p).filter(|id| self.source(id).is_some())
+            {
+                return Some(id);
+            }
         }
         match self.sources.as_slice() {
             [only] => Some(only.config.id.clone()),
@@ -842,6 +870,12 @@ impl DbState {
             c.path = Some(root.join(p));
         }
         if let Some(root) = &self.root {
+            // SQLite attached databases (track DX) too.
+            for v in c.options.iter_mut().filter(|(k, _)| k.starts_with("attach.")).map(|(_, v)| v) {
+                if !v.trim().is_empty() && Path::new(v.trim()).is_relative() {
+                    *v = root.join(v.trim()).display().to_string();
+                }
+            }
             for k in ["sslrootcert", "sslcert", "sslkey"] {
                 if let Some(v) = c.options.get_mut(k)
                     && !v.trim().is_empty()
@@ -1161,9 +1195,17 @@ impl DbState {
         for r in self.results.iter_mut().filter(|r| source.is_none_or(|s| r.source == s)) {
             r.edits.submitting = false;
         }
-        for ds in self.sources.iter_mut().filter(|d| source.is_none_or(|s| d.config.id == s)) {
-            ds.status = ConnStatus::Disconnected;
-            ds.tree = SchemaTree::default();
+        let ids: Vec<String> =
+            self.sources.iter().filter(|d| source.is_none_or(|s| d.config.id == s)).map(|d| d.config.id.clone()).collect();
+        for id in ids {
+            // The metadata stays visible (stale) and is cached for the next session.
+            let kept = self.keep_stale(&id);
+            if let Some(ds) = self.source_mut(&id) {
+                ds.status = ConnStatus::Disconnected;
+                if !kept {
+                    ds.tree = SchemaTree::default();
+                }
+            }
         }
     }
 
@@ -1282,8 +1324,11 @@ impl DbState {
         self.passwords.clear();
         self.nav.load(root.as_deref());
         self.scripts = script::ScriptState::default();
+        self.cache = Default::default();
         self.root = root.clone();
+        self.sql_files = sql_settings::SqlFileSettings::load(root.as_deref());
         self.loaded = true;
+        sql_nav::sweep_ddl_dirs_once();
         let Some(root) = root else { return };
         let path = root.join(DATASOURCES_FILE);
         let Ok(text) = std::fs::read_to_string(&path) else { return };
@@ -1303,6 +1348,7 @@ impl DbState {
                 for (p, id) in stored.bindings {
                     self.bindings.insert(root.join(p), id);
                 }
+                self.load_caches();
             }
             Err(e) => {
                 // Keep the unreadable file for the user instead of overwriting it later.
@@ -1367,6 +1413,8 @@ pub(crate) fn sync_project(s: &mut Session) -> bool {
 struct WorkerSink<'a> {
     run: u64,
     stmt: usize,
+    /// The result set of the statement being received (several for a SQL Server batch).
+    part: usize,
     /// Keep the cursor open after a page and wait for `More` (the last statement of a run).
     wait: bool,
     rx: &'a Receiver<Req>,
@@ -1377,13 +1425,27 @@ struct WorkerSink<'a> {
 
 impl ResultSink for WorkerSink<'_> {
     fn columns(&mut self, columns: &[Column]) {
-        let _ = self.events.send(Event::Columns { run: self.run, stmt: self.stmt, columns: columns.to_vec() });
+        let _ = self.events.send(Event::Columns {
+            run: self.run,
+            stmt: self.stmt,
+            part: self.part,
+            columns: columns.to_vec(),
+        });
+    }
+
+    fn next_result(&mut self) -> bool {
+        // Every result set gets its own tab (a deferred request stops the batch instead).
+        if self.deferred.is_some() {
+            return false;
+        }
+        self.part += 1;
+        true
     }
 
     fn page(&mut self, page: Page) -> bool {
         let Page { rows, last } = page;
         let waiting = !last && self.wait;
-        let _ = self.events.send(Event::Page { run: self.run, stmt: self.stmt, rows, last, waiting });
+        let _ = self.events.send(Event::Page { run: self.run, stmt: self.stmt, part: self.part, rows, last, waiting });
         if last {
             return true;
         }
@@ -1512,6 +1574,7 @@ fn worker_main(
                     let mut sink = WorkerSink {
                         run,
                         stmt: i,
+                        part: 0,
                         wait: i + 1 == n,
                         rx: &rx,
                         events: &events,
@@ -1552,6 +1615,8 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     changed |= schema_tools::pump(s);
     changed |= redis_browser::pump(s);
     s.db.history.flush();
+    s.db.flush_caches();
+    sql_nav::clean_closed_ddl(s);
     changed
 }
 
@@ -1580,7 +1645,13 @@ fn handle(s: &mut Session, ev: Event) {
             {
                 ds.status = ConnStatus::Failed(error.clone());
                 if worker.starts_with("meta:") {
-                    ds.tree = SchemaTree { error: Some(error.clone()), ..SchemaTree::default() };
+                    // Cached metadata stays visible (stale) with the error.
+                    if ds.tree.info.is_some() {
+                        ds.tree = meta_cache::stale_copy(&ds.tree);
+                        ds.tree.error = Some(error.clone());
+                    } else {
+                        ds.tree = SchemaTree { error: Some(error.clone()), ..SchemaTree::default() };
+                    }
                 }
             }
             if worker.starts_with("meta:") {
@@ -1604,7 +1675,7 @@ fn handle(s: &mut Session, ev: Event) {
             let name = db.source(&source).map(|d| d.config.name.clone()).unwrap_or(source);
             s.notify(NotificationLevel::Error, &format!("Cannot connect to {name}"), error);
         }
-        Event::Columns { run, stmt, columns } => {
+        Event::Columns { run, stmt, part, columns } => {
             if columns.is_empty() {
                 return;
             }
@@ -1619,13 +1690,15 @@ fn handle(s: &mut Session, ev: Event) {
                 None if multi => format!("{} [{}]", info.title, stmt + 1),
                 None => info.title.clone(),
             };
+            // Later result sets of a batch: `title (2)`, `title (3)`.
+            let title = if part > 0 { format!("{title} ({})", part + 1) } else { title };
             let (source, owner, worker, table, sort, replace, filter) = (
                 info.source.clone(),
                 info.owner.clone(),
                 info.worker.clone(),
                 info.table.clone(),
                 info.sort,
-                info.replace.filter(|_| stmt == 0),
+                info.replace.filter(|_| stmt == 0 && part == 0),
                 info.filter.clone(),
             );
             let base_sql = info.base_sql.clone().unwrap_or_else(|| sql.clone());
@@ -1656,6 +1729,7 @@ fn handle(s: &mut Session, ev: Event) {
                 base_sql,
                 run,
                 stmt,
+                part,
                 worker,
             };
             match db.results.iter_mut().find(|r| r.id == id) {
@@ -1665,12 +1739,14 @@ fn handle(s: &mut Session, ev: Event) {
             db.active_result = Some(id);
             crate::services::show(s, crate::services::ServicesSection::Database);
         }
-        Event::Page { run, stmt, rows, last, waiting } => {
+        Event::Page { run, stmt, part, rows, last, waiting } => {
             if let Some(info) = db.runs.get_mut(&run) {
                 info.waiting = waiting;
             }
             let started = db.runs.get(&run).map(|r| r.started);
-            let Some(r) = db.results.iter_mut().find(|r| r.run == run && r.stmt == stmt) else { return };
+            let Some(r) = db.results.iter_mut().find(|r| r.run == run && r.stmt == stmt && r.part == part) else {
+                return;
+            };
             let room = MAX_RESULT_ROWS.saturating_sub(r.rows.len());
             let overflow = rows.len() > room;
             r.rows.extend(rows.into_iter().take(room));
@@ -1699,13 +1775,15 @@ fn handle(s: &mut Session, ev: Event) {
                     summary.elapsed_ms
                 ),
             };
-            if let Some(r) = db.results.iter_mut().find(|r| r.run == run && r.stmt == stmt) {
+            let parts = db.results.iter().filter(|r| r.run == run && r.stmt == stmt).count();
+            for r in db.results.iter_mut().filter(|r| r.run == run && r.stmt == stmt) {
+                let last_part = r.part + 1 >= parts;
                 r.status = ResultStatus::Done;
                 r.has_more = false;
-                if !summary.complete {
+                if !summary.complete && last_part {
                     r.truncated = true;
                 }
-                if summary.complete {
+                if summary.complete || r.elapsed_ms.is_none() {
                     r.elapsed_ms = Some(summary.elapsed_ms);
                 }
             }
@@ -1719,7 +1797,8 @@ fn handle(s: &mut Session, ev: Event) {
             let cancelled = error == DbError::Cancelled || cancel_requested && matches!(error, DbError::Query(_));
             let msg = if cancelled { "Query cancelled".to_string() } else { error.to_string() };
             let mut has_tab = false;
-            if let Some(r) = db.results.iter_mut().find(|r| r.run == run && r.stmt == stmt) {
+            // The error belongs to the batch's latest result set.
+            if let Some(r) = db.results.iter_mut().filter(|r| r.run == run && r.stmt == stmt).max_by_key(|r| r.part) {
                 has_tab = true;
                 r.has_more = false;
                 if cancelled {
@@ -1787,6 +1866,7 @@ fn handle(s: &mut Session, ev: Event) {
             db.log(OutputLevel::Error, "", e.clone());
             s.status = e;
         }
+        Event::MetaCache { source, root, tree } => meta_cache::on_loaded(db, &source, &root, tree),
     }
 }
 
@@ -1820,11 +1900,29 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
     }
     let mut follow_up: Vec<MetaReq> = Vec::new();
     let mut expand: Option<String> = None;
+    if result.is_ok() {
+        db.cache_dirty(source);
+    }
+    let was_stale = matches!(req, MetaReq::Info) && result.is_ok() && db.source(source).is_some_and(|d| d.tree.stale);
+    let old_tables = match (&req, &result) {
+        (MetaReq::Tables(schema), Ok(MetaResult::Tables(_))) => db
+            .source(source)
+            .and_then(|d| d.tree.schemas.get(schema))
+            .and_then(|n| n.tables.clone()),
+        _ => None,
+    };
+    let carried_schema = match &req {
+        MetaReq::Tables(schema) if result.is_ok() => Some(schema.clone()),
+        _ => None,
+    };
     let Some(ds) = db.source_mut(source) else { return };
     let err = result.as_ref().err().cloned();
     match (req, result) {
         (MetaReq::Info, Ok(MetaResult::Info(info))) => {
             ds.tree.loading = false;
+            ds.tree.stale = false;
+            ds.tree.cached_unix = None;
+            ds.tree.error = None;
             let old = std::mem::take(&mut ds.tree.schemas);
             for name in &wanted {
                 let node = old.get(name).cloned().unwrap_or_default();
@@ -1880,6 +1978,16 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
         // Handled above (`sql_nav::on_query`).
         (MetaReq::Query(..), _) => {}
     }
+    if was_stale {
+        for r in meta_cache::refresh_after_connect(db, source, true) {
+            if !follow_up.contains(&r) {
+                follow_up.push(r);
+            }
+        }
+    }
+    if let Some(schema) = carried_schema {
+        follow_up.extend(meta_cache::carry_details(db, source, &schema, old_tables));
+    }
     if let Some(e) = err {
         db.log(OutputLevel::Error, source, e);
     }
@@ -1930,6 +2038,7 @@ fn on_plan(s: &mut Session, run: u64, result: Result<Plan, String>) {
                 base_sql: sql,
                 run,
                 stmt: 0,
+                part: 0,
                 worker,
             });
             db.active_result = Some(id);
@@ -2002,7 +2111,10 @@ fn on_applied(
 
 /// Stop background work (window closing): cancel running queries and close every connection.
 pub(crate) fn shutdown(s: &mut Session) {
+    // The metadata cache is written before the process can exit.
+    s.db.save_caches_now();
     s.db.disconnect(None);
+    sql_nav::remove_own_ddl(&mut s.db);
 }
 
 #[cfg(test)]
@@ -2076,10 +2188,60 @@ mod tests {
             base_sql: String::new(),
             run: 0,
             stmt: 0,
+            part: 0,
             worker: String::new(),
         };
         assert_eq!(r.status_line(), "500 rows fetched in 12 ms; more available");
         r.has_more = false;
         assert_eq!(r.status_line(), "500 rows retrieved in 12 ms");
+    }
+
+    /// A SQL Server batch's result sets each get a tab (track DX): `title`, `title (2)`, … and
+    /// all of them finish with the statement; an error lands on the latest one.
+    #[test]
+    fn every_result_set_of_a_batch_gets_a_tab() {
+        let mut s = Session::new();
+        let run = 7;
+        let info = |title: &str| RunInfo {
+            worker: "query:ms".into(),
+            source: "ms".into(),
+            owner: "o".into(),
+            title: title.into(),
+            statements: vec!["exec p".into()],
+            replace: None,
+            table: None,
+            sort: None,
+            base_sql: None,
+            filter: ResultFilter::default(),
+            started: Instant::now(),
+            cancel_requested: false,
+            waiting: false,
+        };
+        s.db.runs.insert(run, info("batch"));
+        let col = |n: &str| vec![Column { name: n.into(), type_name: String::new() }];
+        handle(&mut s, Event::Columns { run, stmt: 0, part: 0, columns: col("a") });
+        handle(&mut s, Event::Page { run, stmt: 0, part: 0, rows: vec![vec![Cell::Int(1)]], last: true, waiting: false });
+        handle(&mut s, Event::Columns { run, stmt: 0, part: 1, columns: col("b") });
+        handle(
+            &mut s,
+            Event::Page { run, stmt: 0, part: 1, rows: vec![vec![Cell::Int(2)], vec![Cell::Int(3)]], last: true, waiting: false },
+        );
+        let summary = ExecSummary { rows_fetched: 3, complete: true, elapsed_ms: 4, ..Default::default() };
+        handle(&mut s, Event::StmtDone { run, stmt: 0, summary });
+        let tabs: Vec<(String, usize, ResultStatus)> =
+            s.db.results.iter().map(|r| (r.title.clone(), r.rows.len(), r.status)).collect();
+        assert_eq!(
+            tabs,
+            vec![("batch".to_string(), 1, ResultStatus::Done), ("batch (2)".to_string(), 2, ResultStatus::Done)]
+        );
+        // A failure after the second result set is shown on it.
+        s.db.runs.insert(8, info("again"));
+        handle(&mut s, Event::Columns { run: 8, stmt: 0, part: 0, columns: col("a") });
+        handle(&mut s, Event::Columns { run: 8, stmt: 0, part: 1, columns: col("b") });
+        handle(&mut s, Event::StmtFailed { run: 8, stmt: 0, error: DbError::Query("boom".into()) });
+        let failed: Vec<&ResultSet> = s.db.results.iter().filter(|r| r.run == 8).collect();
+        assert_eq!(failed.len(), 2);
+        assert_eq!(failed[1].error.as_deref(), Some("boom"));
+        assert_eq!(failed[0].error, None);
     }
 }

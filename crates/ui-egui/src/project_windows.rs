@@ -181,8 +181,17 @@ impl ProjectWindows {
                 }
                 crate::App::window_logic(&ctx, &mut w.session, &mut w.ui);
                 crate::App::paint(ui, &mut w.session, &mut w.ui, persisted, !native.active());
+                // Open database transactions ask Commit / Rollback / Cancel before the window
+                // closes (track DX); once they ended the window closes itself.
                 if ctx.input(|i| i.viewport().close_requested()) {
-                    w.closed = true;
+                    if codecraft_engine::database::tx::close_window_blocked(&mut w.session) {
+                        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                    } else {
+                        w.closed = true;
+                    }
+                }
+                if w.session.db.txs.take_close_window() {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             });
             requests.extend(w.ui.window_requests.drain(..).map(|r| (Some(index), r)));

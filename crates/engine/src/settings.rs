@@ -68,6 +68,8 @@ pub const PAGE_LIVE_TEMPLATES: &str = "Editor › Live Templates";
 pub const PAGE_RUN_CONFIGS: &str = "Build, Execution, Deployment › Run Configurations";
 pub const PAGE_RUST: &str = "Languages & Frameworks › Rust";
 pub const PAGE_PYTHON: &str = "Languages & Frameworks › Python";
+/// SQL dialects and data sources of files, SQL in Rust strings (track DX; project settings).
+pub const PAGE_SQL: &str = "Languages & Frameworks › SQL";
 pub const PAGE_VCS: &str = "Version Control › Commit Message Generation";
 pub const PAGE_TOOLS: &str = "Tools › AI Agents";
 pub const PAGE_OTHER: &str = "Other";
@@ -87,6 +89,7 @@ pub const PAGES: &[&str] = &[
     PAGE_RUN_CONFIGS,
     PAGE_RUST,
     PAGE_PYTHON,
+    PAGE_SQL,
     PAGE_VCS,
     PAGE_TOOLS,
 ];

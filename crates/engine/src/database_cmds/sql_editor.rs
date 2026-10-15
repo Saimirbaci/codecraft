@@ -659,6 +659,8 @@ fn run_file(s: &mut Session, p: &Value) -> CmdResult {
     let start = ScriptStart {
         path: path.clone(),
         text,
+        first_line: 0,
+        scope: None,
         source: source.clone(),
         worker,
         mode,
@@ -682,6 +684,21 @@ fn script_confirm(s: &mut Session, p: &Value) -> CmdResult {
     if !bool_or(p, "confirm", false) {
         s.status = "Cancelled".into();
         return ok();
+    }
+    // Run from Caret / Run Selection run the same part again (track DX).
+    if let Some((text, first_line, scope, values)) = c.part {
+        let start = ScriptStart {
+            worker: console_worker(Some(&c.path), 0),
+            path: c.path,
+            text,
+            first_line,
+            scope: Some(scope),
+            source: c.source,
+            mode: c.mode,
+            confirmed: true,
+            values,
+        };
+        return super::files::start_script(s, start);
     }
     run_file(s, &json!({ "path": c.path, "dataSource": c.source, "mode": c.mode, "confirm": true }))
 }

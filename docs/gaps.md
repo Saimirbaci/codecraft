@@ -447,12 +447,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     explorer filter, schemas to introspect, counts, routines, node refresh; pinned result tabs;
     SQL live templates. Remaining: analysis is lexical (subqueries flattened; the ambiguity check
     is single-level; unqualified usages may over-match; no SQL in Python/TypeScript strings);
-    PostgreSQL/MySQL DDL is generated (no checks, sequences, triggers, partitions, grants) and
-    DDL tabs are temp files never cleaned; routines come from information_schema without
-    parameter lists; no metadata cache across disconnects; scripts take parameters only via
-    `params`, keep logs in memory (last 20) and have no "run from caret"; no schema selector for
-    SQLite; Go to Database Object has no menu item (RustRover has none); rename covers table
-    aliases and CTEs, not column aliases.
+    PostgreSQL/MySQL DDL is generated (no checks, sequences, triggers, partitions, grants);
+    routines come from information_schema without parameter lists; scripts take parameters only
+    via `params` and keep logs in memory (last 20); Go to Database Object has no menu item
+    (RustRover has none).
 40. Database transactions and data tools (track DB): the grid submits inside an open transaction
     with a savepoint (it used to commit the user's transaction), COMMIT of a failed PostgreSQL
     transaction reports the rollback, the transaction state comes from the server, grid submit
@@ -460,15 +458,13 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     transaction indicator, and a Commit/Rollback/Cancel guard on disconnect, closing a console or
     the project, and quit; query timeout and real cancel; keep-alive and safe reconnect (reads
     retried once, writes and transactions never); Compare Data with a sync script; pg_dump /
-    mysqldump / SQLite dump and restore; streamed export; full-text search. Remaining: closing a
-    secondary project window isn't guarded (its transactions roll back at shutdown, logged), nor
-    is opening another project in the same window; editing only a data source's name still asks;
-    MySQL transaction state is tracked from statements and MySQL is untested here (no server);
-    the timeout covers the time to the first rows (client side, no server `statement_timeout`);
-    no savepoint commands; Compare Data keeps 5,000 differences per kind and needs keys that sort
-    alike on both sides; no live progress for psql/pg_restore input; tool paths only per data
-    source; full-text search is LIKE/ILIKE without full-text indexes or paging; Data Tools forms
-    have no schema/table pickers; exported INSERTs can't target another dialect.
+    mysqldump / SQLite dump and restore; streamed export; full-text search. Remaining: editing
+    only a data source's name still asks; MySQL transaction state is tracked from statements and
+    MySQL is untested here (no server); the client-side timeout covers the time to the first
+    rows; Compare Data keeps 5,000 differences per kind and needs keys that sort alike on both
+    sides; no live progress for psql/pg_restore input; tool paths only per data source;
+    full-text search is LIKE/ILIKE without full-text indexes or paging; exported INSERTs can't
+    target another dialect.
 41. Database schema tools (track DA): Create/Modify Table with a live SQL preview (PostgreSQL and
     SQLite in one transaction, SQLite via a rebuild that keeps views, triggers and foreign keys;
     MySQL statement by statement with exact reporting), Drop/Rename/Truncate with preview, SQL
@@ -544,10 +540,46 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     consoles) and DuckDB (the CLI). Only Redis was tested against a real server (one the tests
     start); SQL Server, ClickHouse and DuckDB against fakes. Remaining: no MongoDB (the driver is
     too heavy); SQL Server has no Windows/Kerberos/Azure AD auth, named instances need their
-    port, only the first result set of a batch is shown, no actual plans, no Create/Modify
-    Table; ClickHouse has no transactions or grid edits, `ssl=true` needs port 8443 set by hand,
-    cancel needs the KILL QUERY privilege, sessions expire after 600 s idle; Redis TLS only on
-    macOS/Windows, no Cluster/Sentinel/SUBSCRIBE/MONITOR, binary strings read-only, no consumer
-    groups, at most 100,000 keys in the browser, Redis consoles still get SQL completion; DuckDB
-    needs its CLI, runs each statement in its own process (no transactions or session state),
-    may lose HUGEINT/DECIMAL precision, no Explain Plan; no Dump for the four new kinds.
+    port, no actual plans; ClickHouse has no transactions or grid edits, `ssl=true` needs port
+    8443 set by hand, cancel needs the KILL QUERY privilege, sessions expire after 600 s idle;
+    Redis TLS only on macOS/Windows, no Cluster/Sentinel/SUBSCRIBE/MONITOR, binary strings
+    read-only, no consumer groups, at most 100,000 keys in the browser; DuckDB needs its CLI,
+    runs each statement in its own process (no transactions or session state), may lose
+    HUGEINT/DECIMAL precision; no Dump for the four new kinds.
+
+## M13 (2026-10-15)
+
+48. DataGrip follow-ups (track DX): savepoints (Set / Rollback to / Release on the open
+    transaction, `SAVE TRANSACTION` on SQL Server, typed ones tracked too) listed in the
+    console's transaction indicator and its Savepoint menu, Rollback to Savepoint recovering a
+    failed PostgreSQL transaction; the query timeout also sets the server's own limit
+    (PostgreSQL `statement_timeout`, re-applied after a rollback undoes it; MySQL
+    `max_execution_time`; MariaDB `max_statement_time`; SQL Server `LOCK_TIMEOUT`) and clearing it
+    restores the default (`RESET` / `= DEFAULT`; option `server_timeout=off` keeps it client-side);
+    the Commit/Rollback/Cancel guard also on closing a project window and on opening another
+    project in the window; the introspected tree cached per data source in
+    `.codecraft/db-cache/` (git-ignored, keyed by server), shown greyed and offline after a
+    disconnect or restart, used by completion and Database Object without connecting, reloaded
+    level by level on connect; Run from Caret and Run Selection as a script with the execution
+    log (file line numbers, production confirmation runs the same part); schema and table pickers
+    in the Data Tools forms (Dump picks tables with checkboxes); every result set of a SQL Server
+    batch in its own tab and Create/Modify Table for SQL Server (`sp_rename`, `ALTER COLUMN`,
+    named default constraints, `MS_Description` comments, transactional); DuckDB Explain Plan and
+    Explain Analyze from the CLI's box drawing; Settings › Languages & Frameworks › SQL (dialect
+    per file or folder, default data source per folder or project, SQL in Rust strings) with SQL
+    Dialect… and Data Source for File… in the file toolbar; SQLite attached databases
+    (`attach.<alias>` options, `db.sqlite.attach`) as schemas in the tree and the schema
+    selector; DDL tabs deleted when closed, at shutdown and (other processes' leftovers) at start;
+    Redis consoles complete command names and get no SQL inspections or navigation; rename of
+    column aliases (ORDER BY / GROUP BY / HAVING uses and `cte.alias` outside a CTE). Remaining:
+    SQL Server's later result sets wait while an earlier one over 500 rows still has rows to
+    fetch, Create/Modify Table there can't add or drop IDENTITY in place or read existing
+    comments, and both are tested against generated SQL and unit fakes only (no server here);
+    MySQL/MariaDB savepoints and server timeouts are untested (no server); `max_execution_time`
+    covers only SELECTs; the metadata cache keeps up to 50,000 tables per schema and 32 MB per
+    data source, and its file is written a few seconds after metadata arrives (a crash in that
+    window loses the newest level); DuckDB plans are read from the box drawing (an unusual
+    layout shows as raw text) and need the CLI; the file dialect only changes splitting and
+    parameters (highlighting and inspections stay generic SQL); attaching a SQLite database has
+    no tree menu item (the options field or `db.sqlite.attach`); column alias rename is lexical
+    (WHERE uses are left alone, unqualified uses of a CTE column outside it are not renamed).
