@@ -18,6 +18,8 @@ pub mod agent_access;
 pub mod agent_mcp;
 pub mod agent_tools;
 mod agent_tools_cmds;
+// M15 track AI: Review jobs' tool calls in their worktree.
+mod agent_worktree;
 pub mod agent_sessions;
 pub mod appearance;
 mod bookmark_cmds;
@@ -362,6 +364,9 @@ pub struct Session {
     decor: decorations::DecorState,
     runs: runs::Runs,
     jobs: jobs::Jobs,
+    /// The directory [`Session::isolate_home`] was given (sessions this one opens for agents'
+    /// worktrees are isolated the same way; M15 AI).
+    pub(crate) isolated_home: Option<std::path::PathBuf>,
 }
 
 impl Default for Session {
@@ -448,6 +453,7 @@ impl Session {
             decor: Default::default(),
             runs: runs::Runs::default(),
             jobs: jobs::Jobs::default(),
+            isolated_home: None,
         }
     }
 
@@ -504,6 +510,7 @@ impl Session {
     /// and saved agent sessions (which this also turns on). For tests and embedders that must
     /// never touch the user's real files.
     pub fn isolate_home(&mut self, dir: &std::path::Path) {
+        self.isolated_home = Some(dir.to_path_buf());
         self.agents.sessions.dir_override = Some(dir.join(agent_sessions::DIR_NAME));
         self.scratch.dir_override = Some(dir.join("scratches"));
         self.hot_exit.fallback_dir = Some(dir.join("unsaved"));

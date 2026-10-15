@@ -17,6 +17,10 @@
 //! codecraft-cli mcp <project> [--allow run,debug,profile,write,db-write] [--no-lsp]
 //!                                              MCP server over stdio with CodeCraft's engine tools
 //! codecraft-cli mcp --connect <port>           stdio bridge to a running CodeCraft IDE
+//! codecraft-cli mcp --ide                      the same, finding the IDE (the job's environment, else
+//!                                              the window whose project holds the working directory)
+//! codecraft-cli mcp --print-config <claude|codex|gemini|cursor|grok|json> [project] [--allow caps] [--ide]
+//!                                              ready-to-paste client configuration (absolute paths)
 //! codecraft-cli debug <project> <config|file> --break file:line [--eval expr]… [--json] [--timeout secs]
 //!                                              run to the first stop, print it, evaluate, stop
 //! codecraft-cli analyze <project> [--scope path] [--format json|sarif|text] [--tools a,b]

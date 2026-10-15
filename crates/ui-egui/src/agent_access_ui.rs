@@ -82,6 +82,13 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
         if ui.button("Reset to Defaults").on_hover_text("Read: Allow; everything else: Ask").clicked() {
             cmds.push(("agentAccess.reset", Value::Null));
         }
+        if ui
+            .button("Connect an External Agent…")
+            .on_hover_text("Configuration for Claude Code, Codex, Gemini CLI, Cursor, Grok or any MCP client")
+            .clicked()
+        {
+            cmds.push(("agent.connectExternal", Value::Null));
+        }
     });
     ui.add_space(8.0);
     ui.label(

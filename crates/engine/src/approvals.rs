@@ -153,6 +153,14 @@ impl Approvals {
         true
     }
 
+    /// Remove a card without a decision: the request was cancelled or its client went away. The
+    /// asker sees its channel close. Returns false if it is no longer pending.
+    pub fn withdraw(&mut self, id: ApprovalId) -> bool {
+        let Some(pos) = self.pending.iter().position(|(r, _)| r.id == id) else { return false };
+        self.pending.remove(pos);
+        true
+    }
+
     /// Forget "allow always" for the sources matching `f` (their next requests ask again).
     pub fn forget_always(&mut self, f: impl Fn(&str) -> bool) {
         self.always.retain(|s| !f(s));
@@ -186,5 +194,17 @@ mod tests {
         assert!(a.is_empty());
         assert_eq!(rx2.recv().ok(), Some(Decision::Allow));
         assert!(!a.decide(id, Decision::Deny));
+    }
+
+    #[test]
+    fn withdrawn_cards_go_without_a_decision() {
+        let mut a = Approvals::default();
+        let (id, rx) = a.sink().ask("Codex (job 2)", "Run tests", ApprovalKind::Command { command: "x".into(), cwd: None });
+        a.pump();
+        assert!(a.withdraw(id));
+        assert!(a.is_empty());
+        assert!(rx.recv().is_err(), "the asker sees the channel close, not a decision");
+        assert!(!a.withdraw(id));
+        assert!(!a.decide(id, Decision::Allow));
     }
 }

@@ -71,7 +71,7 @@ time; **Low** is polish.
 | 21 | Low | Inspect Code, Rust | With cargo-deny installed, the default profile runs `cargo deny check advisories`, which fetches the advisory database over the network. | Open (a profile decision; turn the analyzer off in the profile). |
 | 22 | Low | Debugger, Rust | Each Rust session's output has LLDB's "This version of LLDB has no plugin for the language rust" warning (values still read well through the formatters). | Open. |
 | 23 | Low | Debugger, C++ | A C++ reference local (`const Item& it`) shows its address, not the referenced value, until expanded. | Open. |
-| 24 | Low | Agents | `test_run`'s `commandLine` includes the internal JUnit XML temp path; `inspect`'s `tools[]` uses `command_line` while the rest is camelCase. | Open (docs show the real shape). |
+| 24 | Low | Agents | `test_run`'s `commandLine` includes the internal JUnit XML temp path; `inspect`'s `tools[]` uses `command_line` while the rest is camelCase. | Fixed (M15 AI): `commandLine` everywhere, SQL columns' `typeName`, CodeCraft's temp report files left out of command lines; `crates/engine/tests/agent_results_camel_case.rs` walks every tool's result. |
 | 25 | Low | Profiler | `profile_hotspots` follows the Method List's sort in the IDE (sorting by Total there changes the agent's order). | Open. |
 | 26 | Low | Settings, Python | Languages & Frameworks › Python has no interpreter picker (the status bar and `python.interpreter.select` have one). | Open. |
 | 27 | Low | Run, Python | A failed test's location in the Run tool window is the absolute path, which wraps in a narrow panel. | Open. |

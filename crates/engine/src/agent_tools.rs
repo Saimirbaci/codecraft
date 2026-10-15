@@ -9,9 +9,14 @@
 //! them. Tools that wait (for a debugger stop, test results, a language server, a profile) park
 //! the call; [`pump`] (from `Session::pump`) finishes it when the condition holds or its timeout
 //! passes. Nothing blocks the UI thread.
+//!
+//! A call can be cancelled by its client (`notifications/cancelled`, [`cancel`]) or abandoned
+//! when the client disconnects ([`client_gone`]); either withdraws its approval card. A Review
+//! job's calls run in a session on its worktree ([`crate::agent_worktree`]), never on the open
+//! project.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -45,24 +50,85 @@ pub struct Caller {
     pub name: String,
     /// The built-in agent job behind the call (through the bridge).
     pub job: Option<JobId>,
+    /// A Review job's directory in its worktree: the call runs there (files, runs, tests,
+    /// analysis, debugging), never on the open project. An empty path: the worktree is gone.
+    pub root: Option<PathBuf>,
 }
+
+/// The `clientInfo` field a job's bridge sends with its job id.
+pub const CLIENT_INFO_JOB: &str = "codecraftJob";
+/// The `clientInfo` field with the job's key ([`job_key`]); a job id without it is not trusted.
+pub const CLIENT_INFO_JOB_KEY: &str = "codecraftJobKey";
 
 impl Caller {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into(), job: None }
+        Self { name: name.into(), job: None, root: None }
     }
 
-    /// From an MCP client's `clientInfo` (`name`, and `codecraftJob` when the bridge of an agent
-    /// job connected). A job id that is not one of the session's jobs is ignored.
+    /// From an MCP client's `clientInfo` (`name`, and `codecraftJob` + `codecraftJobKey` when
+    /// the bridge of an agent job connected). A job id that is not one of the session's jobs, or
+    /// comes without the job's key, is ignored (any client with the lock file's token could
+    /// claim to be an Auto job otherwise).
     pub fn from_client_info(s: &Session, info: &Value, fallback: &str) -> Self {
-        let job = info.get("codecraftJob").and_then(Value::as_u64).map(JobId).filter(|j| s.agents.job(*j).is_some());
-        if let Some(job) = job.and_then(|j| s.agents.job(j)) {
-            return Self { name: format!("{} (job {})", job.backend.label(), job.id.0), job: Some(job.id) };
+        let job = info.get(CLIENT_INFO_JOB).and_then(Value::as_u64).map(JobId).filter(|j| s.agents.job(*j).is_some());
+        let key = info.get(CLIENT_INFO_JOB_KEY).and_then(Value::as_str).unwrap_or_default();
+        if let Some(job) = job.filter(|j| !key.is_empty() && key == job_key(s, *j)).and_then(|j| s.agents.job(j)) {
+            let root = (job.mode == crate::approvals::AgentMode::Review).then(|| {
+                job.worktree.as_ref().map(|wt| crate::normalize_path(&wt.cwd())).unwrap_or_default()
+            });
+            return Self { name: format!("{} (job {})", job.backend.label(), job.id.0), job: Some(job.id), root };
         }
         let name = info.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).unwrap_or(fallback);
-        Self { name: name.to_string(), job: None }
+        Self { name: name.to_string(), job: None, root: None }
     }
 }
+
+/// The secret a job's bridge proves it belongs to `job` with (in the bridge's environment, never
+/// in the lock file). Stable for the session, different per job.
+pub fn job_key(s: &Session, job: JobId) -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let st = &s.agent_tools.job_secret;
+    let part = |salt: u8| {
+        let mut h = st.hasher.build_hasher();
+        h.write(st.token.as_bytes());
+        h.write_u8(salt);
+        h.write_u64(job.0);
+        h.finish()
+    };
+    format!("{:016x}{:016x}", part(1), part(2))
+}
+
+/// One call on one connection, for `notifications/cancelled` and disconnects.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallKey {
+    /// The connection (`ide:3`, `stdio`).
+    pub client: String,
+    /// The JSON-RPC id of the `tools/call`.
+    pub request: Value,
+}
+
+impl CallKey {
+    pub fn new(client: impl Into<String>, request: Value) -> Self {
+        Self { client: client.into(), request }
+    }
+}
+
+/// Per-session randomness behind [`job_key`].
+pub(crate) struct JobSecret {
+    hasher: std::hash::RandomState,
+    token: String,
+}
+
+impl Default for JobSecret {
+    fn default() -> Self {
+        Self { hasher: std::hash::RandomState::new(), token: codecraft_mcp::new_token().unwrap_or_default() }
+    }
+}
+
+/// The connection name of calls a session forwards to a worktree session.
+const FORWARD_CLIENT: &str = "worktree";
+/// How long a forwarded call may take at most (the worktree session has its own timeouts).
+const FORWARD_TIMEOUT: Duration = Duration::from_secs(3600);
 
 /// Pending calls and language-server answers.
 pub struct AgentToolsState {
@@ -74,6 +140,14 @@ pub struct AgentToolsState {
     pub answered: u64,
     /// How long an Ask waits for the user ([`APPROVAL_TIMEOUT`]; tests shorten it).
     pub approval_timeout: Duration,
+    /// Calls the client cancelled or abandoned by disconnecting.
+    pub cancelled: u64,
+    pub(crate) job_secret: JobSecret,
+    /// Tells this session's per-job files from other sessions' in the same process.
+    pub(crate) instance: u64,
+    /// Sessions on Review jobs' worktrees.
+    pub(crate) worktrees: Vec<crate::agent_worktree::WorktreeSession>,
+    next_forward: u64,
 }
 
 impl Default for AgentToolsState {
@@ -85,6 +159,16 @@ impl Default for AgentToolsState {
             lsp_done: BTreeMap::new(),
             answered: 0,
             approval_timeout: APPROVAL_TIMEOUT,
+            cancelled: 0,
+            job_secret: JobSecret::default(),
+            instance: {
+                use std::hash::{BuildHasher, Hasher};
+                let mut h = std::hash::RandomState::new().build_hasher();
+                h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+                h.finish()
+            },
+            worktrees: Vec::new(),
+            next_forward: 0,
         }
     }
 }
@@ -102,6 +186,11 @@ impl AgentToolsState {
     /// Names of the waiting calls (status display, tests).
     pub fn pending_tools(&self) -> Vec<String> {
         self.pending.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// The worktree directories Review jobs' calls run in now (status display, tests).
+    pub fn worktree_roots(&self) -> Vec<PathBuf> {
+        self.worktrees.iter().map(|w| w.root.clone()).collect()
     }
 
     pub(crate) fn next_lsp_token(&mut self) -> u64 {
@@ -135,6 +224,7 @@ pub(crate) fn on_lsp_response(s: &mut Session, token: u64, result: Result<Value,
 
 struct PendingCall {
     caller: Caller,
+    key: Option<CallKey>,
     name: String,
     deadline: Instant,
     respond: Respond,
@@ -205,6 +295,12 @@ enum Wait {
     ProjectLoad {
         tool: String,
         args: Value,
+    },
+    /// The answer of a call forwarded to a Review job's worktree session.
+    Worktree {
+        slot: Arc<Mutex<Option<ToolResult>>>,
+        job: JobId,
+        forward: u64,
     },
 }
 
@@ -661,6 +757,11 @@ pub fn static_capability(name: &str) -> Option<Capability> {
 /// Handle one tool call: check the policy (asking the user when needed), run the tool, and answer
 /// through `respond` now or from a later [`pump`].
 pub fn submit(s: &mut Session, caller: Caller, name: &str, args: Value, respond: Respond) {
+    submit_call(s, caller, None, name, args, respond);
+}
+
+/// [`submit`] for a call the transport can cancel later ([`cancel`], [`client_gone`]).
+pub fn submit_call(s: &mut Session, caller: Caller, key: Option<CallKey>, name: &str, args: Value, respond: Respond) {
     let args = match args {
         Value::Object(_) => args,
         Value::Null => json!({}),
@@ -673,17 +774,34 @@ pub fn submit(s: &mut Session, caller: Caller, name: &str, args: Value, respond:
     if db_call {
         let _ = s.execute("db.listDataSources", &Value::Null);
     }
-    let cap = match required_capability(s, name, &args) {
+    let mut cap = match required_capability(s, name, &args) {
         Ok(c) => c,
         Err(e) => return respond(ToolResult::error(e)),
     };
-    let job_mode = caller.job.and_then(|j| s.agents.job(j)).map(|j| j.mode);
+    // A Review job's SQL runs on its worktree's data sources, which this session may not know
+    // (a SQLite file of the worktree): judge the SQL on its own, strictly.
+    if caller.root.is_some() && cap == Capability::Read {
+        let sql = match name {
+            t::DB_QUERY => args.get("sql"),
+            t::EXECUTE => args.pointer("/params/sql"),
+            _ => None,
+        };
+        if sql.and_then(Value::as_str).is_some_and(|q| sql_writes_in(codecraft_db::Dialect::Postgres, q)) {
+            cap = Capability::DbWrite;
+        }
+    }
+    let mut job_mode = caller.job.and_then(|j| s.agents.job(j)).map(|j| j.mode);
+    // A Review job's writes land in its worktree, and its user reviews them file by file
+    // afterwards: like the agent's own edits there, they need no card (Off still denies).
+    if caller.root.is_some() && cap == Capability::Write && job_mode == Some(crate::approvals::AgentMode::Review) {
+        job_mode = Some(crate::approvals::AgentMode::Auto);
+    }
     match s.agent_access.verdict(&caller.name, job_mode, cap) {
         Verdict::Deny(why) => {
             s.agent_tools.answered += 1;
             respond(ToolResult::error(why));
         }
-        Verdict::Allow => start(s, caller, name, args, respond),
+        Verdict::Allow => start(s, caller, key, name, args, respond),
         Verdict::Ask => {
             let source = crate::agent_access::approval_source(&caller.name, cap);
             let title = format!("{} wants to use {name} ({})", caller.name, cap.label().to_lowercase());
@@ -692,6 +810,7 @@ pub fn submit(s: &mut Session, caller: Caller, name: &str, args: Value, respond:
             s.status = format!("{} asks to use {name}", caller.name);
             s.agent_tools.pending.push(PendingCall {
                 caller,
+                key,
                 name: name.to_string(),
                 deadline: Instant::now() + s.agent_tools.approval_timeout,
                 respond,
@@ -699,6 +818,55 @@ pub fn submit(s: &mut Session, caller: Caller, name: &str, args: Value, respond:
             });
         }
     }
+}
+
+/// The client cancelled a call (`notifications/cancelled`): stop waiting for it, withdraw its
+/// approval card, and answer it with an error (the transport sends nothing for a cancelled
+/// request). Work it already started (a test run, a debug session) goes on. True if the call was
+/// still waiting.
+pub fn cancel(s: &mut Session, client: &str, request: &Value) -> bool {
+    let pos = s
+        .agent_tools
+        .pending
+        .iter()
+        .position(|p| p.key.as_ref().is_some_and(|k| k.client == client && k.request == *request));
+    let Some(pos) = pos else { return false };
+    let call = s.agent_tools.pending.remove(pos);
+    abandon(s, call, "cancelled by the client");
+    true
+}
+
+/// A client disconnected: every call of it that still waits is dropped and its approval cards
+/// are withdrawn at once. Returns how many calls were dropped.
+pub fn client_gone(s: &mut Session, client: &str) -> usize {
+    let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut s.agent_tools.pending)
+        .into_iter()
+        .partition(|p| p.key.as_ref().is_some_and(|k| k.client == client));
+    s.agent_tools.pending = keep;
+    let n = gone.len();
+    for call in gone {
+        abandon(s, call, "the client disconnected");
+    }
+    n
+}
+
+fn abandon(s: &mut Session, call: PendingCall, why: &str) {
+    match &call.wait {
+        Wait::Approval { approval, .. } => {
+            s.approvals.withdraw(*approval);
+        }
+        Wait::Worktree { job, forward, .. } => {
+            if let Some(ws) = s.agent_tools.worktrees.iter_mut().find(|w| w.job == *job) {
+                cancel(&mut ws.session, FORWARD_CLIENT, &json!(forward));
+            }
+        }
+        _ => {}
+    }
+    s.agent_tools.cancelled += 1;
+    if s.status.contains(&call.name) {
+        s.status.clear();
+    }
+    (call.respond)(ToolResult::error(format!("{}: {why}", call.name)));
 }
 
 /// Tools that need the project's run configurations, targets or files (QA M14: right after
@@ -718,45 +886,142 @@ const NEED_LOADED_PROJECT: &[&str] = &[
 /// How long a call waits for the project to load.
 const PROJECT_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
-fn start(s: &mut Session, caller: Caller, name: &str, args: Value, respond: Respond) {
+fn start(s: &mut Session, caller: Caller, key: Option<CallKey>, name: &str, args: Value, respond: Respond) {
+    if caller.root.is_some() {
+        let step = forward(s, &caller, name, &args);
+        return settle_step(s, caller, key, name.to_string(), step, respond);
+    }
     if s.project_loading() && NEED_LOADED_PROJECT.contains(&name) {
         let wait = Wait::ProjectLoad { tool: name.to_string(), args };
-        return settle_step(s, caller, name.to_string(), Step::Wait(wait, PROJECT_LOAD_TIMEOUT), respond);
+        return settle_step(s, caller, key, name.to_string(), Step::Wait(wait, PROJECT_LOAD_TIMEOUT), respond);
     }
     let step = run_tool(s, &caller, name, &args);
-    settle_step(s, caller, name.to_string(), step, respond);
+    settle_step(s, caller, key, name.to_string(), step, respond);
+}
+
+/// Run the tool here, or in the Review job's worktree session.
+fn run_or_forward(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step {
+    if caller.root.is_some() { forward(s, caller, name, args) } else { run_tool(s, caller, name, args) }
+}
+
+/// Hand a Review job's call to the session on its worktree (opened on first use). Paths inside
+/// the open project are moved into the worktree; writes outside the worktree are refused.
+fn forward(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step {
+    let (Some(job), Some(root)) = (caller.job, caller.root.clone()) else {
+        return done_err("this call has no worktree to run in");
+    };
+    let args = match s.project_root() {
+        Some(project) => crate::agent_worktree::remap_paths(args, &project, &root),
+        None => args.clone(),
+    };
+    if matches!(name, t::FILE_WRITE | t::FILE_EDIT)
+        && let Some(raw) = args.get("path").and_then(Value::as_str)
+    {
+        let p = Path::new(raw.trim());
+        let abs = crate::normalize_path(&if p.is_absolute() { p.to_path_buf() } else { root.join(p) });
+        if !abs.starts_with(&root) {
+            return done_err(format!(
+                "a Review job writes only inside its worktree ({}); {} is outside it",
+                root.display(),
+                abs.display()
+            ));
+        }
+    }
+    let existing = s.agent_tools.worktrees.iter().position(|w| w.job == job && w.root == root);
+    let index = match existing {
+        Some(i) => i,
+        None => {
+            // The job's worktree moved (recreated for a follow-up): the old session goes.
+            let (stale, keep): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut s.agent_tools.worktrees).into_iter().partition(|w| w.job == job);
+            s.agent_tools.worktrees = keep;
+            stale.into_iter().for_each(crate::agent_worktree::close);
+            match crate::agent_worktree::open(s, job, &root) {
+                Ok(ws) => {
+                    s.agent_tools.worktrees.push(ws);
+                    s.agent_tools.worktrees.len() - 1
+                }
+                Err(e) => return done_err(e),
+            }
+        }
+    };
+    s.agent_tools.next_forward += 1;
+    let n = s.agent_tools.next_forward;
+    let slot: Arc<Mutex<Option<ToolResult>>> = Arc::new(Mutex::new(None));
+    let out = Arc::clone(&slot);
+    let Some(ws) = s.agent_tools.worktrees.get_mut(index) else {
+        return done_err("the worktree session is gone");
+    };
+    submit_call(
+        &mut ws.session,
+        Caller::new(caller.name.clone()),
+        Some(CallKey::new(FORWARD_CLIENT, json!(n))),
+        name,
+        args,
+        Box::new(move |r| {
+            *out.lock().unwrap_or_else(PoisonError::into_inner) = Some(r);
+        }),
+    );
+    Step::Wait(Wait::Worktree { slot, job, forward: n }, FORWARD_TIMEOUT)
 }
 
 /// Answer a finished step, or park it (polled once right away so instant results don't wait a
 /// pump).
-fn settle_step(s: &mut Session, caller: Caller, name: String, step: Step, respond: Respond) {
+fn settle_step(s: &mut Session, caller: Caller, key: Option<CallKey>, name: String, step: Step, respond: Respond) {
     match step {
         Step::Done(r) => {
             s.agent_tools.answered += 1;
             respond(r);
         }
         Step::Wait(mut wait, timeout) => match poll(s, &caller, &mut wait) {
-            Some(step) => settle_step(s, caller, name, step, respond),
+            Some(step) => settle_step(s, caller, key, name, step, respond),
             None => {
                 let deadline = Instant::now() + timeout;
-                s.agent_tools.pending.push(PendingCall { caller, name, deadline, respond, wait });
+                s.agent_tools.pending.push(PendingCall { caller, key, name, deadline, respond, wait });
             }
         },
     }
 }
 
-/// Finish parked calls. True if any was answered.
-pub(crate) fn pump(s: &mut Session) -> bool {
-    if s.agent_tools.pending.is_empty() {
+/// Pump the Review jobs' worktree sessions; close those whose job stopped running and that have
+/// nothing left to answer.
+fn pump_worktrees(s: &mut Session) -> bool {
+    if s.agent_tools.worktrees.is_empty() {
         return false;
     }
-    let calls = std::mem::take(&mut s.agent_tools.pending);
+    let mut list = std::mem::take(&mut s.agent_tools.worktrees);
     let mut changed = false;
+    for ws in &mut list {
+        changed |= ws.session.pump();
+    }
+    let (keep, done): (Vec<_>, Vec<_>) = list.into_iter().partition(|ws| {
+        let running = s.agents.job(ws.job).is_some_and(|j| j.is_running());
+        let waiting =
+            s.agent_tools.pending.iter().any(|p| matches!(&p.wait, Wait::Worktree { job, .. } if *job == ws.job));
+        running || waiting || ws.session.agent_tools.busy()
+    });
+    // Sessions opened while these were pumped (none today) are kept too.
+    let opened = std::mem::replace(&mut s.agent_tools.worktrees, keep);
+    s.agent_tools.worktrees.extend(opened);
+    for ws in done {
+        changed = true;
+        crate::agent_worktree::close(ws);
+    }
+    changed
+}
+
+/// Finish parked calls. True if any was answered.
+pub(crate) fn pump(s: &mut Session) -> bool {
+    let mut changed = pump_worktrees(s);
+    if s.agent_tools.pending.is_empty() {
+        return changed;
+    }
+    let calls = std::mem::take(&mut s.agent_tools.pending);
     for mut call in calls {
         match poll(s, &call.caller, &mut call.wait) {
             Some(step) => {
                 changed = true;
-                settle_step(s, call.caller, call.name, step, call.respond);
+                settle_step(s, call.caller, call.key, call.name, step, call.respond);
             }
             None if Instant::now() >= call.deadline => {
                 changed = true;
@@ -770,13 +1035,16 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     changed
 }
 
-/// Answer every parked call (the session is closing).
+/// Answer every parked call (the session is closing) and close the worktree sessions.
 pub(crate) fn shutdown(s: &mut Session) {
     for call in std::mem::take(&mut s.agent_tools.pending) {
         if let Wait::Approval { approval, .. } = &call.wait {
             s.approvals.decide(*approval, Decision::Deny);
         }
         (call.respond)(ToolResult::error("CodeCraft is shutting down"));
+    }
+    for mut ws in std::mem::take(&mut s.agent_tools.worktrees) {
+        ws.session.shutdown();
     }
 }
 
@@ -834,10 +1102,10 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
             Some(run_tool(s, caller, &tool, &args))
         }
         Wait::Approval { rx, cap, tool, args, .. } => match rx.try_recv() {
-            Ok(Decision::Allow) => Some(run_tool(s, caller, tool, args)),
+            Ok(Decision::Allow) => Some(run_or_forward(s, caller, tool, args)),
             Ok(Decision::AllowAlways) => {
                 s.agent_access.allow_for_session(&caller.name, *cap);
-                Some(run_tool(s, caller, tool, args))
+                Some(run_or_forward(s, caller, tool, args))
             }
             Ok(Decision::Deny) | Err(TryRecvError::Disconnected) => Some(done_err("denied by the user")),
             Err(TryRecvError::Empty) => None,
@@ -1037,6 +1305,7 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
             }
             Some(db_outcome(s, source, before, *output_before, *limit, added.take()))
         }
+        Wait::Worktree { slot, .. } => slot.lock().unwrap_or_else(PoisonError::into_inner).take().map(Step::Done),
     }
 }
 
@@ -1100,6 +1369,17 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
             let params = args.get("params").cloned().unwrap_or(Value::Null);
             match s.execute(&id, &params) {
                 Ok(v) => done_json(json!({ "id": id, "result": v })),
+                // A command that needs the project's settings (run configurations, data
+                // sources) while the project is still loading: run it again once it has (M15 AI:
+                // `runConfig.create` right after `codecraft-cli mcp` started said "no project is
+                // open").
+                Err(e)
+                    if s.project_loading()
+                        && (matches!(e, CommandError::Disabled(_)) || e.to_string().contains("no project is open")) =>
+                {
+                    let wait = Wait::ProjectLoad { tool: name.to_string(), args: args.clone() };
+                    Step::Wait(wait, PROJECT_LOAD_TIMEOUT)
+                }
                 Err(e) => cmd_err(e),
             }
         }
@@ -1336,9 +1616,32 @@ fn inspection_results(s: &mut Session, limit: usize) -> Step {
             Value::Object(o)
         })
         .collect();
+    // The analyzers that ran, in the camelCase of every other result (QA M14 #24: `command_line`),
+    // without CodeCraft's temporary report files.
+    let tools: Vec<Value> = v
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .map(|t| {
+                    let mut o = Map::new();
+                    for key in ["tool", "ok", "outcome"] {
+                        if let Some(x) = t.get(key) {
+                            o.insert(key.into(), x.clone());
+                        }
+                    }
+                    let cl = t.get("command_line").or_else(|| t.get("commandLine")).and_then(Value::as_str);
+                    if let Some(cl) = cl.filter(|c| !c.is_empty()) {
+                        o.insert("commandLine".into(), json!(crate::agent_tools_cmds::public_command_line(cl)));
+                    }
+                    Value::Object(o)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mut out = json!({
         "scope": v.get("scopeLabel").or_else(|| v.get("scope")).cloned().unwrap_or(Value::Null),
-        "tools": v.get("tools").cloned().unwrap_or(Value::Null),
+        "tools": tools,
         "counts": v.get("counts").cloned().unwrap_or(Value::Null),
         "total": total,
         "findings": list,
@@ -1833,7 +2136,10 @@ fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usiz
                 let mut o = Map::new();
                 for key in ["sql", "columns", "rows", "totalRows", "statusLine", "error", "hasMore"] {
                     if let Some(x) = v.get(key).filter(|x| !x.is_null()) {
-                        o.insert(key.into(), x.clone());
+                        // Column descriptions in the camelCase of every other result (QA M14
+                        // #24: `type_name`); rows are values and stay as the database gave them.
+                        let x = if key == "columns" { camel_case_objects(x) } else { x.clone() };
+                        o.insert(key.into(), x);
                     }
                 }
                 results.push(Value::Object(o));
@@ -1872,6 +2178,33 @@ fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usiz
         );
     }
     done_json(v)
+}
+
+/// `snake_case` → `snakeCase`.
+fn camel_case(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper = false;
+    for c in key.chars() {
+        if c == '_' {
+            upper = !out.is_empty();
+        } else if upper {
+            out.extend(c.to_uppercase());
+            upper = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The keys of the objects in `v` (an object or an array of them, one level) in camelCase.
+fn camel_case_objects(v: &Value) -> Value {
+    let obj = |o: &Map<String, Value>| Value::Object(o.iter().map(|(k, x)| (camel_case(k), x.clone())).collect());
+    match v {
+        Value::Object(o) => obj(o),
+        Value::Array(a) => Value::Array(a.iter().map(|x| x.as_object().map_or_else(|| x.clone(), obj)).collect()),
+        other => other.clone(),
+    }
 }
 
 // ---------------------------------------------------------------- helpers for embedders
@@ -1944,6 +2277,18 @@ mod tests {
         ] {
             assert!(!agent_reads_only(sql, Dialect::Postgres), "{sql}");
         }
+    }
+
+    #[test]
+    fn keys_become_camel_case() {
+        assert_eq!(camel_case("type_name"), "typeName");
+        assert_eq!(camel_case("a_b_c"), "aBC");
+        assert_eq!(camel_case("already"), "already");
+        assert_eq!(camel_case("_lead"), "lead");
+        assert_eq!(camel_case("trail_"), "trail");
+        let v = camel_case_objects(&json!([{ "type_name": "int", "name": "n_items" }, 3]));
+        assert_eq!(v, json!([{ "typeName": "int", "name": "n_items" }, 3]));
+        assert_eq!(camel_case_objects(&json!({ "is_key": true })), json!({ "isKey": true }));
     }
 
     #[test]

@@ -100,6 +100,41 @@ pub fn cleanup_stale(dir: &Path, ide_name: &str) -> Vec<PathBuf> {
     removed
 }
 
+/// The live server of `ide_name` whose workspace folder holds `dir` (the deepest such folder when
+/// several IDE windows match): `(port, info)`. Lets a bridge started from a project directory
+/// find the IDE that has that project open without knowing the port.
+pub fn find_for_dir(lock_dir: &Path, ide_name: &str, dir: &Path) -> Option<(u16, LockInfo)> {
+    let entries = std::fs::read_dir(lock_dir).ok()?;
+    let real = dir.canonicalize().ok();
+    let mut best: Option<(usize, u16, LockInfo)> = None;
+    for entry in entries.flatten().take(1000) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lock") {
+            continue;
+        }
+        let Some(port) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u16>().ok()) else {
+            continue;
+        };
+        let Ok(info) = read(&path) else { continue };
+        if info.ide_name != ide_name || !pid_alive(info.pid) {
+            continue;
+        }
+        let depth = info
+            .workspace_folders
+            .iter()
+            .map(PathBuf::from)
+            .filter(|f| dir.starts_with(f) || real.as_ref().is_some_and(|r| r.starts_with(f)))
+            .map(|f| f.components().count())
+            .max();
+        if let Some(depth) = depth
+            && best.as_ref().is_none_or(|(d, _, _)| depth > *d)
+        {
+            best = Some((depth, port, info));
+        }
+    }
+    best.map(|(_, port, info)| (port, info))
+}
+
 /// Whether a process with this id exists. When the check itself cannot run, the process is
 /// assumed alive (never delete a lock file on a guess).
 pub fn pid_alive(pid: u32) -> bool {
@@ -235,5 +270,34 @@ mod tests {
         assert!(ours_alive.exists() && other_dead.exists() && garbage.exists());
         // A missing directory is not an error.
         assert!(cleanup_stale(&dir.path().join("missing"), "CodeCraft").is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_ide_for_a_directory_is_found_by_its_workspace_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let me = std::process::id();
+        let mut outer = info(me, "CodeCraft");
+        outer.workspace_folders = vec!["/work".into()];
+        let mut inner = info(me, "CodeCraft");
+        inner.workspace_folders = vec!["/work/app".into()];
+        inner.auth_token = "inner".into();
+        let mut gone = info(dead, "CodeCraft");
+        gone.workspace_folders = vec!["/work/app/sub".into()];
+        let mut other = info(me, "Visual Studio Code");
+        other.workspace_folders = vec!["/work/app/sub".into()];
+        write(dir.path(), 2001, &outer).unwrap();
+        write(dir.path(), 2002, &inner).unwrap();
+        write(dir.path(), 2003, &gone).unwrap();
+        write(dir.path(), 2004, &other).unwrap();
+        std::fs::write(dir.path().join("x.lock"), b"{}").unwrap();
+        let (port, found) = find_for_dir(dir.path(), "CodeCraft", Path::new("/work/app/sub/src")).unwrap();
+        assert_eq!((port, found.auth_token.as_str()), (2002, "inner"), "the deepest live folder");
+        assert_eq!(find_for_dir(dir.path(), "CodeCraft", Path::new("/work/lib")).unwrap().0, 2001);
+        assert!(find_for_dir(dir.path(), "CodeCraft", Path::new("/elsewhere")).is_none());
+        assert!(find_for_dir(&dir.path().join("missing"), "CodeCraft", Path::new("/work")).is_none());
     }
 }

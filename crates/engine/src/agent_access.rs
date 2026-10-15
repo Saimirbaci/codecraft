@@ -7,8 +7,8 @@
 //! In the IDE, Ask shows an approval card (Allow once / Always for this session / Deny) and the
 //! tool call waits for it. Headless there is nobody to ask: Ask is denied, and `--allow …` turns
 //! capabilities on. Agent jobs launched in Auto mode get Ask capabilities without prompts (their
-//! user chose Auto); Review jobs never write files through the IDE (their changes belong in the
-//! worktree). The policy is saved in `$CODECRAFT_HOME/agent-access.json`.
+//! user chose Auto); Review jobs never write the open project's files (their calls run on their
+//! worktree, `crate::agent_worktree`). The policy is saved in `$CODECRAFT_HOME/agent-access.json`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

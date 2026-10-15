@@ -826,11 +826,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     over stdio, and a fake agent CLI that receives the bridge. Agents can't push, share, open or merge pull requests, upload to deployment servers or prune Docker (refused, not askable), and an agent's SQL needs `db-write` unless it is a plain read without known side-effect functions (lead, 2026-10-15). Remaining: Claude Code connected
     over `/ide` filters which IDE-server tools its model sees, so the engine tools may only reach
     it through the bridge or `claude mcp add` (not verified against a real `claude`, which tests
-    never run); headless Gemini and Grok jobs (Auto/Review) get no MCP server (their CLIs only
+    never run); ~~headless Gemini and Grok jobs (Auto/Review) get no MCP server (their CLIs only
     read MCP servers from settings files); the bridge's job tag is trusted from any client that
     has the lock file's token; a Review job's tool calls act on the open project, not its
     worktree; approval cards of a client that disconnects stay until they time
-    out; MCP `notifications/cancelled` does not cancel a waiting engine tool; one evaluation at a
+    out; MCP `notifications/cancelled` does not cancel a waiting engine tool~~ (M15 track AI,
+    item 60; Grok needs a one-time `grok mcp add`); one evaluation at a
     time (`debug_evaluate` shares the Evaluate Expression slot with the user); no MCP resources or
     progress notifications for long waits; `inspect` returns the open findings of the last run
     (no baseline/diff), and `analyze --format sarif` is CodeCraft's own minimal SARIF (no rule
@@ -1026,8 +1027,69 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     skips `python.packages.*`). Remaining (Low): the Python Console's Stop waits for the process
     on the UI thread (seconds in the panic hunt); cargo-deny's
     network fetch in the default Rust profile, LLDB's "no plugin for rust" line in Rust debug
-    output, C++ reference locals showing addresses, the JUnit temp path in `test_run`'s command
-    line and `command_line` in `inspect`'s tool list, hotspot order following the IDE's method
+    output, C++ reference locals showing addresses, ~~the JUnit temp path in `test_run`'s command
+    line and `command_line` in `inspect`'s tool list~~ (M15 AI, item 60), hotspot order following the IDE's method
     sort, no interpreter picker on Settings › Python, absolute test locations in the Run window;
     the gallery leaves out the Terminal, Python Console, Rust REPL, a Git repository and remote
     windows.
+
+## M15 (2026-10-15)
+
+60. AI agents everywhere (track AI): every agent CLI gets CodeCraft's tools the way it documents,
+    never by editing the user's files. Gemini Auto/Review jobs: a per-job settings file in the
+    temp directory (`codecraft-agent-<pid>-<session>-job<N>/gemini-system-defaults.json`, mode
+    0600, removed when the turn ends) named by `GEMINI_CLI_SYSTEM_DEFAULTS_PATH`, Gemini's
+    documented lowest settings layer, holding the machine's own system defaults plus
+    `mcpServers.codecraft` (Gemini merges `mcpServers` by name, so the user's servers stay);
+    `~/.gemini` is never touched. Grok: its headless mode reads MCP servers only from
+    `~/.grok/config.toml`/`.grok/config.toml` and its `GROK_CONFIG` overlay is documented not to
+    add servers, so CodeCraft gives none, says so in the job's feed, and prints the one-time
+    `grok mcp add codecraft-ide -- codecraft-cli mcp --ide`; every CLI job carries
+    `CODECRAFT_IDE_PORT`, `CODECRAFT_IDE_LOCK_DIR`, `CODECRAFT_JOB`, `CODECRAFT_JOB_KEY` so such a
+    user-registered bridge reaches this IDE as the job. Job tags need the job's key (a
+    per-session secret per job, in the bridge's environment): a client that only has the lock
+    file's token can no longer pass itself off as an Auto job. `--ide` bridges
+    (`codecraft-cli mcp --ide`, `codecraft --mcp-bridge --ide`) find the IDE from the job's
+    environment, else the live CodeCraft whose project holds the working directory
+    (`lockfile::find_for_dir`). Review jobs' tool calls run in a headless session opened on the
+    job's directory in its worktree (`engine/src/agent_worktree.rs`): files, runs, tests,
+    inspections, problems, debugging, profiling and SQLite files are the worktree's; absolute
+    paths of the open project are moved into the worktree, writes outside it refused, writes
+    inside need no card (reviewed afterwards), the rest asks as for Ask jobs (SQL that writes is
+    judged on its own, as the IDE may not know the worktree's data source); CodeCraft's
+    `.codecraft/` state there is git-ignored so the review lists only the agent's changes; the
+    session closes (in the background) when the job stops running. Cancellation: MCP
+    `notifications/cancelled` cancels a call waiting for its approval card (the card is
+    withdrawn, `Approvals::withdraw`) or for a stop, test results, a run's end, a profile or a
+    language server; the transports send nothing for a cancelled request (`Inflight` in
+    `crates/mcp`); a client that disconnects has its waiting calls dropped and cards withdrawn at
+    once (`agent_tools::{cancel, client_gone}`, IDE server and stdio). QA M14 #24: `inspect`'s
+    tools are `{tool, ok, outcome, commandLine}`, SQL column descriptions camelCase (`typeName`),
+    command lines in `test_run`/`test_results`/`run_output`/`inspect` leave out CodeCraft's temp
+    report files and their companion flags (pytest JUnit XML, GoogleTest/Catch2/doctest/Boost
+    reports, jest/vitest JSON, clang-tidy fixes); `agent_results_camel_case.rs` walks every tool's
+    result (debugpy, pytest, ruff, a fake profiler, SQLite) for snake_case keys and temp paths.
+    `codecraft_execute` now waits for the project load like the other tools (`runConfig.create`
+    right after `codecraft-cli mcp` started said "no project is open"). `codecraft-cli mcp
+    --print-config claude|codex|gemini|cursor|grok|json [project] [--allow …] [--ide]` prints
+    ready configuration with absolute paths; Agents › ⇄ and Settings › Tools › Agent Access ›
+    Connect an External Agent… (`agent.connectExternal`) show the same per client (this IDE and
+    headless) with Copy buttons. `docs/agents.md`: per-CLI delivery, Connect an external agent,
+    Cancellation and disconnects, and a Playbook (debug a failing test, find a hotspot and verify
+    the fix, fix lint problems in changed files, inspect a database table safely, review a
+    branch) with sample results. Tests: fake Gemini/Grok/Claude CLIs (shell scripts), forged job
+    tags, cancellation and disconnects over WebSocket and in-process stdio, a Review job's calls
+    on its worktree (files, a remapped project path, a refused outside write, debugging and SQL in
+    the worktree's session, the review without `.codecraft/`), and the built binary for
+    `--print-config`, `--ide` and stdio cancellation. Remaining: Grok jobs get the tools only
+    after the user's one-time `grok mcp add`, and whether Grok passes its environment to MCP
+    servers (the job tag) was not verified against a real `grok` (never run with a prompt here),
+    nor was Gemini's reading of `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` (checked in its 0.39 source,
+    exercised with a fake); a `codecraft` server the user defined in `~/.gemini/settings.json`
+    overrides the job's; a Review job's worktree session starts its own language servers and
+    project scan (memory, a few seconds), and a data source it adds for a worktree SQLite file
+    goes into that session's settings; cancelling a call stops the waiting, not work it already
+    started (a test run, a debug session); `codecraft_execute` passes a command's own JSON
+    through (older commands such as `debug.state` keep snake_case fields); the language-server
+    tools' result keys are checked only where rust-analyzer runs (`agent_tools.rs`), not by the
+    walker; Connect an External Agent has no UI test of its own (the command is tested).

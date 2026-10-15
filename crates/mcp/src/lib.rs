@@ -143,17 +143,69 @@ pub struct ToolCall {
     pub reply: Reply,
 }
 
+/// The tool calls of one connection still waiting for their answer, and those the client
+/// cancelled (`notifications/cancelled`): an answer to a cancelled request is not sent (MCP: the
+/// receiver of a cancellation should not respond).
+#[derive(Debug, Default)]
+pub(crate) struct Inflight {
+    pending: std::collections::HashSet<String>,
+    cancelled: std::collections::HashSet<String>,
+}
+
+/// Shared by a connection's reader and the [`Reply`] handles of its calls.
+pub(crate) type InflightRef = std::sync::Arc<std::sync::Mutex<Inflight>>;
+
+/// A request id as a set key (`7` and `"7"` stay different).
+fn id_key(id: &Value) -> String {
+    id.to_string()
+}
+
+impl Inflight {
+    /// A tool call was handed to the host.
+    pub(crate) fn started(this: &InflightRef, id: &Value) {
+        server::lock(this).pending.insert(id_key(id));
+    }
+
+    /// The client cancelled `id`; true if that call is still waiting (its answer will be dropped).
+    pub(crate) fn cancel(this: &InflightRef, id: &Value) -> bool {
+        let mut st = server::lock(this);
+        let key = id_key(id);
+        if st.pending.contains(&key) {
+            st.cancelled.insert(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The answer to `id` is going out: whether it may be sent (false when it was cancelled).
+    fn finish(this: &InflightRef, id: &Value) -> bool {
+        let mut st = server::lock(this);
+        let key = id_key(id);
+        st.pending.remove(&key);
+        !st.cancelled.remove(&key)
+    }
+}
+
 /// Answers one tool call. Dropping it unanswered sends an error, so a client never waits on a
-/// request the host forgot.
+/// request the host forgot. Nothing is sent for a request the client cancelled.
 #[derive(Debug)]
 pub struct Reply {
     id: Value,
     out: Option<Sender<server::Outgoing>>,
+    inflight: Option<InflightRef>,
 }
 
 impl Reply {
+    #[cfg(test)]
     fn new(id: Value, out: Sender<server::Outgoing>) -> Self {
-        Self { id, out: Some(out) }
+        Self { id, out: Some(out), inflight: None }
+    }
+
+    /// A reply that honours the connection's cancellations.
+    pub(crate) fn tracked(id: Value, out: Sender<server::Outgoing>, inflight: &InflightRef) -> Self {
+        Inflight::started(inflight, &id);
+        Self { id, out: Some(out), inflight: Some(inflight.clone()) }
     }
 
     /// The JSON-RPC id being answered.
@@ -174,10 +226,13 @@ impl Reply {
     }
 
     fn send_raw(&mut self, msg: Value) -> bool {
-        match self.out.take() {
-            Some(out) => out.send(server::Outgoing::Text(msg.to_string())).is_ok(),
-            None => false,
+        let Some(out) = self.out.take() else { return false };
+        if let Some(inflight) = &self.inflight
+            && !Inflight::finish(inflight, &self.id)
+        {
+            return false;
         }
+        out.send(server::Outgoing::Text(msg.to_string())).is_ok()
     }
 }
 
@@ -272,5 +327,34 @@ mod tests {
         let server::Outgoing::Text(t) = rx.try_recv().unwrap();
         assert!(t.contains("\"ok\""));
         assert!(rx.try_recv().is_err(), "a sent reply must not also send an error on drop");
+    }
+
+    #[test]
+    fn cancelled_requests_get_no_answer() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let inflight = InflightRef::default();
+        let a = Reply::tracked(json!(1), tx.clone(), &inflight);
+        let b = Reply::tracked(json!("1"), tx.clone(), &inflight);
+        assert!(Inflight::cancel(&inflight, &json!(1)));
+        assert!(!Inflight::cancel(&inflight, &json!(99)), "nothing waits for 99");
+        assert!(!a.send(ToolResult::text("late")), "the answer to a cancelled call is dropped");
+        assert!(rx.try_recv().is_err());
+        // A different id (a string "1") is still answered, and dropping it answers with an error.
+        drop(b);
+        let server::Outgoing::Text(t) = rx.try_recv().unwrap();
+        assert!(t.contains("dropped"), "{t}");
+        // A cancel after the answer went out does not affect a later request with the same id.
+        let c = Reply::tracked(json!(2), tx.clone(), &inflight);
+        assert!(c.send(ToolResult::text("ok")));
+        assert!(!Inflight::cancel(&inflight, &json!(2)));
+        let d = Reply::tracked(json!(2), tx, &inflight);
+        assert!(d.send(ToolResult::text("again")));
+        assert_eq!(rx.try_iter().count(), 2);
+        // A cancelled call whose reply is dropped sends nothing either.
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let e = Reply::tracked(json!(3), tx, &inflight);
+        Inflight::cancel(&inflight, &json!(3));
+        drop(e);
+        assert!(rx.try_recv().is_err());
     }
 }

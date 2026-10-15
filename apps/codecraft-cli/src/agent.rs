@@ -16,12 +16,47 @@ use codecraft_engine::agent_tools::{self, Caller, result_json, result_text};
 
 const MCP_USAGE: &str = "usage: codecraft-cli mcp <project> [--allow run,debug,profile,write,db-write] [--no-lsp]
        codecraft-cli mcp --connect <port> [--lock-dir dir]
+       codecraft-cli mcp --ide [--lock-dir dir]
+       codecraft-cli mcp --print-config <claude|codex|gemini|cursor|grok|json> [project] [--allow caps] [--ide]
 
 Serves CodeCraft's engine tools (debugging, analysis, profiling, tests, runs, databases) over MCP
 on stdin/stdout. The session stays open across calls: debug sessions, profiles and test runs live
 until the client disconnects. Reading is always allowed; everything else is denied unless listed
 in --allow (there is nobody to approve it). `--connect` bridges to a running CodeCraft IDE instead
-(its access policy and approval prompts apply).";
+(its access policy and approval prompts apply); `--ide` finds that IDE itself (an agent job's
+environment, else the CodeCraft window whose project holds the working directory), so one entry
+in a client's user configuration serves every project. `--print-config` prints the client's
+configuration for this binary (the headless server for [project], default the current directory,
+or with --ide the IDE bridge) without writing any file.";
+
+/// `mcp --print-config <client> [project] [--allow caps] [--ide]`.
+fn print_config(args: &Args) -> Result<ExitCode, String> {
+    let client = args.value("--print-config").unwrap_or_default();
+    let kind = agent_mcp::ClientKind::parse(client).ok_or_else(|| {
+        let ids: Vec<&str> = agent_mcp::ClientKind::ALL.iter().map(|k| k.id()).collect();
+        format!("unknown client `{client}` ({})", ids.join(", "))
+    })?;
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find this program's path: {e}"))?;
+    let exe = exe.canonicalize().unwrap_or(exe).display().to_string();
+    let server = if args.has("--ide") {
+        agent_mcp::ide_bridge_server(&exe, true)
+    } else {
+        let project = match args.positional.first() {
+            Some(p) => PathBuf::from(p),
+            None => std::env::current_dir().map_err(|e| format!("no current directory: {e}"))?,
+        };
+        if !project.is_dir() {
+            return Err(format!("{} is not a directory", project.display()));
+        }
+        let project = project.canonicalize().unwrap_or(project);
+        let allow = args.values("--allow");
+        parse_allow(&allow)?;
+        let allow = if allow.is_empty() { "run,debug,profile".to_string() } else { allow.join(",") };
+        agent_mcp::headless_server(&exe, &project.display().to_string(), &allow)
+    };
+    println!("{}", agent_mcp::client_config(kind, &server));
+    Ok(ExitCode::SUCCESS)
+}
 
 /// The one-shot commands act for the person who ran them: every capability is allowed.
 fn everything() -> AgentAccess {
@@ -112,9 +147,17 @@ pub(crate) fn mcp(raw: &[String]) -> Result<ExitCode, String> {
         println!("\nSee docs/agents.md for every tool with an example call and result.");
         return Ok(ExitCode::SUCCESS);
     }
-    let args = Args::parse(raw, &["--allow", "--connect", "--lock-dir"], &["--no-lsp"])?;
-    if let Some(port) = args.value("--connect") {
-        let mut bridge = vec![agent_mcp::BRIDGE_FLAG.to_string(), "--port".into(), port.to_string()];
+    let args = Args::parse(raw, &["--allow", "--connect", "--lock-dir", "--print-config"], &["--no-lsp", "--ide"])?;
+    if args.value("--print-config").is_some() {
+        return print_config(&args);
+    }
+    let port = args.value("--connect");
+    if port.is_some() || args.has("--ide") {
+        let mut bridge = vec![agent_mcp::BRIDGE_FLAG.to_string()];
+        match port {
+            Some(port) => bridge.extend(["--port".to_string(), port.to_string()]),
+            None => bridge.push("--ide".into()),
+        }
         if let Some(dir) = args.value("--lock-dir") {
             bridge.push("--lock-dir".into());
             bridge.push(dir.to_string());

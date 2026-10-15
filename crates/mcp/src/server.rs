@@ -305,6 +305,7 @@ fn run_connection(
     out_rx: &Receiver<Outgoing>,
 ) {
     let info = ServerInfo { name: &shared.name, version: &shared.version, tools: &shared.tools };
+    let inflight = crate::InflightRef::default();
     let mut last_ping = Instant::now();
     loop {
         if shared.stop.load(Ordering::Relaxed) {
@@ -364,7 +365,7 @@ fn run_connection(
                     None
                 }
                 Dispatch::ToolCall { id: request, name, arguments } => {
-                    let reply = crate::Reply::new(request.clone(), out_tx.clone());
+                    let reply = crate::Reply::tracked(request.clone(), out_tx.clone(), &inflight);
                     let call = ToolCall { client: id, request: request.clone(), name, arguments, reply };
                     if shared.emit(ServerEvent::ToolCall(call)) {
                         None
@@ -373,6 +374,7 @@ fn run_connection(
                     }
                 }
                 Dispatch::Cancelled { request } => {
+                    crate::Inflight::cancel(&inflight, &request);
                     shared.emit(ServerEvent::Cancelled { client: id, request });
                     None
                 }
