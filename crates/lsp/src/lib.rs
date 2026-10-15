@@ -40,7 +40,10 @@ use std::time::Duration;
 
 pub use lsp_types;
 pub use rust_ext::{ExpandedMacro, TestRunnable, decode_expanded_macro, decode_test_runnables};
-pub use servers::{ServerCommand, ServerKind, extra_bin_dirs, find_server, which};
+pub use servers::{
+    PYTHON_AUTO, PYTHON_SERVERS, PythonServer, ServerCommand, ServerKind, extra_bin_dirs, find_python_server, find_server,
+    which,
+};
 
 use crossbeam_channel::Receiver;
 use lsp_types::{notification as notif, request as req};

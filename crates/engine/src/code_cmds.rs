@@ -69,11 +69,21 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Some("Alt+Enter"),
             "",
             Context::Editor,
-            |s| crate::cargo_deps::or_cargo_toml(s, has_lsp_editor),
+            |s| {
+                // An analyzer's fixes at the caret work without a language server (M15 EA).
+                if has_editor(s).is_ok() && crate::analysis::editor::has_context_actions(s) {
+                    return Ok(());
+                }
+                crate::cargo_deps::or_cargo_toml(s, has_lsp_editor)
+            },
             |s, _| {
                 // Cargo.toml has no language server: dependency updates and advisories (M12 RS).
                 if crate::cargo_deps::is_cargo_toml_editor(s) {
                     return crate::cargo_deps::show_context_actions(s);
+                }
+                // No language server for the file: the analyzer's fixes and suppressions alone.
+                if has_lsp_editor(s).is_err() {
+                    return crate::analysis::editor::show_context_actions(s);
                 }
                 s.lsp_code_actions()?;
                 ok()

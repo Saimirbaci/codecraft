@@ -73,8 +73,10 @@ fn test_tree_selection_filters_and_coverage_window() {
     let (si, ti) = codecraft_engine::testing::test_key(&key).unwrap();
     assert_eq!(run.test(si, ti).unwrap().name, "test_fail");
     assert!(h.query_by_label_contains("AssertionError: bad math").is_some());
-    let link = format!("at {}:5", root.join("tests/test_math.py").display());
-    assert!(h.query_by_label(&link).is_some(), "the failure point link");
+    // Relative to the project in the Run window (QA M14 #27); agents keep the absolute path.
+    assert!(h.query_by_label("at tests/test_math.py:5").is_some(), "the failure point link");
+    let summary = h.state_mut().session.execute("test.summary", &json!({ "tab": tab.0 })).unwrap().to_string();
+    assert!(summary.contains(&root.join("tests/test_math.py").display().to_string()), "{summary}");
 
     // Show Passed off hides test_add; Show Ignored off hides test_skip.
     h.get_by_label("Show Passed").click();

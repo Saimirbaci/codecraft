@@ -33,6 +33,9 @@ pub enum ProblemSource {
     Cargo,
     /// CodeCraft's own inspections (unresolved tables and columns in SQL, …).
     Inspection,
+    /// Findings of the external analyzers (Inspect Code, analysis on save: Ruff, Clippy,
+    /// clang-tidy, …) shown in the editor (M15 track EA).
+    Analysis,
 }
 
 /// A diagnostic in a file, in char-based positions (line, char column; zero-based).

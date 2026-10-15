@@ -500,6 +500,7 @@ fn diagnostic_json(s: &Session, p: &Problem) -> Value {
         codecraft_workspace::ProblemSource::RustAnalyzer => "rust-analyzer",
         codecraft_workspace::ProblemSource::Cargo => "cargo",
         codecraft_workspace::ProblemSource::Inspection => "codecraft",
+        codecraft_workspace::ProblemSource::Analysis => "codecraft-analysis",
     };
     let mut d = json!({
         "message": p.message,

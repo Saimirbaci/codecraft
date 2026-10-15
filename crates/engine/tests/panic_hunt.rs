@@ -110,6 +110,11 @@ fn skip(id: &str, params: &Value) -> bool {
     if matches!(id, "analysis.run" | "analysis.installTool") && !params.is_null() {
         return true;
     }
+    // Analyze File Now starts the file's analyzers on save (Ruff, Clippy, clang-tidy/clangd;
+    // analysis_editor tests drive it; M15 EA).
+    if id == "analysis.analyzeFile" && !params.is_null() {
+        return true;
+    }
     let spawns = id.starts_with("cargo.")
         || id.starts_with("build.")
         || matches!(

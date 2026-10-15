@@ -636,6 +636,7 @@ impl Session {
             || self.launch.busy()
             || self.zig.busy()
             || self.typescript.busy()
+            || self.analysis.editor.on_save.busy()
     }
 
     /// Stop the language server and running processes (window closing).
@@ -852,6 +853,8 @@ impl Session {
         local_history::after_save(self, &saved_paths);
         remote::after_save(self, &saved_paths);
         python_format::after_save(self, &saved_paths);
+        // M15 EA: Ruff / Clippy / clang-tidy on the saved files, in the background.
+        analysis::on_save::after_save(self, &saved_paths);
         if !errors.is_empty() {
             let msg = errors.join("\n");
             self.notify(NotificationLevel::Error, "Cannot save files", msg.clone());

@@ -52,6 +52,7 @@ mod popups;
 mod profiler_ui;
 mod project_windows;
 mod pull_requests_ui;
+mod python_settings_ui;
 mod python_ui;
 mod rc_ui;
 mod redis_ui;

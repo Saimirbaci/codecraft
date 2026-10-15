@@ -489,6 +489,8 @@ fn problems(s: &mut Session, p: &Value) -> CmdResult {
                 codecraft_workspace::ProblemSource::RustAnalyzer => "language-server",
                 codecraft_workspace::ProblemSource::Cargo => "cargo",
                 codecraft_workspace::ProblemSource::Inspection => "inspection",
+                // Analyzer findings come below, with their ids (M15 EA).
+                codecraft_workspace::ProblemSource::Analysis => continue,
             };
             let mut v = json!({
                 "file": path,
@@ -511,6 +513,8 @@ fn problems(s: &mut Session, p: &Value) -> CmdResult {
         let mut findings: Vec<&crate::inspections::Finding> = r
             .open()
             .filter(|f| scope.as_ref().is_none_or(|sc| f.path.starts_with(sc)))
+            // Re-analyzed on save since (the newer findings follow; M15 EA).
+            .filter(|f| !crate::analysis::editor::superseded(s, f))
             .filter(|f| severity_rank(f.severity) >= severity_rank(min))
             .collect();
         findings.sort_by(|a, b| (&a.path, a.start.line, a.start.column).cmp(&(&b.path, b.start.line, b.start.column)));
@@ -536,6 +540,33 @@ fn problems(s: &mut Session, p: &Value) -> CmdResult {
             }
             out.push((severity_rank(f.severity), v));
         }
+    }
+    // Findings of the analysis on save, with the key `analysis.editorFix` takes (M15 EA).
+    for e in crate::analysis::editor::saved_findings(s, scope.as_deref()) {
+        let f = &e.finding;
+        if severity_rank(f.severity) < severity_rank(min) {
+            continue;
+        }
+        let mut v = json!({
+            "file": f.path,
+            "line": f.start.line + 1,
+            "column": f.start.column + 1,
+            "endLine": f.end.line + 1,
+            "severity": severity_id(f.severity),
+            "message": clip(&f.message, 2000),
+            "source": "analysis",
+            "analyzer": f.tool.id(),
+            "key": e.key,
+        });
+        if let Some(o) = v.as_object_mut() {
+            if let Some(code) = &f.code {
+                o.insert("code".into(), json!(code));
+            }
+            if !f.fixes.is_empty() {
+                o.insert("fixable".into(), json!(true));
+            }
+        }
+        out.push((severity_rank(f.severity), v));
     }
     // Errors first, then by file and line (the map is already ordered by file).
     out.sort_by_key(|a| std::cmp::Reverse(a.0));

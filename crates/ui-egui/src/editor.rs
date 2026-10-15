@@ -727,6 +727,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let path = s.ws.doc(editor.doc).and_then(|d| d.path.clone());
     let problems: Vec<Problem> =
         path.as_deref().map(|p| s.ws.highlighted_problems_for(p).into_iter().cloned().collect()).unwrap_or_default();
+    // Hover texts of the analyzers' findings (M15 EA).
+    let analysis_hover = path.as_deref().map(|p| codecraft_engine::analysis::editor::hover_entries(s, p)).unwrap_or_default();
     let (find_matches, find_current) = s.find_bar.as_ref().map(|b| (b.matches.clone(), b.current)).unwrap_or_default();
     // Highlight Usages in File (until Escape), while the document is unchanged.
     let usage_ranges: Vec<std::ops::Range<usize>> = s
@@ -1183,6 +1185,12 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         .input(|i| i.pointer.hover_pos())
         .filter(|p| gutter.contains(*p) && bp_area.contains(&p.x) && path.is_some())
         .and_then(|p| map.line((((p.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize));
+    // The most severe error or warning starting on each line (gutter marks; M15 EA).
+    let mut problem_lines: std::collections::BTreeMap<usize, Severity> = std::collections::BTreeMap::new();
+    for p in problems.iter().filter(|p| p.severity <= Severity::Warning) {
+        let e = problem_lines.entry(p.start.line).or_insert(p.severity);
+        *e = (*e).min(p.severity);
+    }
     // Gutter marks go on a line's first row only.
     for r in rows.iter().filter(|r| r.start == 0) {
         let (line, y) = (&r.line, &r.y);
@@ -1195,6 +1203,15 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         }
         if marks.execution == Some(*line) {
             crate::debug_panel::paint_exec_arrow(&painter, pos2(bp_x, cy), &theme);
+        }
+        // An error or warning on the line: a small mark left of its number (M15 EA).
+        if let Some(sev) = problem_lines.get(line)
+            && breakpoint.is_none()
+            && marks.execution != Some(*line)
+            && hover_line != Some(*line)
+        {
+            let x = bp_area.start + (char_w * 0.5).clamp(2.5, 6.0);
+            painter.circle_filled(pos2(x, cy), (char_w * 0.28).clamp(2.0, 3.0), severity_color(&theme, *sev));
         }
         let bookmark = bookmark_lines.iter().find(|(l, _)| l == line).map(|(_, m)| *m);
         if let Some(m) = bookmark {
@@ -1485,11 +1502,14 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     {
         let off = hit(pos, &rows, ui);
         let p = doc.offset_to_position(off);
-        let msgs: Vec<String> = problems
+        let mut msgs: Vec<String> = problems
             .iter()
             .filter(|pr| pr.start <= p && p <= pr.end && pr.severity <= Severity::Info)
+            .filter(|pr| pr.source != codecraft_workspace::ProblemSource::Analysis)
             .map(|pr| pr.message.clone())
             .collect();
+        // Analyzer findings: the analyzer, rule, message and what Alt+Enter offers (M15 EA).
+        msgs.extend(analysis_hover.iter().filter(|(a, b, _)| *a <= p && p <= *b).map(|(_, _, t)| t.clone()));
         if !msgs.is_empty() {
             response = response.on_hover_text_at_pointer(msgs.join("\n\n"));
         } else if !marks.locals.is_empty() {

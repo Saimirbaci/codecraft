@@ -603,6 +603,8 @@ pub fn project_problems(s: &Session, path: Option<&Path>) -> Vec<ProjectProblem>
                 ProblemSource::RustAnalyzer => "language_server",
                 ProblemSource::Cargo => "build",
                 ProblemSource::Inspection => "inspection",
+                // Analyzer findings are added below with their ids (M15 EA).
+                ProblemSource::Analysis => continue,
             };
             out.push(ProjectProblem {
                 abs: file.to_path_buf(),
@@ -619,7 +621,7 @@ pub fn project_problems(s: &Session, path: Option<&Path>) -> Vec<ProjectProblem>
         }
     }
     if let Some(r) = &s.inspections.results {
-        for f in r.open().filter(|f| path.is_none_or(|p| p == f.path)) {
+        for f in r.open().filter(|f| path.is_none_or(|p| p == f.path) && !crate::analysis::editor::superseded(s, f)) {
             out.push(ProjectProblem {
                 abs: f.path.clone(),
                 path: rel_path(root.as_deref(), &f.path),
@@ -633,6 +635,22 @@ pub fn project_problems(s: &Session, path: Option<&Path>) -> Vec<ProjectProblem>
                 id: Some(f.id),
             });
         }
+    }
+    // Findings of the analysis on save (M15 EA).
+    for e in crate::analysis::editor::saved_findings(s, None).filter(|e| path.is_none_or(|p| p == e.finding.path)) {
+        let f = &e.finding;
+        out.push(ProjectProblem {
+            abs: f.path.clone(),
+            path: rel_path(root.as_deref(), &f.path),
+            line: f.start.line + 1,
+            column: f.start.column + 1,
+            severity: Level::of(f.severity),
+            source: "analysis",
+            analyzer: Some(f.tool.id()),
+            rule: Some(f.rule().to_string()),
+            message: f.message.lines().next().unwrap_or("").to_string(),
+            id: None,
+        });
     }
     out.sort_by(|a, b| (a.severity, &a.path, a.line, a.column).cmp(&(b.severity, &b.path, b.line, b.column)));
     out

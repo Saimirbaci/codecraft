@@ -880,6 +880,60 @@ pub(crate) fn start_opts(
     Ok(job)
 }
 
+/// A quiet job over some files with exactly `tools` (M15 track EA: analysis on save). Nothing is
+/// saved, the Inspection Results and job ids are left alone, and CMake is never configured.
+pub(crate) fn spec_for_files(s: &mut Session, files: Vec<PathBuf>, tools: Vec<Tool>) -> Result<JobSpec, CommandError> {
+    let root = s.project_root().ok_or_else(|| CommandError::Failed("no project is open".into()))?;
+    let profile = crate::analysis::profiles::resolve(s, None).map_err(CommandError::BadParams)?;
+    let cargo = s.ws.project.as_ref().and_then(|p| p.cargo.as_ref());
+    let cargo_root = match cargo {
+        Some(m) => Some(m.workspace_root.clone()),
+        None => root.join("Cargo.toml").is_file().then(|| root.clone()),
+    };
+    let scope = match files.as_slice() {
+        [one] => ResolvedScope {
+            scope: Scope::new(ScopeKind::File, Some(one.clone())),
+            label: format!("File {}", one.display()),
+            files: files.clone(),
+            only: None,
+        },
+        _ => ResolvedScope {
+            scope: Scope::new(ScopeKind::Glob, None),
+            label: format!("{} saved files", files.len()),
+            only: Some(files.iter().cloned().collect()),
+            files,
+        },
+    };
+    let mut env = crate::analysis::analyzers::env(s, &root);
+    env.cmake = None;
+    Ok(JobSpec {
+        kind: JobKind::Inspect,
+        root,
+        cargo_root,
+        use_clippy: s.ws.settings.use_clippy,
+        tools: Some(tools),
+        editions: Vec::new(),
+        programs: s.inspections.programs.clone(),
+        format: false,
+        scope,
+        only: None,
+        job: 0,
+        profile: Arc::new(profile),
+        env,
+        baseline: crate::analysis::baseline::current(s),
+    })
+}
+
+/// Run a job to completion on the calling (worker) thread, without progress messages. Returns
+/// the results and whether it was cancelled (M15 track EA).
+pub(crate) fn run_spec(spec: &JobSpec, cancel: &AtomicBool) -> (InspectionResults, bool) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    // Nobody reads progress: sends fail at once instead of piling up.
+    drop(rx);
+    let out = run_job(spec, cancel, &tx);
+    (out.results, out.cancelled)
+}
+
 /// Stop the run in progress (its processes are killed).
 pub(crate) fn cancel(s: &mut Session) -> bool {
     match s.inspections.running.take() {
@@ -894,12 +948,16 @@ pub(crate) fn cancel(s: &mut Session) -> bool {
 
 pub(crate) fn shutdown(s: &mut Session) {
     cancel(s);
+    crate::analysis::on_save::shutdown(s);
 }
 
 pub(crate) fn pump(s: &mut Session) -> bool {
     // The M14 analysis services: tool installs, the commit check (M14 CA).
     let services = crate::analysis::pump(s);
-    services | pump_run(s)
+    let run = pump_run(s);
+    // Findings in the editor: analysis on save, moving with edits (M15 EA).
+    let editor = crate::analysis::editor::pump(s);
+    services | run | editor
 }
 
 fn pump_run(s: &mut Session) -> bool {

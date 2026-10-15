@@ -289,6 +289,19 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                             run_command(s, st, "lsp.restart", &Value::Null);
                         }
                     }
+                    // No Python language server: offer the managed basedpyright (M15 EA).
+                    if kind == codecraft_engine::ServerKind::Python && s.python_server_missing() {
+                        let installing = s.analysis.install.running.as_ref().is_some_and(|j| j.tool == "basedpyright");
+                        if installing {
+                            ui.label(RichText::new("Installing basedpyright…").size(12.0).color(muted));
+                        } else if ui
+                            .add(egui::Label::new(RichText::new("Install basedpyright").size(12.0).color(st.theme.link)).sense(Sense::click()))
+                            .on_hover_text("Python files have no language server: install basedpyright into CodeCraft's own tools ($CODECRAFT_HOME/tools, with uv; never globally)")
+                            .clicked()
+                        {
+                            run_command(s, st, "analysis.installTool", &json!({ "tool": "basedpyright", "confirm": true }));
+                        }
+                    }
                 }
                 // Rust External Linter: cargo check / Clippy on save.
                 if shown("rustExternalLinter") && s.ws.project.as_ref().is_some_and(|p| p.cargo.is_some()) {
