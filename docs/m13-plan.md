@@ -1,6 +1,6 @@
 # M13: daily-use depth II
 
-Status: in progress (2026-10-14). Goal: close the "Remaining" lists in `docs/gaps.md` that a
+Status: done (2026-10-15; all five tracks landed, in-scope parity 407/407; remaining depth is in `docs/gaps.md` items 47–51). Goal: close the "Remaining" lists in `docs/gaps.md` that a
 daily user hits first (Git/GitHub, the database work after M12, nothing lost on restart, the
 Settings a user expects to change, run configurations) and the last six RustRover menu items, so
 in-scope parity reaches 407/407. Same rules as M4/M10–M12: read `AGENTS.md` and
