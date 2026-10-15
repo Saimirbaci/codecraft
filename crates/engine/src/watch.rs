@@ -107,7 +107,8 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             let in_tree = proj.tree.find(p).is_some();
             let exists = p.exists();
             // Local history snapshots are written on every save; they never need a rescan.
-            let snapshot = p.starts_with(crate::local_history::HistoryStore::dir_for(&proj.root));
+            let snapshot = p.starts_with(crate::local_history::HistoryStore::dir_for(&proj.root))
+                || p.starts_with(proj.root.join(crate::hot_exit::DIR));
             in_tree != exists && !snapshot && !p.components().any(|c| c.as_os_str() == ".git")
         })
     });

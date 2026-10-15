@@ -308,6 +308,9 @@ pub struct Editor {
     /// edited or kept open. Shown in italics.
     #[serde(default)]
     pub preview: bool,
+    /// View › Active Editor › Soft-Wrap for this tab; `None` follows the `soft_wrap` setting.
+    #[serde(default)]
+    pub soft_wrap: Option<bool>,
     /// Ask the view to scroll the primary caret into view on the next frame.
     pub reveal_caret: bool,
 }
@@ -323,6 +326,7 @@ impl Editor {
             folded: BTreeSet::new(),
             pinned: false,
             preview: false,
+            soft_wrap: None,
             reveal_caret: true,
         }
     }

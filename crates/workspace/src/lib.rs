@@ -191,6 +191,9 @@ pub struct Settings {
     pub rename_in_place: bool,
     /// Reopen the last project(s) and their editors on startup (System Settings).
     pub reopen_last_project: bool,
+    /// Hot exit (System Settings): unsaved changes and untitled buffers are kept in
+    /// `.codecraft/unsaved/` across restarts instead of being written or asked about on quit.
+    pub hot_exit: bool,
     /// Generate run configurations for the project's entry points when a project without saved
     /// configurations opens.
     pub generate_run_configs: bool,
@@ -332,6 +335,7 @@ impl Default for Settings {
             completion_argument_placeholders: false,
             rename_in_place: true,
             reopen_last_project: true,
+            hot_exit: true,
             generate_run_configs: true,
             power_save_mode: false,
             file_type_associations: BTreeMap::new(),
@@ -495,6 +499,12 @@ impl Workspace {
 
     pub fn editor(&self, id: EditorId) -> Option<&Editor> {
         self.editors.get(&id)
+    }
+
+    /// Whether `editor` soft-wraps: its own View › Active Editor › Soft-Wrap choice, else the
+    /// `soft_wrap` setting.
+    pub fn soft_wrap_of(&self, editor: EditorId) -> bool {
+        self.editors.get(&editor).and_then(|e| e.soft_wrap).unwrap_or(self.settings.soft_wrap)
     }
 
     pub fn editor_mut(&mut self, id: EditorId) -> Option<&mut Editor> {

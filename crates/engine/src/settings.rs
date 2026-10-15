@@ -239,6 +239,13 @@ pub const SETTINGS: &[SettingDef] = &[
         "Reopen the last project(s) with their windows, tabs and splits when CodeCraft starts",
         Kind::Bool,
     ),
+    def(
+        "hot_exit",
+        "Keep unsaved changes on exit (hot exit)",
+        PAGE_SYSTEM,
+        "Quit and close without asking: unsaved changes and untitled buffers are kept in .codecraft/unsaved/ (autosaved every few seconds) and come back when the project opens; off = files are saved on quit",
+        Kind::Bool,
+    ),
     def("keymap", "Keymap", PAGE_KEYMAP, "macOS or Windows/Linux; empty = the platform default", Kind::Keymap),
     def(
         "keymap_overrides",

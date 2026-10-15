@@ -772,7 +772,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
 
     // ------------------------------------------------------------ soft wrap
     let wrap_cols = ((text_rect.width() - 8.0) / char_w.max(1.0)).floor().max(10.0) as usize;
-    let wrap = (settings.soft_wrap && doc.len_lines() <= MAX_WRAP_LINES).then(|| WrapConfig::new(wrap_cols, tab));
+    // The tab's own View › Active Editor › Soft-Wrap choice, else the setting.
+    let soft_wrap = editor.soft_wrap.unwrap_or(settings.soft_wrap);
+    let wrap = (soft_wrap && doc.len_lines() <= MAX_WRAP_LINES).then(|| WrapConfig::new(wrap_cols, tab));
     let map: Arc<DisplayMap> = match wrap {
         None => Arc::new(DisplayMap::build(doc, folds, &editor.folded, None)),
         Some(cfg) => {

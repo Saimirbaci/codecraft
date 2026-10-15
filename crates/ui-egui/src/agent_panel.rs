@@ -40,6 +40,14 @@ pub struct AgentUi {
     pub renaming: Option<(String, String)>,
     /// "Delete All" was clicked once; the second click deletes.
     pub confirm_clear: bool,
+    /// History search text and filters (status label, backend id; empty = all).
+    pub history_query: String,
+    pub history_status: String,
+    pub history_backend: String,
+    /// The Clean Up confirmation: what `agent.sessions.cleanup` would remove.
+    pub cleanup: Option<Value>,
+    /// Clean Up removes only the worktrees and keeps the sessions in History.
+    pub cleanup_worktrees_only: bool,
 }
 
 impl Default for AgentUi {
@@ -59,6 +67,11 @@ impl Default for AgentUi {
             history_open: true,
             renaming: None,
             confirm_clear: false,
+            history_query: String::new(),
+            history_status: String::new(),
+            history_backend: String::new(),
+            cleanup: None,
+            cleanup_worktrees_only: false,
         }
     }
 }
@@ -273,15 +286,167 @@ fn job_list(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme)
 // ------------------------------------------------------------------------- history
 
 /// Earlier sessions of this project (saved across restarts) that are not open as jobs.
+/// Status filters offered in the History header: (status label, menu text).
+const STATUS_FILTERS: [(&str, &str); 8] = [
+    ("", "Any status"),
+    ("running", "Running"),
+    ("finished", "Finished"),
+    ("failed", "Failed"),
+    ("interrupted", "Interrupted"),
+    ("stopped", "Stopped"),
+    ("reviewing", "Reviewing"),
+    ("done", "Done"),
+];
+
+/// The History filter from the header's fields.
+fn history_filter(st: &UiState) -> agent_sessions::Filter {
+    let pick = |v: &str| (!v.is_empty()).then(|| v.to_string());
+    agent_sessions::Filter {
+        query: st.agent.history_query.trim().to_string(),
+        status: pick(&st.agent.history_status),
+        backend: pick(&st.agent.history_backend),
+    }
+}
+
+/// The same filter as command params (export).
+fn filter_params(st: &UiState) -> Value {
+    json!({
+        "query": st.agent.history_query.trim(),
+        "status": st.agent.history_status,
+        "backend": st.agent.history_backend,
+    })
+}
+
+/// Search, status and backend filters, Export and Clean Up.
+fn history_tools(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, cmd: &mut Option<(&'static str, Value)>) {
+    ui.horizontal(|ui| {
+        ui.add(
+            TextEdit::singleline(&mut st.agent.history_query)
+                .id(Id::new("agent-history-search"))
+                .hint_text("Search sessions")
+                .desired_width(150.0),
+        )
+        .on_hover_text("Words in the title, the first prompt, the agent, the branch or the date (YYYY-MM-DD)");
+        let status_text =
+            STATUS_FILTERS.iter().find(|(v, _)| *v == st.agent.history_status).map_or("Any status", |(_, l)| *l);
+        egui::ComboBox::from_id_salt("agent-history-status").selected_text(status_text).width(96.0).show_ui(ui, |ui| {
+            for (v, label) in STATUS_FILTERS {
+                ui.selectable_value(&mut st.agent.history_status, v.to_string(), label);
+            }
+        });
+        let backend_text = Backend::from_id(&st.agent.history_backend).map_or("Any agent", |b| b.label());
+        egui::ComboBox::from_id_salt("agent-history-backend").selected_text(backend_text).width(96.0).show_ui(
+            ui,
+            |ui| {
+                ui.selectable_value(&mut st.agent.history_backend, String::new(), "Any agent");
+                for b in Backend::ALL {
+                    ui.selectable_value(&mut st.agent.history_backend, b.id().to_string(), b.label());
+                }
+            },
+        );
+        ui.menu_button("Export", |ui| {
+            for (label, format) in [("As Markdown…", "markdown"), ("As JSON…", "json")] {
+                if ui.button(label).on_hover_text("Export the sessions shown").clicked() {
+                    let mut p = filter_params(st);
+                    if let Some(o) = p.as_object_mut() {
+                        o.insert("format".into(), json!(format));
+                        o.insert("pick".into(), json!(true));
+                    }
+                    *cmd = Some(("agent.sessions.export", p));
+                    ui.close();
+                }
+            }
+        });
+        if ui
+            .button("Clean Up…")
+            .on_hover_text(
+                "Remove interrupted sessions and sessions older than 30 days, with the review worktrees CodeCraft \
+                 created for them (asks first)",
+            )
+            .clicked()
+        {
+            match s.execute("agent.sessions.cleanup", &json!({})) {
+                Ok(plan) => st.agent.cleanup = Some(plan),
+                Err(e) => s.status = e.to_string(),
+            }
+        }
+    });
+}
+
+/// The Clean Up confirmation: what goes, then Delete / Cancel.
+fn cleanup_dialog(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
+    let Some(plan) = st.agent.cleanup.clone() else { return };
+    let theme = st.theme.clone();
+    let list = |key: &str| plan.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    let sessions = list("sessions");
+    let worktrees = list("worktrees");
+    let kept = list("keptWorktrees");
+    let mut close = false;
+    let mut confirm = false;
+    let resp = egui::Modal::new(Id::new("codecraft-agent-cleanup")).show(ctx, |ui| {
+        ui.set_max_width(520.0);
+        ui.label(RichText::new("Clean Up Agent Sessions").strong());
+        ui.add_space(4.0);
+        if sessions.is_empty() {
+            ui.label("Nothing to clean up: no interrupted sessions and none older than 30 days.");
+        } else {
+            ui.label(format!(
+                "{} session(s) and {} review worktree(s) will be removed:",
+                sessions.len(),
+                worktrees.len()
+            ));
+            ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                for x in &sessions {
+                    let title = x.get("title").and_then(Value::as_str).unwrap_or("");
+                    let status = x.get("status").and_then(Value::as_str).unwrap_or("");
+                    let title = if title.is_empty() { "(untitled)" } else { title };
+                    ui.label(RichText::new(format!("• {title} ({status})")).color(theme.text));
+                    if let Some(wt) = x.get("worktree").and_then(Value::as_str) {
+                        ui.label(RichText::new(format!("    worktree {wt}")).small().color(theme.text_muted));
+                    }
+                }
+            });
+            if !kept.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} worktree(s) CodeCraft did not create are left alone.", kept.len()))
+                        .small()
+                        .color(theme.warning),
+                );
+            }
+            ui.checkbox(&mut st.agent.cleanup_worktrees_only, "Keep the sessions in History (remove only worktrees)");
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if !sessions.is_empty() && ui.button(RichText::new("Delete").color(theme.error)).clicked() {
+                confirm = true;
+            }
+            if ui.button(if sessions.is_empty() { "Close" } else { "Cancel" }).clicked() {
+                close = true;
+            }
+        });
+    });
+    if confirm {
+        let only = st.agent.cleanup_worktrees_only;
+        st.agent.cleanup = None;
+        run_command(s, st, "agent.sessions.cleanup", &json!({ "confirm": true, "worktreesOnly": only }));
+    } else if close || resp.should_close() {
+        st.agent.cleanup = None;
+    }
+}
+
 fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
-    let rows: Vec<SessionSummary> = agent_sessions::history(s).into_iter().cloned().collect();
+    cleanup_dialog(ui.ctx(), s, st);
+    let filter = history_filter(st);
+    let total = agent_sessions::history(s).len();
+    let rows: Vec<SessionSummary> = agent_sessions::history_filtered(s, &filter).into_iter().cloned().collect();
     let loading = s.agents.sessions.loading;
     let warnings = s.agents.sessions.warnings.clone();
     let mut cmd: Option<(&'static str, Value)> = None;
     let mut select_session: Option<String> = None;
     ui.horizontal(|ui| {
         let arrow = if st.agent.history_open { "▼" } else { "▶" };
-        let header = RichText::new(format!("{arrow} History · {}", rows.len())).small().strong().color(theme.text_muted);
+        let count = if filter.is_empty() { rows.len().to_string() } else { format!("{} of {total}", rows.len()) };
+        let header = RichText::new(format!("{arrow} History · {count}")).small().strong().color(theme.text_muted);
         if ui
             .add(egui::Label::new(header).sense(egui::Sense::click()))
             .on_hover_text("Earlier agent sessions of this project")
@@ -324,6 +489,12 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
     if !st.agent.history_open {
         return;
     }
+    if total > 0 {
+        history_tools(ui, s, st, &mut cmd);
+    }
+    if rows.is_empty() && total > 0 {
+        ui.label(RichText::new("No session matches.").small().color(theme.text_muted));
+    }
     let now = agent_sessions::now_ms();
     ScrollArea::vertical().id_salt("agent-history").max_height(140.0).auto_shrink([false, true]).show(ui, |ui| {
         for row in &rows {
@@ -335,12 +506,15 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
                     rename_field(ui, st, &row.id, &mut cmd);
                     return;
                 }
-                let meta = format!(
+                let mut meta = format!(
                     "{} · {} · {}",
                     row.backend.label(),
                     mode_label(row.mode),
                     agent_sessions::age_label(now, row.created_ms)
                 );
+                if row.elsewhere {
+                    meta.push_str(" · in another window");
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(RichText::new(&meta).small().color(theme.text_muted));
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
@@ -352,12 +526,20 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
                         if row.worktree.is_some() && !row.worktree_exists {
                             tip.push_str("\nIts review worktree no longer exists.");
                         }
-                        tip.push_str("\nClick to open; right-click for more.");
+                        if row.elsewhere {
+                            tip.push_str("\nRunning in another CodeCraft window; follow it there.");
+                        } else {
+                            tip.push_str("\nClick to open; right-click for more.");
+                        }
                         let resp = ui
                             .add(egui::Button::selectable(false, RichText::new(title).color(theme.text)).truncate())
                             .on_hover_text(tip);
                         if resp.clicked() {
-                            select_session = Some(row.id.clone());
+                            if row.elsewhere {
+                                s.status = "This agent session is running in another CodeCraft window".into();
+                            } else {
+                                select_session = Some(row.id.clone());
+                            }
                         }
                         resp.context_menu(|ui| {
                             if ui.button("Open").clicked() {
@@ -375,6 +557,16 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
                             if ui.button("Open Session File in Editor").clicked() {
                                 cmd = Some(("agent.sessions.reveal", json!({ "session": row.id, "inEditor": true })));
                                 ui.close();
+                            }
+                            for (label, format) in [("Export as Markdown…", "markdown"), ("Export as JSON…", "json")]
+                            {
+                                if ui.button(label).clicked() {
+                                    cmd = Some((
+                                        "agent.sessions.export",
+                                        json!({ "session": row.id, "format": format, "pick": true }),
+                                    ));
+                                    ui.close();
+                                }
                             }
                             ui.separator();
                             if ui.button(RichText::new("Delete").color(theme.error)).clicked() {

@@ -222,6 +222,11 @@ pub struct Job {
     pub(crate) restored_decisions: Vec<(String, ReviewDecision)>,
     /// The pending prompt continues the agent's session (`--resume`) once the worktree exists.
     pub(crate) pending_resume: bool,
+    /// While a turn resumes the agent's own session: the prompt with this job's transcript, run
+    /// in a new session if the resume fails without any output (the agent's store was cleared).
+    pub(crate) resume_seed: Option<String>,
+    /// The current turn produced output (text, tools, file changes).
+    pub(crate) turn_output: bool,
     runner: Runner,
     events_tx: Sender<AgentEvent>,
     events: Receiver<AgentEvent>,
@@ -399,7 +404,7 @@ impl AgentsState {
         self.cleanups > 0 || self.jobs.iter().any(|j| j.is_running() || j.review_pending || !j.permissions.is_empty())
     }
 
-    fn worktrees_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn worktrees_dir(&self) -> Option<PathBuf> {
         self.settings.worktrees_dir.clone().or_else(git::default_base_dir)
     }
 }
@@ -597,6 +602,8 @@ pub(crate) fn new_job(
         worktree_path: None,
         restored_decisions: Vec::new(),
         pending_resume: false,
+        resume_seed: None,
+        turn_output: false,
         runner: Runner::Idle,
         events_tx,
         events,
@@ -646,6 +653,10 @@ fn launch(
 ) -> Result<(), CommandError> {
     let scrub = s.agents.settings.scrub_api_keys;
     job.started = Instant::now();
+    job.turn_output = false;
+    if !(follow_up && matches!(job.mode, AgentMode::Auto | AgentMode::Review)) {
+        job.resume_seed = None;
+    }
     job.turn_error = false;
     job.turn_reported_duration = false;
     job.stop_requested = false;
@@ -752,6 +763,9 @@ pub(crate) fn follow_up(s: &mut Session, id: JobId, prompt: &str) -> Result<(), 
         _ => {
             let resumable = job.session_id.is_some() || job.backend == Backend::Grok;
             if resumable {
+                // If the agent cannot find its session any more, the turn is retried with the
+                // transcript (see `finish_turn`).
+                job.resume_seed = Some(format!("{preamble}{prompt}"));
                 launch(s, &mut job, &info, prompt.to_string(), true, None)
             } else {
                 // No agent session to resume: start one that carries the transcript.
@@ -788,6 +802,7 @@ fn recreate_worktree(s: &mut Session, job: &mut Job, prompt: &str, preamble: Str
     let same_place = old_id.is_some();
     let wt_id = old_id.unwrap_or_else(|| format!("{}-{}", job.id.0, unix_millis()));
     job.pending_resume = same_place && job.session_id.is_some();
+    job.resume_seed = job.pending_resume.then(|| format!("{preamble}{prompt}"));
     job.pending_prompt =
         Some(if job.pending_resume { prompt.to_string() } else { format!("{preamble}{prompt}") });
     job.status = JobStatus::Preparing;
@@ -1185,8 +1200,12 @@ fn apply_event(s: &mut Session, id: JobId, ev: AgentEvent) {
     let mut turn_over = false;
     match ev {
         AgentEvent::Session { id: sid } => job.session_id = Some(sid),
-        AgentEvent::Text { text } => job.push(Activity::Text { text }),
+        AgentEvent::Text { text } => {
+            job.turn_output = true;
+            job.push(Activity::Text { text });
+        }
         AgentEvent::TextDelta { text } => {
+            job.turn_output = true;
             if job.streaming_text
                 && let Some(Activity::Text { text: last }) = job.activity.back_mut()
             {
@@ -1197,6 +1216,7 @@ fn apply_event(s: &mut Session, id: JobId, ev: AgentEvent) {
             }
         }
         AgentEvent::ToolUse { id: tid, tool, summary, .. } => {
+            job.turn_output = true;
             job.push(Activity::Tool { id: tid, tool, summary, state: ToolState::Running, output: String::new() });
         }
         AgentEvent::ToolResult { id: tid, ok, output } => {
@@ -1208,6 +1228,7 @@ fn apply_event(s: &mut Session, id: JobId, ev: AgentEvent) {
             }
         }
         AgentEvent::FileChanged { path, kind } => {
+            job.turn_output = true;
             if !job.changed_files.contains(&path) {
                 job.changed_files.push(path.clone());
             }
@@ -1279,6 +1300,16 @@ fn finish_turn(s: &mut Session, id: JobId) {
     if !job.is_running() {
         return;
     }
+    let seed = job.resume_seed.take();
+    if let Some(seed) = seed
+        && job.turn_error
+        && !job.stop_requested
+        && !job.turn_output
+        && retry_with_transcript(s, id, seed)
+    {
+        return;
+    }
+    let Some(job) = s.agents.job_mut(id) else { return };
     if !job.turn_reported_duration {
         let d = u64::try_from(job.started.elapsed().as_millis()).unwrap_or(u64::MAX);
         job.duration_ms = Some(job.duration_ms.unwrap_or(0).saturating_add(d));
@@ -1318,6 +1349,33 @@ fn finish_turn(s: &mut Session, id: JobId) {
     if mode != AgentMode::Review {
         s.ws.notify(level, format!("Agent {}", status.label()), title);
     }
+}
+
+/// A resumed turn failed before the agent said anything (`claude --resume` whose own session
+/// store was cleared, …): run the prompt again in a new session that carries the transcript.
+/// False if it could not be started (the turn then fails as usual).
+fn retry_with_transcript(s: &mut Session, id: JobId, seed: String) -> bool {
+    let Some(backend) = s.agents.job(id).map(|j| j.backend) else { return false };
+    let Some(info) = backend_info(s, backend) else { return false };
+    let Some(pos) = s.agents.jobs.iter().position(|j| j.id == id) else { return false };
+    let mut job = s.agents.jobs.remove(pos);
+    let old = job.session_id.take();
+    let failure = job.error.take();
+    job.push(Activity::Info {
+        text: format!(
+            "The agent could not resume its session{}{}; continuing in a new session with this conversation's transcript.",
+            old.as_deref().map(|o| format!(" {o}")).unwrap_or_default(),
+            failure.as_deref().map(|e| format!(" ({})", truncate(e, 200))).unwrap_or_default(),
+        ),
+    });
+    let started = launch(s, &mut job, &info, seed, false, None);
+    let ok = started.is_ok();
+    if !ok {
+        job.session_id = old;
+        job.error = failure;
+    }
+    s.agents.jobs.insert(pos.min(s.agents.jobs.len()), job);
+    ok
 }
 
 // ------------------------------------------------------------------ ACP host requests

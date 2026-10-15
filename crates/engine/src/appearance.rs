@@ -132,6 +132,12 @@ pub fn zoom_of(settings: &Settings) -> f32 {
 /// Commands shown with a checkmark, and whether each is on. Radio items (Navigation Bar
 /// placement) are checked when selected.
 pub fn checked(s: &Session, id: &str) -> Option<bool> {
+    // Soft-Wrap is per tab (View › Active Editor).
+    if id == "view.toggleSoftWrap"
+        && let Some(e) = s.ws.active_editor()
+    {
+        return Some(s.ws.soft_wrap_of(e));
+    }
     checked_in(&s.ws.settings, &s.appearance, id)
 }
 

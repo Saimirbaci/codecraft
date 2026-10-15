@@ -89,6 +89,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
+/// The session snapshot, with each tab's column selection mode (kept by the engine).
+pub fn snapshot(s: &Session) -> SessionSnapshot {
+    s.ws.session_snapshot_with(|id| s.editing.column_mode.contains(&id))
+}
+
 fn project_root(s: &Session) -> Option<PathBuf> {
     s.ws.project.as_ref().map(|p| p.root.clone())
 }
@@ -140,7 +145,7 @@ fn to_json(snap: &SessionSnapshot) -> Result<String, String> {
 /// Save the open project's session now. `Ok(None)` without a project.
 pub fn save_now(s: &mut Session) -> Result<Option<PathBuf>, String> {
     let Some(root) = project_root(s) else { return Ok(None) };
-    let json = to_json(&s.ws.session_snapshot())?;
+    let json = to_json(&snapshot(s))?;
     let path = write_snapshot(&s.session_store, &root, &json)?;
     s.session_store.last_saved = Some((root, json));
     Ok(Some(path))
@@ -176,6 +181,9 @@ pub fn restore(s: &mut Session, snap: &SessionSnapshot) -> RestoreSummary {
     }
     let summary =
         s.ws.restore_session(snap, |p| docs.iter().find(|(q, _)| q == p).and_then(|(_, d)| d.map(|(id, _)| id)));
+    for id in &summary.column_mode {
+        s.editing.column_mode.insert(*id);
+    }
     // Documents opened for tabs the restore dropped (a group the tree does not show, over a cap)
     // are closed again.
     for (_, doc) in &docs {
@@ -238,7 +246,7 @@ pub(crate) fn restore_on_open(s: &mut Session) {
                 log::info!("session restore skipped {} missing file(s)", summary.skipped.len());
             }
             // What was just restored needs no save until it changes.
-            if let Ok(json) = to_json(&s.ws.session_snapshot()) {
+            if let Ok(json) = to_json(&snapshot(s)) {
                 s.session_store.last_saved = Some((root, json));
             }
         }
@@ -264,7 +272,7 @@ pub(crate) fn autosave(s: &mut Session) {
         _ => store.last_check = Some(now),
     }
     let Some(root) = project_root(s) else { return };
-    let Ok(json) = to_json(&s.ws.session_snapshot()) else { return };
+    let Ok(json) = to_json(&snapshot(s)) else { return };
     let store = &mut s.session_store;
     if store.last_saved.as_ref().is_some_and(|(r, j)| *r == root && *j == json) {
         return;
@@ -319,11 +327,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
 }
 
 fn state(s: &mut Session, _: &Value) -> CmdResult {
-    serde_json::to_value(s.ws.session_snapshot()).map_err(|e| CommandError::Failed(e.to_string()))
+    serde_json::to_value(snapshot(s)).map_err(|e| CommandError::Failed(e.to_string()))
 }
 
 fn save(s: &mut Session, p: &Value) -> CmdResult {
-    let snap = s.ws.session_snapshot();
+    let snap = snapshot(s);
     let (groups, tabs) = (snap.groups.len(), snap.tab_count());
     let file = match opt_path(p, "path") {
         Some(path) => {

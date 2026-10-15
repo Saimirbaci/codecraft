@@ -70,6 +70,18 @@ const ERROR_NOTE_EVERY: Duration = Duration::from_secs(60);
 /// A saved session updated this recently may belong to a job running in another window.
 const RECENT_MS: u64 = 60_000;
 const INTERRUPTED_NOTE: &str = "Interrupted:";
+/// A running job's lock file (`<session>.lock`) is touched this often…
+pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(4);
+/// …and a lock not touched for this long belongs to a job that is gone (a crash).
+pub const STALE_AFTER_MS: u64 = 20_000;
+/// The listing is read again this often while a session runs in another window.
+const REFRESH_EVERY: Duration = Duration::from_secs(3);
+const MAX_LOCK_BYTES: u64 = 4096;
+/// Clean Up removes sessions not updated for this many days by default.
+pub const CLEANUP_DAYS: u64 = 30;
+const MAX_EXPORT_BYTES: usize = 64 << 20;
+const ELSEWHERE: &str =
+    "this session is running in another CodeCraft window; follow it there (it is listed here as finished once it ends)";
 
 // ------------------------------------------------------------------------------ the file
 
@@ -159,6 +171,8 @@ struct Header {
     backend_session_id: Option<String>,
     #[serde(default)]
     worktree: Option<Worktree>,
+    #[serde(default)]
+    prompt: String,
 }
 
 /// One saved session in a listing.
@@ -180,6 +194,19 @@ pub struct SessionSummary {
     pub worktree_exists: bool,
     pub bytes: u64,
     pub file: PathBuf,
+    /// Running in another window (of this or another CodeCraft process): its lock file is fresh.
+    pub elsewhere: bool,
+    /// The start of the first prompt (for search).
+    pub prompt_head: String,
+    /// The repository of the review worktree.
+    pub worktree_repo: Option<PathBuf>,
+}
+
+/// Characters of the first prompt kept in a listing for search.
+const PROMPT_HEAD_CHARS: usize = 500;
+
+fn prompt_head(prompt: &str) -> String {
+    prompt.chars().take(PROMPT_HEAD_CHARS).collect()
 }
 
 impl SessionSummary {
@@ -190,6 +217,7 @@ impl SessionSummary {
             "backend": self.backend.id(),
             "mode": mode_id(self.mode),
             "status": self.status.label(),
+            "runningElsewhere": self.elsewhere,
             "created": self.created_ms,
             "updated": self.updated_ms,
             "costUsd": self.cost_usd,
@@ -213,6 +241,16 @@ pub struct Persist {
     fingerprint: Option<u64>,
     status: Option<JobStatus>,
     at: Option<Instant>,
+    /// The lock file written while the job runs, and when it was last touched.
+    lock: Option<PathBuf>,
+    beat: Option<Instant>,
+}
+
+/// An export waiting for the file dialog (`agent.sessions.export` with `pick`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingExport {
+    sessions: Vec<String>,
+    markdown: bool,
 }
 
 enum WriteMsg {
@@ -230,6 +268,8 @@ struct Scan {
     project: PathBuf,
     sessions: Vec<SessionSummary>,
     warnings: Vec<String>,
+    /// A refresh: the listing stays shown while it is read and is replaced by the result.
+    refresh: bool,
 }
 
 /// Saved agent sessions of the open project, and the switches for saving them.
@@ -252,6 +292,9 @@ pub struct SessionsState {
     writer: Option<Writer>,
     prune_due: bool,
     last_error_note: Option<Instant>,
+    /// When the last listing was read (refreshes while sessions run elsewhere).
+    scanned_at: Option<Instant>,
+    pending_export: Option<PendingExport>,
 }
 
 impl Default for SessionsState {
@@ -270,6 +313,8 @@ impl Default for SessionsState {
             writer: None,
             prune_due: false,
             last_error_note: None,
+            scanned_at: None,
+            pending_export: None,
         }
     }
 }
@@ -608,6 +653,9 @@ fn summary_of(saved: &SavedSession, file: PathBuf, bytes: u64) -> SessionSummary
         worktree_exists: saved.worktree.is_some(),
         bytes,
         file,
+        elsewhere: false,
+        prompt_head: prompt_head(&saved.prompt),
+        worktree_repo: saved.worktree.as_ref().map(|w| w.repo.clone()),
     }
 }
 
@@ -619,7 +667,9 @@ fn save_job(store: &mut SessionsState, job: &mut Job, interrupted: bool) {
     if interrupted && job.is_running() {
         saved.status = JobStatus::Interrupted;
     }
-    job.persist = Persist { fingerprint: Some(fingerprint(job)), status: Some(job.status), at: Some(Instant::now()) };
+    job.persist.fingerprint = Some(fingerprint(job));
+    job.persist.status = Some(job.status);
+    job.persist.at = Some(Instant::now());
     let text = match encode(&mut saved) {
         Ok(t) => t,
         Err(e) => return store.warn(format!("session {key}: {e}")),
@@ -646,7 +696,63 @@ fn due(job: &Job, now: Instant) -> bool {
 pub(crate) fn save_detached(s: &mut Session, job: &mut Job) {
     if active(s) {
         save_job(&mut s.agents.sessions, job, false);
+        unlock(&mut s.agents.sessions, job);
     }
+}
+
+/// The lock file of a session file.
+/// The lock file of a session file: `<sessions dir>/.locks/<project key>/<session>.lock`, beside
+/// the project's directory so listings (and tools reading it) see session files only.
+pub fn lock_file(session_file: &Path) -> PathBuf {
+    let name = session_file.with_extension("lock").file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    match session_file.parent() {
+        Some(project_dir) => {
+            let key = project_dir.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+            project_dir.parent().unwrap_or(project_dir).join(".locks").join(key).join(name)
+        }
+        None => PathBuf::from(name),
+    }
+}
+
+/// Touch the lock of a running job (every [`HEARTBEAT_EVERY`]), so other windows and processes
+/// list it as running rather than interrupted; drop it once the job stops.
+fn heartbeat(store: &mut SessionsState, job: &mut Job, now: Instant) {
+    if !job.is_running() {
+        unlock(store, job);
+        return;
+    }
+    if job.persist.beat.is_some_and(|t| now.duration_since(t) < HEARTBEAT_EVERY) {
+        return;
+    }
+    let Some(key) = job.session_key.clone().filter(|k| valid_key(k)) else { return };
+    let Some(dir) = store.project_dir(&job.project) else { return };
+    let file = lock_file(&dir.join(format!("{key}.json")));
+    let body = json!({ "pid": std::process::id(), "heartbeatMs": now_ms(), "job": job.id.0 }).to_string();
+    store.send(WriteMsg::Write(file.clone(), body));
+    job.persist.lock = Some(file);
+    job.persist.beat = Some(now);
+}
+
+fn unlock(store: &mut SessionsState, job: &mut Job) {
+    if let Some(file) = job.persist.lock.take() {
+        store.send(WriteMsg::Remove(file));
+    }
+    job.persist.beat = None;
+}
+
+/// Whether the lock next to a session file says its job is alive (touched recently).
+fn locked(session_file: &Path, now: u64) -> bool {
+    let file = lock_file(session_file);
+    let Ok(meta) = std::fs::metadata(&file) else { return false };
+    if !meta.is_file() || meta.len() > MAX_LOCK_BYTES {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(&file) else { return false };
+    let Some(beat) = serde_json::from_str::<Value>(&text).ok().and_then(|v| v.get("heartbeatMs")?.as_u64()) else {
+        return false;
+    };
+    // A clock far in the future is not trusted either.
+    now.saturating_sub(beat) < STALE_AFTER_MS && beat.saturating_sub(now) < STALE_AFTER_MS
 }
 
 /// Window closing: save every job (running ones as interrupted) and wait for the writes.
@@ -659,6 +765,7 @@ pub(crate) fn shutdown(s: &mut Session) {
         if job.is_running() || job.persist.fingerprint != Some(fingerprint(job)) {
             save_job(&mut agents.sessions, job, true);
         }
+        unlock(&mut agents.sessions, job);
     }
     if !agents.sessions.flush(FLUSH_TIMEOUT) {
         log::warn!("agent sessions: the last saves did not finish in time");
@@ -683,10 +790,20 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         if due(job, now) {
             save_job(&mut agents.sessions, job, false);
         }
+        heartbeat(&mut agents.sessions, job, now);
     }
     if agents.sessions.prune_due && !agents.sessions.loading {
         let live: HashSet<String> = agents.jobs.iter().filter_map(|j| j.session_key.clone()).collect();
         prune(&mut agents.sessions, &live, now_ms());
+    }
+    // Sessions running in another window: read the listing again until they end.
+    let st = &mut agents.sessions;
+    if !st.loading
+        && st.saved.iter().any(|x| x.elsewhere)
+        && st.scanned_at.is_none_or(|t| now.duration_since(t) >= REFRESH_EVERY)
+    {
+        let root = st.project.clone();
+        start_scan_inner(st, root, true);
     }
     changed
 }
@@ -714,23 +831,32 @@ fn drain_errors(s: &mut Session) -> bool {
 // ------------------------------------------------------------------------------ listing
 
 fn start_scan(store: &mut SessionsState, root: Option<PathBuf>) {
-    store.project_key = root.as_deref().map(project_key);
-    store.project = root.clone();
-    store.saved.clear();
-    store.warnings.clear();
+    start_scan_inner(store, root, false);
+}
+
+/// Read the listing in the background. `refresh`: keep showing the current one meanwhile (no
+/// spinner) and replace it with the result.
+fn start_scan_inner(store: &mut SessionsState, root: Option<PathBuf>, refresh: bool) {
+    store.scanned_at = Some(Instant::now());
+    if !refresh {
+        store.project_key = root.as_deref().map(project_key);
+        store.project = root.clone();
+        store.saved.clear();
+        store.warnings.clear();
+        store.prune_due = false;
+    }
     store.scan = None;
     store.loading = false;
-    store.prune_due = false;
     let (Some(root), Some(dir)) = (root.clone(), root.as_deref().and_then(|r| store.project_dir(r))) else { return };
     let (tx, rx) = bounded(1);
     let spawned = std::thread::Builder::new().name("codecraft-agent-sessions-scan".into()).spawn(move || {
         let (sessions, warnings) = scan_dir(&dir);
-        let _ = tx.send(Scan { project: root, sessions, warnings });
+        let _ = tx.send(Scan { project: root, sessions, warnings, refresh });
     });
     match spawned {
         Ok(_) => {
             store.scan = Some(rx);
-            store.loading = true;
+            store.loading = !refresh;
         }
         Err(e) => store.warn(format!("cannot list agent sessions: {e}")),
     }
@@ -756,7 +882,19 @@ fn drain_scan(s: &mut Session) -> bool {
     };
     store.scan = None;
     store.loading = false;
+    store.scanned_at = Some(Instant::now());
     if store.project.as_ref() != Some(&scan.project) {
+        return true;
+    }
+    if scan.refresh {
+        // Live jobs keep their own entries; everything else is what is on disk now.
+        let live: HashSet<String> = s.agents.jobs.iter().filter_map(|j| j.session_key.clone()).collect();
+        let store = &mut s.agents.sessions;
+        let mut fresh = scan.sessions;
+        fresh.retain(|x| !live.contains(&x.id));
+        fresh.extend(store.saved.drain(..).filter(|x| live.contains(&x.id)));
+        store.saved = fresh;
+        sort(&mut store.saved);
         return true;
     }
     for w in scan.warnings {
@@ -813,11 +951,16 @@ fn read_text(path: &Path) -> Result<String, String> {
 fn read_summary(path: &Path, id: &str) -> Result<SessionSummary, String> {
     let text = read_text(path)?;
     let h: Header = serde_json::from_str(&text).map_err(|e| format!("not a session file ({e})"))?;
+    // A running job whose lock is fresh runs in another window; otherwise it was interrupted.
+    let elsewhere = h.status.is_active() && locked(path, now_ms());
     let status = match h.status {
-        JobStatus::Running | JobStatus::Preparing => JobStatus::Interrupted,
+        JobStatus::Running | JobStatus::Preparing if !elsewhere => JobStatus::Interrupted,
         s => s,
     };
     Ok(SessionSummary {
+        elsewhere,
+        prompt_head: prompt_head(&h.prompt),
+        worktree_repo: h.worktree.as_ref().map(|w| w.repo.clone()),
         id: id.to_string(),
         title: h.title,
         backend: h.backend,
@@ -858,7 +1001,10 @@ fn prune(store: &mut SessionsState, live: &HashSet<String>, now: u64) -> usize {
             break;
         }
         let maybe_running = s.status == JobStatus::Interrupted && now.saturating_sub(s.updated_ms) < RECENT_MS;
-        if live.contains(&s.id) || maybe_running {
+        // A session whose review worktree still exists is only removed by Clean Up (which asks
+        // and removes the worktree with it), so no worktree is left without its session.
+        let has_worktree = s.worktree.as_deref().is_some_and(Path::is_dir);
+        if live.contains(&s.id) || maybe_running || s.elsewhere || has_worktree {
             continue;
         }
         victims.push(s.id.clone());
@@ -868,6 +1014,7 @@ fn prune(store: &mut SessionsState, live: &HashSet<String>, now: u64) -> usize {
     let files: Vec<PathBuf> =
         store.saved.iter().filter(|s| victims.contains(&s.id)).map(|s| s.file.clone()).collect();
     for f in files {
+        store.send(WriteMsg::Remove(lock_file(&f)));
         store.send(WriteMsg::Remove(f));
     }
     store.saved.retain(|s| !victims.contains(&s.id));
@@ -881,6 +1028,11 @@ fn prune(store: &mut SessionsState, live: &HashSet<String>, now: u64) -> usize {
 pub fn history(s: &Session) -> Vec<&SessionSummary> {
     let live: HashSet<&str> = s.agents.jobs.iter().filter_map(|j| j.session_key.as_deref()).collect();
     s.agents.sessions.saved.iter().filter(|x| !live.contains(x.id.as_str())).collect()
+}
+
+/// Whether the listing says `key` runs in another window (its lock is fresh).
+pub fn running_elsewhere(s: &Session, key: &str) -> bool {
+    s.agents.sessions.saved.iter().any(|x| x.id == key && x.elsewhere)
 }
 
 fn live_job(s: &Session, key: &str) -> Option<JobId> {
@@ -919,6 +1071,9 @@ pub fn open(s: &mut Session, key: &str) -> Result<JobId, CommandError> {
     }
     if let Some(id) = live_job(s, key) {
         return Ok(id);
+    }
+    if running_elsewhere(s, key) {
+        return Err(CommandError::Failed(ELSEWHERE.into()));
     }
     let file = find_file(s, key).ok_or_else(|| CommandError::Failed(format!("no saved agent session `{key}`")))?;
     let saved = read_session(&file).map_err(CommandError::Failed)?;
@@ -982,7 +1137,12 @@ fn restore(s: &mut Session, saved: SavedSession, key: &str) -> JobId {
     job.restored_decisions = saved.review.into_iter().map(|d| (d.rel, d.decision)).collect();
     if status == saved.status {
         // Unchanged since it was saved: no need to write it again.
-        job.persist = Persist { fingerprint: Some(fingerprint(&job)), status: Some(status), at: Some(Instant::now()) };
+        job.persist = Persist {
+            fingerprint: Some(fingerprint(&job)),
+            status: Some(status),
+            at: Some(Instant::now()),
+            ..Persist::default()
+        };
     }
     let collect = status == JobStatus::Reviewing && job.worktree.is_some();
     let id = agents::insert_restored(s, job, collect);
@@ -1068,14 +1228,20 @@ fn delete(s: &mut Session, key: &str) -> Result<(), CommandError> {
             return Err(CommandError::Failed("the agent is still working; stop it first".into()));
         }
         agents::discard(s, id)?;
+    } else if running_elsewhere(s, key) {
+        return Err(CommandError::Failed(ELSEWHERE.into()));
     }
     let file = find_file(s, key);
     let saved = file.as_deref().and_then(|f| read_session(f).ok());
-    if let Some(wt) = saved.and_then(|x| x.worktree).filter(|w| w.path.is_dir()) {
+    let base = s.agents.worktrees_dir();
+    if let Some(wt) = saved.and_then(|x| x.worktree).filter(|w| w.path.is_dir())
+        && base.as_deref().is_some_and(|b| ours(&wt.path, &wt.branch, b))
+    {
         agents::remove_worktree_later(s, wt);
     }
     let st = &mut s.agents.sessions;
     if let Some(f) = file {
+        st.send(WriteMsg::Remove(lock_file(&f)));
         st.send(WriteMsg::Remove(f));
     }
     st.saved.retain(|x| x.id != key);
@@ -1119,6 +1285,371 @@ fn file_url(path: &Path) -> String {
     out
 }
 
+// ------------------------------------------------------------------------------ search
+
+/// History search and filters (`agent.sessions.list` / `export` params, the History header).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filter {
+    /// Words that must all appear (case-insensitive) in the title, first prompt, backend,
+    /// branch, id or creation date.
+    pub query: String,
+    /// A status label (`finished`, `interrupted`, …); `running` also matches preparing and
+    /// sessions running in another window.
+    pub status: Option<String>,
+    /// A backend id (`claude`, `codex`, …).
+    pub backend: Option<String>,
+}
+
+impl Filter {
+    pub fn from_params(p: &Value) -> Self {
+        let pick = |k: &str| opt_str(p, k).map(str::trim).filter(|v| !v.is_empty() && *v != "all").map(str::to_string);
+        Self {
+            query: opt_str(p, "query").map(|q| truncate(q.trim(), 200)).unwrap_or_default(),
+            status: pick("status").map(|v| v.to_ascii_lowercase()),
+            backend: pick("backend").map(|v| v.to_ascii_lowercase()),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.query.is_empty() && self.status.is_none() && self.backend.is_none()
+    }
+
+    fn status_ok(&self, status: JobStatus) -> bool {
+        match self.status.as_deref() {
+            None => true,
+            Some("running") => status.is_active(),
+            Some(want) => status.label() == want,
+        }
+    }
+
+    fn fields_ok(&self, fields: &[&str]) -> bool {
+        let hay = fields.join("\n").to_lowercase();
+        self.query.to_lowercase().split_whitespace().all(|w| hay.contains(w))
+    }
+
+    /// Whether a saved session matches.
+    pub fn matches(&self, x: &SessionSummary) -> bool {
+        self.status_ok(x.status)
+            && self.backend.as_deref().is_none_or(|b| x.backend.id() == b)
+            && self.fields_ok(&[
+                &x.title,
+                &x.prompt_head,
+                x.backend.label(),
+                x.branch.as_deref().unwrap_or(""),
+                &x.id,
+                &utc_date(x.created_ms),
+            ])
+    }
+
+    /// Whether an open job matches.
+    pub fn matches_job(&self, j: &Job) -> bool {
+        self.status_ok(j.status)
+            && self.backend.as_deref().is_none_or(|b| j.backend.id() == b)
+            && self.fields_ok(&[
+                &j.title,
+                &prompt_head(&j.prompt),
+                j.backend.label(),
+                j.worktree.as_ref().map(|w| w.branch.as_str()).unwrap_or(""),
+                j.session_key.as_deref().unwrap_or(""),
+                &utc_date(j.created_ms),
+            ])
+    }
+}
+
+/// [`history`] narrowed by a filter.
+pub fn history_filtered<'a>(s: &'a Session, f: &Filter) -> Vec<&'a SessionSummary> {
+    history(s).into_iter().filter(|x| f.matches(x)).collect()
+}
+
+// ------------------------------------------------------------------------------ clean up
+
+/// Whether a worktree is one CodeCraft created for a review: under the worktrees directory as
+/// `<base>/<project hash>/<id>` on the branch `codecraft/agent-<id>`.
+pub fn ours(path: &Path, branch: &str, base: &Path) -> bool {
+    let id = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    !id.is_empty()
+        && path.parent().and_then(Path::parent) == Some(base)
+        && !path.components().any(|c| matches!(c, std::path::Component::ParentDir))
+        && branch == format!("codecraft/agent-{id}")
+}
+
+/// One session Clean Up would remove.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CleanupItem {
+    pub id: String,
+    pub title: String,
+    pub status: JobStatus,
+    pub updated_ms: u64,
+    /// The review worktree that goes with it (one CodeCraft created that still exists).
+    pub worktree: Option<PathBuf>,
+    /// A worktree the session names that CodeCraft did not create: left alone.
+    pub foreign_worktree: Option<PathBuf>,
+}
+
+/// Sessions that Clean Up removes: interrupted ones (not touched for a minute) and ones not
+/// updated for `days`, never an open job or one running in another window.
+pub fn cleanup_plan(s: &Session, days: u64) -> Vec<CleanupItem> {
+    let now = now_ms();
+    let age = days.saturating_mul(86_400_000);
+    let base = s.agents.worktrees_dir();
+    history(s)
+        .into_iter()
+        .filter(|x| !x.elsewhere)
+        .filter(|x| {
+            let idle = now.saturating_sub(x.updated_ms);
+            (x.status == JobStatus::Interrupted && idle >= RECENT_MS) || idle >= age
+        })
+        .map(|x| {
+            let existing = x.worktree.clone().filter(|p| p.is_dir());
+            let mine = existing
+                .as_deref()
+                .is_some_and(|p| base.as_deref().is_some_and(|b| ours(p, x.branch.as_deref().unwrap_or(""), b)));
+            CleanupItem {
+                id: x.id.clone(),
+                title: x.title.clone(),
+                status: x.status,
+                updated_ms: x.updated_ms,
+                worktree: existing.clone().filter(|_| mine),
+                foreign_worktree: existing.filter(|_| !mine),
+            }
+        })
+        .collect()
+}
+
+fn cleanup_json(items: &[CleanupItem]) -> Value {
+    json!({
+        "sessions": items.iter().map(|i| json!({
+            "id": i.id, "title": i.title, "status": i.status.label(), "updated": i.updated_ms,
+            "worktree": i.worktree, "foreignWorktree": i.foreign_worktree,
+        })).collect::<Vec<_>>(),
+        "worktrees": items.iter().filter_map(|i| i.worktree.clone()).collect::<Vec<_>>(),
+        "keptWorktrees": items.iter().filter_map(|i| i.foreign_worktree.clone()).collect::<Vec<_>>(),
+    })
+}
+
+/// Remove the planned sessions (unless `worktrees_only`) and their worktrees. Returns
+/// (sessions removed, worktrees removed).
+fn cleanup(s: &mut Session, items: &[CleanupItem], worktrees_only: bool) -> (usize, usize) {
+    let (mut sessions, mut worktrees) = (0, 0);
+    for item in items {
+        let Some(summary) = s.agents.sessions.saved.iter().find(|x| x.id == item.id).cloned() else { continue };
+        if let (Some(path), Some(repo), Some(branch)) =
+            (item.worktree.clone(), summary.worktree_repo.clone(), summary.branch.clone())
+        {
+            let wt = Worktree { repo, path, branch, baseline: String::new(), prefix: PathBuf::new() };
+            agents::remove_worktree_later(s, wt);
+            worktrees += 1;
+            if let Some(x) = s.agents.sessions.saved.iter_mut().find(|x| x.id == item.id) {
+                x.worktree_exists = false;
+            }
+        }
+        if !worktrees_only {
+            let st = &mut s.agents.sessions;
+            st.send(WriteMsg::Remove(lock_file(&summary.file)));
+            st.send(WriteMsg::Remove(summary.file.clone()));
+            st.saved.retain(|x| x.id != item.id);
+            sessions += 1;
+        }
+    }
+    (sessions, worktrees)
+}
+
+// ------------------------------------------------------------------------------ export
+
+fn md_escape_fence(text: &str) -> String {
+    // A fence longer than any backtick run inside.
+    let mut longest = 0;
+    let mut run = 0;
+    for c in text.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// A session as Markdown: a header with its facts, then the conversation.
+pub fn to_markdown(x: &SavedSession) -> String {
+    let mut out = String::new();
+    let title = if x.title.trim().is_empty() { "(untitled)" } else { x.title.trim() };
+    out.push_str(&format!("# {title}\n\n"));
+    let mut facts = vec![
+        format!("- **Agent:** {} · {}", x.backend.label(), x.mode),
+        format!("- **Status:** {}", x.status.label()),
+        format!("- **Created:** {} (UTC)", utc_date(x.created_ms)),
+    ];
+    if let Some(c) = x.cost_usd {
+        facts.push(format!("- **Cost:** ${c:.2}"));
+    }
+    if let Some(d) = x.duration_ms {
+        facts.push(format!("- **Duration:** {:.1} s", d as f64 / 1000.0));
+    }
+    if !x.project.as_os_str().is_empty() {
+        facts.push(format!("- **Project:** `{}`", x.project.display()));
+    }
+    if let Some(wt) = &x.worktree {
+        facts.push(format!("- **Branch:** `{}`", wt.branch));
+    }
+    facts.push(format!("- **Session:** `{}`", x.id));
+    out.push_str(&facts.join("\n"));
+    out.push_str("\n\n");
+    if x.dropped > 0 {
+        out.push_str(&format!("_{} earlier entries were not saved._\n\n", x.dropped));
+    }
+    for a in &x.activity {
+        match a {
+            Activity::Prompt { text } => out.push_str(&format!("## User\n\n{}\n\n", text.trim())),
+            Activity::Text { text } => out.push_str(&format!("## Assistant\n\n{}\n\n", text.trim())),
+            Activity::Tool { tool, summary, state, output, .. } => {
+                let how = match state {
+                    ToolState::Ok => "done",
+                    ToolState::Failed => "failed",
+                    ToolState::Running => "interrupted",
+                };
+                out.push_str(&format!("- **{tool}** {summary} ({how})\n"));
+                let output = output.trim();
+                if !output.is_empty() {
+                    let shown = truncate(output, 2_000);
+                    let fence = md_escape_fence(&shown);
+                    out.push_str(&format!("\n{fence}\n{shown}\n{fence}\n"));
+                }
+                out.push('\n');
+            }
+            Activity::FileChanged { path, change } => {
+                out.push_str(&format!("- Changed `{}` ({change:?})\n\n", path.display()))
+            }
+            Activity::Plan { entries } => {
+                for e in entries {
+                    let mark = if e.status == "completed" { "x" } else { " " };
+                    out.push_str(&format!("- [{mark}] {}\n", e.content));
+                }
+                out.push('\n');
+            }
+            Activity::Result { is_error, cost_usd, duration_ms, .. } => {
+                let mut bits = vec![if *is_error { "Turn ended with an error" } else { "Turn finished" }.to_string()];
+                if let Some(c) = cost_usd {
+                    bits.push(format!("${c:.2}"));
+                }
+                if let Some(d) = duration_ms {
+                    bits.push(format!("{:.1} s", *d as f64 / 1000.0));
+                }
+                out.push_str(&format!("_{}_\n\n", bits.join(" · ")));
+            }
+            Activity::Error { message } => out.push_str(&format!("> **Error:** {}\n\n", message.trim())),
+            Activity::Info { text } => out.push_str(&format!("_{}_\n\n", text.trim())),
+            Activity::Log { .. } => {}
+        }
+    }
+    out
+}
+
+/// The sessions an export covers: `session`/`sessions` params, else the History filtered by
+/// `query`/`status`/`backend` (open jobs included).
+fn export_keys(s: &Session, p: &Value) -> Result<Vec<String>, CommandError> {
+    if opt_str(p, "session").is_some() || p.get("job").is_some_and(|v| !v.is_null()) {
+        return Ok(vec![key_param(s, p)?]);
+    }
+    if let Some(list) = p.get("sessions").and_then(Value::as_array) {
+        let keys: Vec<String> = list.iter().filter_map(Value::as_str).take(MAX_SESSIONS).map(str::to_string).collect();
+        if let Some(bad) = keys.iter().find(|k| !valid_key(k)) {
+            return Err(CommandError::BadParams(format!("`{bad}` is not a session id")));
+        }
+        return Ok(keys);
+    }
+    let filter = Filter::from_params(p);
+    let root_key = s.agents.sessions.project_key.clone();
+    let mut keys: Vec<(u64, String)> = s
+        .agents
+        .jobs
+        .iter()
+        .filter(|j| root_key.as_deref() == Some(project_key(&j.project).as_str()) && filter.matches_job(j))
+        .filter_map(|j| Some((j.created_ms, j.session_key.clone()?)))
+        .collect();
+    keys.extend(history_filtered(s, &filter).into_iter().map(|x| (x.created_ms, x.id.clone())));
+    keys.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    Ok(keys.into_iter().map(|(_, k)| k).collect())
+}
+
+/// A session's full record: the open job's, else its file.
+fn export_record(s: &Session, key: &str) -> Result<SavedSession, CommandError> {
+    if let Some(j) = s.agents.jobs.iter().find(|j| j.session_key.as_deref() == Some(key)) {
+        return Ok(to_saved(j, key));
+    }
+    let file = find_file(s, key).ok_or_else(|| CommandError::Failed(format!("no saved agent session `{key}`")))?;
+    read_session(&file).map_err(CommandError::Failed)
+}
+
+fn export(s: &mut Session, p: &Value) -> CmdResult {
+    let format = opt_str(p, "format").unwrap_or("").to_ascii_lowercase();
+    let path = crate::params::opt_path(p, "path").map(|p| crate::normalize_path(&p));
+    let explicit = ["session", "sessions", "job", "query", "status", "backend"].iter().any(|k| p.get(*k).is_some());
+    // The file dialog's answer to an earlier `pick`.
+    let pending = if !explicit && path.is_some() { s.agents.sessions.pending_export.take() } else { None };
+    let (keys, markdown) = match pending {
+        Some(pe) => (pe.sessions, pe.markdown),
+        None => {
+            let markdown = match format.as_str() {
+                "markdown" | "md" => true,
+                "json" => false,
+                "" => path.as_deref().and_then(Path::extension).is_some_and(|e| e == "md" || e == "markdown"),
+                other => return Err(CommandError::BadParams(format!("unknown format `{other}` (markdown or json)"))),
+            };
+            (export_keys(s, p)?, markdown)
+        }
+    };
+    if keys.is_empty() {
+        return Err(CommandError::Failed("no agent sessions to export".into()));
+    }
+    if bool_or(p, "pick", false) {
+        let ext = if markdown { "md" } else { "json" };
+        let name = if keys.len() == 1 { format!("agent-session.{ext}") } else { format!("agent-sessions.{ext}") };
+        s.agents.sessions.pending_export = Some(PendingExport { sessions: keys.clone(), markdown });
+        s.effects.push(Effect::PickFile {
+            title: "Export Agent Sessions".into(),
+            command: "agent.sessions.export".into(),
+            param: "path".into(),
+            save: true,
+            extensions: vec![ext.into()],
+            default_name: Some(name),
+        });
+        return Ok(json!({ "picking": true, "sessions": keys.len() }));
+    }
+    let mut records = Vec::new();
+    let mut bytes = 0usize;
+    for k in &keys {
+        let r = export_record(s, k)?;
+        bytes = bytes.saturating_add(r.prompt.len()).saturating_add(r.activity.len().saturating_mul(64));
+        records.push(r);
+        if bytes > MAX_EXPORT_BYTES {
+            break;
+        }
+    }
+    let text = if markdown {
+        records.iter().map(to_markdown).collect::<Vec<_>>().join("\n---\n\n")
+    } else if records.len() == 1 && opt_str(p, "session").is_some() {
+        serde_json::to_string_pretty(&records[0]).map_err(|e| CommandError::Failed(e.to_string()))?
+    } else {
+        serde_json::to_string_pretty(&json!({
+            "project": s.agents.sessions.project,
+            "exportedMs": now_ms(),
+            "sessions": records,
+        }))
+        .map_err(|e| CommandError::Failed(e.to_string()))?
+    };
+    let fmt = if markdown { "markdown" } else { "json" };
+    match path {
+        Some(path) => {
+            write_file(&path, &text).map_err(CommandError::Failed)?;
+            s.status = format!("Exported {} agent session(s) to {}", records.len(), path.display());
+            Ok(json!({ "file": path, "sessions": records.len(), "format": fmt }))
+        }
+        None => Ok(json!({ "text": text, "sessions": records.len(), "format": fmt })),
+    }
+}
+
 // ------------------------------------------------------------------------------ commands
 
 /// The session param: `session` (id) or `job` (an open job's session).
@@ -1137,7 +1668,8 @@ fn key_param(s: &Session, p: &Value) -> Result<String, CommandError> {
     Err(CommandError::BadParams("missing string param `session`".into()))
 }
 
-fn list(s: &mut Session, _: &Value) -> CmdResult {
+fn list(s: &mut Session, p: &Value) -> CmdResult {
+    let filter = Filter::from_params(p);
     let st = &s.agents.sessions;
     let key = st.project_key.clone();
     let mut rows: Vec<(u64, String, Value)> = Vec::new();
@@ -1148,6 +1680,9 @@ fn list(s: &mut Session, _: &Value) -> CmdResult {
             continue;
         }
         seen.insert(k.clone());
+        if !filter.matches_job(j) {
+            continue;
+        }
         let saved = st.saved.iter().find(|x| &x.id == k);
         rows.push((
             j.created_ms,
@@ -1173,7 +1708,7 @@ fn list(s: &mut Session, _: &Value) -> CmdResult {
         ));
     }
     for x in &st.saved {
-        if seen.contains(&x.id) {
+        if seen.contains(&x.id) || !filter.matches(x) {
             continue;
         }
         let mut v = x.to_json(None);
@@ -1199,10 +1734,13 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "agent.sessions.list",
             "List Agent Sessions",
             None,
-            "→ {project, dir, saving, loading, sessions: [{id, title, backend, mode, status (\"interrupted\" for jobs \
-             that were running when CodeCraft quit), created, updated (Unix ms), costUsd, durationMs, \
-             backendSessionId, worktree, branch, worktreeExists, job (open job id or null), file, bytes}], \
-             warnings} — this project's saved agent sessions, newest first",
+            "{query?: string, status?: string, backend?: string} → {project, dir, saving, loading, sessions: [{id, \
+             title, backend, mode, status (\"interrupted\" for jobs that were running when CodeCraft quit; \
+             \"running\" with runningElsewhere for a job running in another window), created, updated (Unix ms), \
+             costUsd, durationMs, backendSessionId, worktree, branch, worktreeExists, job (open job id or null), \
+             file, bytes}], warnings} — this project's saved agent sessions, newest first; `query` words must all \
+             appear in the title, first prompt, backend, branch, id or date; `status` (running matches preparing \
+             too) and `backend` (claude, codex, …) filter",
             Context::Global,
             always,
             list,
@@ -1300,6 +1838,43 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 }
                 Ok(json!({ "file": file, "dir": dir }))
             },
+        ),
+        spec(
+            "agent.sessions.cleanup",
+            "Clean Up Agent Sessions",
+            None,
+            "{days?: int (30), worktreesOnly?: bool, confirm?: bool} → {sessions: [{id, title, status, updated, \
+             worktree, foreignWorktree}], worktrees, keptWorktrees, removed?, worktreesRemoved?} — interrupted \
+             sessions and sessions not updated for `days`, with the review worktrees CodeCraft created for them \
+             (never one it did not create, an open job or one running in another window); without `confirm` \
+             only lists them; `worktreesOnly` keeps the sessions in History",
+            Context::Global,
+            always,
+            |s, p| {
+                let days = opt_usize(p, "days")?.map_or(CLEANUP_DAYS, |d| u64::try_from(d).unwrap_or(u64::MAX));
+                let plan = cleanup_plan(s, days);
+                let mut out = cleanup_json(&plan);
+                if bool_or(p, "confirm", false) {
+                    let (removed, worktrees) = cleanup(s, &plan, bool_or(p, "worktreesOnly", false));
+                    s.status = format!("Removed {removed} agent session(s) and {worktrees} worktree(s)");
+                    if let Some(o) = out.as_object_mut() {
+                        o.insert("removed".into(), json!(removed));
+                        o.insert("worktreesRemoved".into(), json!(worktrees));
+                    }
+                }
+                Ok(out)
+            },
+        ),
+        spec(
+            "agent.sessions.export",
+            "Export Agent Sessions",
+            None,
+            "{session?: id | sessions?: [id] | query?, status?, backend? (the History filter), format?: \
+             \"markdown\" | \"json\", path?: string, pick?: bool} → {text | file, sessions, format} — the \
+             conversation as Markdown, or the saved records as JSON; `pick` asks for the file first",
+            Context::Global,
+            always,
+            export,
         ),
         spec(
             "agent.sessions.reload",

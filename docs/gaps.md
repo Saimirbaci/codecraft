@@ -58,9 +58,13 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    Help › Help; `cargo xtask bundle|dmg|package-linux|package-windows`). (2026-10-13: project
    windows open at exit are reopened on start with the main window's last project, each with
    its editors; Settings › Appearance & Behavior › System Settings › Reopen projects on startup,
-   `codecraft --no-restore`.) Remaining: Merge All
-   Project Windows (macOS window tabs) is not implemented; window positions and sizes of the extra
-   project windows are not restored (they open at the main window's size); plain-key and Alt+character shortcuts (Backspace, Tab, Alt+/) are not native key
+   `codecraft --no-restore`.) ~~Window positions and sizes of the extra project windows are not
+   restored~~ (M13 track SR, 2026-10-15: the main window's position and size, and each project
+   window's position and size per project root, are saved in the app state and restored; a
+   window no longer follows the main window's size). Remaining: Merge All
+   Project Windows (macOS window tabs) is not implemented; saved positions are not checked
+   against the connected displays (a window saved on a detached monitor relies on macOS moving
+   it back); plain-key and Alt+character shortcuts (Backspace, Tab, Alt+/) are not native key
    equivalents, so the native menu shows no shortcut for them; enabled states refresh every 250 ms
    instead of when a menu opens; no Developer ID signing or notarization in CI; the Windows zip task
    is untested on Windows.
@@ -76,9 +80,11 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    the focused group and the tool-window layout are saved per project in
    `.codecraft/workspace.json` (the config directory when the project is read-only) on close,
    project switch and every 30 s while they change, and restored when the project opens;
-   `session.save`/`session.restore`/`session.state` for agents.) Remaining: unsaved buffers'
-   text is not restored (Quit still prompts); untitled buffers and scratch files without a path
-   are not restored; per-tab soft-wrap/column-mode state is not saved.
+   `session.save`/`session.restore`/`session.state` for agents.) ~~Unsaved buffers' text is not
+   restored (Quit still prompts); untitled buffers and scratch files without a path are not
+   restored; per-tab soft-wrap/column-mode state is not saved~~ (M13 track SR, 2026-10-15: hot
+   exit, item 49; View › Active Editor › Soft-Wrap is per tab and, with column selection mode,
+   saved and restored with the tab). Remaining: no detachable editor windows.
 9. ~~Completion: no snippet placeholders (snippets are flattened), no completion item resolve,
    no auto-popup tuning (RustRover's delays and fuzzy ranking)~~ (M10, 2026-10-13: LSP snippets
    (`$1`, `${2:x}`, nesting, mirrors, `${3|a,b|}` choices in a chooser, `$0`, `TM_*`/`CLIPBOARD`
@@ -432,13 +438,13 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `$CODECRAFT_HOME/agent-sessions/<project key>/` (prompt, feed, status, cost, the backend's
     session id, review state), listed in the Agents tool window after a restart (running ones as
     Interrupted) and resumable (`claude --resume`, `codex exec resume`, ACP `session/load`, else a
-    transcript seed). Remaining: two windows on one project don't see each other's live jobs (the
-    other's shows as interrupted); a failed `claude --resume` (its own store cleared) isn't
-    retried with the transcript; worktrees of interrupted reviews stay until resumed or deleted,
-    and pruning removes old session files but not their worktrees; Gemini's `--resume` argument
-    wasn't checked against a real CLI; sessions are per project root (feedback jobs on CodeCraft's
-    own source appear only when that folder is open); opening/renaming reads the file
-    synchronously (≤ 2 MB); no search, filter or export in History.
+    transcript seed). ~~Two windows on one project don't see each other's live jobs; a failed
+    `claude --resume` isn't retried with the transcript; pruning leaves worktrees behind; no
+    search, filter or export in History~~ (M13 track SR, 2026-10-15: item 49). Remaining:
+    Gemini's `--resume` argument wasn't checked against a real CLI; sessions are per project root
+    (feedback jobs on CodeCraft's own source appear only when that folder is open);
+    opening/renaming reads the file synchronously (≤ 2 MB); a job running in another window is
+    listed but can't be followed live from this one (its feed shows after it ends).
 39. SQL editor and explorer (track DC): Go to Declaration, Quick Documentation, Find Usages,
     Rename and quick-fixes in SQL (files, consoles, Rust strings); inspections (UPDATE/DELETE
     without WHERE, INSERT count mismatch, SELECT * in views, unused alias/CTE, ambiguous column,
@@ -551,3 +557,38 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     groups, at most 100,000 keys in the browser, Redis consoles still get SQL completion; DuckDB
     needs its CLI, runs each statement in its own process (no transactions or session state),
     may lose HUGEINT/DECIMAL precision, no Explain Plan; no Dump for the four new kinds.
+
+## M13 (2026-10-15)
+
+49. Nothing lost on restart (track SR): hot exit (Settings › Appearance & Behavior › System
+    Settings, on by default): every few seconds the text of each modified file and each untitled
+    buffer is written to `<project>/.codecraft/unsaved/` (git-ignored; the config directory's
+    `unsaved/` when the project is read-only or none is open) as atomic writes on a worker
+    thread, only when it changed; quitting, closing a project window or switching projects keeps
+    them without asking instead of saving, and the next open brings them back modified (one undo
+    step back to the disk text) with a banner: Compare with Disk (the diff view), Dismiss/Keep My
+    Changes, Discard. A file changed or deleted on disk meanwhile is flagged and is not saved
+    over (Save reports it, closing its tab keeps the changes for next time) until the user keeps
+    or discards; kept files go once saved, reverted, closed or discarded; 16 MB per buffer, 200
+    buffers and 128 MB per project; a buffer still live in another window is never restored
+    twice; `hotExit.state`/`keepNow`/`restore`/`compareWithDisk`/`keepChanges`/`discard`. With
+    hot exit off, quit saves as before. View › Active Editor › Soft-Wrap is per tab; it and
+    column selection mode are saved with the tab. The main window's position and each project
+    window's position and size (per project) are restored. Agent sessions: a running job keeps
+    a heartbeat lock next to its session file, so another window (or process) on the project
+    lists it as running, refreshes until it ends, and never opens, deletes or cleans it up; a
+    resumed turn that fails before any output (`claude --resume` whose store was cleared, also
+    `codex exec resume`) runs again in a new session seeded with the transcript; History has
+    search (title, first prompt, agent, branch, date), status and agent filters and Export
+    (Markdown or JSON, one session or the filtered list, `agent.sessions.export`); Clean Up
+    (`agent.sessions.cleanup`) lists interrupted sessions and sessions older than 30 days with
+    the review worktrees CodeCraft created for them, asks, then removes them (or only the
+    worktrees); worktrees it did not create are never touched, and the automatic count/size
+    pruning now skips sessions whose worktree still exists. Remaining: no editor-group restore
+    for untitled buffers' original tab position (they reopen in the focused group); no "save
+    before closing?" prompt for untitled buffers when hot exit is off (they are lost, as before);
+    the conflict check uses the file's modification time (a tool that rewrites a file and
+    restores its mtime goes unnoticed); kept buffers of files outside the project come back with
+    the project that kept them; Clean Up's age is fixed at 30 days in the UI (`days` param for
+    agents); a session running in another window can't be followed live; window positions are
+    not checked against the connected displays.

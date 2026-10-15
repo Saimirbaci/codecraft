@@ -528,7 +528,10 @@ fn group(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focus
         crate::database_panel::console_toolbar(ui, s, st);
     }
     match s.ws.group(g).and_then(|gr| gr.active) {
-        Some(eid) => editor::show(ui, s, st, eid),
+        Some(eid) => {
+            crate::hot_exit_ui::banner(ui, s, st, eid);
+            editor::show(ui, s, st, eid)
+        }
         None => {
             ui.centered_and_justified(|ui| {
                 let hints = [

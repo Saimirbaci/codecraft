@@ -32,6 +32,7 @@ mod er_diagram;
 mod feedback;
 mod fonts;
 mod history_ui;
+mod hot_exit_ui;
 mod http_ui;
 mod inspections_ui;
 pub mod keymap;
@@ -223,6 +224,7 @@ impl App {
     pub fn new(open: Option<PathBuf>) -> Self {
         let mut session = Session::new();
         session.session_store.enable();
+        session.hot_exit.enabled = true;
         session.run_store.generate.auto = true;
         // Cargo.toml completion and the newer-version inspection ask crates.io (M12 track RS).
         session.rust.deps.online = true;
@@ -259,6 +261,9 @@ impl App {
         let mut session = Session::new();
         session.lsp_enabled = false;
         session.session_store.enable();
+        // Hot exit too, with read-only projects' buffers beside the snapshots.
+        session.hot_exit.enabled = true;
+        session.hot_exit.fallback_dir = Some(fallback_dir.join("unsaved"));
         session.session_store.fallback_dir = Some(fallback_dir);
         Self::build(None, persisted, false, true, session)
     }
@@ -299,6 +304,10 @@ impl App {
         if let Some(path) = target {
             run_command(&mut app.session, &mut app.ui, "file.open", &json!({ "path": path }));
         }
+        // Untitled buffers kept by hot exit while no project was open come back too.
+        if reopen && app.session.ws.project.is_none() {
+            codecraft_engine::hot_exit::restore_on_open(&mut app.session);
+        }
         // The other project windows open at the last exit come back too (not when a path was
         // given on the command line).
         if reopen && !explicit {
@@ -308,6 +317,13 @@ impl App {
             }
         }
         app
+    }
+
+    /// Copy the project windows' positions and sizes into the persisted state.
+    fn remember_window_rects(&mut self) {
+        for (root, rect) in self.windows.rects() {
+            self.persisted.remember_window_rect(&root, rect);
+        }
     }
 
     /// Save the app state every [`STATE_AUTOSAVE_EVERY`] when it changed.
@@ -704,11 +720,21 @@ impl eframe::App for App {
         // The native menu shows the focused window's enabled states.
         let focused = self.windows.focused(ctx).and_then(|i| self.windows.session(i));
         self.native_menu.update(ctx, focused.unwrap_or(&self.session));
-        // Remember the main window size (eframe's own persistence is not enabled).
-        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+        // Remember the main window size and position (eframe's own persistence is not enabled).
+        let (inner, outer, minimized, full) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.inner_rect, v.outer_rect, v.minimized.unwrap_or(false), v.fullscreen.unwrap_or(false))
+        });
+        if let Some(r) = inner {
             let size = [r.width(), r.height()];
-            if self.persisted.window_size != Some(size) && !ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+            if self.persisted.window_size != Some(size) && !minimized && !full {
                 self.persisted.window_size = Some(size);
+            }
+        }
+        if let Some(r) = outer {
+            let pos = [r.min.x, r.min.y];
+            if self.persisted.window_pos != Some(pos) && !minimized && !full {
+                self.persisted.window_pos = Some(pos);
             }
         }
     }
@@ -731,6 +757,7 @@ impl eframe::App for App {
         }
         self.windows.sync_settings(&mut self.session);
         codecraft_engine::app_cmds::set_project_window_count(self.windows.count());
+        self.remember_window_rects();
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
@@ -753,8 +780,10 @@ impl eframe::App for App {
 
     fn on_exit(&mut self) {
         let open_windows = self.windows.project_roots();
+        self.remember_window_rects();
         self.windows.shutdown();
-        let _ = self.session.save_all();
+        // Hot exit keeps unsaved buffers for the next start (no prompt); off, they are saved.
+        codecraft_engine::hot_exit::quit_save(&mut self.session);
         if self.persist {
             self.persisted.capture(&self.session, &self.ui);
             self.persisted.open_windows = open_windows;
@@ -774,19 +803,19 @@ pub fn launch(launch: Launch) -> eframe::Result {
     let Launch { open, no_restore } = launch;
     let persisted = PersistedState::load();
     let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("CodeCraft")
-            .with_inner_size(size)
-            .with_min_inner_size([640.0, 400.0]),
-        ..Default::default()
-    };
+    let mut viewport =
+        egui::ViewportBuilder::default().with_title("CodeCraft").with_inner_size(size).with_min_inner_size([640.0, 400.0]);
+    if let Some(pos) = persisted.saved_window_pos() {
+        viewport = viewport.with_position(pos);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "CodeCraft",
         options,
         Box::new(move |_cc| {
             let mut session = Session::new();
             session.session_store.autosave = true;
+            session.hot_exit.enabled = true;
             session.run_store.generate.auto = true;
             session.session_store.restore_on_open = !no_restore;
             let mut app = App::build(open, persisted, true, !no_restore, session);
