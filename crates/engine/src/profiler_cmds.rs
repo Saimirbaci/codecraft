@@ -20,11 +20,12 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.profile",
             "Profile 'Run'",
             None,
-            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number} — run the selected (or given) \
-             run configuration under a profiler in a Run tab (Cargo targets and CMake chains are built first, then \
-             only the program is recorded; CPU: xctrace on macOS, samply, perf on Linux, cProfile or py-spy for \
-             Python; memory: leaks on macOS, heaptrack on Linux, tracemalloc or memray for Python), then open the \
-             snapshot in the Profiler tool window → {tab, job, config, tool}",
+            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number, interval?: number} — run the \
+             selected (or given) run configuration under a profiler in a Run tab (Cargo targets and CMake chains are \
+             built first, then only the program is recorded; CPU: xctrace on macOS, samply, perf on Linux, cProfile \
+             or py-spy for Python; memory: leaks on macOS, heaptrack on Linux, tracemalloc or memray for Python; \
+             `interval`: seconds between tracemalloc memory samples, default 0.1, 0 = one snapshot at the end), then \
+             open the snapshot in the Profiler tool window → {tab, job, config, tool}",
             Context::Global,
             can_profile,
             profile_selected,
@@ -235,7 +236,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.selectTab",
             "Select Profiler View",
             None,
-            "{tab: flameGraph|icicle|callTree|methodList|timeline}",
+            "{tab: flameGraph|icicle|callTree|methodList|timeline|memory}",
             Context::Global,
             always,
             |s, p| {
@@ -257,6 +258,49 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 let thread = opt_usize(p, "thread")?;
                 profiler::select_thread(s, thread)?;
                 ok()
+            },
+        ),
+        spec(
+            "profiler.selectRange",
+            "Select Time Range",
+            None,
+            "{startMs?: number, endMs?: number} — show only the samples taken between the two times (ms since the \
+             first sample; formats with sample times: xctrace, samply): the flame graph, call tree, method list, hot \
+             lines and the editor gutter follow, as does the thread selection; without both, the whole run → \
+             {startMs, endMs, durationMs}",
+            Context::Global,
+            has_snapshot,
+            select_range,
+        ),
+        spec(
+            "profiler.atCaret",
+            "Profile Context Configuration",
+            None,
+            "{path?: string, line?: int (0-based), kind?: cpu|memory, tool?: string, seconds?: number, interval?: \
+             number} — profile what the gutter ▶ at the line runs (default: the caret): the test there (Rust `cargo \
+             test --lib name -- --exact`, pytest `file::test`, GoogleTest/Catch2/doctest/Boost.Test filters), its \
+             module or `main`; built first like run.profile → {job, tab, config, tool}",
+            Context::Global,
+            always,
+            profile_at_caret,
+        ),
+        spec(
+            "profiler.openPeakSnapshot",
+            "Open Snapshot at Memory Peak",
+            None,
+            "— open the whole tracemalloc snapshot taken nearest the memory peak (written next to the open snapshot \
+             by memory profiles with periodic snapshots)",
+            Context::Global,
+            has_peak,
+            |s, _| {
+                let path = s
+                    .profiler
+                    .snapshot
+                    .as_ref()
+                    .and_then(Snapshot::peak_snapshot)
+                    .ok_or_else(|| CommandError::Failed("this snapshot has no snapshot at the memory peak".into()))?;
+                profiler::open_snapshot(s, &path)?;
+                Ok(json!({ "path": path }))
             },
         ),
         spec(
@@ -419,6 +463,23 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
+            "profiler.openLocation",
+            "Open Source Location",
+            None,
+            "{file: string, line?: int (1-based)} — open a source file of the profile at a line (relative paths \
+             against the project root), e.g. an allocation site at the memory peak",
+            Context::Global,
+            has_snapshot,
+            |s, p| {
+                let file = req_str(p, "file")?.to_string();
+                let line = opt_usize(p, "line")?
+                    .map(|l| u32::try_from(l).map_err(|_| CommandError::BadParams("`line` is out of range".into())))
+                    .transpose()?;
+                profiler::jump_to_location(s, &file, line)?;
+                ok()
+            },
+        ),
+        spec(
             "profiler.callTree",
             "Profiler Call Tree",
             None,
@@ -458,6 +519,16 @@ fn has_snapshot(s: &Session) -> Result<(), String> {
     s.profiler.snapshot.as_ref().map(|_| ()).ok_or_else(|| "no profiler snapshot is open".into())
 }
 
+fn has_peak(s: &Session) -> Result<(), String> {
+    has_snapshot(s)?;
+    s.profiler
+        .snapshot
+        .as_ref()
+        .and_then(Snapshot::peak_snapshot)
+        .map(|_| ())
+        .ok_or_else(|| "the snapshot has no snapshot at the memory peak".into())
+}
+
 fn picker_open(s: &Session) -> Result<(), String> {
     s.profiler.attach.as_ref().map(|_| ()).ok_or_else(|| "the process list is not open".into())
 }
@@ -485,25 +556,61 @@ fn req_node(p: &Value, key: &str) -> Result<u32, CommandError> {
 
 fn profile_selected(s: &mut Session, p: &Value) -> CmdResult {
     let p = if p.is_object() { p.clone() } else { json!({}) };
-    let kind = match opt_str(&p, "kind") {
-        Some(k) => profiler::ProfileKind::from_name(k)
-            .ok_or_else(|| CommandError::BadParams(format!("unknown kind `{k}` (cpu|memory)")))?,
-        None => profiler::ProfileKind::Cpu,
-    };
-    let tool = crate::profiler_agent_cmds::tool_param(&p)?;
-    let seconds = crate::profiler_agent_cmds::seconds_param(&p)?;
+    let params = crate::profiler_agent_cmds::RecordParams::read(&p)?;
     let config = crate::profiler_agent_cmds::config_for(s, &p)?;
-    let python = profiler::project_python(s);
-    let plan = crate::profiler_plan::plan_config(&config, python.as_deref()).map_err(CommandError::Failed)?;
-    let job = profiler::record(s, profiler::RecordRequest { plan, kind, tool, seconds })?;
-    let j = s.profiler.job(job);
+    crate::profiler_agent_cmds::record_config(s, &config, &params)
+}
+
+/// Profile Context Configuration: what the gutter ▶ at a line runs (a test, a module's tests,
+/// `main`), under a profiler.
+fn profile_at_caret(s: &mut Session, p: &Value) -> CmdResult {
+    let p = if p.is_object() { p.clone() } else { json!({}) };
+    let (path, line) = match (opt_path(&p, "path"), opt_usize(&p, "line")?) {
+        (Some(path), line) => (profiler::resolve_path(s, &path), line.unwrap_or(0)),
+        (None, _) => {
+            let (e, d) = s.ws.active().ok_or_else(|| CommandError::Disabled("no editor".into()))?;
+            let path = d.path.clone().ok_or_else(|| CommandError::Failed("the file is not saved".into()))?;
+            (path, d.doc.char_to_line(e.selections.primary().head))
+        }
+    };
+    let params = crate::profiler_agent_cmds::RecordParams::read(&p)?;
+    let config = crate::profiler_agent_cmds::context_config_at(s, &path, line)?;
+    crate::profiler_agent_cmds::record_config(s, &config, &params)
+}
+
+fn select_range(s: &mut Session, p: &Value) -> CmdResult {
+    let num = |key: &str| -> Result<Option<f64>, CommandError> {
+        match p.get(key) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .map(Some)
+                .ok_or_else(|| CommandError::BadParams(format!("`{key}` must be a number of milliseconds"))),
+        }
+    };
+    let (start, end) = (num("startMs")?, num("endMs")?);
+    let duration = s.profiler.snapshot.as_ref().and_then(|snap| snap.profile.duration_ns).unwrap_or(0);
+    let range = match (start, end) {
+        (None, None) => None,
+        (a, b) => Some((
+            a.map_or(0, profiler::ms_to_ns),
+            b.map_or(duration, profiler::ms_to_ns),
+        )),
+    };
+    profiler::select_range(s, range)?;
+    let snap = snapshot_mut(s)?;
+    let r = snap.selection.range;
     Ok(json!({
-        "tab": j.and_then(|j| j.tab).map(|t| t.0),
-        "job": job,
-        "config": config.name,
-        "tool": j.and_then(|j| j.tool),
-        "state": j.map(|j| j.state),
+        "startMs": r.map(|r| ns_ms(r.0)),
+        "endMs": r.map(|r| ns_ms(r.1)),
+        "durationMs": snap.profile.duration_ns.map(ns_ms),
     }))
+}
+
+/// Nanoseconds as milliseconds with one decimal.
+pub(crate) fn ns_ms(ns: u64) -> f64 {
+    (ns as f64 / 100_000.0).round() / 10.0
 }
 
 fn focus(s: &mut Session, p: &Value) -> CmdResult {
@@ -668,6 +775,23 @@ fn status(s: &Session) -> Value {
             "durationMs": p.duration_ns.map(|d| d / 1_000_000),
             "notes": p.notes,
             "baseline": snap.baseline.as_ref().map(|b| json!({ "path": b.path, "total": b.total })),
+            "hasSampleTimes": p.has_sample_times(),
+            // What the views show now (the analysis) and what was asked for (still analysing
+            // when they differ).
+            "range": snap.analysis.range.map(|r| json!({ "startMs": ns_ms(r.0), "endMs": ns_ms(r.1) })),
+            "selection": json!({
+                "thread": snap.selection.thread,
+                "range": snap.selection.range.map(|r| json!({ "startMs": ns_ms(r.0), "endMs": ns_ms(r.1) })),
+            }),
+            "selectedSamples": snap.analysis.samples,
+            "memory": p.memory.as_ref().map(|m| json!({
+                "peak": m.peak,
+                "peakText": p.unit.format(m.peak),
+                "peakMs": m.peak_ms,
+                "points": m.points.len(),
+                "intervalMs": m.interval_ms,
+                "peakSnapshot": snap.peak_snapshot(),
+            })),
         })
     });
     let jobs: Vec<Value> = pr.jobs.iter().rev().take(5).map(crate::profiler_agent_cmds::job_json).collect();
@@ -775,18 +899,28 @@ fn methods_dump(s: &mut Session, p: &Value) -> CmdResult {
         .iter()
         .filter_map(|i| snap.analysis.methods.get(*i))
         .take(limit)
-        .map(|m| {
-            let mut v = frame_json(snap, m.frame);
-            if let Some(o) = v.as_object_mut() {
-                o.insert("self".into(), json!(m.self_weight));
-                o.insert("total".into(), json!(m.total));
-                o.insert("selfPercent".into(), json!(tree.percent(m.self_weight)));
-                o.insert("totalPercent".into(), json!(tree.percent(m.total)));
-            }
-            v
-        })
+        .map(|m| method_json(&snap.profile, tree, m))
         .collect();
     Ok(json!(out))
+}
+
+/// One method as `profiler.methods` lists it.
+pub(crate) fn method_json(
+    profile: &codecraft_profile::Profile,
+    tree: &codecraft_profile::CallTree,
+    m: &codecraft_profile::MethodStat,
+) -> Value {
+    let mut v = match profile.frame(m.frame) {
+        Some(f) => json!({ "frame": m.frame, "name": f.name, "module": f.module, "location": f.location() }),
+        None => json!({ "frame": m.frame }),
+    };
+    if let Some(o) = v.as_object_mut() {
+        o.insert("self".into(), json!(m.self_weight));
+        o.insert("total".into(), json!(m.total));
+        o.insert("selfPercent".into(), json!(tree.percent(m.self_weight)));
+        o.insert("totalPercent".into(), json!(tree.percent(m.total)));
+    }
+    v
 }
 
 #[cfg(test)]
@@ -821,7 +955,7 @@ mod tests {
         let script = format!(
             "#!/bin/sh\n{trap}FIXTURE='{fixture}'\necho \"{name} $*\" >> '{calls}'\n\
              if [ \"$1\" = script ]; then cat \"$FIXTURE\"; exit 0; fi\n\
-             out=''\nprev=''\nfor a in \"$@\"; do if [ \"$prev\" = -o ]; then out=\"$a\"; fi; prev=\"$a\"; done\n{body}\n",
+             out=''\nprev=''\nfor a in \"$@\"; do if [ \"$a\" = -- ]; then break; fi; if [ \"$prev\" = -o ]; then out=\"$a\"; fi; prev=\"$a\"; done\n{body}\n",
             fixture = fixture_path.display(),
             calls = calls.display(),
         );
@@ -1065,6 +1199,200 @@ mod tests {
         assert!(s.profiler.recent().is_empty());
     }
 
+    /// The xctrace fixture with its later samples on a second thread ("Worker").
+    fn two_thread_trace() -> String {
+        let fixture = include_str!("../../profile/tests/fixtures/xctrace-time-profile.xml");
+        let parts: Vec<&str> = fixture.split("<thread ref=\"2\"/>").collect();
+        let mut out = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            out.push_str(part);
+            if i + 1 == parts.len() {
+                break;
+            }
+            out.push_str(match i {
+                0..=18 => "<thread ref=\"2\"/>",
+                19 => "<thread id=\"9000\" fmt=\"Worker  0x99 (hot, pid: 72611)\"><tid id=\"9001\" fmt=\"0x99\">153</tid></thread>",
+                _ => "<thread ref=\"9000\"/>",
+            });
+        }
+        out
+    }
+
+    fn open_trace(dir: &Path) -> (Session, PathBuf) {
+        let (mut s, _) = project_with_snapshot(dir);
+        let path = s.project_root().unwrap().join("two.xml");
+        std::fs::write(&path, two_thread_trace()).unwrap();
+        s.execute("run.openProfilerSnapshot", &json!({ "path": path })).unwrap();
+        pump_until(&mut s, loaded);
+        (s, path)
+    }
+
+    fn reanalysed(s: &Session) -> bool {
+        s.profiler.loading.is_none()
+            && s.profiler.snapshot.as_ref().is_some_and(|x| x.analysis.selection() == x.selection)
+    }
+
+    #[test]
+    fn time_ranges_and_threads_filter_every_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = open_trace(dir.path());
+        let status = s.execute("profiler.status", &Value::Null).unwrap();
+        assert_eq!(status["snapshot"]["hasSampleTimes"], true);
+        assert_eq!(status["snapshot"]["threads"].as_array().unwrap().len(), 2, "{status}");
+        let snap = s.profiler.snapshot.as_ref().unwrap();
+        let (whole, duration) = (snap.analysis.tree.total, snap.profile.duration_ns.unwrap());
+        let hot_c = Path::new("/work/hot/hot.c");
+        let whole_lines = snap.lines.for_path(hot_c).unwrap().to_vec();
+        // The first half of the run.
+        let half = duration as f64 / 2e6;
+        let r = s.execute("profiler.selectRange", &json!({ "startMs": 0, "endMs": half })).unwrap();
+        assert_eq!(r["startMs"], 0.0);
+        pump_until(&mut s, reanalysed);
+        let snap = s.profiler.snapshot.as_ref().unwrap();
+        let expected = codecraft_profile::Analysis::select(
+            &snap.profile,
+            &codecraft_profile::Selection { thread: None, range: Some((0, profiler::ms_to_ns(half))) },
+        );
+        assert_eq!(snap.analysis.tree.total, expected.tree.total);
+        assert!(snap.analysis.tree.total < whole && snap.analysis.tree.total > 0);
+        // The gutter's numbers are the range's.
+        let range_lines = snap.lines.for_path(hot_c).unwrap().to_vec();
+        assert_ne!(range_lines, whole_lines);
+        assert!(range_lines.iter().map(|h| h.total).max() <= whole_lines.iter().map(|h| h.total).max());
+        let status = s.execute("profiler.status", &Value::Null).unwrap();
+        assert!(status["snapshot"]["range"]["endMs"].as_f64().unwrap() > 0.0, "{status}");
+        // A thread keeps the range: the worker has only later samples, so none in the first half.
+        s.execute("profiler.selectThread", &json!({ "thread": 1 })).unwrap();
+        pump_until(&mut s, reanalysed);
+        let snap = s.profiler.snapshot.as_ref().unwrap();
+        assert_eq!(snap.analysis.thread, Some(1));
+        assert!(snap.analysis.range.is_some());
+        assert_eq!(snap.analysis.tree.total, 0);
+        assert!(snap.lines.for_path(hot_c).is_none_or(|l| l.is_empty()));
+        // The whole run of the worker: its own lines only (per-thread line statistics).
+        s.execute("profiler.selectRange", &Value::Null).unwrap();
+        pump_until(&mut s, reanalysed);
+        let snap = s.profiler.snapshot.as_ref().unwrap();
+        assert!(snap.analysis.range.is_none() && snap.analysis.tree.total > 0);
+        let worker_lines: u64 = snap.lines.for_path(hot_c).unwrap().iter().map(|h| h.self_weight).sum();
+        let all_lines: u64 = whole_lines.iter().map(|h| h.self_weight).sum();
+        assert!(worker_lines > 0 && worker_lines < all_lines, "{worker_lines} of {all_lines}");
+        // Bad requests.
+        assert!(matches!(s.execute("profiler.selectRange", &json!({ "startMs": "x" })), Err(CommandError::BadParams(_))));
+        assert!(s.execute("profiler.selectRange", &json!({ "startMs": f64::MAX, "endMs": -5 })).is_ok());
+        pump_until(&mut s, reanalysed);
+        s.execute("run.openProfilerSnapshot", &json!({ "path": "profile.txt" })).unwrap();
+        pump_until(&mut s, loaded);
+        let e = s.execute("profiler.selectRange", &json!({ "startMs": 1, "endMs": 2 })).unwrap_err();
+        assert!(e.to_string().contains("no sample times"), "{e}");
+        s.shutdown();
+    }
+
+    /// QA M14 #25: agents' hotspots followed the Method List's sort in the IDE; now their order
+    /// is fixed (and `sort` picks self or total), and the IDE's thread filter doesn't change them.
+    #[test]
+    fn agent_hotspots_ignore_the_ides_method_sort() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = open_trace(dir.path());
+        let names = |v: &Value| -> Vec<String> {
+            v["hotspots"].as_array().unwrap().iter().map(|h| h["name"].as_str().unwrap().to_string()).collect()
+        };
+        let before = s.execute("profiler.hotspots", &json!({ "limit": 6 })).unwrap();
+        assert_eq!(before["sort"], "self");
+        assert!(before["order"].as_str().unwrap().starts_with("selfPercent desc"));
+        s.execute("profiler.sortMethods", &json!({ "column": "name", "descending": true })).unwrap();
+        assert_eq!(names(&s.execute("profiler.hotspots", &json!({ "limit": 6 })).unwrap()), names(&before));
+        s.execute("profiler.sortMethods", &json!({ "column": "total" })).unwrap();
+        assert_eq!(names(&s.execute("profiler.hotspots", &json!({ "limit": 6 })).unwrap()), names(&before));
+        // The IDE's method list did change.
+        let ide = s.execute("profiler.methods", &json!({ "limit": 1 })).unwrap();
+        assert_ne!(ide[0]["name"], before["hotspots"][0]["name"]);
+        // Sorted by total: non-increasing totals.
+        let by_total = s.execute("profiler.hotspots", &json!({ "limit": 6, "sort": "total" })).unwrap();
+        let totals: Vec<f64> =
+            by_total["hotspots"].as_array().unwrap().iter().map(|h| h["totalPercent"].as_f64().unwrap()).collect();
+        assert!(totals.windows(2).all(|w| w[0] >= w[1]), "{totals:?}");
+        assert!(s.execute("profiler.hotspots", &json!({ "sort": "name" })).is_err());
+        // A thread selected in the IDE: the agent still gets all threads, unless it asks.
+        s.execute("profiler.selectThread", &json!({ "thread": 1 })).unwrap();
+        pump_until(&mut s, reanalysed);
+        let again = s.execute("profiler.hotspots", &json!({ "limit": 6 })).unwrap();
+        assert_eq!(names(&again), names(&before));
+        assert_eq!(again["total"], before["total"]);
+        let worker = s.execute("profiler.hotspots", &json!({ "limit": 6, "thread": "worker" })).unwrap();
+        assert!(worker["selection"]["thread"].as_str().unwrap().starts_with("Worker"), "{worker}");
+        assert!(worker["total"].as_u64().unwrap() < before["total"].as_u64().unwrap());
+        assert!(s.execute("profiler.hotspots", &json!({ "thread": "nope" })).is_err());
+        assert!(s.execute("profiler.hotspots", &json!({ "thread": 7 })).is_err());
+        // The report: the same fixed order, plus thread and range restrictions.
+        let rep = s.execute("profiler.report", &json!({ "top": 6 })).unwrap();
+        let rep_names: Vec<&str> = rep["top"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(rep_names, names(&before));
+        let rep = s.execute("profiler.report", &json!({ "sort": "total", "thread": 0, "range": { "startMs": 0, "endMs": 10 } })).unwrap();
+        assert_eq!(rep["sort"], "total");
+        assert_eq!(rep["selection"]["threadIndex"], 0);
+        assert_eq!(rep["selection"]["range"]["endMs"], 10.0);
+        assert!(rep["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("time range")));
+        assert!(s.execute("profiler.report", &json!({ "range": [1, 2] })).is_err());
+        assert!(s.execute("profiler.report", &json!({ "range": { "startMs": "a" } })).is_err());
+        assert!(s.execute("profiler.report", &json!({ "sort": 5 })).is_ok(), "a non-string sort is ignored");
+        let hits = s.execute("profiler.lineHits", &json!({ "path": "/work/hot/hot.c", "thread": 1 })).unwrap();
+        assert!(!hits["lines"].as_array().unwrap().is_empty());
+        // A snapshot without times can't take a range.
+        let e = s
+            .execute("profiler.report", &json!({ "snapshot": "profile.txt", "range": { "startMs": 0, "endMs": 1 } }))
+            .unwrap();
+        if e.get("pending").is_some() {
+            pump_until(&mut s, |s| !s.profiler.busy());
+        }
+        assert!(s.execute("profiler.report", &json!({ "snapshot": "profile.txt", "range": { "startMs": 0 } })).is_err());
+        s.shutdown();
+    }
+
+    /// Profile Context Configuration (the gutter's Profile): the pytest test at the line, run
+    /// under the profiler (a fake py-spy here).
+    #[test]
+    fn profile_the_test_at_the_caret() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = session(dir.path());
+        let bin = dir.path().join("bin");
+        fake_tool(&bin, "py-spy", SPEEDSCOPE, false);
+        let root = std::fs::canonicalize(dir.path()).unwrap().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let test = root.join("test_calc.py");
+        std::fs::write(&test, "def helper():\n    return 1\n\n\ndef test_slow():\n    assert helper() == 1\n").unwrap();
+        std::fs::write(root.join("notes.txt"), "nothing\n").unwrap();
+        s.execute("file.open", &json!({ "path": root })).unwrap();
+        // 0-based line 5 is in test_slow.
+        let r = s.execute("profiler.atCaret", &json!({ "path": test, "line": 5, "tool": "py-spy" })).unwrap();
+        assert_eq!(r["config"], "pytest test_slow");
+        pump_until(&mut s, |s| !s.profiler.busy());
+        let out: Vec<String> = s.ws.runs.iter().flat_map(|r| r.lines.iter().map(|l| l.text.clone())).collect();
+        assert!(s.profiler.snapshot.is_some(), "{:?} {out:?} {}", s.profiler.error, calls(&bin));
+        let log = calls(&bin);
+        assert!(log.contains("-m pytest"), "{log}");
+        assert!(log.contains(&format!("{}::test_slow", test.display())), "{log}");
+        // The agent form: a 1-based line.
+        let r = s.execute("profiler.record", &json!({ "test": { "path": "test_calc.py", "line": 6 }, "tool": "py-spy" })).unwrap();
+        assert!(r["command"].as_str().unwrap().contains("test_calc.py::test_slow"), "{r}");
+        assert_eq!(r["config"], "pytest test_slow");
+        pump_until(&mut s, |s| !s.profiler.busy());
+        // From the editor's caret.
+        s.execute("file.open", &json!({ "path": test })).unwrap();
+        s.execute("profiler.atCaret", &json!({ "tool": "py-spy", "kind": "cpu" })).unwrap();
+        pump_until(&mut s, |s| !s.profiler.busy());
+        // Nothing to profile, bad lines, bad params.
+        let e = s.execute("profiler.atCaret", &json!({ "path": root.join("notes.txt"), "line": 0 })).unwrap_err();
+        assert!(e.to_string().contains("nothing to profile"), "{e}");
+        assert!(s.execute("profiler.atCaret", &json!({ "path": root.join("none.py") })).is_err());
+        assert!(s.execute("profiler.atCaret", &json!({ "path": test, "line": 5, "kind": "gpu" })).is_err());
+        assert!(s.execute("profiler.atCaret", &json!({ "path": test, "line": 5, "interval": -1 })).is_err());
+        assert!(s.execute("profiler.record", &json!({ "test": { "path": "test_calc.py", "line": 0 } })).is_err());
+        assert!(s.execute("profiler.record", &json!({ "test": { "line": 3 } })).is_err());
+        assert!(s.execute("profiler.record", &json!({ "test": "x" })).is_err());
+        s.shutdown();
+    }
+
     #[test]
     fn bad_snapshots_report_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -1097,7 +1425,7 @@ mod tests {
             .map(|c| c.id)
             .filter(|id| (id.starts_with("profiler.") || id.contains("rofil")) && *id != "profiler.install")
             // These start real profilers (profiler_agent_cmds tests drive them with fakes).
-            .filter(|id| !matches!(*id, "profiler.record" | "profiler.profileMemory"))
+            .filter(|id| !matches!(*id, "profiler.record" | "profiler.profileMemory" | "profiler.atCaret"))
             .collect();
         assert!(ids.len() > 25, "{ids:?}");
         for id in ids {

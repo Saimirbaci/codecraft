@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{Value, json};
 
 use codecraft_cargo::{CargoCommand, CargoInvocation};
+use codecraft_profile::{HotspotOrder, Selection};
 
 use crate::commands::{CmdResult, CommandSpec, Context, always, spec};
 use crate::params::{opt_str, opt_usize, req_str};
@@ -23,12 +24,15 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.record",
             "Record Profile",
             None,
-            "{config?: int|name, command?: string|[string], cwd?: string, pid?: int, python?: bool, kind?: cpu|memory, \
-             tool?: xctrace|samply|perf|py-spy|cProfile|tracemalloc|memray|leaks|heaptrack, seconds?: number} — \
-             profile a run configuration (default: the selected one), a command line (`cargo test name`, `pytest -k x`, \
-             `./build/app --fast`, `python app.py`) or a running process (`pid`). Cargo targets and CMake chains are \
-             built first; `seconds` stops the recording early. → {job, state, tool, tab}; poll profiler.job, then \
-             profiler.report {snapshot: job}",
+            "{config?: int|name, command?: string|[string], cwd?: string, test?: {path, line (1-based)}, pid?: int, \
+             python?: bool, kind?: cpu|memory, tool?: xctrace|samply|perf|py-spy|cProfile|tracemalloc|memray|leaks|\
+             heaptrack, seconds?: number, interval?: number} — profile a run configuration (default: the selected \
+             one), a command line (`cargo test name`, `pytest -k x`, `./build/app --fast`, `python app.py`), the test \
+             at a source line (`test`: what the gutter ▶ runs there — `cargo test --lib name -- --exact`, pytest \
+             `file::test`, a GoogleTest/Catch2/doctest/Boost.Test filter) or a running process (`pid`). Cargo \
+             targets and CMake chains are built first; `seconds` stops the recording early; `interval` = seconds \
+             between tracemalloc memory samples (default 0.1; 0 = only the snapshot at the end). → {job, state, \
+             tool, tab}; poll profiler.job, then profiler.report {snapshot: job}",
             Context::Global,
             always,
             record,
@@ -79,11 +83,15 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.report",
             "Profiler Report",
             None,
-            "{snapshot?: job id|path, top?: int (15), lines?: int (10), focus?: string} — the hot spots of a \
-             snapshot (default: the open one, else the newest job's) → {snapshot, unit, total, totalText, threads, \
-             top: [{name, location: file:line, selfPercent, totalPercent, self, total, calls?}], topByTotal, \
-             hotLines: [{location, function, selfPercent, totalPercent, code}], focus?: {percent, inside, callers, \
-             callees, hotLines}, notes}; {pending: true, job} while it loads",
+            "{snapshot?: job id|path, top?: int (15), lines?: int (10), focus?: string, sort?: self|total, thread?: \
+             int|name, range?: {startMs, endMs}} — the hot spots of a snapshot (default: the open one, else the \
+             newest job's) → {snapshot, unit, total, totalText, threads, sort, order, top: [{name, location: \
+             file:line, selfPercent, totalPercent, self, total, calls?}], topByTotal, hotLines: [{location, \
+             function, selfPercent, totalPercent, code}], focus?: {percent, inside, callers, callees, hotLines}, \
+             memory?: {peak, peakMs, timeline, atPeak, peakSnapshot}, selection?: {thread, range}, notes}. `top` is \
+             in a fixed order whatever the IDE's Method List shows: by self (default) or total weight, then the \
+             other, then name, location. `thread` and `range` (ms since the first sample; xctrace and samply \
+             snapshots) restrict everything to those samples. {pending: true, job} while it loads",
             Context::Global,
             always,
             report,
@@ -103,8 +111,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.lineHits",
             "Profiler Line Hits",
             None,
-            "{path: string, snapshot?: job id|path} — samples per source line of a file (the editor gutter's \
-             numbers) → {file, unit, lines: [{line, self, total, selfPercent, totalPercent}]}",
+            "{path: string, snapshot?: job id|path, thread?: int|name, range?: {startMs, endMs}} — samples per \
+             source line of a file (the editor gutter's numbers), of one thread and a time range when given → \
+             {file, unit, lines: [{line, self, total, selfPercent, totalPercent}]}",
             Context::Global,
             always,
             line_hits,
@@ -125,7 +134,93 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 }
             },
         ),
+        spec(
+            "profiler.memory",
+            "Profiler Memory Timeline",
+            None,
+            "{snapshot?: job id|path, points?: int (100), top?: int (20)} — memory over time of a tracemalloc \
+             profile with periodic snapshots → {peak, peakText, peakMs, intervalMs, timeline: [{ms, current, \
+             peak}], atPeak: [{name, location, size, sizeText, count, percentOfPeak, callers}], peakSnapshot: \
+             path (profiler.report it for the whole tree at the peak)}",
+            Context::Global,
+            always,
+            |s, p| {
+                let points = opt_usize(p, "points")?.unwrap_or(100);
+                let top = opt_usize(p, "top")?.unwrap_or(20);
+                match resolve(s, p.get("snapshot"))? {
+                    Resolved::Pending(v) => Ok(v),
+                    Resolved::Ready(c, _) => profiler_report::memory(&c.profile, &c.path, points, top).ok_or_else(|| {
+                        CommandError::Failed(
+                            "this snapshot has no memory timeline (profile memory with tracemalloc: profiler.record \
+                             {kind: memory, interval: 0.1})"
+                                .into(),
+                        )
+                    }),
+                }
+            },
+        ),
     ]
+}
+
+/// `thread` (an index, or a name or part of one) and `range` ({startMs, endMs}) of a request.
+pub(crate) fn selection_param(p: &Value, profile: &codecraft_profile::Profile) -> Result<Selection, CommandError> {
+    let thread = match p.get("thread") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let i = n
+                .as_u64()
+                .and_then(|i| usize::try_from(i).ok())
+                .filter(|i| *i < profile.threads.len())
+                .ok_or_else(|| CommandError::BadParams(format!("no thread {n} (there are {})", profile.threads.len())))?;
+            Some(i)
+        }
+        Some(Value::String(name)) => {
+            let q = name.to_lowercase();
+            let exact = profile.threads.iter().position(|t| t.name.to_lowercase() == q);
+            let i = exact.or_else(|| profile.threads.iter().position(|t| t.name.to_lowercase().contains(&q)));
+            Some(i.ok_or_else(|| {
+                let names: Vec<&str> = profile.threads.iter().take(10).map(|t| t.name.as_str()).collect();
+                CommandError::BadParams(format!("no thread matches `{name}` (threads: {})", names.join(", ")))
+            })?)
+        }
+        Some(_) => return Err(CommandError::BadParams("`thread` is an index or a name".into())),
+    };
+    let range = match p.get("range") {
+        None | Some(Value::Null) => None,
+        Some(r) if r.is_object() => {
+            let num = |k: &str| -> Result<Option<f64>, CommandError> {
+                match r.get(k) {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(v) => v
+                        .as_f64()
+                        .filter(|x| x.is_finite())
+                        .map(Some)
+                        .ok_or_else(|| CommandError::BadParams(format!("`range.{k}` must be a number of milliseconds"))),
+                }
+            };
+            if !profile.has_sample_times() {
+                return Err(CommandError::BadParams(format!(
+                    "{} snapshots have no sample times; `range` needs an xctrace or samply snapshot",
+                    profile.format.label()
+                )));
+            }
+            let duration = profile.duration_ns.unwrap_or(0);
+            let start = num("startMs")?.map_or(0, profiler::ms_to_ns);
+            let end = num("endMs")?.map_or(duration, profiler::ms_to_ns);
+            Some((start.min(end), end.max(start)))
+        }
+        Some(_) => return Err(CommandError::BadParams("`range` is {startMs, endMs}".into())),
+    };
+    Ok(Selection { thread, range })
+}
+
+/// `sort` of hotspot lists (`self` by default).
+pub(crate) fn sort_param(p: &Value) -> Result<HotspotOrder, CommandError> {
+    match opt_str(p, "sort") {
+        None => Ok(HotspotOrder::SelfWeight),
+        Some(x) => HotspotOrder::from_name(x)
+            .ok_or_else(|| CommandError::BadParams(format!("unknown sort `{x}` (self|total)"))),
+    }
 }
 
 /// A job as JSON.
@@ -208,10 +303,111 @@ pub(crate) fn config_for(s: &mut Session, p: &Value) -> Result<RunConfig, Comman
     }
 }
 
+/// `interval`: seconds between tracemalloc memory samples (0 turns them off).
+pub(crate) fn interval_param(p: &Value) -> Result<Option<f64>, CommandError> {
+    match p.get("interval") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_f64()
+            .filter(|x| x.is_finite() && *x >= 0.0)
+            .map(|x| Some(x.min(3600.0)))
+            .ok_or_else(|| CommandError::BadParams("`interval` must be a number of seconds (0 = off)".into())),
+    }
+}
+
+/// What to record with (`kind`, `tool`, `seconds`, `interval`), read before anything starts.
+pub(crate) struct RecordParams {
+    pub kind: ProfileKind,
+    pub tool: Option<ProfilerTool>,
+    pub seconds: Option<u64>,
+    pub interval: Option<f64>,
+}
+
+impl RecordParams {
+    pub(crate) fn read(p: &Value) -> Result<Self, CommandError> {
+        Ok(Self { kind: kind_param(p)?, tool: tool_param(p)?, seconds: seconds_param(p)?, interval: interval_param(p)? })
+    }
+}
+
+/// Profile a run configuration → {tab, job, config, tool, state}.
+pub(crate) fn record_config(s: &mut Session, config: &RunConfig, params: &RecordParams) -> CmdResult {
+    let python = profiler::project_python(s);
+    let plan = crate::profiler_plan::plan_config(config, python.as_deref()).map_err(CommandError::Failed)?;
+    let job = profiler::record(
+        s,
+        RecordRequest {
+            plan,
+            kind: params.kind,
+            tool: params.tool,
+            seconds: params.seconds,
+            interval: params.interval,
+        },
+    )?;
+    let j = s.profiler.job(job);
+    Ok(json!({
+        "tab": j.and_then(|j| j.tab).map(|t| t.0),
+        "job": job,
+        "config": config.name,
+        "tool": j.and_then(|j| j.tool),
+        "state": j.map(|j| j.state),
+    }))
+}
+
+/// What the gutter ▶ at a line (0-based) of a file runs: the Rust test (`cargo test --lib
+/// name -- --exact`), test module or `main` there; a pytest test (`file::test`); a C++ test or
+/// suite of GoogleTest, Catch2, doctest or Boost.Test (the CMake target with the framework's
+/// filter); a single-file program.
+pub(crate) fn context_config_at(s: &Session, path: &Path, line: usize) -> Result<RunConfig, CommandError> {
+    if !path.is_file() {
+        return Err(CommandError::BadParams(format!("no such file: {}", path.display())));
+    }
+    if let Some((title, inv)) = crate::run_cmds::context_invocation(s, path, line) {
+        return Ok(RunConfig::cargo(title, inv));
+    }
+    let text = match s.ws.doc_by_path(path).and_then(|id| s.ws.doc(id)) {
+        Some(d) => d.doc.text(),
+        None => codecraft_fs::read_text_file(path).map_err(|e| CommandError::Failed(e.to_string()))?,
+    };
+    let root = s.project_root().unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
+    crate::run_configs::context_config(&root, path, &text, line).ok_or_else(|| {
+        CommandError::Failed(format!(
+            "nothing to profile at {}:{} (no test, test module or main function there)",
+            path.display(),
+            line.saturating_add(1)
+        ))
+    })
+}
+
 fn record(s: &mut Session, p: &Value) -> CmdResult {
     let kind = kind_param(p)?;
     let tool = tool_param(p)?;
     let seconds = seconds_param(p)?;
+    let interval = interval_param(p)?;
+    // The test (or module, or main) at a source line, like the gutter's ▶ (1-based line).
+    if let Some(t) = p.get("test").filter(|t| !t.is_null()) {
+        let path = t
+            .get("path")
+            .and_then(Value::as_str)
+            .filter(|x| !x.is_empty())
+            .ok_or_else(|| CommandError::BadParams("`test` is {path, line} (line 1-based)".into()))?;
+        let line = t
+            .get("line")
+            .and_then(Value::as_u64)
+            .filter(|l| *l >= 1)
+            .ok_or_else(|| CommandError::BadParams("`test.line` is a 1-based line number".into()))?;
+        let path = profiler::resolve_path(s, Path::new(path));
+        let line = usize::try_from(line - 1).map_err(|_| CommandError::BadParams("`test.line` is out of range".into()))?;
+        let config = context_config_at(s, &path, line)?;
+        let params = RecordParams { kind, tool, seconds, interval };
+        let started = record_config(s, &config, &params)?;
+        let job = started.get("job").and_then(Value::as_u64).unwrap_or(0);
+        let mut v = s.profiler.job(job).map(job_json).unwrap_or(Value::Null);
+        if let Some(o) = v.as_object_mut() {
+            o.insert("config".into(), json!(config.name));
+            o.insert("command".into(), json!(config.command_line()));
+        }
+        return Ok(v);
+    }
     if let Some(pid) = opt_usize(p, "pid")? {
         let pid = u32::try_from(pid).map_err(|_| CommandError::BadParams("`pid` is out of range".into()))?;
         let python = p.get("python").and_then(Value::as_bool).unwrap_or(false);
@@ -247,7 +443,7 @@ fn record(s: &mut Session, p: &Value) -> CmdResult {
             crate::profiler_plan::plan_config(&config, python.as_deref()).map_err(CommandError::Failed)?
         }
     };
-    let job = profiler::record(s, RecordRequest { plan, kind, tool, seconds })?;
+    let job = profiler::record(s, RecordRequest { plan, kind, tool, seconds, interval })?;
     Ok(s.profiler.job(job).map(job_json).unwrap_or(Value::Null))
 }
 
@@ -307,16 +503,28 @@ fn resolve(s: &mut Session, v: Option<&Value>) -> Result<Resolved, CommandError>
     Ok(Resolved::Pending(pending(job, JobState::Loading)))
 }
 
+/// The analysis of a request's selection (`thread`, `range`): the cached one when neither is
+/// given.
+fn analysis_for(c: &Cached, p: &Value) -> Result<std::sync::Arc<codecraft_profile::Analysis>, CommandError> {
+    let sel = selection_param(p, &c.profile)?;
+    if sel == Selection::default() {
+        return Ok(std::sync::Arc::clone(&c.analysis));
+    }
+    Ok(std::sync::Arc::new(codecraft_profile::Analysis::select(&c.profile, &sel)))
+}
+
 fn report(s: &mut Session, p: &Value) -> CmdResult {
     let top = opt_usize(p, "top")?.unwrap_or(15);
     let lines = opt_usize(p, "lines")?.unwrap_or(10);
     let focus = opt_str(p, "focus").map(str::to_string);
+    let sort = sort_param(p)?;
     let root = s.project_root();
     match resolve(s, p.get("snapshot"))? {
         Resolved::Pending(v) => Ok(v),
         Resolved::Ready(c, debug_build) => {
-            let opts = ReportOptions { top, lines, focus, root, debug_build };
-            Ok(profiler_report::report(&c.profile, &c.analysis, &c.path, &opts))
+            let analysis = analysis_for(&c, p)?;
+            let opts = ReportOptions { top, lines, focus, root, debug_build, sort };
+            Ok(profiler_report::report(&c.profile, &analysis, &c.path, &opts))
         }
     }
 }
@@ -341,9 +549,10 @@ fn line_hits(s: &mut Session, p: &Value) -> CmdResult {
     match resolve(s, p.get("snapshot"))? {
         Resolved::Pending(v) => Ok(v),
         Resolved::Ready(c, _) => {
-            let index = profiler::LineIndex::build(&c.profile);
+            let analysis = analysis_for(&c, p)?;
+            let index = profiler::LineIndex::for_analysis(&c.profile, &analysis);
             let hits = index.for_path(&file).unwrap_or(&[]);
-            Ok(profiler_report::line_hits(&c.profile, c.analysis.tree.total, &file, hits))
+            Ok(profiler_report::line_hits(&c.profile, analysis.tree.total, &file, hits))
         }
     }
 }

@@ -72,7 +72,7 @@ time; **Low** is polish.
 | 22 | Low | Debugger, Rust | Each Rust session's output has LLDB's "This version of LLDB has no plugin for the language rust" warning (values still read well through the formatters). | Open. |
 | 23 | Low | Debugger, C++ | A C++ reference local (`const Item& it`) shows its address, not the referenced value, until expanded. | Open. |
 | 24 | Low | Agents | `test_run`'s `commandLine` includes the internal JUnit XML temp path; `inspect`'s `tools[]` uses `command_line` while the rest is camelCase. | Open (docs show the real shape). |
-| 25 | Low | Profiler | `profile_hotspots` follows the Method List's sort in the IDE (sorting by Total there changes the agent's order). | Open. |
+| 25 | Low | Profiler | `profile_hotspots` follows the Method List's sort in the IDE (sorting by Total there changes the agent's order). | Fixed (M15 PP): a fixed, documented order (`sort: self` by default or `total`, ties by name, location, module) over all threads and the whole run, whatever the IDE shows; `profiler.hotspots`, `profiler.report`, `profile_hotspots` and `profile_stop` take `sort` and say which order they used. Regression tests in `profiler_cmds` and `tests/agent_tools.rs`. |
 | 26 | Low | Settings, Python | Languages & Frameworks › Python has no interpreter picker (the status bar and `python.interpreter.select` have one). | Open. |
 | 27 | Low | Run, Python | A failed test's location in the Run tool window is the absolute path, which wraps in a narrow panel. | Open. |
 

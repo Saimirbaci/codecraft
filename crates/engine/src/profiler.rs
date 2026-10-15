@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use codecraft_cargo::{CargoMessage, RunEvent, RunHandle};
 use codecraft_dap::processes::ProcessInfo;
-use codecraft_profile::{Analysis, Edge, Profile};
+use codecraft_profile::{Analysis, Edge, Profile, Selection};
 use codecraft_workspace::{ConsoleKind, RunStatus, RunTabId, ToolWindowId};
 
 pub use codecraft_profile as profile;
@@ -230,6 +230,8 @@ pub enum ProfilerTab {
     MethodList,
     /// Thread activity over time.
     Timeline,
+    /// Memory over time and the top allocations at the peak (tracemalloc).
+    Memory,
 }
 
 impl ProfilerTab {
@@ -240,6 +242,7 @@ impl ProfilerTab {
             "callTree" | "tree" => Some(Self::CallTree),
             "methodList" | "methods" => Some(Self::MethodList),
             "timeline" | "threads" => Some(Self::Timeline),
+            "memory" => Some(Self::Memory),
             _ => None,
         }
     }
@@ -282,8 +285,17 @@ pub struct LineIndex {
 
 impl LineIndex {
     pub fn build(p: &Profile) -> Self {
+        Self::from_lines(p, &p.lines)
+    }
+
+    /// The index of a selection's lines (see [`Analysis::lines`]).
+    pub fn for_analysis(p: &Profile, a: &Analysis) -> Self {
+        Self::from_lines(p, a.lines(p))
+    }
+
+    pub fn from_lines(p: &Profile, lines: &[codecraft_profile::LineStat]) -> Self {
         let mut acc: HashMap<String, HashMap<u32, (u64, u64)>> = HashMap::new();
-        for l in &p.lines {
+        for l in lines {
             let Some(file) = p.frame(l.frame).and_then(|f| f.file.as_ref()) else { continue };
             let e = acc.entry(file.clone()).or_default().entry(l.line).or_insert((0, 0));
             e.0 = e.0.saturating_add(l.self_weight);
@@ -377,15 +389,18 @@ pub struct Snapshot {
     pub method: Option<u32>,
     /// Callers and callees of the selected method.
     pub method_edges: (Vec<Edge>, Vec<Edge>),
-    /// Per-line weights by file.
+    /// Per-line weights by file, of the selected thread and time range.
     pub lines: Arc<LineIndex>,
     /// Compared against.
     pub baseline: Option<Baseline>,
+    /// The thread and time range asked for (the analysis catches up on a worker thread).
+    pub selection: Selection,
 }
 
 impl Snapshot {
     fn new(path: PathBuf, profile: Arc<Profile>, analysis: Arc<Analysis>) -> Self {
-        let lines = Arc::new(LineIndex::build(&profile));
+        let lines = Arc::new(LineIndex::default());
+        let selection = analysis.selection();
         let mut s = Self {
             path,
             profile,
@@ -403,6 +418,7 @@ impl Snapshot {
             method_edges: (Vec::new(), Vec::new()),
             lines,
             baseline: None,
+            selection,
         };
         s.reset_view();
         s
@@ -410,6 +426,7 @@ impl Snapshot {
 
     /// After (re)analysis: keep the search, reset positions that refer to old node ids.
     fn reset_view(&mut self) {
+        self.lines = Arc::new(LineIndex::for_analysis(&self.profile, &self.analysis));
         self.zoom = None;
         self.selected = None;
         self.expanded.clear();
@@ -486,6 +503,35 @@ impl Snapshot {
     /// Title for the tool window: the file name.
     pub fn title(&self) -> String {
         self.path.file_name().map_or_else(|| self.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+    }
+
+    /// The selection's line statistics of a method (the Method List's hot lines).
+    pub fn lines_of(&self, frame: u32) -> &[codecraft_profile::LineStat] {
+        self.analysis.lines_of(&self.profile, frame)
+    }
+
+    /// The whole snapshot at the memory peak, written next to this one (tracemalloc with
+    /// periodic snapshots).
+    pub fn peak_snapshot(&self) -> Option<PathBuf> {
+        peak_snapshot_path(&self.path, &self.profile)
+    }
+}
+
+/// The file with the snapshot at the memory peak, next to a snapshot (when it exists).
+pub fn peak_snapshot_path(path: &Path, p: &Profile) -> Option<PathBuf> {
+    let name = p.memory.as_ref()?.peak_snapshot_file.as_ref()?;
+    let file = path.parent()?.join(name);
+    (file != path && file.is_file()).then_some(file)
+}
+
+/// Milliseconds (as agents and the UI give them) to nanoseconds.
+pub fn ms_to_ns(ms: f64) -> u64 {
+    if ms.is_nan() || ms <= 0.0 {
+        0
+    } else if ms >= (u64::MAX / 1_000_000) as f64 {
+        u64::MAX
+    } else {
+        (ms * 1e6).round() as u64
     }
 }
 
@@ -602,6 +648,29 @@ impl ProfilerState {
     /// Whether a recording or its build is running.
     pub fn recording_active(&self) -> bool {
         !self.recordings.is_empty() || !self.builds.is_empty()
+    }
+
+    /// Whether a Run/Build tab is a profile's build step still running (a Cargo build runs
+    /// outside the Run window's processes, so `run.stop` asks here).
+    pub fn builds_in(&self, tab: RunTabId) -> bool {
+        self.builds.iter().any(|b| b.tab == tab)
+    }
+
+    /// The Run/Build tabs of profile builds in progress, oldest first.
+    pub fn build_tabs(&self) -> Vec<RunTabId> {
+        self.builds.iter().map(|b| b.tab).collect()
+    }
+
+    /// How native addresses in samply snapshots are symbolicated: `atos` on macOS,
+    /// `addr2line` (or `llvm-addr2line`) elsewhere; tests point `tool_dirs` at fakes.
+    pub fn symbolizers(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let find = |name: &str| match &self.tool_dirs {
+            Some(dirs) => dirs.iter().map(|d| d.join(name)).find(|p| p.is_file()),
+            None => codecraft_lsp::which(name),
+        };
+        let atos = if cfg!(target_os = "macos") || self.tool_dirs.is_some() { find("atos") } else { None };
+        let addr2line = find("addr2line").or_else(|| find("llvm-addr2line"));
+        (atos, addr2line)
     }
 
     /// `$CODECRAFT_HOME/profiler` (or `~/.codecraft/profiler`).
@@ -960,6 +1029,12 @@ fn convert_for_file(s: &Session, path: &Path) -> Convert {
     if file.ends_with(".memray.bin") || (file.starts_with("memray-") && file.ends_with(".bin")) {
         return Convert::Memray { python: python(), memray: s.profiler.find_tool(ProfilerTool::Memray), cwd };
     }
+    // samply / Firefox Profiler JSON: frames with only addresses are symbolicated.
+    let ours = [".tracemalloc.json", ".peak.json", ".speedscope.json", ".pstats.json", ".syms.json"];
+    if (file.ends_with(".json") || file.ends_with(".json.gz")) && !ours.iter().any(|x| file.ends_with(x)) {
+        let (atos, addr2line) = s.profiler.symbolizers();
+        return Convert::Samply { atos, addr2line };
+    }
     Convert::None
 }
 
@@ -1008,7 +1083,7 @@ fn spawn_load(s: &mut Session, path: PathBuf, convert: Convert, purpose: Purpose
                     let p = codecraft_profile::load(&file).map_err(|e| e.to_string())?;
                     (file, p)
                 }
-                Converted::Parsed(file, p) => (file, p),
+                Converted::Parsed(file, p) => (file, *p),
             };
             let analysis = Analysis::new(&profile, None);
             let baseline = (purpose == Purpose::Baseline).then(|| {
@@ -1048,16 +1123,48 @@ fn spawn_load(s: &mut Session, path: PathBuf, convert: Convert, purpose: Purpose
     }
 }
 
-/// Show another thread (`None` = all threads merged): reanalysed on a worker thread.
+/// Show another thread (`None` = all threads merged), keeping the time range: reanalysed on a
+/// worker thread.
 pub(crate) fn select_thread(s: &mut Session, thread: Option<usize>) -> Result<(), CommandError> {
+    let range = s.profiler.snapshot.as_ref().and_then(|snap| snap.selection.range);
+    select(s, Selection { thread, range })
+}
+
+/// Show a time range (nanoseconds since the first sample; `None` = the whole run), keeping
+/// the thread: every view (flame graph, call tree, method list, hot lines, gutter) follows.
+pub(crate) fn select_range(s: &mut Session, range: Option<(u64, u64)>) -> Result<(), CommandError> {
     let snap =
         s.profiler.snapshot.as_ref().ok_or_else(|| CommandError::Failed("no profiler snapshot is open".into()))?;
-    if let Some(t) = thread
+    if range.is_some() && !snap.profile.has_sample_times() {
+        return Err(CommandError::Failed(format!(
+            "{} snapshots have no sample times, so there is no time range to select",
+            snap.profile.format.label()
+        )));
+    }
+    let thread = snap.selection.thread;
+    select(s, Selection { thread, range })
+}
+
+/// Show a selection of the open snapshot: reanalysed on a worker thread.
+pub(crate) fn select(s: &mut Session, sel: Selection) -> Result<(), CommandError> {
+    let snap =
+        s.profiler.snapshot.as_mut().ok_or_else(|| CommandError::Failed("no profiler snapshot is open".into()))?;
+    if let Some(t) = sel.thread
         && t >= snap.profile.threads.len()
     {
         return Err(CommandError::BadParams(format!("no thread {t}")));
     }
-    if snap.analysis.thread == thread {
+    let duration = snap.profile.duration_ns.unwrap_or(0);
+    let sel = Selection {
+        thread: sel.thread,
+        range: snap.profile.effective_range(&sel).map(|(a, b)| (a.min(duration), b.min(duration))),
+    };
+    snap.selection = sel;
+    if snap.analysis.selection() == sel {
+        s.profiler.loads.retain(|l| l.purpose != Purpose::Reanalyse);
+        if s.profiler.loads.iter().all(|l| l.purpose != Purpose::Open) {
+            s.profiler.loading = None;
+        }
         return Ok(());
     }
     let (profile, path) = (Arc::clone(&snap.profile), snap.path.clone());
@@ -1066,7 +1173,7 @@ pub(crate) fn select_thread(s: &mut Session, thread: Option<usize>) -> Result<()
     std::thread::Builder::new()
         .name("profiler-analyse".into())
         .spawn(move || {
-            let analysis = Analysis::new(&profile, thread);
+            let analysis = Analysis::select(&profile, &sel);
             let _ = tx.send(Ok(Loaded { path: job_path, profile, analysis, baseline: None }));
         })
         .map_err(|e| CommandError::Failed(format!("cannot start a worker thread: {e}")))?;
@@ -1084,6 +1191,8 @@ pub(crate) struct RecordRequest {
     pub kind: ProfileKind,
     pub tool: Option<ProfilerTool>,
     pub seconds: Option<u64>,
+    /// tracemalloc: seconds between memory samples (`None`: the default, 0: off).
+    pub interval: Option<f64>,
 }
 
 /// A fresh snapshot path: `<dir>/snapshots/<name>-<time>.<ext>`.
@@ -1130,7 +1239,10 @@ pub(crate) fn project_python(s: &Session) -> Option<PathBuf> {
 
 /// Start a profiling job: build first when the plan says so, then record.
 pub(crate) fn record(s: &mut Session, req: RecordRequest) -> Result<u64, CommandError> {
-    let RecordRequest { plan, kind, tool, seconds } = req;
+    let RecordRequest { mut plan, kind, tool, seconds, interval } = req;
+    if interval.is_some() {
+        plan.sample_interval_ms = interval.map(crate::profiler_plan::seconds_to_ms);
+    }
     let python = match &plan.target {
         Target::Python { python, .. } => Some(python.clone()),
         Target::Native { .. } => None,
@@ -1229,7 +1341,11 @@ fn convert_for(
             Some(print) => Convert::Heaptrack { print },
             None => Convert::None,
         },
-        ProfilerTool::Samply | ProfilerTool::PySpy | ProfilerTool::Tracemalloc => Convert::None,
+        ProfilerTool::Samply => {
+            let (atos, addr2line) = s.profiler.symbolizers();
+            Convert::Samply { atos, addr2line }
+        }
+        ProfilerTool::PySpy | ProfilerTool::Tracemalloc => Convert::None,
     }
 }
 
@@ -1255,14 +1371,20 @@ fn start_recording(
     let title = s.profiler.job(job).map_or_else(|| format!("Profile {}", plan.name), |j| j.title.clone());
     let tab = crate::runs::start_process(s, &cmd, &title)?;
     if let Some(t) = s.ws.run_mut(tab) {
+        let interval = crate::profiler_plan::tracemalloc_interval(plan);
         let note = match tool {
-            ProfilerTool::Xctrace => "Recording with Instruments' Time Profiler (xctrace)…",
-            ProfilerTool::Leaks => "Recording allocations that are still live when the program exits (leaks --atExit)…",
-            ProfilerTool::Tracemalloc => {
-                "Tracing Python allocations (tracemalloc); the snapshot is taken when the program ends…"
+            ProfilerTool::Xctrace => "Recording with Instruments' Time Profiler (xctrace)…".to_string(),
+            ProfilerTool::Leaks => {
+                "Recording allocations that are still live when the program exits (leaks --atExit)…".to_string()
             }
-            ProfilerTool::CProfile => "Profiling with cProfile…",
-            _ => "Recording…",
+            ProfilerTool::Tracemalloc if interval > 0.0 => format!(
+                "Tracing Python allocations (tracemalloc): memory is sampled every {interval} s with a snapshot at the peak, and the live allocations are taken when the program ends…"
+            ),
+            ProfilerTool::Tracemalloc => {
+                "Tracing Python allocations (tracemalloc); the snapshot is taken when the program ends…".to_string()
+            }
+            ProfilerTool::CProfile => "Profiling with cProfile…".to_string(),
+            _ => "Recording…".to_string(),
         };
         t.push(ConsoleKind::System, note);
     }

@@ -60,6 +60,20 @@ pub(crate) fn gutter_run_menu(
                 cmds.push(("debug.atCaret", at.clone()));
                 close = true;
             }
+            if ui.button("⏱  Profile").on_hover_text("Profile the test (or main) here: where the time goes").clicked() {
+                cmds.push(("profiler.atCaret", at.clone()));
+                close = true;
+            }
+            if ui
+                .button("⏱  Profile Memory")
+                .on_hover_text("Profile what allocates (tracemalloc, memray, leaks, heaptrack)")
+                .clicked()
+            {
+                let mut p = at.clone();
+                p["kind"] = json!("memory");
+                cmds.push(("profiler.atCaret", p));
+                close = true;
+            }
             ui.separator();
             if ui.button("Run All Tests in File").clicked() {
                 cmds.push(("run.testsInFile", json!({ "path": file })));

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use codecraft_profile::{Analysis, FunctionDelta, MethodStat, Profile, Unit};
+use codecraft_profile::{Analysis, FunctionDelta, HotspotOrder, MethodStat, Profile, Unit};
 
 /// Source files read for line excerpts at most (per report).
 const MAX_EXCERPT_FILES: usize = 12;
@@ -25,11 +25,21 @@ pub struct ReportOptions {
     pub root: Option<PathBuf>,
     /// A Cargo debug build was profiled.
     pub debug_build: bool,
+    /// The order of `top` (fixed, whatever the Method List shows).
+    pub sort: HotspotOrder,
 }
 
 impl Default for ReportOptions {
     fn default() -> Self {
-        Self { top: 15, lines: 10, focus: None, root: None, debug_build: false }
+        Self { top: 15, lines: 10, focus: None, root: None, debug_build: false, sort: HotspotOrder::SelfWeight }
+    }
+}
+
+/// How hotspot lists are ordered, for the reader.
+pub fn order_text(sort: HotspotOrder) -> &'static str {
+    match sort {
+        HotspotOrder::SelfWeight => "selfPercent desc, then totalPercent desc, then name, location, module",
+        HotspotOrder::Total => "totalPercent desc, then selfPercent desc, then name, location, module",
     }
 }
 
@@ -127,18 +137,45 @@ pub fn report(p: &Profile, a: &Analysis, path: &Path, opts: &ReportOptions) -> V
     if let Some(d) = p.duration_ns {
         out.insert("durationMs".into(), json!(d / 1_000_000));
     }
-    let mut threads: Vec<(&str, u64)> = p.threads.iter().map(|t| (t.name.as_str(), t.total())).collect();
-    threads.sort_by_key(|x| std::cmp::Reverse(x.1));
+    // Thread shares within the selected time range (of all threads' weight there).
+    let totals = p.thread_totals(a.range);
+    let all: u64 = totals.iter().fold(0u64, |x, y| x.saturating_add(*y));
+    let mut threads: Vec<(usize, &str, u64)> =
+        p.threads.iter().zip(&totals).enumerate().map(|(i, (t, w))| (i, t.name.as_str(), *w)).collect();
+    threads.sort_by(|x, y| y.2.cmp(&x.2).then(x.0.cmp(&y.0)));
     out.insert(
         "threads".into(),
-        json!(threads.iter().take(8).map(|(n, w)| json!({ "name": n, "percent": pct(*w, total) })).collect::<Vec<_>>()),
+        json!(
+            threads
+                .iter()
+                .take(8)
+                .map(|(i, n, w)| json!({ "index": i, "name": n, "percent": pct(*w, all) }))
+                .collect::<Vec<_>>()
+        ),
     );
     if p.threads.len() > 8 {
         out.insert("moreThreads".into(), json!(p.threads.len() - 8));
     }
-    out.insert("top".into(), json!(a.methods.iter().take(top).map(|m| function_json(p, m, total)).collect::<Vec<_>>()));
-    let mut by_total: Vec<&MethodStat> = a.methods.iter().collect();
-    by_total.sort_by(|x, y| y.total.cmp(&x.total).then(y.self_weight.cmp(&x.self_weight)));
+    if a.thread.is_some() || a.range.is_some() {
+        out.insert(
+            "selection".into(),
+            json!({
+                "thread": a.thread.and_then(|t| p.threads.get(t)).map(|t| t.name.clone()),
+                "threadIndex": a.thread,
+                "range": a.range.map(|r| json!({
+                    "startMs": crate::profiler_cmds::ns_ms(r.0),
+                    "endMs": crate::profiler_cmds::ns_ms(r.1),
+                })),
+                "samples": a.samples,
+            }),
+        );
+    }
+    // A fixed order, independent of the Method List's sort in the IDE (QA M14 #25).
+    let ordered = codecraft_profile::hotspots(p, &a.methods, opts.sort);
+    out.insert("sort".into(), json!(opts.sort.name()));
+    out.insert("order".into(), json!(order_text(opts.sort)));
+    out.insert("top".into(), json!(ordered.iter().take(top).map(|m| function_json(p, m, total)).collect::<Vec<_>>()));
+    let by_total = codecraft_profile::hotspots(p, &a.methods, HotspotOrder::Total);
     let top_total: Vec<Value> = by_total
         .iter()
         .take(top)
@@ -153,9 +190,12 @@ pub fn report(p: &Profile, a: &Analysis, path: &Path, opts: &ReportOptions) -> V
         .collect();
     out.insert("topByTotal".into(), json!(top_total));
     let mut sources = Sources::new(opts.root.clone());
-    out.insert("hotLines".into(), json!(hot_lines(p, total, opts.lines, &mut sources, None)));
+    out.insert("hotLines".into(), json!(hot_lines(p, a, total, opts.lines, &mut sources, None)));
     if let Some(q) = opts.focus.as_deref().filter(|q| !q.trim().is_empty()) {
         out.insert("focus".into(), focus(p, a, q, top, &mut sources));
+    }
+    if let Some(m) = memory(p, path, 50, top.min(20)) {
+        out.insert("memory".into(), m);
     }
     let mut notes: Vec<String> = p.notes.clone();
     let bare = p.unsymbolicated_weight();
@@ -168,6 +208,9 @@ pub fn report(p: &Profile, a: &Analysis, path: &Path, opts: &ReportOptions) -> V
     if p.lines.is_empty() {
         notes.push(format!("{} has no per-line samples; hotLines is empty", p.format.label()));
     }
+    if a.range.is_some() {
+        notes.push("Restricted to the samples of the selected time range: percentages are of that range".into());
+    }
     if opts.debug_build {
         notes.push("A Cargo debug build was profiled: timings differ from release builds (profile with --release and debug = true in [profile.release])".into());
     }
@@ -178,15 +221,24 @@ pub fn report(p: &Profile, a: &Analysis, path: &Path, opts: &ReportOptions) -> V
     Value::Object(out)
 }
 
-/// The heaviest source lines by self weight (`only`: frames to restrict to).
-fn hot_lines(p: &Profile, total: u64, n: usize, sources: &mut Sources, only: Option<&[bool]>) -> Vec<Value> {
-    let mut lines: Vec<&codecraft_profile::LineStat> = p
-        .lines
+/// The heaviest source lines of the selection by self weight (`only`: frames to restrict to).
+fn hot_lines(
+    p: &Profile,
+    a: &Analysis,
+    total: u64,
+    n: usize,
+    sources: &mut Sources,
+    only: Option<&[bool]>,
+) -> Vec<Value> {
+    let mut lines: Vec<&codecraft_profile::LineStat> = a
+        .lines(p)
         .iter()
         .filter(|l| l.self_weight > 0)
         .filter(|l| only.is_none_or(|o| o.get(l.frame as usize).copied().unwrap_or(false)))
         .collect();
-    lines.sort_by(|x, y| y.self_weight.cmp(&x.self_weight).then(y.total.cmp(&x.total)));
+    lines.sort_by(|x, y| {
+        y.self_weight.cmp(&x.self_weight).then(y.total.cmp(&x.total)).then((x.frame, x.line).cmp(&(y.frame, y.line)))
+    });
     lines
         .iter()
         .take(n.min(100))
@@ -253,7 +305,7 @@ fn focus(p: &Profile, a: &Analysis, query: &str, top: usize, sources: &mut Sourc
         ),
         None => (Vec::new(), Vec::new()),
     };
-    let lines = hot_lines(p, total, 10, sources, Some(&inside_frames(p, &inside)));
+    let lines = hot_lines(p, a, total, 10, sources, Some(&inside_frames(p, &inside)));
     json!({
         "query": query,
         "matched": names,
@@ -368,6 +420,63 @@ pub fn timeline(p: &Profile, buckets: usize) -> Value {
         "threads": threads,
         "note": if p.duration_ns.is_none() { "this format has no sample times" } else { "activity[i] = weight sampled in the i-th time slice" },
     })
+}
+
+/// Memory over time and the top allocation sites at the peak (tracemalloc with periodic
+/// snapshots); `None` when the profile has no memory timeline.
+pub fn memory(p: &Profile, path: &Path, points: usize, top: usize) -> Option<Value> {
+    let m = p.memory.as_ref()?;
+    let n = points.clamp(2, 1000);
+    // Downsampled to `n` points, each the highest of the ones it covers (peaks survive).
+    let step = m.points.len().div_ceil(n).max(1);
+    let timeline: Vec<Value> = m
+        .points
+        .chunks(step)
+        .filter_map(|c| {
+            let last = c.last()?;
+            let peak = c.iter().map(|x| x.peak).max().unwrap_or(last.peak);
+            Some(json!({ "ms": last.time_ms, "current": last.current, "peak": peak }))
+        })
+        .collect();
+    let at_peak: Vec<Value> = m
+        .at_peak
+        .iter()
+        .take(top.clamp(1, 200))
+        .map(|a| {
+            let mut v = json!({
+                "name": a.name,
+                "size": a.size,
+                "sizeText": Unit::Bytes.format(a.size),
+                "count": a.count,
+                "percentOfPeak": pct(a.size, m.peak_snapshot_bytes.unwrap_or(m.peak)),
+            });
+            if let (Some(o), Some(file)) = (v.as_object_mut(), &a.file) {
+                let loc = match a.line {
+                    Some(l) => format!("{file}:{l}"),
+                    None => file.clone(),
+                };
+                o.insert("location".into(), json!(loc));
+                if !a.callers.is_empty() {
+                    o.insert("callers".into(), json!(a.callers));
+                }
+            }
+            v
+        })
+        .collect();
+    Some(json!({
+        "peak": m.peak,
+        "peakText": Unit::Bytes.format(m.peak),
+        "peakMs": m.peak_ms,
+        "intervalMs": m.interval_ms,
+        "points": m.points.len(),
+        "timeline": timeline,
+        "peakSnapshotMs": m.peak_snapshot_ms,
+        "peakSnapshotBytes": m.peak_snapshot_bytes,
+        "atPeak": at_peak,
+        "peakSnapshot": crate::profiler::peak_snapshot_path(path, p),
+        "note": "timeline[i] = live traced memory (current) and the highest value since the previous point (peak); \
+                 atPeak = allocation sites live in the snapshot nearest the peak (taken when memory reached a new high)",
+    }))
 }
 
 #[cfg(test)]

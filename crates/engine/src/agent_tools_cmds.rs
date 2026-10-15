@@ -163,8 +163,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.hotspots",
             "Profiler Hotspots",
             None,
-            "{limit?: int (default 20)} → {snapshot, samples, hotspots: [{name, selfPercent, totalPercent, self, total, \
-             file?, line?, module?}]}",
+            "{limit?: int (default 20), sort?: self|total, thread?: int|name, range?: {startMs, endMs}} → \
+             {snapshot, samples, sort, order, hotspots: [{name, selfPercent, totalPercent, self, total, file?, line?, \
+             module?}]} — in a fixed order whatever the IDE shows (all threads and the whole run unless `thread` / \
+             `range` are given): by self (default) or total weight, then the other, then name, location, module",
             Context::Global,
             always,
             hotspots,
@@ -976,14 +978,35 @@ fn hotspots(s: &mut Session, p: &Value) -> CmdResult {
         };
         return Err(CommandError::Disabled(why));
     }
+    let sort = crate::profiler_agent_cmds::sort_param(p)?;
     let status = s.execute("profiler.status", &Value::Null)?;
-    // More than `limit`, to find the project's own functions below library code.
-    let methods = s.execute("profiler.methods", &json!({ "limit": limit.max(PROJECT_SCAN) }))?;
+    // The order is fixed (QA M14 #25: it followed the IDE's Method List sort), and so is the
+    // selection: all threads and the whole run unless the request names a thread or a range.
+    let (profile, analysis) = {
+        let snap = s
+            .profiler
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| CommandError::Disabled("no profiler snapshot is open".into()))?;
+        let sel = crate::profiler_agent_cmds::selection_param(p, &snap.profile)?;
+        let analysis = if snap.analysis.selection() == sel {
+            std::sync::Arc::clone(&snap.analysis)
+        } else if let Some(c) = s.profiler.cached(&snap.path).filter(|_| sel == codecraft_profile::Selection::default())
+        {
+            c.analysis
+        } else {
+            std::sync::Arc::new(codecraft_profile::Analysis::select(&snap.profile, &sel))
+        };
+        (std::sync::Arc::clone(&snap.profile), analysis)
+    };
+    let ordered = codecraft_profile::hotspots(&profile, &analysis.methods, sort);
     let root = s.project_root();
-    let all: Vec<Value> = methods
-        .as_array()
-        .map(|a| a.iter().map(|m| hotspot_json(m, root.as_deref())).collect())
-        .unwrap_or_default();
+    // More than `limit`, to find the project's own functions below library code.
+    let all: Vec<Value> = ordered
+        .iter()
+        .take(limit.max(PROJECT_SCAN))
+        .map(|m| hotspot_json(&crate::profiler_cmds::method_json(&profile, &analysis.tree, m), root.as_deref()))
+        .collect();
     let list: Vec<Value> = all.iter().take(limit).cloned().collect();
     let snap = status.get("snapshot").cloned().unwrap_or(Value::Null);
     let memory = snap.get("unit").and_then(Value::as_str).is_some_and(|u| u == "bytes");
@@ -992,14 +1015,29 @@ fn hotspots(s: &mut Session, p: &Value) -> CmdResult {
     } else {
         "selfPercent: time in the function itself; totalPercent: including what it calls"
     };
+    let restricted = analysis.thread.is_some() || analysis.range.is_some();
     let mut out = json!({
         "snapshot": snap.get("path"),
         "unit": snap.get("unit"),
-        "samples": snap.get("samples"),
-        "total": snap.get("total"),
+        "samples": if restricted { json!(analysis.samples) } else { snap.get("samples").cloned().unwrap_or(Value::Null) },
+        "total": analysis.tree.total,
+        "sort": sort.name(),
+        "order": crate::profiler_report::order_text(sort),
         "hotspots": list,
         "note": note,
     });
+    if restricted && let Some(o) = out.as_object_mut() {
+        o.insert(
+            "selection".into(),
+            json!({
+                "thread": analysis.thread.and_then(|t| profile.threads.get(t)).map(|t| t.name.clone()),
+                "range": analysis.range.map(|r| json!({
+                    "startMs": crate::profiler_cmds::ns_ms(r.0),
+                    "endMs": crate::profiler_cmds::ns_ms(r.1),
+                })),
+            }),
+        );
+    }
     // When library code (the standard library, the interpreter's import machinery) fills the top
     // of the list, the project's own functions come separately (QA M14: a tracemalloc report
     // showed only `<frozen importlib._bootstrap>` frames).

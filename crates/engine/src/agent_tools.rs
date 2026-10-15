@@ -188,6 +188,8 @@ enum Wait {
         limit: usize,
         /// The newest profile's snapshot was opened (it was not the one shown).
         reopened: bool,
+        /// `self` or `total` (M15 PP: a fixed order, not the Method List's).
+        sort: Option<String>,
     },
     RunDone {
         args: Value,
@@ -255,6 +257,11 @@ fn timeout_arg(args: &Value, default_ms: u64) -> Duration {
 
 fn usize_arg(args: &Value, key: &str, default: usize, max: usize) -> usize {
     args.get(key).and_then(Value::as_u64).map_or(default, |n| usize::try_from(n).unwrap_or(max)).clamp(1, max)
+}
+
+/// `sort` of profile hotspots (`self` | `total`), passed on as given (the command validates it).
+fn sort_arg(args: &Value) -> Option<String> {
+    args.get("sort").and_then(Value::as_str).map(str::to_string)
 }
 
 // ---------------------------------------------------------------- capabilities
@@ -962,7 +969,7 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 None => None,
             }
         }
-        Wait::Profile { limit, reopened } => {
+        Wait::Profile { limit, reopened, sort } => {
             use crate::profiler::JobState;
             // A profile still building its target (Cargo, CMake), recording or loading (QA M14:
             // profile_hotspots right after profile_start of a Cargo target said "no snapshot").
@@ -998,11 +1005,17 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                     return None;
                 }
             }
-            Some(match s.execute("profiler.hotspots", &json!({ "limit": limit })) {
+            let mut params = json!({ "limit": limit });
+            let mut report_params = json!({ "top": limit });
+            if let Some(sort) = sort.as_deref() {
+                params["sort"] = json!(sort);
+                report_params["sort"] = json!(sort);
+            }
+            Some(match s.execute("profiler.hotspots", &params) {
                 Ok(mut v) => {
                     // The full report adds the hottest lines with their code, a total-time
                     // ranking and notes (missing symbols, debug builds); skipped while it loads.
-                    if let Ok(report) = s.execute("profiler.report", &json!({ "top": limit }))
+                    if let Ok(report) = s.execute("profiler.report", &report_params)
                         && report.get("pending").is_none()
                         && let Some(o) = v.as_object_mut()
                     {
@@ -1158,19 +1171,23 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
                 }
             } else if let Some(c) = command {
                 p = json!({ "command": c });
+            } else if let Some(t) = args.get("test").filter(|t| !t.is_null()) {
+                // The test at a source line (1-based), like the gutter's ▶ (M15 PP).
+                p = json!({ "test": t });
             } else if s.run_configs.is_empty() {
                 return done_err(
                     "the project has no run configurations; pass `command` (e.g. \"python3 main.py\", \"cargo run --release\", \"./build/app\")",
                 );
             }
             if let Some(o) = p.as_object_mut() {
-                for key in ["kind", "tool", "seconds"] {
+                for key in ["kind", "tool", "seconds", "interval"] {
                     if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
                         o.insert(key.into(), v.clone());
                     }
                 }
             }
-            let id = if command.is_some() && args.get("config").is_none() { "profiler.record" } else { "run.profile" };
+            let by_record = args.get("config").is_none() && (command.is_some() || p.get("test").is_some());
+            let id = if by_record { "profiler.record" } else { "run.profile" };
             match s.execute(id, &p) {
                 Ok(mut v) => {
                     if let Some(o) = v.as_object_mut() {
@@ -1191,11 +1208,11 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
             {
                 return step;
             }
-            Step::Wait(Wait::Profile { limit, reopened: false }, timeout_arg(args, 120_000))
+            Step::Wait(Wait::Profile { limit, reopened: false, sort: sort_arg(args) }, timeout_arg(args, 120_000))
         }
         t::PROFILE_HOTSPOTS => {
             let limit = usize_arg(args, "limit", 20, 200);
-            Step::Wait(Wait::Profile { limit, reopened: false }, timeout_arg(args, 120_000))
+            Step::Wait(Wait::Profile { limit, reopened: false, sort: sort_arg(args) }, timeout_arg(args, 120_000))
         }
         t::TEST_RUN => test_run(s, args),
         t::TEST_RESULTS => exec_done(s, "test.summary", args.clone()),

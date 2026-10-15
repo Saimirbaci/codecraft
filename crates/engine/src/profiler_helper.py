@@ -7,17 +7,28 @@ Subcommands:
       {"codecraft": "cprofile", "totalTime": s, "functions": [{name, file, line, calls,
       primcalls, tt, ct, callers: [[index, calls, primcalls, tt, ct], ...]}]}
 
-  tracemalloc OUT [--frames N] -- (SCRIPT | -m MODULE) ARGS...
+  tracemalloc OUT [--frames N] [--interval S] -- (SCRIPT | -m MODULE) ARGS...
       Run a program with tracemalloc on and, when it ends (normally, by an exception or
       sys.exit), write the live allocations grouped by traceback (root first) to OUT:
       {"codecraft": "tracemalloc", "current": bytes, "peak": bytes, "when": "...",
        "traces": [{size, count, frames: [{name, file, line}]}]}
+      With --interval S (> 0), a background thread also records the traced memory every S
+      seconds and takes a snapshot whenever the live memory reaches a new high (10% above the
+      last one), so the snapshot nearest the peak is kept:
+       "interval": S, "timeline": [[ms, current, peak since the previous point], ...],
+       "peakSnapshot": {"time": ms, "current": bytes, "file": "<OUT>.peak.json",
+                        "top": [{name, file, line, size, count, callers: [...]}]}
+      and that snapshot is written whole (same format) to the "file" next to OUT. The memory
+      the held snapshot itself takes is subtracted from the numbers.
 """
 
+import array
 import ast
 import json
 import os
 import sys
+import threading
+import time
 
 HELPER = os.path.abspath(__file__)
 
@@ -113,20 +124,98 @@ def internal(filename):
     )
 
 
-def dump_tracemalloc(out, when):
+MAX_POINTS = 5000
+
+
+class Sampler:
+    """Traced memory every `interval` seconds, and the snapshot nearest the peak."""
+
+    def __init__(self, interval):
+        self.interval = interval
+        self.start = time.monotonic()
+        # Flat [ms, current, peak, ms, current, peak, ...] (small: it is traced too).
+        self.points = array.array("d")
+        self.best = None  # (snapshot, ms, current)
+        self.best_current = 0
+        # Memory the held snapshot takes (subtracted from readings).
+        self.overhead = 0
+        self.peak = 0
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self.run, name="codecraft-tracemalloc", daemon=True)
+
+    def begin(self):
+        self.thread.start()
+
+    def run(self):
+        while not self.done.wait(self.interval):
+            try:
+                self.tick()
+            except Exception:
+                return
+
+    def tick(self):
+        import tracemalloc
+
+        with self.lock:
+            if not tracemalloc.is_tracing():
+                return
+            current, peak = tracemalloc.get_traced_memory()
+            if hasattr(tracemalloc, "reset_peak"):
+                tracemalloc.reset_peak()
+            current = max(0, current - self.overhead)
+            peak = max(current, peak - self.overhead)
+            self.peak = max(self.peak, peak)
+            ms = (time.monotonic() - self.start) * 1000.0
+            self.points.extend((round(ms, 1), current, peak))
+            if len(self.points) >= 3 * MAX_POINTS:
+                self.halve()
+            if current > self.best_current * 1.1 + 65536:
+                # Release the previous snapshot first, then measure what the new one takes.
+                self.best = None
+                before = tracemalloc.get_traced_memory()[0]
+                snapshot = tracemalloc.take_snapshot()
+                after = tracemalloc.get_traced_memory()[0]
+                self.overhead = max(0, after - before)
+                self.best = (snapshot, ms, current)
+                self.best_current = current
+                if hasattr(tracemalloc, "reset_peak"):
+                    tracemalloc.reset_peak()
+
+    def halve(self):
+        """Merge pairs of points (keeping the higher peak) when there are too many."""
+        p = self.points
+        merged = array.array("d")
+        n = len(p) // 3
+        for i in range(0, 3 * (n - n % 2), 6):
+            merged.extend((p[i + 3], p[i + 4], max(p[i + 2], p[i + 5])))
+        if n % 2:
+            merged.extend(p[3 * (n - 1):3 * n])
+        self.points = merged
+        self.interval *= 2
+
+    def finish(self):
+        self.done.set()
+        if self.thread.is_alive() and self.thread is not threading.current_thread():
+            self.thread.join(timeout=max(1.0, self.interval * 2))
+        try:
+            self.tick()
+        except Exception:
+            pass
+
+    def timeline(self):
+        p = self.points
+        return [[p[i], int(p[i + 1]), int(p[i + 2])] for i in range(0, len(p) - 2, 3)]
+
+
+def trace_list(snapshot, names, limit=20000):
     import tracemalloc
 
-    if not tracemalloc.is_tracing():
-        return
-    current, peak = tracemalloc.get_traced_memory()
-    snapshot = tracemalloc.take_snapshot()
-    tracemalloc.stop()
     snapshot = snapshot.filter_traces(
         [tracemalloc.Filter(False, tracemalloc.__file__), tracemalloc.Filter(False, HELPER)]
     )
-    names = Names()
     traces = []
-    for stat in snapshot.statistics("traceback")[:20000]:
+    for stat in snapshot.statistics("traceback")[:limit]:
         frames = list(stat.traceback)  # oldest (root) first on Python 3.7+
         while frames and internal(frames[0].filename):
             frames.pop(0)
@@ -140,7 +229,71 @@ def dump_tracemalloc(out, when):
                 ],
             }
         )
-    doc = {"codecraft": "tracemalloc", "current": current, "peak": peak, "when": when, "traces": traces}
+    return traces
+
+
+def top_sites(traces, limit=200):
+    """Allocation sites (the innermost frame) by size, with the callers of the heaviest trace."""
+    sites = {}
+    for t in traces:
+        frames = t["frames"]
+        if not frames:
+            continue
+        leaf = frames[-1]
+        key = (leaf["file"], leaf["line"])
+        site = sites.get(key)
+        if site is None:
+            site = {"name": leaf["name"], "file": leaf["file"], "line": leaf["line"], "size": 0, "count": 0,
+                    "callers": [], "_best": -1}
+            sites[key] = site
+        site["size"] += t["size"]
+        site["count"] += t["count"]
+        if t["size"] > site["_best"]:
+            site["_best"] = t["size"]
+            site["callers"] = ["%s (%s:%s)" % (f["name"], f["file"], f["line"]) for f in reversed(frames[:-1])][:5]
+    out = sorted(sites.values(), key=lambda s: (-s["size"], s["file"] or "", s["line"]))[:limit]
+    for s in out:
+        del s["_best"]
+    return out
+
+
+def peak_path(out):
+    base = out[:-5] if out.endswith(".json") else out
+    return base + ".peak.json"
+
+
+def dump_tracemalloc(out, when, sampler=None):
+    import tracemalloc
+
+    if not tracemalloc.is_tracing():
+        return
+    if sampler is not None:
+        sampler.finish()
+    overhead = sampler.overhead if sampler is not None else 0
+    current, peak = tracemalloc.get_traced_memory()
+    current = max(0, current - overhead)
+    peak = max(current, peak - overhead, sampler.peak if sampler is not None else 0)
+    snapshot = tracemalloc.take_snapshot()
+    best = sampler.best if sampler is not None else None
+    tracemalloc.stop()
+    names = Names()
+    doc = {"codecraft": "tracemalloc", "current": current, "peak": peak, "when": when,
+           "traces": trace_list(snapshot, names)}
+    if sampler is not None:
+        doc["interval"] = sampler.interval
+        doc["timeline"] = sampler.timeline()
+        if best is not None:
+            snap, ms, live = best
+            peak_traces = trace_list(snap, names)
+            info = {"time": round(ms, 1), "current": live, "file": os.path.basename(peak_path(out)),
+                    "top": top_sites(peak_traces)}
+            doc["peakSnapshot"] = info
+            peak_doc = {"codecraft": "tracemalloc", "current": live, "peak": peak,
+                        "when": "at the peak (%.1f s after the start)" % (ms / 1000.0),
+                        "traces": peak_traces, "interval": sampler.interval, "timeline": doc["timeline"],
+                        "peakSnapshot": dict(info, file=None)}
+            with open(peak_path(out), "w", encoding="utf-8") as f:
+                json.dump(peak_doc, f)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(doc, f)
 
@@ -152,8 +305,12 @@ def run_tracemalloc(argv):
     out = argv[0]
     rest = argv[1:]
     frames = 25
-    if rest[:1] == ["--frames"] and len(rest) > 1:
-        frames = max(1, min(100, int(rest[1])))
+    interval = 0.0
+    while rest[:1] in (["--frames"], ["--interval"]) and len(rest) > 1:
+        if rest[0] == "--frames":
+            frames = max(1, min(100, int(rest[1])))
+        else:
+            interval = max(0.0, min(3600.0, float(rest[1])))
         rest = rest[2:]
     if rest[:1] == ["--"]:
         rest = rest[1:]
@@ -169,6 +326,10 @@ def run_tracemalloc(argv):
         sys.argv = [script] + args
         sys.path[0] = os.path.dirname(os.path.abspath(script))
     tracemalloc.start(frames)
+    sampler = None
+    if interval > 0:
+        sampler = Sampler(max(0.005, interval))
+        sampler.begin()
     when = "when the program ended"
     try:
         if module:
@@ -182,7 +343,7 @@ def run_tracemalloc(argv):
         when = "when the program raised %s" % type(e).__name__
         raise
     finally:
-        dump_tracemalloc(out, when)
+        dump_tracemalloc(out, when, sampler)
 
 
 def main():

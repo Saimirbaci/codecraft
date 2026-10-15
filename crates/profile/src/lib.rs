@@ -25,11 +25,12 @@ use std::io::Read;
 use std::path::Path;
 
 pub use analysis::{
-    Analysis, CallNode, CallTree, Edge, FlameGraph, FlameRect, FunctionDelta, MethodStat, callees, callers, compare,
-    matched_weight, methods, outermost_matches, path_hashes, path_weights, search, subtree_methods,
+    Analysis, CallNode, CallTree, Edge, FlameGraph, FlameRect, FunctionDelta, HotspotOrder, MethodStat, callees, callers,
+    compare, hotspots, matched_weight, methods, outermost_matches, path_hashes, path_weights, search, subtree_methods,
 };
 pub use model::{
-    Format, Frame, LineStat, MAX_DEPTH, Profile, ProfileBuilder, StackNode, TIMELINE_BUCKETS, Thread, Unit,
+    Allocation, Format, Frame, LineNode, LineStat, MAX_DEPTH, MAX_MEMORY_POINTS, MemoryPoint, MemoryTimeline,
+    NO_LINE_NODE, Profile, ProfileBuilder, Selection, StackNode, TIMELINE_BUCKETS, Thread, TimedSample, Unit,
     fold_lines, is_address,
 };
 
@@ -56,13 +57,23 @@ pub enum ProfileError {
 
 /// Read and parse a snapshot file.
 pub fn load(path: &Path) -> Result<Profile, ProfileError> {
+    parse(&read_file(path)?)
+}
+
+/// A snapshot file's bytes, gunzipped when compressed (capped like [`load`]).
+pub fn read_snapshot(path: &Path) -> Result<Vec<u8>, ProfileError> {
+    let bytes = read_file(path)?;
+    if bytes.starts_with(&[0x1f, 0x8b]) { gunzip(&bytes) } else { Ok(bytes) }
+}
+
+fn read_file(path: &Path) -> Result<Vec<u8>, ProfileError> {
     let file = std::fs::File::open(path).map_err(|e| ProfileError::Io(format!("{}: {e}", path.display())))?;
     let mut bytes = Vec::new();
     file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|e| ProfileError::Io(e.to_string()))?;
     if bytes.len() as u64 > MAX_FILE_BYTES {
         return Err(ProfileError::TooLarge(format!("more than {} MB on disk", MAX_FILE_BYTES >> 20)));
     }
-    parse(&bytes)
+    Ok(bytes)
 }
 
 /// Parse a snapshot from bytes, detecting the format from the content.

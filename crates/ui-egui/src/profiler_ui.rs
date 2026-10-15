@@ -68,6 +68,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 ProfilerTab::CallTree => call_tree(ui, snap, &theme, &mut cmds),
                 ProfilerTab::MethodList => method_list(ui, snap, &theme, &mut cmds),
                 ProfilerTab::Timeline => timeline(ui, snap, &theme, &mut cmds),
+                ProfilerTab::Memory => memory_view(ui, snap, &theme, &mut cmds),
             }
         }
     }
@@ -167,12 +168,27 @@ fn toolbar(
             (ProfilerTab::CallTree, "Call Tree", "callTree"),
             (ProfilerTab::MethodList, "Method List", "methodList"),
             (ProfilerTab::Timeline, "Timeline", "timeline"),
+            (ProfilerTab::Memory, "Memory", "memory"),
         ] {
+            if t == ProfilerTab::Memory && p.memory.is_none() {
+                continue;
+            }
             if ui.selectable_label(tab == t, label).clicked() && tab != t {
                 cmds.push(("profiler.selectTab", json!({ "tab": id })));
             }
         }
         ui.separator();
+        // The selected time range (every view shows only its samples).
+        if let Some((a, b)) = snap.selection.range {
+            let text = format!("⏱ {} – {}", ms_text(a), ms_text(b));
+            let pending = snap.analysis.range != snap.selection.range;
+            let chip = ui
+                .add(egui::Button::new(RichText::new(text).color(if pending { theme.text_muted } else { theme.accent })).small())
+                .on_hover_text("Only the samples of this time range are shown. Click to show the whole run.");
+            if chip.clicked() {
+                cmds.push(("profiler.selectRange", Value::Null));
+            }
+        }
         let current = match snap.analysis.thread.and_then(|t| p.threads.get(t)) {
             Some(t) => t.name.clone(),
             None => "All threads".to_string(),
@@ -870,7 +886,8 @@ fn method_edges(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cm
     let unit = snap.profile.unit;
     let tree = &snap.analysis.tree;
     let (callers, callees) = &snap.method_edges;
-    let lines = snap.method.map_or(&[][..], |f| snap.profile.lines_of(f));
+    // The selected thread's and time range's lines.
+    let lines = snap.method.map_or(&[][..], |f| snap.lines_of(f));
     let n = if lines.is_empty() { 2 } else { 3 };
     ui.columns(n, |cols| {
         let mut it = cols.iter_mut();
@@ -926,7 +943,7 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
     let p = &snap.profile;
     let Some(duration) = p.duration_ns else {
         ui.label(
-            RichText::new("This snapshot has no sample times (Instruments / xctrace recordings have them).")
+            RichText::new("This snapshot has no sample times (Instruments / xctrace and samply recordings have them).")
                 .color(theme.text_muted),
         );
         // Keep the tool window's height (a bottom panel shrinks to short content).
@@ -934,16 +951,61 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
         return;
     };
     let max = p.threads.iter().flat_map(|t| t.activity.iter().copied()).max().unwrap_or(0).max(1);
-    ui.label(
-        RichText::new(format!(
-            "{:.2} s · {} threads · click a thread to show only it",
-            duration as f64 / 1e9,
-            p.threads.len()
-        ))
-        .color(theme.text_muted)
-        .small(),
-    );
+    ui.horizontal_wrapped(|ui| {
+        ui.label(
+            RichText::new(format!(
+                "{:.2} s · {} threads · drag across the strips to select a time range (every view follows); click a thread to show only it",
+                duration as f64 / 1e9,
+                p.threads.len()
+            ))
+            .color(theme.text_muted)
+            .small(),
+        );
+        if snap.selection.range.is_some() && ui.small_button("Whole Run").clicked() {
+            cmds.push(("profiler.selectRange", Value::Null));
+        }
+    });
     let label_w = 200.0;
+    let drag_id = egui::Id::new("profiler-timeline-drag");
+    let dragging: Option<(f32, f32)> = ui.ctx().data(|d| d.get_temp(drag_id));
+    // The selected (or being dragged) span as fractions of the run.
+    let span = |sel: Option<(u64, u64)>| -> Option<(f32, f32)> {
+        let (a, b) = sel?;
+        let d = duration.max(1) as f64;
+        Some(((a as f64 / d) as f32, (b as f64 / d) as f32))
+    };
+    let shown = dragging.map(|(a, b)| (a.min(b), a.max(b))).or_else(|| span(snap.selection.range));
+    // The time axis.
+    {
+        let width = ui.available_width().max(label_w + 100.0);
+        let (rect, _) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::hover());
+        let painter = ui.painter_at(rect);
+        let strip = strip_rect(rect, label_w);
+        for k in 0..=4 {
+            let f = k as f32 / 4.0;
+            let x = strip.left() + f * strip.width();
+            painter.line_segment(
+                [pos2(x, rect.bottom() - 5.0), pos2(x, rect.bottom())],
+                egui::Stroke::new(1.0, theme.text_muted),
+            );
+            let align = match k {
+                0 => Align2::LEFT_BOTTOM,
+                4 => Align2::RIGHT_BOTTOM,
+                _ => Align2::CENTER_BOTTOM,
+            };
+            painter.text(
+                pos2(x, rect.bottom() - 6.0),
+                align,
+                ms_text((duration as f64 * f64::from(f)) as u64),
+                FontId::proportional(11.0),
+                theme.text_muted,
+            );
+        }
+        if let Some((a, b)) = shown {
+            paint_span(&painter, strip, a, b, theme);
+        }
+    }
+    let mut finished: Option<(f32, f32)> = None;
     ScrollArea::vertical().id_salt("profiler-timeline").auto_shrink([false, false]).show_rows(
         ui,
         ROW_H,
@@ -952,12 +1014,30 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
             for i in range {
                 let Some(t) = p.threads.get(i) else { continue };
                 let width = ui.available_width().max(label_w + 100.0);
-                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click_and_drag());
+                resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, format!("Thread {}", t.name)));
                 let painter = ui.painter_at(rect);
                 if snap.analysis.thread == Some(i) {
                     painter.rect_filled(rect, 0.0, theme.list_selection);
                 } else if resp.hovered() {
                     painter.rect_filled(rect, 0.0, theme.hover);
+                }
+                // Dragging over the strips selects a time range.
+                let strip_area = strip_rect(rect, label_w);
+                let frac = |x: f32| ((x - strip_area.left()) / strip_area.width().max(1.0)).clamp(0.0, 1.0);
+                if resp.drag_started()
+                    && let Some(pos) = ui.input(|i| i.pointer.press_origin()).or_else(|| resp.interact_pointer_pos())
+                {
+                    // From where the button went down (not where the drag threshold was passed).
+                    let now = resp.interact_pointer_pos().map_or(frac(pos.x), |p| frac(p.x));
+                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, (frac(pos.x), now)));
+                } else if resp.dragged()
+                    && let (Some(pos), Some((a, _))) = (resp.interact_pointer_pos(), dragging)
+                {
+                    ui.ctx().data_mut(|d| d.insert_temp(drag_id, (a, frac(pos.x))));
+                } else if resp.drag_stopped() {
+                    finished = dragging;
+                    ui.ctx().data_mut(|d| d.remove::<(f32, f32)>(drag_id));
                 }
                 let name_rect =
                     Rect::from_min_max(rect.min + vec2(6.0, 0.0), pos2(rect.left() + label_w, rect.bottom()));
@@ -969,8 +1049,8 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
                     theme.text,
                 );
                 let strip = Rect::from_min_max(
-                    pos2(rect.left() + label_w + 4.0, rect.top() + 3.0),
-                    pos2(rect.right() - 6.0, rect.bottom() - 3.0),
+                    pos2(strip_area.left(), rect.top() + 3.0),
+                    pos2(strip_area.right(), rect.bottom() - 3.0),
                 );
                 painter.rect_filled(strip, 0.0, theme.panel_bg.lerp_to_gamma(theme.text_muted, 0.12));
                 let n = t.activity.len().max(1) as f32;
@@ -984,6 +1064,9 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
                     let level = (*a as f32 / max as f32).clamp(0.08, 1.0);
                     painter.rect_filled(cell, 0.0, theme.panel_bg.lerp_to_gamma(theme.accent, level));
                 }
+                if let Some((a, b)) = shown {
+                    paint_span(&painter, strip, a, b, theme);
+                }
                 let resp = resp.on_hover_text(format!("{} · {}", t.name, p.unit.format(t.total())));
                 if resp.clicked() {
                     let same = snap.analysis.thread == Some(i);
@@ -992,6 +1075,130 @@ fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) 
             }
         },
     );
+    // A drag across less than half a percent of the run is a click, not a range.
+    if let Some((a, b)) = finished {
+        let (a, b) = (a.min(b), a.max(b));
+        if b - a > 0.005 {
+            let ms = |f: f32| duration as f64 * f64::from(f) / 1e6;
+            cmds.push(("profiler.selectRange", json!({ "startMs": ms(a), "endMs": ms(b) })));
+        }
+    }
+}
+
+/// The activity strip of a timeline row.
+fn strip_rect(row: Rect, label_w: f32) -> Rect {
+    Rect::from_min_max(pos2(row.left() + label_w + 4.0, row.top()), pos2((row.right() - 6.0).max(row.left() + label_w + 10.0), row.bottom()))
+}
+
+/// The selected span over a strip: the rest dimmed, the edges marked.
+fn paint_span(painter: &egui::Painter, strip: Rect, a: f32, b: f32, theme: &Theme) {
+    let x = |f: f32| strip.left() + f.clamp(0.0, 1.0) * strip.width();
+    let (xa, xb) = (x(a), x(b).max(x(a) + 1.0));
+    let dim = theme.panel_bg.gamma_multiply(0.7);
+    painter.rect_filled(Rect::from_min_max(strip.min, pos2(xa, strip.bottom())), 0.0, dim);
+    painter.rect_filled(Rect::from_min_max(pos2(xb, strip.top()), strip.max), 0.0, dim);
+    let stroke = egui::Stroke::new(1.5, theme.accent);
+    painter.line_segment([pos2(xa, strip.top()), pos2(xa, strip.bottom())], stroke);
+    painter.line_segment([pos2(xb, strip.top()), pos2(xb, strip.bottom())], stroke);
+}
+
+/// Nanoseconds as `12.3 ms` / `1.25 s`.
+fn ms_text(ns: u64) -> String {
+    let ms = ns as f64 / 1e6;
+    if ms >= 1000.0 { format!("{:.2} s", ms / 1000.0) } else { format!("{ms:.1} ms") }
+}
+
+// ---------------------------------------------------------------- memory
+
+/// Memory over time (traced memory per sample, the peak marked) and the allocation sites live at
+/// the snapshot nearest the peak (tracemalloc with periodic snapshots).
+fn memory_view(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
+    let Some(m) = &snap.profile.memory else {
+        ui.label(RichText::new("This snapshot has no memory timeline (profile memory with tracemalloc).").color(theme.text_muted));
+        ui.allocate_space(ui.available_size());
+        return;
+    };
+    let bytes = codecraft_engine::profiler::profile::Unit::Bytes;
+    ui.horizontal_wrapped(|ui| {
+        let when = m.peak_ms.map_or_else(String::new, |t| format!(" at {}", ms_text(t.saturating_mul(1_000_000))));
+        ui.label(RichText::new(format!("Peak {}{when}", bytes.format(m.peak))).strong());
+        ui.label(
+            RichText::new(format!("· {} samples every {} ms", m.points.len(), m.interval_ms)).color(theme.text_muted).small(),
+        );
+        if snap.peak_snapshot().is_some()
+            && ui.small_button("Open Snapshot at Peak").on_hover_text("The whole call tree of what was live at the peak").clicked()
+        {
+            cmds.push(("profiler.openPeakSnapshot", Value::Null));
+        }
+    });
+    // The chart.
+    let chart_h = (ui.available_height() * 0.45).clamp(80.0, 220.0);
+    let width = ui.available_width().max(120.0);
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, chart_h), Sense::hover());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Other, true, "Memory over time"));
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 2.0, theme.panel_bg.lerp_to_gamma(theme.text_muted, 0.08));
+    let plot = rect.shrink2(vec2(6.0, 14.0));
+    let t_max = m.points.last().map_or(1, |p| p.time_ms.max(1)) as f32;
+    let v_max = m.points.iter().map(|p| p.peak.max(p.current)).max().unwrap_or(0).max(m.peak).max(1) as f32;
+    let at = |t: u64, v: u64| pos2(plot.left() + t as f32 / t_max * plot.width(), plot.bottom() - v as f32 / v_max * plot.height());
+    let peaks: Vec<egui::Pos2> = m.points.iter().map(|p| at(p.time_ms, p.peak)).collect();
+    let current: Vec<egui::Pos2> = m.points.iter().map(|p| at(p.time_ms, p.current)).collect();
+    if peaks.len() > 1 {
+        painter.add(egui::Shape::line(peaks, egui::Stroke::new(1.0, theme.warning.gamma_multiply(0.7))));
+    }
+    if current.len() > 1 {
+        painter.add(egui::Shape::line(current, egui::Stroke::new(2.0, theme.accent)));
+    }
+    if let Some(t) = m.peak_snapshot_ms {
+        let x = at(t, 0).x;
+        painter.line_segment([pos2(x, plot.top()), pos2(x, plot.bottom())], egui::Stroke::new(1.0, theme.error));
+        painter.text(pos2(x + 3.0, plot.top()), Align2::LEFT_TOP, "snapshot at peak", FontId::proportional(10.5), theme.error);
+    }
+    painter.text(rect.left_top() + vec2(4.0, 1.0), Align2::LEFT_TOP, bytes.format(v_max as u64), FontId::proportional(10.5), theme.text_muted);
+    painter.text(rect.right_bottom() - vec2(4.0, 1.0), Align2::RIGHT_BOTTOM, ms_text((t_max as u64).saturating_mul(1_000_000)), FontId::proportional(10.5), theme.text_muted);
+    if let Some(pos) = resp.hover_pos().filter(|p| plot.contains(*p)) {
+        let t = ((pos.x - plot.left()) / plot.width().max(1.0) * t_max) as u64;
+        let i = m.points.partition_point(|p| p.time_ms < t).min(m.points.len().saturating_sub(1));
+        if let Some(p) = m.points.get(i) {
+            resp.on_hover_text(format!("{}: {} live (peak {})", ms_text(p.time_ms.saturating_mul(1_000_000)), bytes.format(p.current), bytes.format(p.peak)));
+        }
+    }
+    ui.add_space(4.0);
+    let title = match (m.peak_snapshot_ms, m.peak_snapshot_bytes) {
+        (Some(t), Some(b)) => format!("Live at the snapshot nearest the peak ({}, {})", ms_text(t.saturating_mul(1_000_000)), bytes.format(b)),
+        _ => "Live at the peak".to_string(),
+    };
+    ui.label(RichText::new(title).strong().small());
+    header(ui, theme, &["Size", "Count", "Function", "Location"]);
+    let whole = m.peak_snapshot_bytes.unwrap_or(m.peak).max(1);
+    ScrollArea::vertical().id_salt("profiler-memory").auto_shrink([false, false]).show_rows(ui, ROW_H, m.at_peak.len(), |ui, range| {
+        for i in range {
+            let Some(a) = m.at_peak.get(i) else { continue };
+            let location = match (&a.file, a.line) {
+                (Some(f), Some(l)) => format!("{f}:{l}"),
+                (Some(f), None) => f.clone(),
+                _ => String::new(),
+            };
+            let text = format!(
+                "{} ({:.1}%)   ·   {}   ·   {}   ·   {}",
+                bytes.format(a.size),
+                a.size as f64 * 100.0 / whole as f64,
+                a.count,
+                a.name,
+                location
+            );
+            let mut resp = ui.selectable_label(false, RichText::new(text).small());
+            if !a.callers.is_empty() {
+                resp = resp.on_hover_text(format!("Called from:\n{}", a.callers.join("\n")));
+            }
+            if resp.clicked()
+                && let Some(f) = &a.file
+            {
+                cmds.push(("profiler.openLocation", json!({ "file": f, "line": a.line })));
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------- editor gutter
@@ -1009,7 +1216,8 @@ impl GutterHits {
     pub(crate) fn collect(s: &Session, path: &std::path::Path) -> Self {
         let Some(snap) = &s.profiler.snapshot else { return Self::default() };
         let Some(hits) = snap.lines.for_path(path) else { return Self::default() };
-        let total = snap.profile.total();
+        // Shares of the selection (thread, time range), like the views.
+        let total = snap.analysis.tree.total;
         let lines: std::collections::HashMap<usize, (u64, u64)> =
             hits.iter().filter_map(|h| Some(((h.line as usize).checked_sub(1)?, (h.self_weight, h.total)))).collect();
         let max = lines.values().map(|(_, t)| *t).max().unwrap_or(0);

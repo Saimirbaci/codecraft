@@ -95,6 +95,8 @@ fn skip(id: &str, params: &Value) -> bool {
                 // M14 track PF: record with real profilers (profiler_agent_cmds tests use fakes).
                 | "profiler.record"
                 | "profiler.profileMemory"
+                // M15 PP: profiles the test at the caret (profiler_cmds tests use fakes).
+                | "profiler.atCaret"
         )
     {
         return true;

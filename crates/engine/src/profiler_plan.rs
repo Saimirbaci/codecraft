@@ -69,6 +69,22 @@ pub struct Plan {
     pub env: Vec<(String, String)>,
     /// A Cargo debug build: timings are not representative of release code.
     pub debug_build: bool,
+    /// tracemalloc: milliseconds between memory samples (`None`:
+    /// [`DEFAULT_TRACEMALLOC_INTERVAL_MS`], 0: one snapshot at the end only).
+    pub sample_interval_ms: Option<u64>,
+}
+
+/// Milliseconds between tracemalloc memory samples by default.
+pub const DEFAULT_TRACEMALLOC_INTERVAL_MS: u64 = 100;
+
+/// Seconds (a request's `interval`) as milliseconds; hostile values become 0 (off).
+pub fn seconds_to_ms(s: f64) -> u64 {
+    if s.is_finite() && s > 0.0 { (s.min(3600.0) * 1000.0).round() as u64 } else { 0 }
+}
+
+/// The tracemalloc sampling interval of a plan, in seconds (0 = off).
+pub fn tracemalloc_interval(plan: &Plan) -> f64 {
+    plan.sample_interval_ms.unwrap_or(DEFAULT_TRACEMALLOC_INTERVAL_MS).min(3_600_000) as f64 / 1000.0
 }
 
 impl Plan {
@@ -197,6 +213,7 @@ fn plan_cargo(name: &str, inv: &CargoInvocation) -> Result<Plan, String> {
         cwd: inv.cwd.clone(),
         env: inv.env.clone(),
         debug_build: !inv.release,
+        sample_interval_ms: None,
     })
 }
 
@@ -211,6 +228,7 @@ fn plan_process(name: &str, cmd: &ProcessCommand, python: Option<&Path>) -> Resu
         cwd,
         env: cmd.env.clone(),
         debug_build: false,
+        sample_interval_ms: None,
     };
     if matches!(base.as_str(), "sh" | "bash" | "zsh") && cmd.args.first().is_some_and(|a| a == "-c") {
         let script = cmd.args.get(1).ok_or("`sh -c` without a script")?;
@@ -494,7 +512,12 @@ pub fn wrap(
             let (python, rest) = python_only("tracemalloc")?;
             let Target::Python { interp, .. } = &plan.target else { return Err("not a Python program".into()) };
             let mut a = interp.clone();
-            a.extend([helper.display().to_string(), "tracemalloc".into(), out, "--".into()]);
+            a.extend([helper.display().to_string(), "tracemalloc".into(), out]);
+            let interval = tracemalloc_interval(plan);
+            if interval > 0.0 {
+                a.extend(["--interval".into(), format!("{interval}")]);
+            }
+            a.push("--".into());
             a.extend(rest.into_iter().skip(interp.len()));
             (python, a)
         }
@@ -678,7 +701,16 @@ mod tests {
             ("/v/python", "-u -m cProfile -o /o/x.pstats a.py 1".into())
         );
         let c = wrap(ProfilerTool::Tracemalloc, None, &py, None, Path::new("/o/t.json"), h, None).unwrap();
+        assert_eq!(c.args.join(" "), "-u /h.py tracemalloc /o/t.json --interval 0.1 -- a.py 1");
+        let mut every = py.clone();
+        every.sample_interval_ms = Some(500);
+        let c = wrap(ProfilerTool::Tracemalloc, None, &every, None, Path::new("/o/t.json"), h, None).unwrap();
+        assert_eq!(c.args.join(" "), "-u /h.py tracemalloc /o/t.json --interval 0.5 -- a.py 1");
+        every.sample_interval_ms = Some(0);
+        let c = wrap(ProfilerTool::Tracemalloc, None, &every, None, Path::new("/o/t.json"), h, None).unwrap();
         assert_eq!(c.args.join(" "), "-u /h.py tracemalloc /o/t.json -- a.py 1");
+        every.sample_interval_ms = Some(seconds_to_ms(f64::NAN));
+        assert_eq!(tracemalloc_interval(&every), 0.0);
         let c = wrap(ProfilerTool::Memray, None, &py, None, Path::new("/o/m.bin"), h, None).unwrap();
         assert_eq!(c.args.join(" "), "-u -m memray run -f -o /o/m.bin a.py 1");
         let c = wrap(ProfilerTool::PySpy, Some(Path::new("/t/py-spy")), &py, None, out, h, None).unwrap();

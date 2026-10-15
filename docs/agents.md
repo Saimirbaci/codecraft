@@ -266,9 +266,15 @@ A failing expression is a tool error with the debugger's message.
 **`profile_start`** (profile) — a run configuration (`config`) or a command line (`command`:
 `python3 main.py`, `cargo run --release`, `pytest -k slow`, `./build/app`), CPU by default or
 `kind: "memory"`, optionally a `tool` and `seconds`. Cargo and CMake targets are built first.
+`test: {path, line}` (1-based) profiles the test at a source line, as the gutter's Profile does
+(Rust `cargo test --lib name -- --exact`, pytest `file::test`, GoogleTest/Catch2/doctest/Boost.Test
+filters). Memory profiles with tracemalloc sample the memory every `interval` seconds (default
+0.1, `0` = only the snapshot at the end) and keep the snapshot nearest the peak; the report then
+has `memory` (`peak`, `peakMs`, `timeline`, `atPeak` allocation sites, `peakSnapshot`).
 ```json
 { "config": "Run app" }                         → { "tab": 5, "job": 1, "config": "Run app", "tool": "xctrace", "state": "building", "next": "…" }
 { "command": "python3 main.py", "kind": "memory" } → { "tab": 6, "job": 2, "tool": "tracemalloc", "state": "recording", "next": "…" }
+{ "test": { "path": "tests/test_calc.py", "line": 12 } } → { "job": 3, "tool": "cProfile", "config": "pytest test_slow", "command": "… -m pytest …/test_calc.py::test_slow", … }
 ```
 
 **`profile_stop`** (profile) — stops the recording, waits for the snapshot, returns the hotspots.
@@ -277,10 +283,16 @@ records or its snapshot loads; a profile that failed is a tool error naming the 
 output). Rust names are demangled. `inProject` marks the project's own functions; when library
 code (the standard library, Python's import machinery) fills the top of the list,
 `projectHotspots` lists the project's functions separately. For memory profiles the unit is
-`bytes` and the percentages are shares of the allocated bytes.
+`bytes` and the percentages are shares of the allocated bytes. The order is fixed, whatever the
+IDE's Method List shows (and over all threads and the whole run): `sort: "self"` (default; self
+weight, then total) or `"total"` (total, then self), ties by name, location and module; the
+answer says which (`sort`, `order`). `codecraft_execute` `profiler.report` / `profiler.hotspots` /
+`profiler.lineHits` also take `thread` (an index or a name) and `range: {startMs, endMs}` (ms since
+the first sample; xctrace and samply snapshots) to look at one thread or one phase of the run.
 ```json
 { "limit": 3 }
 → { "snapshot": "/home/me/.codecraft/profiler/snapshots/app-….json", "unit": "samples", "samples": 4521, "total": 4521,
+    "sort": "self", "order": "selfPercent desc, then totalPercent desc, then name, location, module",
     "hotspots": [{ "name": "app::parse_line", "module": "app", "selfPercent": 41.2, "totalPercent": 55.0, "self": 1863,
                    "total": 2487, "file": "/work/app/src/parse.rs", "line": 88, "inProject": true }, …],
     "note": "selfPercent: time in the function itself; totalPercent: including what it calls",

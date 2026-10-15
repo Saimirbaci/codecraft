@@ -3,10 +3,13 @@
 //! and the Gecko profile (row tables with a `schema` and `data`, strings in `stringTable`,
 //! subprocesses in `processes`).
 
+use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap};
+
 use serde_json::{Map, Value};
 
 use crate::ProfileError;
-use crate::model::{Format, Frame, MAX_DEPTH, Profile, ProfileBuilder, Unit, scaled_weight};
+use crate::model::{Format, Frame, MAX_DEPTH, Profile, ProfileBuilder, Unit, is_address, scaled_weight};
 
 /// Nested `processes` followed at most this deep.
 const MAX_PROCESS_DEPTH: usize = 16;
@@ -17,25 +20,217 @@ pub fn looks_gecko(v: &Value) -> bool {
 }
 
 pub fn parse(v: &Value) -> Result<Profile, ProfileError> {
-    let processed = v.pointer("/meta/preprocessedProfileVersion").is_some()
-        || v.get("shared").is_some()
-        || v.pointer("/threads/0/frameTable/func").is_some();
-    let mut b = ProfileBuilder::new(if processed { Format::Processed } else { Format::Gecko }, Unit::Samples);
-    let mut unit_set = false;
-    let shared = v.get("shared");
+    parse_inner(v, None).map(|(p, _)| p)
+}
+
+/// Parse with symbols for the frames that have only an address (samply's `--save-only`
+/// output): `symbols` from [`presymbolicated`] or from `atos` / `addr2line` runs over
+/// [`unresolved_libs`]. Returns the profile and how many frames got a symbol; with any, frames
+/// that differ only by line are folded into functions with per-line statistics.
+pub fn parse_with_symbols(v: &Value, symbols: &Symbols) -> Result<(Profile, usize), ProfileError> {
+    let (p, resolved) = parse_inner(v, Some(symbols))?;
+    Ok((if resolved > 0 { crate::model::fold_lines(p) } else { p }, resolved))
+}
+
+/// The processes of a profile (the top level and nested `processes`), with their libraries.
+fn processes(v: &Value) -> Vec<&Value> {
+    let mut out = Vec::new();
     let mut work: Vec<(&Value, usize)> = vec![(v, 0)];
     while let Some((process, depth)) = work.pop() {
-        let libs = process.get("libs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-        for t in process.get("threads").and_then(Value::as_array).into_iter().flatten() {
-            read_thread(&mut b, t, shared, libs, &mut unit_set)?;
-        }
+        out.push(process);
         if depth < MAX_PROCESS_DEPTH {
             for p in process.get("processes").and_then(Value::as_array).into_iter().flatten().rev() {
                 work.push((p, depth + 1));
             }
         }
     }
-    b.finish()
+    out
+}
+
+fn parse_inner(v: &Value, symbols: Option<&Symbols>) -> Result<(Profile, usize), ProfileError> {
+    let processed = v.pointer("/meta/preprocessedProfileVersion").is_some()
+        || v.get("shared").is_some()
+        || v.pointer("/threads/0/frameTable/func").is_some();
+    let mut b = ProfileBuilder::new(if processed { Format::Processed } else { Format::Gecko }, Unit::Samples);
+    let mut unit_set = false;
+    let shared = v.get("shared");
+    let resolved = Cell::new(0usize);
+    for process in processes(v) {
+        let libs = process.get("libs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        for t in process.get("threads").and_then(Value::as_array).into_iter().flatten() {
+            read_thread(&mut b, t, shared, libs, &mut unit_set, symbols, &resolved)?;
+        }
+    }
+    Ok((b.finish()?, resolved.get()))
+}
+
+/// A symbol for an address of a library (from `atos`, `addr2line` or samply's presymbolication).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Symbol {
+    pub name: String,
+    pub file: Option<String>,
+    pub line: Option<u32>,
+}
+
+/// Symbols by (library key — [`UnresolvedLib::key`] — and address relative to the library).
+pub type Symbols = HashMap<(String, u64), Symbol>;
+
+/// A library whose frames have only addresses, with the addresses to look up.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnresolvedLib {
+    /// What [`Symbols`] are keyed by: the library's path, else its debug path or name.
+    pub key: String,
+    pub name: String,
+    pub path: Option<String>,
+    pub debug_name: Option<String>,
+    pub debug_path: Option<String>,
+    pub breakpad_id: Option<String>,
+    pub code_id: Option<String>,
+    /// Addresses relative to the library's base (sorted, unique).
+    pub addresses: Vec<u64>,
+}
+
+/// Addresses looked up at most (over all libraries).
+const MAX_UNRESOLVED: usize = 2_000_000;
+
+fn lib_str(lib: &Value, key: &str) -> Option<String> {
+    lib.get(key).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_string)
+}
+
+/// The key of library `index` (see [`UnresolvedLib::key`]).
+fn lib_key(lib: &Value, index: usize) -> String {
+    lib_str(lib, "path")
+        .or_else(|| lib_str(lib, "debugPath"))
+        .or_else(|| lib_str(lib, "name"))
+        .unwrap_or_else(|| format!("lib#{index}"))
+}
+
+/// The libraries whose frames have no symbol (a bare address), with their addresses.
+pub fn unresolved_libs(v: &Value) -> Vec<UnresolvedLib> {
+    let mut by_key: HashMap<String, (UnresolvedLib, BTreeSet<u64>)> = HashMap::new();
+    let shared = v.get("shared");
+    let mut total = 0usize;
+    for process in processes(v) {
+        let libs = process.get("libs").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
+        for t in process.get("threads").and_then(Value::as_array).into_iter().flatten() {
+            let strings = strings_of(t, shared);
+            let Some(frames) = table(t, shared, "frameTable") else { continue };
+            let funcs = table(t, shared, "funcTable");
+            let resources = table(t, shared, "resourceTable");
+            let ctx = FrameCtx {
+                strings: &strings,
+                frames: &frames,
+                funcs: funcs.as_ref(),
+                resources: resources.as_ref(),
+                sources: None,
+                libs,
+                symbols: None,
+                resolved: None,
+            };
+            for row in 0..frames.len() {
+                let Some((lib, addr)) = ctx.unresolved(row) else { continue };
+                let Some(l) = libs.get(lib) else { continue };
+                let key = lib_key(l, lib);
+                let entry = by_key.entry(key.clone()).or_insert_with(|| {
+                    let info = UnresolvedLib {
+                        key,
+                        name: lib_str(l, "name").unwrap_or_default(),
+                        path: lib_str(l, "path"),
+                        debug_name: lib_str(l, "debugName"),
+                        debug_path: lib_str(l, "debugPath"),
+                        breakpad_id: lib_str(l, "breakpadId"),
+                        code_id: lib_str(l, "codeId"),
+                        addresses: Vec::new(),
+                    };
+                    (info, BTreeSet::new())
+                });
+                if entry.1.insert(addr) {
+                    total += 1;
+                }
+                if total >= MAX_UNRESOLVED {
+                    break;
+                }
+            }
+        }
+    }
+    let mut out: Vec<UnresolvedLib> = by_key
+        .into_values()
+        .map(|(mut lib, addrs)| {
+            lib.addresses = addrs.into_iter().collect();
+            lib
+        })
+        .collect();
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+/// Symbols from samply's presymbolication sidecar (`--unstable-presymbolicate` writes
+/// `<profile>.syms.json`): `{string_table: [...], data: [{debug_name, debug_id, code_id?,
+/// symbol_table: [{rva, size, symbol}]}]}` (function names only). Libraries are matched by
+/// debug id (the profile's `breakpadId`), code id or debug name. Tolerant of missing fields.
+pub fn presymbolicated(syms: &Value, libs: &[UnresolvedLib]) -> Symbols {
+    let mut out = Symbols::new();
+    let strings: Vec<&str> = syms
+        .get("string_table")
+        .or_else(|| syms.get("stringTable"))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|s| s.as_str().unwrap_or("")).collect())
+        .unwrap_or_default();
+    let norm = |s: &str| s.chars().filter(char::is_ascii_alphanumeric).collect::<String>().to_ascii_uppercase();
+    let entries = syms.get("data").or_else(|| syms.get("libs")).and_then(Value::as_array);
+    for entry in entries.into_iter().flatten().take(10_000) {
+        let text = |k: &str| entry.get(k).and_then(Value::as_str).filter(|s| !s.is_empty());
+        let debug_id = text("debug_id").or_else(|| text("debugId")).map(norm);
+        let code_id = text("code_id").or_else(|| text("codeId")).map(norm);
+        let debug_name = text("debug_name").or_else(|| text("debugName"));
+        let Some(lib) = libs.iter().find(|l| {
+            let id_match = match (&debug_id, l.breakpad_id.as_deref().map(norm)) {
+                // A breakpad id is the debug id plus the age.
+                (Some(d), Some(b)) => !d.is_empty() && (b == *d || b.starts_with(d.as_str())),
+                _ => false,
+            };
+            let code_match = matches!((&code_id, l.code_id.as_deref().map(norm)), (Some(a), Some(b)) if !a.is_empty() && *a == b);
+            let name_match = debug_name.is_some_and(|n| l.debug_name.as_deref() == Some(n) || l.name == n);
+            let ids_known = (debug_id.is_some() && l.breakpad_id.is_some()) || (code_id.is_some() && l.code_id.is_some());
+            id_match || code_match || (!ids_known && name_match)
+        }) else {
+            continue;
+        };
+        let mut table: Vec<(u64, u64, String)> = entry
+            .get("symbol_table")
+            .or_else(|| entry.get("symbolTable"))
+            .or_else(|| entry.get("symbols"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .take(5_000_000)
+            .filter_map(|s| {
+                let rva = s.get("rva").or_else(|| s.get("address")).and_then(Value::as_u64)?;
+                let size = s.get("size").and_then(Value::as_u64).unwrap_or(0);
+                let name = match s.get("symbol").or_else(|| s.get("name"))? {
+                    Value::String(n) => n.clone(),
+                    Value::Number(n) => strings.get(usize::try_from(n.as_u64()?).ok()?)?.to_string(),
+                    _ => return None,
+                };
+                (!name.is_empty()).then_some((rva, size, name))
+            })
+            .collect();
+        table.sort_by_key(|x| x.0);
+        for addr in &lib.addresses {
+            let i = table.partition_point(|x| x.0 <= *addr);
+            let Some((rva, size, name)) = i.checked_sub(1).and_then(|i| table.get(i)) else { continue };
+            // A size of 0 means "up to the next symbol".
+            let end = if *size > 0 {
+                rva.saturating_add(*size)
+            } else {
+                table.get(i).map_or(u64::MAX, |next| next.0)
+            };
+            if *addr < end {
+                out.insert((lib.key.clone(), *addr), Symbol { name: name.clone(), file: None, line: None });
+            }
+        }
+    }
+    out
 }
 
 /// A table in either layout.
@@ -104,20 +299,25 @@ enum Memo {
     Done(Option<u32>),
 }
 
+fn strings_of<'a>(t: &'a Value, shared: Option<&'a Value>) -> Vec<&'a str> {
+    t.get("stringArray")
+        .or_else(|| t.get("stringTable"))
+        .or_else(|| shared.and_then(|s| s.get("stringArray")))
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|s| s.as_str().unwrap_or("")).collect())
+        .unwrap_or_default()
+}
+
 fn read_thread(
     b: &mut ProfileBuilder,
     t: &Value,
     shared: Option<&Value>,
     libs: &[Value],
     unit_set: &mut bool,
+    symbols: Option<&Symbols>,
+    resolved: &Cell<usize>,
 ) -> Result<(), ProfileError> {
-    let strings: Vec<&str> = t
-        .get("stringArray")
-        .or_else(|| t.get("stringTable"))
-        .or_else(|| shared.and_then(|s| s.get("stringArray")))
-        .and_then(Value::as_array)
-        .map(|a| a.iter().map(|s| s.as_str().unwrap_or("")).collect())
-        .unwrap_or_default();
+    let strings = strings_of(t, shared);
     let (Some(stacks), Some(frames), Some(samples)) =
         (table(t, shared, "stackTable"), table(t, shared, "frameTable"), Table::of(t.get("samples")))
     else {
@@ -133,6 +333,8 @@ fn read_thread(
         resources: resources.as_ref(),
         sources: sources.as_ref(),
         libs,
+        symbols,
+        resolved: Some(resolved),
     };
 
     let name = t.get("name").and_then(Value::as_str).unwrap_or("Thread");
@@ -160,7 +362,17 @@ fn read_thread(
     let mut frame_ids: Vec<Option<Option<u32>>> = vec![None; frames.len()];
     let mut memo: Vec<Memo> = vec![Memo::Unvisited; stacks.len()];
     let mut chain: Vec<usize> = Vec::new();
+    // Sample times (ms): a `time` column, or `timeDeltas` (newer processed profiles).
+    let deltas = samples.has("timeDeltas");
+    let mut clock = 0.0f64;
     for row in 0..samples.len() {
+        let time_ms = if deltas {
+            clock += samples.get("timeDeltas", row).and_then(Value::as_f64).filter(|x| x.is_finite()).unwrap_or(0.0);
+            Some(clock)
+        } else {
+            samples.get("time", row).and_then(Value::as_f64)
+        }
+        .filter(|x| x.is_finite());
         let Some(stack_row) = samples.index("stack", row) else { continue };
         let weight = match (weights, row_weight) {
             (Some(w), _) => w.get(row).and_then(Value::as_f64).map_or(0, |x| scaled_weight(x, scale)),
@@ -172,7 +384,10 @@ fn read_thread(
         }
         let stack = resolve(b, &stacks, &ctx, &mut frame_ids, &mut memo, &mut chain, stack_row)?;
         if let Some(s) = stack {
-            b.sample(thread, s, weight);
+            match time_ms {
+                Some(ms) => b.sample_at(thread, s, weight, scaled_weight(ms, 1e6)),
+                None => b.sample(thread, s, weight),
+            }
         }
     }
     Ok(())
@@ -247,9 +462,56 @@ struct FrameCtx<'a> {
     /// Newer processed profiles name files through `shared.sources` (`funcTable.source`).
     sources: Option<&'a Table<'a>>,
     libs: &'a [Value],
+    /// Symbols for frames that have only an address.
+    symbols: Option<&'a Symbols>,
+    /// Frames that got a symbol from `symbols`.
+    resolved: Option<&'a Cell<usize>>,
 }
 
 impl FrameCtx<'_> {
+    /// `(library index, address relative to it)` of a frame that has no symbol.
+    fn unresolved(&self, row: usize) -> Option<(usize, u64)> {
+        let fr = self.frames;
+        if let (Some(funcs), Some(func)) = (self.funcs, fr.index("func", row)) {
+            let name = self.string(funcs.index("name", func)).unwrap_or("");
+            if !name.is_empty() && !is_address(name) {
+                return None;
+            }
+            let addr = fr.get("address", row).and_then(Value::as_u64)?;
+            let lib = self.resources.and_then(|r| r.index("lib", funcs.index("resource", func)?))?;
+            return Some((lib, addr));
+        }
+        // Gecko: an absolute address inside a library's mapped range.
+        let location = self.string(fr.index("location", row))?;
+        let addr = u64::from_str_radix(location.trim().strip_prefix("0x")?, 16).ok()?;
+        self.libs.iter().enumerate().find_map(|(i, l)| {
+            let (start, end) = (l.get("start")?.as_u64()?, l.get("end")?.as_u64()?);
+            let offset = l.get("offset").and_then(Value::as_u64).unwrap_or(0);
+            (start <= addr && addr < end).then(|| (i, (addr - start).saturating_add(offset)))
+        })
+    }
+
+    /// The symbol for a frame that has only an address.
+    fn symbol(&self, row: usize) -> Option<&Symbol> {
+        let symbols = self.symbols.filter(|s| !s.is_empty())?;
+        let (lib, addr) = self.unresolved(row)?;
+        let key = lib_key(self.libs.get(lib)?, lib);
+        symbols.get(&(key, addr))
+    }
+
+    /// Apply a symbol to a frame.
+    fn symbolicate(&self, row: usize, frame: &mut Frame) {
+        let Some(sym) = self.symbol(row) else { return };
+        frame.name = sym.name.clone();
+        if sym.file.is_some() {
+            frame.file = sym.file.clone();
+            frame.line = sym.line;
+        }
+        if let Some(c) = self.resolved {
+            c.set(c.get().saturating_add(1));
+        }
+    }
+
     fn string(&self, i: Option<usize>) -> Option<&str> {
         self.strings.get(i?).copied().filter(|s| !s.is_empty())
     }
@@ -296,6 +558,9 @@ impl FrameCtx<'_> {
                     None => "[unknown]".to_string(),
                 };
             }
+            if is_address(&frame.name) {
+                self.symbolicate(row, &mut frame);
+            }
             return Some(frame);
         }
         // Gecko: a location string.
@@ -309,6 +574,9 @@ impl FrameCtx<'_> {
         }
         if frame.line.is_none() && frame.file.is_some() {
             frame.line = fr.get("line", row).and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+        }
+        if is_address(&frame.name) {
+            self.symbolicate(row, &mut frame);
         }
         Some(frame)
     }
@@ -434,6 +702,113 @@ mod tests {
         assert_eq!(addr.module.as_deref(), Some("libxul.so"));
         let js = p.frames.iter().find(|f| f.name == "run").unwrap();
         assert_eq!((js.file.as_deref(), js.line), (Some("app.js"), Some(7)));
+    }
+
+    /// What `samply record --save-only` writes for a program without symbols in the profile:
+    /// function names are the addresses, frames carry the library-relative address.
+    pub(crate) fn unsymbolicated(binary: &str) -> Value {
+        json!({
+            "meta": { "version": 24, "preprocessedProfileVersion": 47, "interval": 1.0, "startTime": 0 },
+            "libs": [
+                { "name": "hot", "path": binary, "debugName": "hot", "debugPath": binary,
+                  "breakpadId": "8D1B6A3F2C4E4B9A9C0D1E2F3A4B5C6D0", "codeId": "8D1B6A3F2C4E4B9A9C0D1E2F3A4B5C6D", "arch": "arm64" },
+                { "name": "libsystem_kernel.dylib", "path": "/no/such/libsystem_kernel.dylib" }
+            ],
+            "shared": { "stringArray": ["0x3f70", "0x3f10", "0x3f14", "0x9a0", "hot", "libsystem_kernel.dylib"] },
+            "threads": [{
+                "name": "main", "tid": 1,
+                "samples": { "length": 4, "stack": [1, 2, 2, 3], "time": [0.5, 1.5, 2.5, 3.5], "weight": null },
+                "stackTable": { "length": 4, "prefix": [null, 0, 0, 0], "frame": [0, 1, 2, 3] },
+                "frameTable": { "length": 4, "func": [0, 1, 2, 3], "address": [16240, 16144, 16148, 2464] },
+                "funcTable": { "length": 4, "name": [0, 1, 2, 3], "resource": [0, 0, 0, 1], "fileName": [null, null, null, null] },
+                "resourceTable": { "length": 2, "lib": [0, 1], "name": [4, 5] }
+            }]
+        })
+    }
+
+    #[test]
+    fn sample_times_give_a_timeline() {
+        let p = parse(&processed()).unwrap();
+        assert!(!p.has_sample_times(), "the fixture has no times");
+        let p = parse(&unsymbolicated("/bin/hot")).unwrap();
+        assert!(p.has_sample_times());
+        assert_eq!(p.duration_ns, Some(3_000_000));
+        assert_eq!(p.samples.iter().map(|s| s.time_ns).collect::<Vec<_>>(), vec![0, 1_000_000, 2_000_000, 3_000_000]);
+        assert_eq!(p.threads[0].activity.len(), crate::TIMELINE_BUCKETS);
+        // Newer processed profiles store deltas.
+        let mut v = unsymbolicated("/bin/hot");
+        let samples = v.pointer_mut("/threads/0/samples").unwrap().as_object_mut().unwrap();
+        samples.remove("time");
+        samples.insert("timeDeltas".into(), json!([10.0, 2.0, "x", 1e308]));
+        let p = parse(&v).unwrap();
+        assert_eq!(p.samples.len(), 4);
+        assert_eq!(p.samples[1].time_ns, 2_000_000);
+        assert!(p.duration_ns.unwrap() > 0);
+    }
+
+    #[test]
+    fn unresolved_addresses_and_symbols() {
+        let v = unsymbolicated("/bin/hot");
+        let libs = unresolved_libs(&v);
+        assert_eq!(libs.len(), 2);
+        let hot = libs.iter().find(|l| l.name == "hot").unwrap();
+        assert_eq!(hot.key, "/bin/hot");
+        assert_eq!(hot.addresses, vec![0x3f10, 0x3f14, 0x3f70]);
+        assert_eq!(hot.breakpad_id.as_deref(), Some("8D1B6A3F2C4E4B9A9C0D1E2F3A4B5C6D0"));
+        let mut symbols = Symbols::new();
+        let sym = |n: &str, l: u32| Symbol { name: n.into(), file: Some("/src/hot.c".into()), line: Some(l) };
+        symbols.insert(("/bin/hot".into(), 0x3f70), sym("main", 6));
+        symbols.insert(("/bin/hot".into(), 0x3f10), sym("fib", 2));
+        symbols.insert(("/bin/hot".into(), 0x3f14), sym("fib", 3));
+        let (p, resolved) = parse_with_symbols(&v, &symbols).unwrap();
+        assert_eq!(resolved, 3);
+        // fib's two addresses fold into one function with per-line statistics.
+        let fib = p.frames.iter().position(|f| f.name == "fib").unwrap() as u32;
+        assert_eq!(p.frames.iter().filter(|f| f.name == "fib").count(), 1);
+        assert_eq!(p.frames[fib as usize].module.as_deref(), Some("hot"));
+        let lines: Vec<(u32, u64)> = p.lines_of(fib).iter().map(|l| (l.line, l.self_weight)).collect();
+        assert_eq!(lines, vec![(2, 1), (3, 2)]);
+        // The library without a symbol keeps its address.
+        assert!(p.frames.iter().any(|f| f.name == "0x9a0"));
+        // Timed samples survive the fold (time-range selections work on symbolicated profiles).
+        assert_eq!(p.samples.len(), 4);
+        assert!(p.samples.iter().all(|s| s.line_node != crate::NO_LINE_NODE));
+        // Only the bare address of a mostly symbolicated profile is looked up.
+        let rest = unresolved_libs(&processed());
+        assert_eq!(rest.iter().map(|l| (l.key.as_str(), l.addresses.clone())).collect::<Vec<_>>(), vec![(
+            "libsystem_c.dylib",
+            vec![7936]
+        )]);
+    }
+
+    #[test]
+    fn samply_presymbolication_sidecar() {
+        let v = unsymbolicated("/bin/hot");
+        let libs = unresolved_libs(&v);
+        let syms = json!({
+            "string_table": ["main", "fib", "unused"],
+            "data": [
+                { "debug_name": "hot", "debug_id": "8D1B6A3F-2C4E-4B9A-9C0D-1E2F3A4B5C6D",
+                  "symbol_table": [ { "rva": 16128, "size": 96, "symbol": 1 }, { "rva": 16240, "size": 0, "symbol": 0 } ] },
+                { "debug_name": "other", "debug_id": "00", "symbol_table": [ { "rva": 0, "size": 10, "symbol": 2 } ] },
+                { "debug_name": "hot", "symbol_table": "nope" },
+                7
+            ]
+        });
+        let found = presymbolicated(&syms, &libs);
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(found[&("/bin/hot".to_string(), 0x3f14)].name, "fib");
+        assert_eq!(found[&("/bin/hot".to_string(), 0x3f70)].name, "main");
+        let (p, resolved) = parse_with_symbols(&v, &found).unwrap();
+        assert_eq!(resolved, 3);
+        assert!(p.frames.iter().any(|f| f.name == "fib"));
+        // Hostile sidecars find nothing and never panic.
+        for bad in [json!(null), json!({ "data": 5 }), json!({ "string_table": [1], "data": [{ "debug_name": "hot",
+            "symbol_table": [{ "rva": -1, "symbol": 99 }, { "rva": u64::MAX, "size": u64::MAX, "symbol": "x" }] }] })]
+        {
+            let f = presymbolicated(&bad, &libs);
+            assert!(f.len() <= 3);
+        }
     }
 
     #[test]

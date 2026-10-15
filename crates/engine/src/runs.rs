@@ -249,6 +249,10 @@ pub(crate) fn stop_all(s: &mut Session) {
     for t in tabs {
         stop(s, t);
     }
+    // A profile's Cargo build runs outside `procs` (M15 PP).
+    for t in s.profiler.build_tabs() {
+        crate::profiler::stop(s, t);
+    }
 }
 
 pub(crate) fn pump(s: &mut Session) -> bool {
