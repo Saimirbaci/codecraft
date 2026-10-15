@@ -340,9 +340,17 @@ pub fn engine_tools() -> Vec<ToolDef> {
         // ----------------------------------------------------------- profiling
         tool(
             PROFILE_START,
-            "Run a configuration under the sampling profiler (xctrace/samply/perf for native code, py-spy/cProfile for \
-             Python). Stop it with profile_stop, or let the program finish and call profile_hotspots",
-            json!({ "config": config_ref() }),
+            "Profile a run configuration or a command line: CPU (xctrace/samply/perf for native code, py-spy/cProfile for \
+             Python) or memory (`kind: memory`: leaks/heaptrack for native code, tracemalloc/memray for Python). Cargo and \
+             CMake targets are built first. Stop it with profile_stop, or let the program finish and call profile_hotspots",
+            json!({
+                "config": config_ref(),
+                "command": { "description": "Instead of `config`: a command line to profile, e.g. `python3 main.py`, \
+                    `cargo run --release`, `pytest -k slow`, `./build/app --fast` (string or array of arguments)" },
+                "kind": { "type": "string", "enum": ["cpu", "memory"], "default": "cpu" },
+                "tool": { "type": "string", "description": "A specific profiler: xctrace, samply, perf, py-spy, cProfile, tracemalloc, memray, leaks, heaptrack" },
+                "seconds": { "type": "number", "minimum": 0, "description": "Stop recording after this many seconds" },
+            }),
             &[],
         ),
         tool(

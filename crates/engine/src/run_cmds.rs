@@ -216,12 +216,7 @@ pub(crate) fn context_invocation(
             .get(from..item.line)
             .is_some_and(|ls| ls.iter().any(|l| l.trim_start().starts_with("#[test]") || l.contains("::test]")))
     };
-    // Which target contains the file.
-    let target = package
-        .targets
-        .iter()
-        .filter(|t| t.src_path.parent().is_some_and(|d| path.starts_with(d)))
-        .max_by_key(|t| t.src_path.parent().map(|d| d.as_os_str().len()).unwrap_or(0))?;
+    let target = target_for_file(&package.targets, path)?;
     let selector = if target.is_lib() {
         TargetSelector::Lib
     } else if target.is_bin() {
@@ -334,4 +329,51 @@ fn run_target(s: &mut Session, p: &Value) -> CmdResult {
     inv.target = Some(target);
     let tab = crate::runs::start(s, inv, &title, false)?;
     Ok(json!({ "tab": tab.0 }))
+}
+
+/// The target a source file belongs to: the target whose root it is, else the one with the
+/// deepest source directory containing it; when a library and a binary share `src/` (the usual
+/// `lib.rs` + `main.rs` package), modules there belong to the library.
+pub(crate) fn target_for_file<'a>(
+    targets: &'a [codecraft_cargo::Target],
+    path: &std::path::Path,
+) -> Option<&'a codecraft_cargo::Target> {
+    if let Some(t) = targets.iter().find(|t| t.src_path == path) {
+        return Some(t);
+    }
+    let depth = |t: &codecraft_cargo::Target| t.src_path.parent().map(|d| d.as_os_str().len()).unwrap_or(0);
+    let containing: Vec<&codecraft_cargo::Target> =
+        targets.iter().filter(|t| t.src_path.parent().is_some_and(|d| path.starts_with(d))).collect();
+    let best = containing.iter().map(|t| depth(t)).max()?;
+    let deepest: Vec<&codecraft_cargo::Target> = containing.into_iter().filter(|t| depth(t) == best).collect();
+    deepest.iter().find(|t| t.is_lib()).or_else(|| deepest.first()).copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use codecraft_cargo::Target;
+
+    use super::target_for_file;
+
+    fn target(name: &str, kind: &str, src: &str) -> Target {
+        Target { name: name.into(), kind: vec![kind.into()], src_path: PathBuf::from(src), ..Target::default() }
+    }
+
+    /// QA M14: a test in `src/lib.rs` of a package that also has `src/main.rs` was run and
+    /// debugged as `--bin` (0 tests ran) because both targets live in `src/`.
+    #[test]
+    fn lib_and_bin_sharing_src() {
+        let targets =
+            [target("shop", "lib", "/p/src/lib.rs"), target("shop", "bin", "/p/src/main.rs"), target("tool", "bin", "/p/src/bin/tool.rs")];
+        let pick = |p: &str| target_for_file(&targets, Path::new(p)).map(|t| (t.name.clone(), t.kind[0].clone()));
+        assert_eq!(pick("/p/src/lib.rs"), Some(("shop".into(), "lib".into())));
+        assert_eq!(pick("/p/src/main.rs"), Some(("shop".into(), "bin".into())));
+        assert_eq!(pick("/p/src/util/mod.rs"), Some(("shop".into(), "lib".into())), "modules belong to the library");
+        assert_eq!(pick("/p/src/bin/tool.rs"), Some(("tool".into(), "bin".into())));
+        assert_eq!(pick("/elsewhere/x.rs"), None);
+        let bin_only = [target("app", "bin", "/p/src/main.rs")];
+        assert_eq!(target_for_file(&bin_only, Path::new("/p/src/cli.rs")).map(|t| t.name.as_str()), Some("app"));
+    }
 }

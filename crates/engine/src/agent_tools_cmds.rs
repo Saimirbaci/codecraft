@@ -269,6 +269,37 @@ pub(crate) fn excerpt(s: &Session, path: &Path, line0: usize, before: usize, aft
         .join("\n")
 }
 
+/// Frame names longer than this lose their parameter list in agent results.
+const MAX_FRAME_NAME: usize = 120;
+
+/// A frame's function name for agents: libc++'s inline namespace dropped (`std::__1::` →
+/// `std::`), and a C++ signature longer than [`MAX_FRAME_NAME`] shortened to `name(…)` (QA M14:
+/// a crash in `lookup(const std::map<std::string, int>&, …)` spelled out 500 characters of
+/// template arguments).
+pub(crate) fn short_frame_name(name: &str) -> String {
+    let name = name.replace("std::__1::", "std::");
+    if name.chars().count() <= MAX_FRAME_NAME {
+        return name;
+    }
+    // The parameter list: the first `(` outside template brackets.
+    let mut depth = 0i32;
+    for (i, c) in name.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            '(' if depth <= 0 && i > 0 => {
+                let head = name.get(..i).unwrap_or(&name);
+                if head.chars().count() <= MAX_FRAME_NAME {
+                    return format!("{head}(…)");
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    clip(&name, MAX_FRAME_NAME)
+}
+
 fn severity_rank(sev: Severity) -> u8 {
     match sev {
         Severity::Error => 3,
@@ -474,6 +505,38 @@ fn problems(s: &mut Session, p: &Value) -> CmdResult {
             out.push((severity_rank(pr.severity), v));
         }
     }
+    // The open findings of the last Inspect Code run (QA M14: `problems` right after `inspect`
+    // said "no problems are known"), with the id `analysis.fix` / `analysis.suppress` take.
+    if let Some(r) = &s.inspections.results {
+        let mut findings: Vec<&crate::inspections::Finding> = r
+            .open()
+            .filter(|f| scope.as_ref().is_none_or(|sc| f.path.starts_with(sc)))
+            .filter(|f| severity_rank(f.severity) >= severity_rank(min))
+            .collect();
+        findings.sort_by(|a, b| (&a.path, a.start.line, a.start.column).cmp(&(&b.path, b.start.line, b.start.column)));
+        for f in findings {
+            let mut v = json!({
+                "file": f.path,
+                "line": f.start.line + 1,
+                "column": f.start.column + 1,
+                "endLine": f.end.line + 1,
+                "severity": severity_id(f.severity),
+                "message": clip(&f.message, 2000),
+                "source": "analysis",
+                "analyzer": f.tool.id(),
+                "id": f.id,
+            });
+            if let (Some(code), Some(o)) = (&f.code, v.as_object_mut()) {
+                o.insert("code".into(), json!(code));
+            }
+            if !f.fixes.is_empty()
+                && let Some(o) = v.as_object_mut()
+            {
+                o.insert("fixable".into(), json!(true));
+            }
+            out.push((severity_rank(f.severity), v));
+        }
+    }
     // Errors first, then by file and line (the map is already ordered by file).
     out.sort_by_key(|a| std::cmp::Reverse(a.0));
     let total = out.len();
@@ -565,7 +628,7 @@ pub(crate) fn stop_summary(s: &Session, frames: usize, context: usize) -> Value 
                 .map(|(i, f)| {
                     let mut v = Map::new();
                     v.insert("index".into(), json!(i));
-                    v.insert("name".into(), json!(f.name));
+                    v.insert("name".into(), json!(short_frame_name(&f.name)));
                     if let Some(path) = &f.path {
                         v.insert("file".into(), json!(path));
                         v.insert("line".into(), json!(f.line + 1));
@@ -914,43 +977,83 @@ fn hotspots(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::Disabled(why));
     }
     let status = s.execute("profiler.status", &Value::Null)?;
-    let methods = s.execute("profiler.methods", &json!({ "limit": limit }))?;
-    let list: Vec<Value> = methods
+    // More than `limit`, to find the project's own functions below library code.
+    let methods = s.execute("profiler.methods", &json!({ "limit": limit.max(PROJECT_SCAN) }))?;
+    let root = s.project_root();
+    let all: Vec<Value> = methods
         .as_array()
-        .map(|a| {
-            a.iter()
-                .map(|m| {
-                    let mut o = Map::new();
-                    for key in ["name", "module", "selfPercent", "totalPercent", "self", "total"] {
-                        if let Some(v) = m.get(key).filter(|v| !v.is_null()) {
-                            o.insert(key.into(), v.clone());
-                        }
-                    }
-                    if let Some(loc) = m.get("location").and_then(Value::as_str) {
-                        match loc.rsplit_once(':').and_then(|(f, l)| l.parse::<usize>().ok().map(|l| (f, l))) {
-                            Some((file, line)) => {
-                                o.insert("file".into(), json!(file));
-                                o.insert("line".into(), json!(line));
-                            }
-                            None => {
-                                o.insert("file".into(), json!(loc));
-                            }
-                        }
-                    }
-                    Value::Object(o)
-                })
-                .collect()
-        })
+        .map(|a| a.iter().map(|m| hotspot_json(m, root.as_deref())).collect())
         .unwrap_or_default();
+    let list: Vec<Value> = all.iter().take(limit).cloned().collect();
     let snap = status.get("snapshot").cloned().unwrap_or(Value::Null);
-    Ok(json!({
+    let memory = snap.get("unit").and_then(Value::as_str).is_some_and(|u| u == "bytes");
+    let note = if memory {
+        "selfPercent: share of the bytes allocated in the function itself; totalPercent: including what it calls"
+    } else {
+        "selfPercent: time in the function itself; totalPercent: including what it calls"
+    };
+    let mut out = json!({
         "snapshot": snap.get("path"),
         "unit": snap.get("unit"),
         "samples": snap.get("samples"),
         "total": snap.get("total"),
         "hotspots": list,
-        "note": "selfPercent: time in the function itself; totalPercent: including what it calls",
-    }))
+        "note": note,
+    });
+    // When library code (the standard library, the interpreter's import machinery) fills the top
+    // of the list, the project's own functions come separately (QA M14: a tracemalloc report
+    // showed only `<frozen importlib._bootstrap>` frames).
+    let in_project = |v: &Value| v.get("inProject") == Some(&Value::Bool(true));
+    if !list.iter().take(5).all(in_project) {
+        let own: Vec<Value> = all.iter().filter(|v| in_project(v)).take(10).cloned().collect();
+        if let Some(o) = out.as_object_mut()
+            && !own.is_empty()
+        {
+            o.insert("projectHotspots".into(), json!(own));
+        }
+    }
+    Ok(out)
+}
+
+/// Methods read to find the project's own hotspots.
+const PROJECT_SCAN: usize = 2000;
+
+/// One method of `profiler.methods` for agents: file and 1-based line apart, `inProject` when
+/// the function is in the project's files.
+fn hotspot_json(m: &Value, root: Option<&Path>) -> Value {
+    let mut o = Map::new();
+    for key in ["name", "module", "selfPercent", "totalPercent", "self", "total"] {
+        if let Some(v) = m.get(key).filter(|v| !v.is_null()) {
+            o.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(loc) = m.get("location").and_then(Value::as_str) {
+        let (file, line) = match loc.rsplit_once(':').and_then(|(f, l)| l.parse::<usize>().ok().map(|l| (f, l))) {
+            Some((file, line)) => (file, Some(line)),
+            None => (loc, None),
+        };
+        let path = Path::new(file);
+        let inside = root.is_some_and(|r| {
+            if path.is_absolute() {
+                path.starts_with(r) || crate::normalize_path(path).starts_with(r)
+            } else {
+                !file.starts_with('<') && !file.starts_with('~') && r.join(path).is_file()
+            }
+        });
+        // Paths relative to the project (cProfile's script names) become absolute.
+        let shown = match root {
+            Some(r) if inside && path.is_relative() => r.join(path).display().to_string(),
+            _ => file.to_string(),
+        };
+        o.insert("file".into(), json!(shown));
+        if let Some(line) = line {
+            o.insert("line".into(), json!(line));
+        }
+        if inside {
+            o.insert("inProject".into(), json!(true));
+        }
+    }
+    Value::Object(o)
 }
 
 // ---------------------------------------------------------------- language servers
@@ -1436,5 +1539,18 @@ mod tests {
         assert!(page["truncated"].is_string());
         assert_eq!(s.execute("run.configurations", &Value::Null).unwrap(), json!([]));
         assert!(s.execute("project.info", &Value::Null).unwrap()["project"].is_null());
+    }
+
+    #[test]
+    fn long_cpp_frame_names_are_shortened() {
+        let long = "lookup(std::__1::map<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>, int, std::__1::less<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>>>, std::__1::allocator<std::__1::pair<std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const, int>>> const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&)";
+        assert_eq!(short_frame_name(long), "lookup(…)");
+        assert_eq!(short_frame_name("main"), "main");
+        assert_eq!(short_frame_name("std::__1::vector<int>::push_back(int&&)"), "std::vector<int>::push_back(int&&)");
+        assert_eq!(short_frame_name("shop::tests::total_of_two::{closure#0}"), "shop::tests::total_of_two::{closure#0}");
+        let weird = "x".repeat(500);
+        assert!(short_frame_name(&weird).chars().count() <= MAX_FRAME_NAME + 1);
+        let template = format!("f<{}>(int)", "a(b)".repeat(100));
+        assert!(short_frame_name(&template).chars().count() <= MAX_FRAME_NAME + 3);
     }
 }

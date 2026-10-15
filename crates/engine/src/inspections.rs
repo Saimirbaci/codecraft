@@ -601,6 +601,23 @@ impl ResolvedScope {
     }
 }
 
+/// Whether a path (relative to the scope's directory) is inside generated build output: CMake
+/// build directories (`cmake-build-debug`, `CMakeFiles` with CMake's own compiler-check sources),
+/// `node_modules`, `__pycache__`, virtual environments. CLion and PyCharm exclude these from
+/// inspections (QA M14: clang-tidy and clangd analysed CMake's `CMakeCXXCompilerId.cpp`).
+pub(crate) fn in_build_output(rel: &Path) -> bool {
+    let mut parts = rel.components().filter_map(|c| match c {
+        std::path::Component::Normal(n) => n.to_str(),
+        _ => None,
+    });
+    // Only the directories count (a file may be called anything).
+    let _ = parts.next_back();
+    parts.any(|d| {
+        d.starts_with("cmake-build-")
+            || matches!(d, "CMakeFiles" | "node_modules" | "__pycache__" | ".venv" | "venv" | ".tox" | ".mypy_cache" | ".git")
+    })
+}
+
 pub(crate) fn resolve_scope(s: &Session, kind: ScopeKind, path: Option<PathBuf>) -> Result<ResolvedScope, CommandError> {
     resolve_scope_with(s, kind, path, None)
 }
@@ -620,9 +637,13 @@ pub(crate) fn resolve_scope_with(
     };
     let tree_files = |under: &Path| -> Vec<PathBuf> {
         match &s.ws.project {
-            Some(p) => {
-                p.tree.files().filter(|n| n.path.starts_with(under)).map(|n| n.path.clone()).take(MAX_SCOPE_FILES).collect()
-            }
+            Some(p) => p
+                .tree
+                .files()
+                .filter(|n| n.path.strip_prefix(under).is_ok_and(|r| !in_build_output(r)))
+                .map(|n| n.path.clone())
+                .take(MAX_SCOPE_FILES)
+                .collect(),
             None => Vec::new(),
         }
     };
@@ -1638,5 +1659,22 @@ mod tests {
         assert_eq!(resolve_path(Path::new("/w"), "src/main.rs"), PathBuf::from("/w/src/main.rs"));
         assert_eq!(resolve_path(Path::new("/w"), "/abs/x.rs"), PathBuf::from("/abs/x.rs"));
         assert_eq!(resolve_path(Path::new("/w"), "./a/../b.py"), PathBuf::from("/w/b.py"));
+    }
+
+    /// QA M14: Inspect Code on a CMake project analysed CMake's own compiler-check sources.
+    #[test]
+    fn build_output_is_not_in_scope() {
+        for p in [
+            "cmake-build-debug/CMakeFiles/4.3.0/CompilerIdCXX/CMakeCXXCompilerId.cpp",
+            "build/CMakeFiles/x.c",
+            "web/node_modules/a/index.js",
+            "pkg/__pycache__/m.py",
+            ".venv/lib/site.py",
+        ] {
+            assert!(super::in_build_output(Path::new(p)), "{p}");
+        }
+        for p in ["main.cpp", "src/build.rs", "cmake-build-notes.md", "src/venv.py", "docs/CMakeFiles.md"] {
+            assert!(!super::in_build_output(Path::new(p)), "{p}");
+        }
     }
 }

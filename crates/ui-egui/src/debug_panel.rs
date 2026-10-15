@@ -108,7 +108,7 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
 
 fn header(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
     let debug = &s.debug;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let bp_count = debug.breakpoints.len();
         for (tab, label, key) in [
             (DebugTab::Variables, "Threads & Variables".to_owned(), "variables"),
@@ -130,8 +130,23 @@ fn header(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
         }
         ui.add_space(6.0);
         toolbar(ui, s, theme, actions);
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| status_label(ui, debug, theme));
+        // Without a session the panel's body says so (and how to start one).
+        if debug.session.is_some() {
+            crate::panels::trailing(ui, status_width(ui, debug), |ui| status_label(ui, debug, theme));
+        }
     });
+}
+
+/// About the width [`status_label`] takes.
+fn status_width(ui: &Ui, debug: &DebugState) -> f32 {
+    let Some(session) = &debug.session else { return 0.0 };
+    let mut text = session.status().label();
+    if text.chars().count() > 80 {
+        text = text.chars().take(80).collect::<String>() + "…";
+    }
+    crate::panels::text_width(ui, &text, egui::TextStyle::Body)
+        + crate::panels::text_width(ui, &session.name, egui::TextStyle::Body)
+        + 48.0
 }
 
 fn shortcut_tip(label: &str, id: &str) -> String {

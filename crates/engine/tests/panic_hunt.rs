@@ -99,6 +99,12 @@ fn skip(id: &str, params: &Value) -> bool {
     {
         return true;
     }
+    // Python Packages runs the project interpreter's pip: `install`/`uninstall`/`upgrade` with
+    // the hostile `{"package": "x", "name": "y"}` ran `pip install y` against the machine's
+    // Python, and listing asks PyPI for outdated packages (network). QA M14.
+    if id.starts_with("python.packages.") {
+        return true;
+    }
     // Analysis jobs start every installed analyzer (clang, clangd, rust-analyzer…) and installs
     // run uv (analysis_ca tests drive them with fakes; M14 CA).
     if matches!(id, "analysis.run" | "analysis.installTool") && !params.is_null() {
