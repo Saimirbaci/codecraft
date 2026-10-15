@@ -83,6 +83,12 @@ fn position_props() -> Value {
     })
 }
 
+/// The order of profile hotspots.
+fn hotspot_sort() -> Value {
+    json!({ "type": "string", "enum": ["self", "total"], "default": "self",
+            "description": "self: by time (or bytes) in the function itself, then total; total: including callees, then self; ties by name and location" })
+}
+
 fn config_ref() -> Value {
     json!({ "description": "A run configuration: its name, or its index from run_configurations",
             "oneOf": [{ "type": "string" }, { "type": "integer", "minimum": 0 }] })
@@ -340,7 +346,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
         // ----------------------------------------------------------- profiling
         tool(
             PROFILE_START,
-            "Profile a run configuration or a command line: CPU (xctrace/samply/perf for native code, py-spy/cProfile for \
+            "Profile a run configuration, a command line or the test at a source line (`test`): CPU (xctrace/samply/perf for native code, py-spy/cProfile for \
              Python) or memory (`kind: memory`: leaks/heaptrack for native code, tracemalloc/memray for Python). Cargo and \
              CMake targets are built first. Stop it with profile_stop, or let the program finish and call profile_hotspots",
             json!({
@@ -350,21 +356,38 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "kind": { "type": "string", "enum": ["cpu", "memory"], "default": "cpu" },
                 "tool": { "type": "string", "description": "A specific profiler: xctrace, samply, perf, py-spy, cProfile, tracemalloc, memray, leaks, heaptrack" },
                 "seconds": { "type": "number", "minimum": 0, "description": "Stop recording after this many seconds" },
+                "test": {
+                    "type": "object",
+                    "description": "Instead of `config`/`command`: profile the test at a source line, like the gutter's run icon \
+                        (Rust `cargo test --lib name -- --exact`, pytest `file::test`, GoogleTest/Catch2/doctest/Boost.Test filters)",
+                    "properties": { "path": path("The test's file"), "line": line("A line of the test") },
+                    "required": ["path", "line"],
+                },
+                "interval": { "type": "number", "minimum": 0, "description": "Memory profiles with tracemalloc: seconds between memory samples (default 0.1; 0 = only the snapshot at the end). The report then has the memory over time and the top allocations at the peak" },
             }),
             &[],
         ),
         tool(
             PROFILE_STOP,
             "Stop the recording and wait for the snapshot; returns the hotspots (like profile_hotspots)",
-            json!({ "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }, "timeoutMs": timeout(120_000) }),
+            json!({
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 },
+                "sort": hotspot_sort(),
+                "timeoutMs": timeout(120_000),
+            }),
             &[],
         ),
         tool(
             PROFILE_HOTSPOTS,
             "The open profiler snapshot's hottest functions: [{name, selfPercent, totalPercent, self, total, file, line}], \
              plus `report` (hottest lines with their code, top functions by total time, notes on missing symbols \
-             or debug builds). Waits for a recording that is still running or loading",
-            json!({ "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }, "timeoutMs": timeout(120_000) }),
+             or debug builds, memory over time for tracemalloc). The order is fixed (see `sort`), whatever the IDE's \
+             Method List shows. Waits for a recording that is still running or loading",
+            json!({
+                "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 },
+                "sort": hotspot_sort(),
+                "timeoutMs": timeout(120_000),
+            }),
             &[],
         ),
         // ----------------------------------------------------------- tests

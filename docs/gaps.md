@@ -424,8 +424,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     are built first and only the program is recorded; the Run window's Stop stops a recording
     like Ctrl+C; xctrace (macOS) and `sample`/`atos` reports are symbolicated to file:line;
     timeline, memory profiling and snapshot diff exist; macOS attach works through xctrace.
-    Remaining: samply's `--save-only` snapshots stay unsymbolicated (no symbol files read);
-    snapshots are parsed whole into memory; no profiling on Docker/SSH targets; no Chrome trace
+    Remaining: samply's `--save-only` snapshots are symbolicated by CodeCraft since M15 (item
+    59: `atos`/`addr2line`, samply's presymbolication file) but not from separate symbol
+    servers or `.dSYM`/`debuglink` files the tools don't find; snapshots are parsed whole into
+    memory; no profiling on Docker/SSH targets; no Chrome trace
     format; py-spy needs root on macOS; speedscope files with mixed units keep only the first
     unit's profiles (memray's: the bytes, not the allocation counts).
 35. SQL in Rust strings (track Q): SQL detected in sqlx/diesel/rusqlite/postgres calls and after
@@ -988,18 +990,15 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Remaining: xctrace's Allocations template hangs when launched non-interactively here, so
     native memory on macOS is "live at exit" from `leaks` (no allocation history, no peak); the
     Time Profiler needs about half a second to start sampling, so very short programs get no
-    samples; tracemalloc takes one snapshot when the program ends (no periodic snapshots or
-    peak snapshot; diff two runs with `profiler.compare`); cProfile's call tree is
-    reconstructed (times are split by edge, recursion is cut) and the deterministic overhead
-    inflates small functions; per-line statistics and the gutter cover all threads (not the
-    thread filter), and timelines exist only for xctrace snapshots (Gecko sample times are not
-    read); no time-range selection on the timeline; diff colours compare shares of each total
-    (not absolute time) and match paths by function name; Cargo test targets with several
-    executables (`cargo test` without `--lib`/`--test`) must be narrowed first; profiling a
-    test or bench at the caret (gutter) is not offered yet (agents pass a `cargo test name` or
-    `pytest` command); py-spy, heaptrack and perf were exercised only through fakes (py-spy
-    needs root on macOS; heaptrack and perf are Linux-only); the memray test doesn't run by
-    default; no Docker/SSH targets.
+    samples; cProfile's call tree is reconstructed (times are split by edge, recursion is cut)
+    and the deterministic overhead inflates small functions; diff colours compare shares of
+    each total (not absolute time) and match paths by function name; Cargo test targets with
+    several executables (`cargo test` without `--lib`/`--test`) must be narrowed first; py-spy,
+    heaptrack and perf were exercised only through fakes (py-spy needs root on macOS; heaptrack
+    and perf are Linux-only); the memray test doesn't run by default; no Docker/SSH targets.
+    M15 track PP (item 59) closed: tracemalloc's periodic snapshots with the peak, per-thread
+    line statistics and gutter marks, Gecko/samply sample times, the time-range selection, and
+    profiling the test at the caret.
 
 56. QA hands-on pass (track QA, `docs/qa-m14.md`): every tool window, the main dialogs and the
     M14 settings pages painted at 1280×800 and 900×700 in both themes with realistic content
@@ -1027,7 +1026,77 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     on the UI thread (seconds in the panic hunt); cargo-deny's
     network fetch in the default Rust profile, LLDB's "no plugin for rust" line in Rust debug
     output, C++ reference locals showing addresses, the JUnit temp path in `test_run`'s command
-    line and `command_line` in `inspect`'s tool list, hotspot order following the IDE's method
-    sort, no interpreter picker on Settings › Python, absolute test locations in the Run window;
+    line and `command_line` in `inspect`'s tool list, no interpreter picker on Settings › Python
+    (the hotspot order following the IDE's method sort was fixed by M15 PP, item 59), absolute test locations in the Run window;
     the gallery leaves out the Terminal, Python Console, Rust REPL, a Git repository and remote
     windows.
+
+## M15 (2026-10-15)
+
+59. Profiling polish (track PP): **Profile the test at the caret** — the gutter ▶ menu has
+    Profile and Profile Memory (`profiler.atCaret {path?, line? (0-based), kind?, tool?,
+    seconds?, interval?}`, the caret by default) and agents pass `profiler.record {test: {path,
+    line (1-based)}}` / `profile_start {test}`: what the ▶ runs there is planned like Run ›
+    Profile — the Rust test as `cargo test --lib name -- --exact` (built with `--no-run`, then
+    only that test is recorded), pytest `file::test` (`python -m cProfile … -m pytest …`), a
+    GoogleTest/Catch2/doctest/Boost.Test test or suite through its CMake target and the
+    framework's filter, a module's tests or `main`. **samply snapshots symbolicated**: frames
+    that samply's `--save-only` leaves as library-relative addresses are looked up in samply's
+    presymbolication file (`<profile>.syms.json`, `--unstable-presymbolicate`) when present, then
+    with `atos -o lib -l base` on macOS or `addr2line -f -C` elsewhere, per library and in
+    batches (`gecko::unresolved_libs` / `parse_with_symbols`, `profiler_convert::Convert::Samply`);
+    symbolicated frames fold into functions with per-line statistics and a note says how many
+    addresses were resolved and with what. Gecko/processed profiles' sample times (`time` or
+    `timeDeltas`) are read, so samply snapshots get the threads timeline too. **Timed samples
+    and selections** (`codecraft_profile::Selection {thread, range}`): profiles with sample
+    times keep each sample (thread, stack, the lines its frames were at, time), so
+    `Analysis::select` builds the call tree, flame graph, method list and per-line statistics of
+    one thread and/or a time range; per-thread line statistics are kept for every profile with
+    lines. **Threads timeline**: drag across the strips to select a range (a time axis, the rest
+    dimmed; a click still picks a thread), a ⏱ chip in the toolbar and Whole Run clear it, and
+    every view, the Method List's hot lines and the editor gutter's heat marks follow the
+    selected thread and range (`profiler.selectRange {startMs?, endMs?}`; `profiler.status`
+    reports `range`, `selection`, `hasSampleTimes`). Agents: `profiler.report`,
+    `profiler.hotspots` and `profiler.lineHits` take `thread` (index or name) and `range:
+    {startMs, endMs}`. **Python memory over time**: the tracemalloc helper samples the traced
+    memory every `interval` seconds (default 0.1; `interval: 0` = the old single snapshot) on a
+    background thread, takes a snapshot whenever live memory reaches a new high (10 % above the
+    last; the snapshot's own memory is subtracted) and writes the snapshot nearest the peak next
+    to the profile (`….peak.json`); the profile carries `memory` (points, peak, when, the top
+    allocation sites at the peak with their callers). A Memory view (chart of live memory and
+    per-interval peaks, the snapshot marker, the allocations at the peak — click to open the
+    line —, Open Snapshot at Peak), `profiler.memory`, `profiler.openPeakSnapshot`,
+    `profiler.openLocation`, and a `memory` section in `profiler.report`. **Agent hotspots in a
+    fixed order** (QA M14 #25): `codecraft_profile::hotspots` orders by self (default) or total
+    weight, then the other, then name, file:line, module, frame — independent of the Method
+    List's sort and of the IDE's thread/range selection; `sort: self|total` on
+    `profiler.hotspots`, `profiler.report`, `profile_hotspots` and `profile_stop` (MCP schema:
+    `sort`, plus `test` and `interval` on `profile_start`, additive), answers say `sort` and
+    `order`. **Stop stops the build**: Run › Stop (the Run window's ■ and the toolbar) found no
+    process during a profile's Cargo build (it runs outside the Run window's processes) and said
+    "Nothing is running"; it now cancels the build and fails the job ("the build was stopped"),
+    and Stop All / closing the project cancel profile builds too. Tests: profile crate (timed
+    selections, per-thread lines, thread index remapping, hotspot order, Gecko times, unresolved
+    addresses, symbols and the presymbolication file, the memory timeline, hostile input),
+    engine unit tests (time ranges and threads through every view and the gutter on a two-thread
+    xctrace export, QA #25 regression, report/lineHits params, profile at the caret with a fake
+    py-spy, atos/addr2line parsing and a fake addr2line), real tools in
+    `crates/engine/tests/profiler_pp.rs` (xctrace on the Rust test at the caret with a time range
+    splitting its two phases, cProfile on the pytest test at the caret, tracemalloc's periodic
+    snapshots and the peak, Stop during a real Cargo build) and in `profiler_convert` (real
+    `atos` on a clang-built binary), egui_kittest `ui-egui/tests/profiler_pp_ui.rs` (dragging a
+    range on the timeline, the Memory view, Profile in the gutter menu).
+    Remaining: samply itself isn't installed here, so its `--save-only` output and the
+    presymbolication file were exercised through fixtures written from samply's documented
+    format (the `atos` path ran for real on a binary built here); symbols come only from the
+    files at the libraries' recorded paths (no symbol servers, no separate `.dSYM` search beyond
+    what `atos` does, no Windows); inlined frames are not expanded (one function per address);
+    time ranges apply to xctrace and samply/Gecko snapshots (cProfile, tracemalloc, collapsed
+    stacks, speedscope and perf script have no per-sample times here); the timeline's range is
+    one span per drag (no zooming into the strips, no range per thread); timed samples are kept
+    up to 4 M (later samples still count, but not in ranges); tracemalloc samples on a Python
+    thread (busy native code without the GIL delays a sample) and the peak snapshot is taken at
+    a sample, so a short spike between samples is in `peak` but not in the snapshot; profiling a
+    pytest test also records it in the Test Runner (the run gets the usual JUnit report); C++
+    tests whose configuration falls back to `ctest -R` profile ctest rather than the test
+    binary; profiling a test on a Docker/SSH target is not offered.

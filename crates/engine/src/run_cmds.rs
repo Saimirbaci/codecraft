@@ -151,10 +151,12 @@ fn stop(s: &mut Session, _: &Value) -> CmdResult {
         crate::debug::stop(s);
         return ok();
     }
+    // A profile's Cargo build runs outside the Run window's processes: Stop stops it too (M15 PP).
+    let running = |s: &Session, t: codecraft_workspace::RunTabId| s.runs.is_running(t) || s.profiler.builds_in(t);
     let target =
         s.ws.active_run
-            .filter(|t| s.runs.is_running(*t))
-            .or_else(|| s.ws.runs.iter().rev().find(|r| s.runs.is_running(r.id)).map(|r| r.id));
+            .filter(|t| running(s, *t))
+            .or_else(|| s.ws.runs.iter().rev().find(|r| running(s, r.id)).map(|r| r.id));
     match target {
         Some(t) => {
             // A profiling run stops like Ctrl+C, so the profiler still writes its snapshot.

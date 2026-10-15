@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Profile;
+use crate::model::{LineStat, Profile, Selection};
 
 /// One node of the call tree: a frame reached through a particular path from a root.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,19 +34,13 @@ pub struct CallTree {
 impl CallTree {
     /// The call tree of one thread (`Some(index)`) or of all threads merged (`None`).
     pub fn build(p: &Profile, thread: Option<usize>) -> Self {
+        Self::build_selection(p, &Selection { thread, range: None })
+    }
+
+    /// The call tree of a selection: one thread or all, a time range or the whole run.
+    pub fn build_selection(p: &Profile, sel: &Selection) -> Self {
         let n = p.stacks.len();
-        let mut weight = vec![0u64; n];
-        let threads: Vec<&crate::model::Thread> = match thread {
-            Some(i) => p.threads.get(i).into_iter().collect(),
-            None => p.threads.iter().collect(),
-        };
-        for t in threads {
-            for (stack, w) in &t.weights {
-                if let Some(slot) = weight.get_mut(*stack as usize) {
-                    *slot = slot.saturating_add(*w);
-                }
-            }
-        }
+        let mut weight = p.stack_weights(sel);
         let self_weight = weight.clone();
         // Children have larger indices than their parents: one reverse pass sums the totals.
         for i in (0..n).rev() {
@@ -484,22 +478,114 @@ pub fn compare(a: &Profile, a_methods: &[MethodStat], b: &Profile, b_methods: &[
     out
 }
 
-/// Everything the Profiler tool window shows for one thread selection.
+/// Everything the Profiler tool window shows for one selection (a thread or all, a time range
+/// or the whole run).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Analysis {
     pub thread: Option<usize>,
+    /// The selected time range (nanoseconds since the first sample), when one applies.
+    #[serde(default)]
+    pub range: Option<(u64, u64)>,
     pub tree: CallTree,
     pub flame: FlameGraph,
     pub methods: Vec<MethodStat>,
+    /// The selection's per-line weights; `None` = the profile's own ([`Profile::lines`]).
+    #[serde(default)]
+    pub lines: Option<Vec<LineStat>>,
+    /// Samples in the selection.
+    #[serde(default)]
+    pub samples: u64,
 }
 
 impl Analysis {
     pub fn new(p: &Profile, thread: Option<usize>) -> Self {
-        let tree = CallTree::build(p, thread);
+        Self::select(p, &Selection { thread, range: None })
+    }
+
+    /// The analysis of a selection.
+    pub fn select(p: &Profile, sel: &Selection) -> Self {
+        let range = p.effective_range(sel);
+        let sel = Selection { thread: sel.thread, range };
+        let tree = CallTree::build_selection(p, &sel);
         let flame = FlameGraph::build(p, &tree);
         let methods = methods(p, &tree);
-        Self { thread, tree, flame, methods }
+        let lines = p.selection_lines(&sel);
+        let samples = p.selection_samples(&sel);
+        Self { thread: sel.thread, range, tree, flame, methods, lines, samples }
     }
+
+    /// The selection.
+    pub fn selection(&self) -> Selection {
+        Selection { thread: self.thread, range: self.range }
+    }
+
+    /// The per-line weights of the selection, sorted by `(frame, line)`.
+    pub fn lines<'a>(&'a self, p: &'a Profile) -> &'a [LineStat] {
+        self.lines.as_deref().unwrap_or(&p.lines)
+    }
+
+    /// The selection's line statistics of one frame.
+    pub fn lines_of<'a>(&'a self, p: &'a Profile, frame: u32) -> &'a [LineStat] {
+        let lines = self.lines(p);
+        let start = lines.partition_point(|l| l.frame < frame);
+        let end = lines.partition_point(|l| l.frame <= frame);
+        lines.get(start..end.max(start)).unwrap_or(&[])
+    }
+}
+
+/// How agents' hotspot lists are ordered (independent of the Method List's display sort).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HotspotOrder {
+    /// Self weight, then total weight, heaviest first.
+    #[default]
+    SelfWeight,
+    /// Total weight, then self weight, heaviest first.
+    Total,
+}
+
+impl HotspotOrder {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "self" | "selfweight" | "self_weight" => Some(Self::SelfWeight),
+            "total" | "cumulative" | "inclusive" => Some(Self::Total),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SelfWeight => "self",
+            Self::Total => "total",
+        }
+    }
+}
+
+/// The method list in a fixed, documented order: by the order's primary weight (descending),
+/// then the other weight (descending), then the function name, its file:line and module
+/// (ascending), then the frame id. The same profile always gives the same list.
+pub fn hotspots(p: &Profile, methods: &[MethodStat], order: HotspotOrder) -> Vec<MethodStat> {
+    type Key<'a> = (std::cmp::Reverse<(u64, u64)>, &'a str, String, &'a str, u32);
+    let mut keyed: Vec<(Key<'_>, MethodStat)> = methods
+        .iter()
+        .map(|m| {
+            let weights = match order {
+                HotspotOrder::SelfWeight => (m.self_weight, m.total),
+                HotspotOrder::Total => (m.total, m.self_weight),
+            };
+            let f = p.frame(m.frame);
+            let key = (
+                std::cmp::Reverse(weights),
+                f.map_or("", |f| f.name.as_str()),
+                f.and_then(crate::model::Frame::location).unwrap_or_default(),
+                f.and_then(|f| f.module.as_deref()).unwrap_or(""),
+                m.frame,
+            );
+            (key, *m)
+        })
+        .collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed.into_iter().map(|(_, m)| m).collect()
 }
 
 #[cfg(test)]
@@ -628,6 +714,53 @@ mod tests {
         assert_eq!((get("leaf").a_self, get("leaf").b_self), (6, 12));
         assert_eq!((get("new").a_self, get("new").b_self), (0, 4));
         assert_eq!(get("main").a_total, 10);
+    }
+
+    #[test]
+    fn analysis_of_a_time_range_and_fixed_hotspot_order() {
+        use crate::model::{Format, Frame, ProfileBuilder, Unit, fold_lines};
+        let mut b = ProfileBuilder::new(Format::Xctrace, Unit::Nanoseconds);
+        let at = |name: &str, line: u32| Frame { name: name.into(), file: Some("a.c".into()), line: Some(line), module: None };
+        let main = b.frame(at("main", 1)).unwrap();
+        let early = b.frame(at("early", 3)).unwrap();
+        let late = b.frame(at("late", 7)).unwrap();
+        let se = b.stack_of(&[main, early]).unwrap().unwrap();
+        let sl = b.stack_of(&[main, late]).unwrap().unwrap();
+        let t = b.thread("t").unwrap();
+        for i in 0..10u64 {
+            b.sample_at(t, if i < 6 { se } else { sl }, 1, i * 1_000_000);
+        }
+        let p = fold_lines(b.finish().unwrap());
+        let whole = Analysis::new(&p, None);
+        assert_eq!((whole.tree.total, whole.samples, whole.range), (10, 10, None));
+        let a = Analysis::select(&p, &Selection { thread: None, range: Some((6_000_000, 9_000_000)) });
+        assert_eq!(a.tree.total, 4);
+        assert_eq!(a.samples, 4);
+        assert_eq!(a.range, Some((6_000_000, 9_000_000)));
+        assert_eq!(a.selection(), Selection { thread: None, range: Some((6_000_000, 9_000_000)) });
+        let names: Vec<&str> = a.methods.iter().map(|m| p.frame(m.frame).unwrap().name.as_str()).collect();
+        assert_eq!(names, vec!["late", "main"]);
+        let late_f = p.frames.iter().position(|f| f.name == "late").unwrap() as u32;
+        let early_f = p.frames.iter().position(|f| f.name == "early").unwrap() as u32;
+        assert_eq!(a.lines_of(&p, late_f).len(), 1);
+        assert!(a.lines_of(&p, early_f).is_empty());
+        assert_eq!(whole.lines_of(&p, early_f)[0].self_weight, 6);
+        // Hotspots: a fixed order by the chosen weight, ties by name.
+        let q = profile("main;b 5\nmain;a 5\nmain;c 3\nmain;c;d 9\n");
+        let qa = Analysis::new(&q, None);
+        let by_self: Vec<&str> =
+            hotspots(&q, &qa.methods, HotspotOrder::SelfWeight).iter().map(|m| q.frame(m.frame).unwrap().name.as_str()).collect();
+        assert_eq!(by_self, vec!["d", "a", "b", "c", "main"]);
+        let by_total: Vec<&str> =
+            hotspots(&q, &qa.methods, HotspotOrder::Total).iter().map(|m| q.frame(m.frame).unwrap().name.as_str()).collect();
+        assert_eq!(by_total, vec!["main", "c", "d", "a", "b"]);
+        // The same whatever order the methods come in.
+        let mut shuffled = qa.methods.clone();
+        shuffled.reverse();
+        assert_eq!(hotspots(&q, &shuffled, HotspotOrder::Total), hotspots(&q, &qa.methods, HotspotOrder::Total));
+        assert_eq!(HotspotOrder::from_name("TOTAL"), Some(HotspotOrder::Total));
+        assert_eq!(HotspotOrder::from_name("x"), None);
+        assert_eq!(HotspotOrder::default().name(), "self");
     }
 
     #[test]

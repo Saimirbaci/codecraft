@@ -6,14 +6,18 @@
 //!   reconstructed top-down from the roots, splitting each function's time between its callees
 //!   by the edges' cumulative times (like snakeviz and gprof2dot). Recursion is cut.
 //! - tracemalloc snapshots (`{"codecraft": "tracemalloc", "traces": [...]}`): the live
-//!   allocations grouped by traceback (root first), with sizes and counts.
+//!   allocations grouped by traceback (root first), with sizes and counts, plus (M15) the
+//!   traced memory over time and the top allocation sites at the snapshot nearest the peak.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
 use crate::ProfileError;
-use crate::model::{Format, Frame, MAX_DEPTH, Profile, ProfileBuilder, Unit, scaled_weight};
+use crate::model::{
+    Allocation, Format, Frame, MAX_DEPTH, MAX_MEMORY_POINTS, MemoryPoint, MemoryTimeline, Profile, ProfileBuilder, Unit,
+    scaled_weight,
+};
 
 /// Which helper document a JSON value is.
 pub fn kind(v: &Value) -> Option<&str> {
@@ -221,8 +225,86 @@ pub fn parse_tracemalloc(v: &Value) -> Result<Profile, ProfileError> {
     if let Some(when) = v.get("when").and_then(Value::as_str) {
         b.note(format!("Snapshot taken {when}"));
     }
-    let p = b.finish()?;
-    Ok(crate::model::fold_lines(p))
+    let memory = memory_timeline(v);
+    if let Some(m) = &memory {
+        match (m.peak_snapshot_ms, m.peak_snapshot_bytes) {
+            (Some(t), Some(bytes)) => b.note(format!(
+                "Memory peaked at {} around {:.1} s; the snapshot nearest the peak ({:.1} s, {} live) is in `memory.atPeak`",
+                Unit::Bytes.format(m.peak),
+                m.peak_ms.unwrap_or(t) as f64 / 1000.0,
+                t as f64 / 1000.0,
+                Unit::Bytes.format(bytes)
+            )),
+            _ => b.note(format!("Memory peaked at {}", Unit::Bytes.format(m.peak))),
+        }
+    }
+    let mut p = crate::model::fold_lines(b.finish()?);
+    p.memory = memory;
+    Ok(p)
+}
+
+/// The helper's memory timeline: `interval` (s), `timeline: [[ms, current, peak], …]` and
+/// `peakSnapshot: {time, current, file, top: [{name, file, line, size, count, callers}]}`.
+fn memory_timeline(v: &Value) -> Option<MemoryTimeline> {
+    let points: Vec<MemoryPoint> = v
+        .get("timeline")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter_map(|p| {
+            let a = p.as_array()?;
+            let n = |i: usize| a.get(i).and_then(Value::as_f64).map(|x| scaled_weight(x, 1.0));
+            let current = n(1)?;
+            Some(MemoryPoint { time_ms: n(0)?, current, peak: n(2).unwrap_or(current).max(current) })
+        })
+        .take(MAX_MEMORY_POINTS)
+        .collect();
+    let mut points = points;
+    points.sort_by_key(|p| p.time_ms);
+    let best = points.iter().max_by_key(|p| (p.peak, std::cmp::Reverse(p.time_ms))).copied();
+    let peak = v.get("peak").and_then(Value::as_u64).unwrap_or(0).max(best.map_or(0, |b| b.peak));
+    let snap = v.get("peakSnapshot").filter(|s| s.is_object());
+    let at_peak: Vec<Allocation> = snap
+        .and_then(|s| s.get("top"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(500)
+        .filter_map(|a| {
+            let size = a.get("size").and_then(Value::as_u64)?;
+            Some(Allocation {
+                name: a.get("name").and_then(Value::as_str).unwrap_or("<module>").to_string(),
+                file: a.get("file").and_then(Value::as_str).filter(|f| !f.is_empty()).map(str::to_string),
+                line: a.get("line").and_then(Value::as_u64).and_then(|l| u32::try_from(l).ok()).filter(|l| *l > 0),
+                size,
+                count: a.get("count").and_then(Value::as_u64).unwrap_or(0),
+                callers: a
+                    .get("callers")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .take(8)
+                    .map(str::to_string)
+                    .collect(),
+            })
+        })
+        .collect();
+    let interval_ms = v.get("interval").and_then(Value::as_f64).map_or(0, |s| scaled_weight(s, 1000.0));
+    Some(MemoryTimeline {
+        interval_ms,
+        points,
+        peak,
+        peak_ms: best.filter(|b| b.peak > 0).map(|b| b.time_ms),
+        at_peak,
+        peak_snapshot_ms: snap.and_then(|s| s.get("time")).and_then(Value::as_f64).map(|t| scaled_weight(t, 1.0)),
+        peak_snapshot_bytes: snap.and_then(|s| s.get("current")).and_then(Value::as_u64),
+        peak_snapshot_file: snap
+            .and_then(|s| s.get("file"))
+            .and_then(Value::as_str)
+            // A file name next to the snapshot, never a path elsewhere.
+            .filter(|f| !f.is_empty() && !f.contains('/') && !f.contains('\\') && *f != "..")
+            .map(str::to_string),
+    })
 }
 
 #[cfg(test)]
@@ -361,5 +443,47 @@ mod tests {
         let _ = parse_cprofile(&cyc);
         assert!(parse_tracemalloc(&json!({ "traces": "x" })).is_err());
         assert!(parse_tracemalloc(&json!({ "traces": [{ "size": 5, "frames": [{}] }] })).is_ok());
+    }
+
+    /// The helper's periodic memory samples and the snapshot nearest the peak.
+    #[test]
+    fn tracemalloc_memory_timeline() {
+        let doc = json!({
+            "codecraft": "tracemalloc", "current": 1000, "peak": 50_000, "when": "when the program ended",
+            "traces": [{ "size": 1000, "count": 1, "frames": [{ "name": "main", "file": "app.py", "line": 3 }] }],
+            "interval": 0.1,
+            "timeline": [[100.0, 2000, 2500], [200.0, 40_000, 50_000], [300.0, 1000, 40_000], ["x"], [400.0], 7],
+            "peakSnapshot": {
+                "time": 200.0, "current": 40_000, "file": "run.tracemalloc.peak.json",
+                "top": [
+                    { "name": "build", "file": "app.py", "line": 9, "size": 39_000, "count": 300, "callers": ["main (app.py:3)"] },
+                    { "name": "<module>", "file": "", "line": 0, "size": 1000 },
+                    { "size": "big" }
+                ]
+            }
+        });
+        let p = parse_tracemalloc(&doc).unwrap();
+        let m = p.memory.as_ref().unwrap();
+        assert_eq!(m.interval_ms, 100);
+        assert_eq!(m.points.len(), 3);
+        assert_eq!(m.peak, 50_000);
+        assert_eq!(m.peak_ms, Some(200));
+        assert_eq!(m.peak_snapshot_ms, Some(200));
+        assert_eq!(m.peak_snapshot_bytes, Some(40_000));
+        assert_eq!(m.peak_snapshot_file.as_deref(), Some("run.tracemalloc.peak.json"));
+        assert_eq!(m.at_peak.len(), 2);
+        assert_eq!((m.at_peak[0].name.as_str(), m.at_peak[0].line, m.at_peak[0].size), ("build", Some(9), 39_000));
+        assert_eq!(m.at_peak[0].callers, vec!["main (app.py:3)".to_string()]);
+        assert_eq!((m.at_peak[1].file.as_deref(), m.at_peak[1].line), (None, None));
+        assert!(p.notes.iter().any(|n| n.contains("peaked at")), "{:?}", p.notes);
+        // The live allocations at the end are the profile itself.
+        assert_eq!(p.total(), 1000);
+        // A peak file that points elsewhere is ignored; no timeline = no memory section.
+        let mut evil = doc.clone();
+        evil["peakSnapshot"]["file"] = json!("../../etc/passwd");
+        assert_eq!(parse_tracemalloc(&evil).unwrap().memory.unwrap().peak_snapshot_file, None);
+        let mut none = doc;
+        none.as_object_mut().unwrap().remove("timeline");
+        assert!(parse_tracemalloc(&none).unwrap().memory.is_none());
     }
 }

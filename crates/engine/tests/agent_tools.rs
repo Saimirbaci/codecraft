@@ -864,6 +864,16 @@ fn profiling_through_tools_with_a_fake_profiler() {
     // Nothing is recording: stop just reports the snapshot.
     let again = ok(&mut s, "profile_stop", json!({ "limit": 1 }));
     assert_eq!(again["hotspots"].as_array().unwrap().len(), 1);
+    // M15 PP (QA M14 #25): the order is fixed whatever the IDE's Method List shows, and `sort`
+    // picks self (default) or total.
+    s.execute("profiler.sortMethods", &json!({ "column": "name", "descending": false })).unwrap();
+    let same = ok(&mut s, "profile_hotspots", json!({ "limit": 5 }));
+    assert_eq!(same["hotspots"], hot["hotspots"]);
+    assert_eq!(same["sort"], "self");
+    let by_total = ok(&mut s, "profile_hotspots", json!({ "limit": 5, "sort": "total" }));
+    assert_eq!(by_total["hotspots"][0]["name"], "main", "{by_total}");
+    assert_eq!(by_total["report"]["sort"], "total", "{by_total}");
+    assert!(err(&mut s, "profile_hotspots", json!({ "sort": "name", "timeoutMs": 5_000 })).contains("sort"));
     assert!(err(&mut s, "profile_start", json!({ "config": 7 })).contains("no run configuration 7"));
     // Without the capability it is denied headless.
     s.agent_access = AgentAccess::headless(&[]);
