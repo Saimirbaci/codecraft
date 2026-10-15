@@ -748,6 +748,11 @@ impl DbState {
         self.secrets = store;
     }
 
+    /// The password store (shared with sessions opened for agents' worktrees).
+    pub(crate) fn secret_store(&self) -> Arc<dyn SecretStore> {
+        Arc::clone(&self.secrets)
+    }
+
     pub fn source(&self, id: &str) -> Option<&DataSource> {
         self.sources.iter().find(|s| s.config.id == id)
     }

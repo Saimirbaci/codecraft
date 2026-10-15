@@ -48,6 +48,10 @@ pub struct AgentUi {
     pub cleanup: Option<Value>,
     /// Clean Up removes only the worktrees and keeps the sessions in History.
     pub cleanup_worktrees_only: bool,
+    /// Connect an External Agent: what `agent.connectExternal` returned, while the window is open.
+    pub connect: Option<Value>,
+    /// The client shown in that window (its id).
+    pub connect_client: String,
 }
 
 impl Default for AgentUi {
@@ -72,6 +76,8 @@ impl Default for AgentUi {
             history_backend: String::new(),
             cleanup: None,
             cleanup_worktrees_only: false,
+            connect: None,
+            connect_client: "claude".into(),
         }
     }
 }
@@ -198,6 +204,13 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
                 .clicked()
             {
                 run_command(s, st, "agent.backends", &json!({ "refresh": true }));
+            }
+            if ui
+                .add(egui::Button::new(RichText::new("⇄").color(theme.text_muted)).frame(false))
+                .on_hover_text("Connect an external agent (Claude Code, Codex, Gemini, Cursor, Grok) to CodeCraft's tools")
+                .clicked()
+            {
+                open_connect(s, st);
             }
             // Terminal track: interactive Claude Code in a terminal tab, connected to CodeCraft.
             if ui
@@ -371,6 +384,107 @@ fn history_tools(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, cmd: &mut
             }
         }
     });
+}
+
+/// Open Connect an External Agent (`agent.connectExternal`).
+pub(crate) fn open_connect(s: &mut Session, st: &mut UiState) {
+    match s.execute("agent.connectExternal", &Value::Null) {
+        Ok(v) => st.agent.connect = Some(v),
+        Err(e) => s.status = e.to_string(),
+    }
+}
+
+/// Connect an External Agent: per client, the entry that reaches this IDE and the headless
+/// server, to copy into the client's configuration (CodeCraft never edits those files).
+pub(crate) fn connect_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let Some(info) = st.agent.connect.clone() else { return };
+    let theme = st.theme.clone();
+    let clients = info.get("clients").and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut open = true;
+    let mut copied: Option<String> = None;
+    egui::Window::new("Connect an External Agent")
+        .id(Id::new("codecraft-agent-connect"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(620.0)
+        .show(ui.ctx(), |ui| {
+            ui.label(
+                RichText::new(
+                    "Give an agent CLI CodeCraft's tools (debugging, analysis, profiling, tests, databases). Copy \
+                     the entry into the client's configuration; CodeCraft doesn't edit those files.",
+                )
+                .color(theme.text_muted),
+            );
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                for c in &clients {
+                    let id = c.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let label = c.get("label").and_then(Value::as_str).unwrap_or(id);
+                    if ui.add(egui::Button::selectable(st.agent.connect_client == id, label)).clicked() {
+                        st.agent.connect_client = id.to_string();
+                    }
+                }
+            });
+            ui.separator();
+            let current =
+                clients.iter().find(|c| c.get("id").and_then(Value::as_str) == Some(st.agent.connect_client.as_str()));
+            let Some(current) = current.or(clients.first()) else { return };
+            let mut snippet = |ui: &mut egui::Ui, title: &str, hint: &str, text: &str| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(title).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Copy").clicked() {
+                            copied = Some(text.to_string());
+                        }
+                    });
+                });
+                ui.label(RichText::new(hint).small().color(theme.text_muted));
+                Frame::new().fill(theme.editor_bg).corner_radius(CornerRadius::same(4)).inner_margin(Margin::same(6)).show(
+                    ui,
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(text).font(FontId::monospace(12.0)).color(theme.text))
+                                .selectable(true)
+                                .wrap(),
+                        );
+                    },
+                );
+                ui.add_space(6.0);
+            };
+            if let Some(text) = current.get("ide").and_then(Value::as_str) {
+                snippet(
+                    ui,
+                    "This IDE",
+                    "Reaches the running CodeCraft window that has the agent's project open; Agent Access and its \
+                     approval prompts apply.",
+                    text,
+                );
+            }
+            match current.get("headless").and_then(Value::as_str) {
+                Some(text) => snippet(
+                    ui,
+                    "Headless (no IDE window)",
+                    "codecraft-cli serves this project itself; only what --allow lists is allowed.",
+                    text,
+                ),
+                None => {
+                    ui.label(RichText::new("Headless: not available here (see below).").small().color(theme.text_muted));
+                }
+            }
+            for n in info.get("notes").and_then(Value::as_array).into_iter().flatten() {
+                if let Some(n) = n.as_str() {
+                    ui.label(RichText::new(format!("• {n}")).small().color(theme.text_muted));
+                }
+            }
+        });
+    if let Some(text) = copied {
+        ui.ctx().copy_text(text);
+        s.status = "Copied the configuration".into();
+    }
+    if !open {
+        st.agent.connect = None;
+    }
 }
 
 /// The Clean Up confirmation: what goes, then Delete / Cancel.

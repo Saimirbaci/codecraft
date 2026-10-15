@@ -228,6 +228,88 @@ pub(crate) fn file_text(s: &Session, path: &Path) -> Result<(String, bool), Comm
     codecraft_fs::read_text_file(path).map(|t| (t, false)).map_err(|e| failed(format!("{}: {e}", path.display())))
 }
 
+/// Flags whose value is the next word (a report file CodeCraft adds goes with them).
+const VALUE_FLAGS: &[&str] =
+    &["--out", "--output", "--output-junit", "--junitxml", "--outputFile", "--log_sink", "--export-fixes", "-o"];
+/// Words CodeCraft adds next to its report files (`instrument_process`, the C++ and JavaScript
+/// runners): left out together with the file.
+const REPORT_COMPANIONS: &[&str] = &[
+    "junit_logging=all",
+    "--reporters=xml",
+    "--duration=true",
+    "--durations",
+    "--log_format=XML",
+    "--log_level=test_suite",
+    "--report_level=short",
+    "--reporter=json",
+    "--json",
+    "--testLocationInResults",
+];
+
+/// The temporary directory as command lines spell it (macOS: `/var/folders/…` and its real
+/// path `/private/var/folders/…`).
+fn temp_prefixes() -> Vec<String> {
+    let tmp = std::env::temp_dir();
+    let mut out = vec![tmp.display().to_string()];
+    if let Ok(real) = tmp.canonicalize() {
+        out.push(real.display().to_string());
+    }
+    out.iter_mut().for_each(|p| {
+        while p.len() > 1 && p.ends_with('/') {
+            p.pop();
+        }
+    });
+    out.retain(|p| p.len() > 1);
+    out
+}
+
+/// A command line as agents see it (QA M14 #24): the report files CodeCraft adds in the
+/// temporary directory (pytest's JUnit XML, GoogleTest/Catch2/doctest/Boost reports, jest/vitest
+/// JSON, clang-tidy fixes) and the arguments that go with them are left out; they are internal
+/// and gone after the run.
+pub(crate) fn public_command_line(cl: &str) -> String {
+    let temps = temp_prefixes();
+    let is_temp = |w: &str| temps.iter().any(|t| w.contains(&format!("{t}/codecraft")));
+    let words: Vec<&str> = cl.split(' ').collect();
+    if !words.iter().any(|w| is_temp(w)) {
+        return cl.to_string();
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for w in words {
+        if is_temp(w) {
+            if out.last().is_some_and(|p| VALUE_FLAGS.contains(&p.trim_matches('\''))) {
+                out.pop();
+            }
+            continue;
+        }
+        out.push(w);
+    }
+    // The companions, and the word before/after them that belongs to them (`-o junit_logging=all`,
+    // `--reporter xml`, `--durations yes`).
+    let mut clean: Vec<&str> = Vec::new();
+    let mut skip_next = false;
+    for (i, w) in out.iter().enumerate() {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        let bare = w.trim_matches('\'');
+        if REPORT_COMPANIONS.contains(&bare) {
+            if bare == "junit_logging=all" && clean.last() == Some(&"-o") {
+                clean.pop();
+            }
+            skip_next = bare == "--durations" && out.get(i + 1) == Some(&"yes");
+            continue;
+        }
+        if bare == "--reporter" && out.get(i + 1) == Some(&"xml") {
+            skip_next = true;
+            continue;
+        }
+        clean.push(w);
+    }
+    clean.join(" ")
+}
+
 /// Cut a string to `max` chars with an ellipsis.
 pub(crate) fn clip(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
@@ -845,7 +927,7 @@ fn run_output(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = json!({
         "tab": tab.0,
         "title": run.title,
-        "commandLine": run.command_line,
+        "commandLine": public_command_line(&run.command_line),
         "status": run_status(run.status),
         "running": s.runs.is_running(tab),
         "totalLines": total + run.dropped_lines,
@@ -940,7 +1022,7 @@ fn test_summary(s: &mut Session, p: &Value) -> CmdResult {
     let mut out = json!({
         "tab": tab.0,
         "title": run.title,
-        "commandLine": run.command_line,
+        "commandLine": public_command_line(&run.command_line),
         "finished": run.finished,
         "status": test_status(run.status()),
         "counts": run.counts(),
@@ -1619,6 +1701,41 @@ mod tests {
         assert!(page["truncated"].is_string());
         assert_eq!(s.execute("run.configurations", &Value::Null).unwrap(), json!([]));
         assert!(s.execute("project.info", &Value::Null).unwrap()["project"].is_null());
+    }
+
+    /// QA M14 #24: `test_run`'s command line showed pytest's JUnit XML in the temp directory.
+    #[test]
+    fn report_files_are_left_out_of_command_lines() {
+        use crate::runs::ProcessCommand;
+        let cwd = std::path::PathBuf::from("/work/app");
+        let pytest = ProcessCommand::new("python3", &["-m", "pytest", "-v", "tests"], cwd.clone());
+        let (instrumented, junit) = crate::testing::instrument_process(&pytest);
+        assert!(junit.is_some());
+        assert!(instrumented.command_line().contains("junitxml"));
+        assert_eq!(public_command_line(&instrumented.command_line()), pytest.command_line());
+        for fw in [
+            crate::testing::Framework::GoogleTest,
+            crate::testing::Framework::Catch2,
+            crate::testing::Framework::Doctest,
+            crate::testing::Framework::BoostTest,
+        ] {
+            let tmp = std::env::temp_dir().join("codecraft-gtest-1-2-0.json");
+            let mut cl = "./build/tests --flag".to_string();
+            for a in crate::testing::cpp::report_args(fw, &tmp) {
+                cl.push(' ');
+                cl.push_str(&a);
+            }
+            assert_eq!(public_command_line(&cl), "./build/tests --flag", "{fw:?}: {cl}");
+        }
+        let vitest = format!(
+            "npx vitest run --reporter=default --reporter=json --outputFile={}",
+            std::env::temp_dir().join("codecraft-vitest-1-2-3.json").display()
+        );
+        assert_eq!(public_command_line(&vitest), "npx vitest run --reporter=default");
+        // Without a CodeCraft temp file nothing changes, even the same words.
+        let user = "pytest -o junit_logging=all --junitxml=out/report.xml --json";
+        assert_eq!(public_command_line(user), user);
+        assert_eq!(public_command_line(""), "");
     }
 
     #[test]

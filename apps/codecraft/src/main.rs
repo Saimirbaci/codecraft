@@ -3,7 +3,9 @@
 //! `codecraft [--no-restore] [PATH]`: open PATH (a file or directory), else the last project(s)
 //! with their editors. `--no-restore` starts without reopening any project or editor.
 //! `codecraft --mcp-bridge --port N [--lock-dir D] [--job J]`: an MCP stdio bridge to the
-//! running IDE's server (what built-in agent jobs launch; see docs/agents.md).
+//! running IDE's server (what built-in agent jobs launch; see docs/agents.md); `--ide` instead of
+//! `--port` finds the IDE (a job's environment, else the window whose project holds the working
+//! directory).
 
 use std::ffi::OsString;
 use std::path::PathBuf;

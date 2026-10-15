@@ -678,6 +678,9 @@ fn launch(
         }
         AgentMode::Auto | AgentMode::Review => {
             let program = info.path.clone().ok_or_else(|| CommandError::Failed(info.backend.install_hint().into()))?;
+            if cli::mcp_support(job.backend) == cli::McpSupport::UserConfig && !follow_up && !mcp_servers.is_empty() {
+                job.push(Activity::Info { text: USER_CONFIG_MCP_HINT.into() });
+            }
             let req = CliRequest {
                 backend: job.backend,
                 program,
@@ -688,6 +691,10 @@ fn launch(
                 continue_last: follow_up && job.session_id.is_none() && job.backend == Backend::Grok,
                 scrub_api_keys: scrub,
                 mcp_servers,
+                // A bridge the user registered with the CLI (`mcp --ide`) finds this IDE and job.
+                env: crate::agent_mcp::job_env(s, job.id),
+                // Gemini reads its MCP servers from a settings file: one of its own per job.
+                settings_dir: Some(settings_dir(s, job.id)),
             };
             let process = codecraft_agent::process::spawn_cli(&req, job.events_tx.clone())
                 .map_err(|e| CommandError::Failed(e.to_string()))?;
@@ -695,6 +702,31 @@ fn launch(
         }
     }
     Ok(())
+}
+
+/// Shown when a headless agent can't be given CodeCraft's tools on its command line (Grok).
+const USER_CONFIG_MCP_HINT: &str = "Grok's headless mode takes MCP servers only from its own configuration, so this \
+    job has CodeCraft's tools only if you added them once (Agents › Connect an External Agent: `grok mcp add \
+    codecraft-ide -- codecraft-cli mcp --ide`). Ask mode always has them.";
+
+/// A private directory for a job's per-run settings files (Gemini's MCP servers), removed when
+/// the turn ends. Named per session too (project windows share the process and job numbers).
+fn settings_dir(s: &Session, id: JobId) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "codecraft-agent-{}-{:x}-job{}",
+        std::process::id(),
+        s.agent_tools.instance,
+        id.0
+    ))
+}
+
+fn remove_settings_dir(s: &Session, id: JobId) {
+    let dir = settings_dir(s, id);
+    if dir.exists()
+        && let Err(e) = std::fs::remove_dir_all(&dir)
+    {
+        log::warn!("cannot remove {}: {e}", dir.display());
+    }
 }
 
 fn backend_info(s: &mut Session, backend: Backend) -> Option<BackendInfo> {
@@ -1306,10 +1338,11 @@ fn apply_event(s: &mut Session, id: JobId, ev: AgentEvent) {
 }
 
 fn finish_turn(s: &mut Session, id: JobId) {
-    let Some(job) = s.agents.job_mut(id) else { return };
-    if !job.is_running() {
+    if !s.agents.job(id).is_some_and(Job::is_running) {
         return;
     }
+    remove_settings_dir(s, id);
+    let Some(job) = s.agents.job_mut(id) else { return };
     let seed = job.resume_seed.take();
     if let Some(seed) = seed
         && job.turn_error
@@ -1564,6 +1597,9 @@ pub(crate) fn shutdown(s: &mut Session) {
             job.worktree = None;
             job.cwd = job.project.clone();
         }
+    }
+    for job in &s.agents.jobs {
+        remove_settings_dir(s, job.id);
     }
     // Last save: jobs still running are saved as interrupted.
     crate::agent_sessions::shutdown(s);

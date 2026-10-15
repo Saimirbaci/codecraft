@@ -25,6 +25,8 @@ const MAX_LINE: usize = 64 * 1024 * 1024;
 
 struct Shared {
     out: Sender<Outgoing>,
+    /// Tool calls waiting for the host, and the ones the client cancelled.
+    inflight: crate::InflightRef,
     closed: AtomicBool,
     initialized: AtomicBool,
     info: Mutex<Value>,
@@ -47,6 +49,7 @@ impl StdioServer {
         let (ev_tx, ev_rx) = unbounded::<ServerEvent>();
         let shared = Arc::new(Shared {
             out: out_tx,
+            inflight: crate::InflightRef::default(),
             closed: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
             info: Mutex::new(Value::Null),
@@ -167,7 +170,7 @@ fn read_loop<R: BufRead>(shared: &Arc<Shared>, config: &ServerConfig, mut input:
                     None
                 }
                 Dispatch::ToolCall { id, name, arguments } => {
-                    let reply = Reply::new(id.clone(), shared.out.clone());
+                    let reply = Reply::tracked(id.clone(), shared.out.clone(), &shared.inflight);
                     let call = ToolCall { client: STDIO_CLIENT, request: id.clone(), name, arguments, reply };
                     if events.send(ServerEvent::ToolCall(call)).is_ok() {
                         None
@@ -176,6 +179,7 @@ fn read_loop<R: BufRead>(shared: &Arc<Shared>, config: &ServerConfig, mut input:
                     }
                 }
                 Dispatch::Cancelled { request } => {
+                    crate::Inflight::cancel(&shared.inflight, &request);
                     let _ = events.send(ServerEvent::Cancelled { client: STDIO_CLIENT, request });
                     None
                 }
@@ -268,6 +272,45 @@ mod tests {
         assert_eq!(lines[3]["id"], 3);
         assert_eq!(lines[3]["result"]["content"][0]["text"], "hi");
         assert!(server.notify("x", json!({})));
+    }
+
+    #[test]
+    fn a_cancelled_call_is_reported_and_not_answered() {
+        let input = [
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"debug_wait_for_stop","arguments":{}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"project_info","arguments":{}}}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1,"reason":"user"}}),
+        ]
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let sink = Sink::default();
+        let mut config = ServerConfig::claude_code("CodeCraft", Vec::new(), None);
+        config.tools = crate::engine_tools::engine_tools();
+        let (_server, events) = StdioServer::start(config, Cursor::new(input.into_bytes()), sink.clone()).unwrap();
+        let mut calls = Vec::new();
+        let mut cancelled = None;
+        while let Ok(ev) = events.recv_timeout(Duration::from_secs(5)) {
+            match ev {
+                ServerEvent::ToolCall(c) => calls.push(c),
+                ServerEvent::Cancelled { request, .. } => cancelled = Some(request),
+                ServerEvent::Disconnected { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(cancelled, Some(json!(1)));
+        for c in calls {
+            let id = c.request.clone();
+            let sent = c.reply.send(ToolResult::text("done"));
+            assert_eq!(sent, id != json!(1), "{id}");
+        }
+        let lines = wait_lines(&sink, 1);
+        std::thread::sleep(Duration::from_millis(50));
+        let lines = if lines.len() < sink.lines().len() { sink.lines() } else { lines };
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["id"], 2);
     }
 
     #[test]

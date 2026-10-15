@@ -125,6 +125,18 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
+            "agent.connectExternal",
+            "Connect an External Agent",
+            None,
+            "→ {running, port, binary, project, clients: [{id, label, ide, headless}], notes} — ready-to-paste \
+             configuration that gives Claude Code, Codex, Gemini CLI, Cursor, Grok or any MCP client CodeCraft's \
+             tools: `ide` reaches this running IDE (its Agent Access policy and approvals apply), `headless` is \
+             `codecraft-cli mcp <project>`. Nothing is written to the clients' files.",
+            Context::Global,
+            always,
+            |s, _| Ok(crate::agent_mcp::connect_snippets(s)),
+        ),
+        spec(
             "agent.settings",
             "Agent Settings",
             None,

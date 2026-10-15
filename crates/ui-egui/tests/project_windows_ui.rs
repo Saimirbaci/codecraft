@@ -11,6 +11,14 @@ use serde_json::{Value, json};
 use codecraft_engine::Popup;
 use codecraft_ui_egui::App;
 
+/// The engine keeps the number of project windows in a process-wide counter that every App
+/// frame updates, so the tests of this binary run one at a time.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn project(dir: &Path, name: &str) {
     std::fs::create_dir_all(dir.join("src")).unwrap();
     std::fs::write(
@@ -23,6 +31,7 @@ fn project(dir: &Path, name: &str) {
 
 #[test]
 fn open_in_new_window_switch_and_share_settings() {
+    let _serial = serial();
     let a = tempfile::tempdir().unwrap();
     let b = tempfile::tempdir().unwrap();
     project(a.path(), "alpha");
@@ -62,6 +71,7 @@ fn open_in_new_window_switch_and_share_settings() {
 
 #[test]
 fn help_shows_the_guide() {
+    let _serial = serial();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(|_| App::ephemeral(None));
     h.run_steps(1);
     h.state_mut().session.execute("help.help", &Value::Null).unwrap();

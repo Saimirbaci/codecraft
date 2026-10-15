@@ -412,6 +412,11 @@ fn settings_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         cmds.push(("settings.dialog.cancel", Value::Null));
     }
     for (id, p) in cmds {
+        if id == "agent.connectExternal" {
+            // Its result is shown in the Connect an External Agent window.
+            crate::agent_panel::open_connect(s, st);
+            continue;
+        }
         run_command(s, st, id, &p);
     }
 }

@@ -655,6 +655,7 @@ impl App {
         settings_ui::show(ui, s, st);
         navbar::show_popups(ui, s, st);
         approvals_ui::show(ui, s, st);
+        agent_panel::connect_window(ui, s, st);
         testing_panel::windows(ui, s, st);
         valgrind_ui::windows(ui, s, st);
         debug_panel::attach_window(ui, s, st);

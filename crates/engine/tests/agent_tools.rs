@@ -499,12 +499,16 @@ fn ide_server_serves_engine_tools_and_agent_jobs_get_the_bridge() {
     assert!(bargs.windows(2).any(|w| w[0] == "--job" && w[1] == job.to_string()), "{bargs:?}");
     let parsed = codecraft_engine::agent_mcp::parse_bridge_args(&bargs).unwrap();
     assert_eq!(parsed.lock_dir.as_deref(), Some(locks.as_path()));
+    // The job's key travels in the server's environment (M15 AI), not on its command line.
+    let key = server["env"]["CODECRAFT_JOB_KEY"].as_str().expect("the job key").to_string();
+    assert!(!bargs.iter().any(|a| a.contains(&key)));
 
     // Run that bridge in-process: the job's calls arrive tagged; Auto mode needs no card.
     let (in_r, mut in_w) = std::io::pipe().unwrap();
     let (out_r, out_w) = std::io::pipe().unwrap();
     let mut tag = serde_json::Map::new();
     tag.insert("codecraftJob".into(), json!(job));
+    tag.insert("codecraftJobKey".into(), json!(key));
     let cfg = codecraft_engine::mcp::bridge::BridgeConfig { port, token: lock.auth_token.clone(), client_tag: tag };
     let bridge = std::thread::spawn(move || codecraft_engine::mcp::bridge::run(&cfg, BufReader::new(in_r), out_w));
     let rx = line_channel(out_r);

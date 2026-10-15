@@ -20,23 +20,75 @@ lock file is `~/.claude/ide/<port>.lock`). It advertises Claude Code's IDE tools
 `openDiff`, `getDiagnostics`, …, unchanged) followed by the engine tools below. Calls are answered
 from the IDE's event loop; tools that wait (a debugger stop, test results) never block the UI.
 
-- **Built-in agent jobs** (the Agents tool window) get the tools automatically:
+- **Built-in agent jobs** (the Agents tool window) get the tools automatically, each the way its
+  CLI documents, never by editing the user's own settings:
   - Claude Code: `--mcp-config` with a `codecraft` stdio server;
   - Codex: `-c mcp_servers.codecraft.command=… -c mcp_servers.codecraft.args=[…]`;
+  - Gemini CLI (Auto/Review): a per-job settings file, `$TMPDIR/codecraft-agent-…-job<N>/gemini-system-defaults.json`,
+    named by `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` (Gemini's documented "system defaults" layer, the
+    lowest one). It holds the machine's own system defaults, if any, plus `mcpServers.codecraft`;
+    Gemini merges `mcpServers` by name across its layers, so the servers in `~/.gemini/settings.json`
+    stay (one the user also named `codecraft` wins). The directory is removed when the turn ends;
+    CodeCraft never reads or writes `~/.gemini`;
+  - Grok (Auto/Review): Grok's headless mode reads MCP servers only from its config files
+    (`~/.grok/config.toml`, `.grok/config.toml`), and its `GROK_CONFIG`/`GROK_CONFIG_PATH`
+    overlay is documented not to add servers, so CodeCraft gives it none and never edits those
+    files. Add CodeCraft once (Agents › Connect an External Agent prints the command):
+    ```sh
+    grok mcp add codecraft-ide -- /path/to/codecraft-cli mcp --ide
+    ```
+    Every Grok job CodeCraft starts carries `CODECRAFT_IDE_PORT`, `CODECRAFT_IDE_LOCK_DIR`,
+    `CODECRAFT_JOB` and `CODECRAFT_JOB_KEY` in its environment, so that server reaches this IDE as
+    the job (if Grok passes its environment to MCP servers; not verified against a real `grok`).
+    The job's feed says this when it starts;
   - Ask mode (ACP: Claude, Codex, Gemini, Grok): `mcpServers` in `session/new`/`session/load`.
 
   The server is the IDE executable itself, `codecraft --mcp-bridge --port <port> --lock-dir <dir>
-  --job <id>`: a stdio bridge to the IDE's server that reads the token from the lock file (never
-  from the command line) and tags the connection with the job, so the job's mode applies (see
-  below). Headless Gemini and Grok runs (Auto/Review) get no MCP server (their CLIs only take MCP
-  servers from their settings files).
-- **Any other agent**: bridge to the running IDE with
-  ```sh
-  claude mcp add codecraft-ide -- codecraft-cli mcp --connect <port>
-  ```
-  (the port is in `ide.status` or the lock file name). The IDE's policy and approval prompts apply.
+  --job <id>` with `CODECRAFT_JOB_KEY` in its environment: a stdio bridge to the IDE's server that
+  reads the token from the lock file (never from the command line) and tags the connection with
+  the job and the job's key (a per-session secret, different per job). The IDE trusts a job tag
+  only with the right key, so another client that has the lock file's token can't pass itself off
+  as an Auto job. The job's mode applies (see below).
+- **Review jobs work on their worktree.** A Review job's tool calls run in a second, headless
+  session opened on its directory in the git worktree: `file_read`/`file_write`/`file_edit`,
+  runs, tests, `inspect`, `problems`, debugging, profiling and SQLite files are the worktree's,
+  never the open project's. Absolute paths of the open project are moved to the same place in
+  the worktree; writes outside the worktree are refused. Writes there need no card (they are
+  reviewed file by file afterwards; Off still denies); running, debugging, profiling and SQL that
+  writes ask as for an Ask job, with the cards in the IDE. CodeCraft's own state in that session
+  (`.codecraft/`) is git-ignored in the worktree, so the review lists only the agent's changes. The
+  session closes when the job stops running.
+- **Any other agent**: see [Connect an external agent](#connect-an-external-agent). The IDE's policy
+  and approval prompts apply.
 - **Claude Code over `/ide`** receives the engine tools in `tools/list` too. Note that Claude Code
-  decides which IDE-server tools it shows its model; if they don't appear, add the bridge above.
+  decides which IDE-server tools it shows its model; if they don't appear, add the bridge.
+
+### Connect an external agent
+
+Agents › ⇄ (or Settings › Tools › Agent Access › Connect an External Agent…, command
+`agent.connectExternal`) shows, for Claude Code, Codex, Gemini CLI, Cursor, Grok and any MCP client,
+the entry to paste into the client's configuration, with absolute paths; CodeCraft never edits
+those files. Two kinds:
+
+- **This IDE**: `codecraft-cli mcp --ide` (or `codecraft --mcp-bridge --ide`) finds the IDE by
+  itself: from a job's environment (`CODECRAFT_IDE_PORT`, …), else the running CodeCraft window
+  whose project holds the working directory (the lock files' `workspaceFolders`). One entry in the
+  client's user configuration serves every project; the IDE's policy and cards apply.
+- **Headless**: `codecraft-cli mcp <project> --allow run,debug,profile` (below).
+
+The same from a terminal, printed with the real path of the binary:
+
+```sh
+codecraft-cli mcp --print-config claude [project] [--allow caps]   # claude mcp add codecraft -- /abs/codecraft-cli mcp /abs/project --allow run,debug,profile
+codecraft-cli mcp --print-config codex                             # codex mcp add … and the ~/.codex/config.toml block
+codecraft-cli mcp --print-config gemini                            # the mcpServers JSON for the project's .gemini/settings.json (~/.gemini/… with --ide)
+codecraft-cli mcp --print-config cursor                            # the mcpServers JSON for .cursor/mcp.json (~/.cursor/mcp.json with --ide)
+codecraft-cli mcp --print-config grok                              # grok mcp add …
+codecraft-cli mcp --print-config json                              # generic {"mcpServers": {…}}
+codecraft-cli mcp --print-config claude --ide                      # claude mcp add --scope user codecraft-ide -- /abs/codecraft-cli mcp --ide
+```
+
+`codecraft-cli mcp --connect <port>` still bridges to one IDE server by port (`ide.status`).
 
 ### Headless: `codecraft-cli mcp`
 
@@ -104,7 +156,8 @@ Each is Off, Ask or Allow. **Ask** shows an approval card in the IDE (the tool a
 **Allow** once, **Always** for this session and this caller and capability, **Deny**); the call
 waits for the answer (2 minutes, then it is denied). Headless, Ask is denied. Agent jobs: **Auto**
 jobs get Ask capabilities without a card (their user chose Auto; Off stays off); **Ask** jobs see
-the cards; **Review** jobs are never allowed `write` (their changes belong in the worktree).
+the cards; **Review** jobs act on their worktree: `write` there needs no card (it is reviewed
+afterwards), the rest is asked as for Ask jobs, and nothing reaches the open project.
 Agents can't change the policy, answer approvals, start other agents or reconfigure the IDE
 integration through `codecraft_execute` (`agentAccess.*` except `get`, `agent.*`, `ide.*`,
 `feedback.*` are refused), nor publish or change things outside this machine: `git.push`/`vcs.push`,
@@ -113,10 +166,26 @@ and syncs, creating/renaming/deleting files on remote hosts, and `docker.prune` 
 user runs them). A data source marked *confirm writes* (production) still asks its own
 confirmation in the IDE, and headless such writes are refused.
 
+## Cancellation and disconnects
+
+A client may cancel a call it is waiting for with MCP's `notifications/cancelled` (`requestId`):
+a call waiting for its approval card has the card withdrawn; a call waiting for a debugger stop,
+test results, a run's end, a profile or a language server stops waiting. Nothing is sent for the
+cancelled request (as MCP asks). Work the call already started goes on (a test run, a debug
+session; stop it with `run_stop` / `debug_control stop`). When a client disconnects, all its
+waiting calls are dropped and their cards withdrawn at once. Both work over the IDE's server,
+the bridge and `codecraft-cli mcp`.
+
 ## Tools
 
 Examples show the arguments an agent sends and the JSON text of the result (shortened with `…`).
-Errors come back as MCP tool errors (`isError: true`) with a message saying what to do.
+Errors come back as MCP tool errors (`isError: true`) with a message saying what to do. Result
+fields are camelCase throughout (`commandLine`, `typeName`, …; `crates/engine/tests/agent_results_camel_case.rs`
+walks every tool's result), and command lines show what the user's command was, without the
+report files CodeCraft adds in the temp directory (pytest's JUnit XML, GoogleTest/Catch2/doctest/
+Boost reports, jest/vitest JSON). `codecraft_execute` passes a command's own JSON through; a few
+older commands (`debug.state`) still use snake_case fields there; the dedicated tools and the
+agent commands (`debug.agentSummary`, `analysis.*`, `profiler.report`, …) don't.
 
 ### Generic
 
@@ -175,14 +244,14 @@ quick-fix exists).
       "message": "`os` imported but unused", "source": "analysis", "analyzer": "ruff", "code": "F401", "id": 0, "fixable": true }] }
 ```
 
-**`inspect`** (run) — Inspect Code on a scope (`file`, `directory`, `project`, `uncommitted`) and
-wait for the findings. Build output (`cmake-build-*`, `CMakeFiles`, `node_modules`, `__pycache__`,
+**`inspect`** (run) — Inspect Code on a scope (`file`, `directory`, `project`, `uncommitted`,
+`glob` with `pattern`) and wait for the findings. Build output (`cmake-build-*`, `CMakeFiles`, `node_modules`, `__pycache__`,
 virtual environments) is not part of a directory or project scope. Rust projects get `cargo
 check` unless `tools` asks for `clippy` (or Settings › Rust turns Clippy on).
 ```json
 { "scope": "file", "path": "mod.py", "tools": ["ruff"] }
 → { "scope": "File mod.py", "counts": { "warning": 1 }, "total": 1,
-    "tools": [{ "tool": "ruff", "ok": true, "outcome": "1 problem", "command_line": "ruff check --output-format=json …" }],
+    "tools": [{ "tool": "ruff", "ok": true, "outcome": "1 problem", "commandLine": "ruff check --output-format=json …" }],
     "findings": [{ "id": 0, "severity": "Warning", "inspection": "F401 unused-import", "tool": "ruff",
     "code": "F401", "file": "/work/app/mod.py", "line": 1, "column": 8, "message": "`os` imported but unused", "fixes": 1 }] }
 ```
@@ -362,6 +431,115 @@ Through `codecraft_execute`, adding or editing a data source (`db.addDataSource`
 `db.editDataSource`) needs `write`; connecting, refreshing, row counts and the query history are
 reads.
 
+## Playbook
+
+Complete call sequences for common tasks, as an agent sends them (any transport). Results are
+shortened with `…`; paths are absolute and lines 1-based in the real answers.
+
+### Debug a failing test
+
+1. Find the failure:
+   ```json
+   test_run { "name": "parses_empty" }
+   → { "tab": 7, "title": "Tests matching 'parses_empty'", "commandLine": "cargo test parses_empty", "finished": true,
+       "status": "failed", "counts": { "passed": 0, "failed": 1, "ignored": 0, "running": 0 }, "durationMs": 1830,
+       "failures": [{ "name": "tests::parses_empty", "suite": "shop", "file": "/work/shop/src/lib.rs", "line": 16,
+                      "message": "assertion `left == right` failed\n  left: 1\n right: 0",
+                      "excerpt": "  15 |         let v = parse(\"\");\n> 16 |         assert_eq!(v.len(), 0);\n  17 |     }" }] }
+   ```
+2. Stop in the code under test and start the test under the debugger (`file` + `line` debugs the
+   test at that line; Python: `pytest file::test` under debugpy):
+   ```json
+   debug_breakpoint_set { "path": "src/lib.rs", "line": 4 }      → { "id": 1, "file": "/work/shop/src/lib.rs", "line": 4, "enabled": true, "verified": true }
+   debug_start { "file": "src/lib.rs", "line": 14 }              → { "state": "building", "started": true, "breakpoints": 1, "next": "call debug_wait_for_stop" }
+   debug_wait_for_stop { "timeoutMs": 120000 }
+   → { "state": "stopped", "reason": "breakpoint", "thread": { "id": 1, "name": "tests::parses_empty" },
+       "frames": [{ "index": 0, "name": "shop::parse", "file": "/work/shop/src/lib.rs", "line": 4, "excerpt": "…" }, …],
+       "locals": [{ "name": "input", "value": "\"\"", "type": "&str" }, { "name": "parts", "value": "size=1", "type": "Vec<&str>", "ref": 1003 }] }
+   ```
+3. Look closer, step, and finish:
+   ```json
+   debug_variables { "ref": 1003 }                → { "ref": 1003, "variables": [{ "name": "[0]", "value": "\"\"", "type": "&str" }] }
+   debug_evaluate { "expression": "input.is_empty()" } → { "expression": "input.is_empty()", "value": "true", "type": "bool" }
+   debug_control { "action": "stepOver" }        → { "state": "stopped", "reason": "step", "frames": [{ "line": 5, … }], "locals": […] }
+   debug_control { "action": "stop" }            → { "state": "none" }
+   ```
+4. Fix (`file_edit`), then `test_run { "name": "parses_empty" }` again → `"status": "passed"`.
+
+### Find a hotspot and verify the fix
+
+```json
+profile_start { "command": "python3 main.py" }       → { "tab": 5, "job": 1, "tool": "cProfile", "state": "recording", "next": "…" }
+profile_hotspots { "limit": 5 }
+→ { "snapshot": "…/profiler/snapshots/main-….json", "unit": "…", "total": …,
+    "hotspots": [{ "name": "slow_sum", "selfPercent": 81.3, "totalPercent": 81.3, "file": "/work/app/main.py", "line": 12, "inProject": true }, …],
+    "report": { "hotLines": [{ "file": "/work/app/main.py", "line": 14, "percent": 64.0, "code": "total += sum(range(i))" }, …] } }
+file_read { "path": "main.py", "startLine": 10, "endLine": 16 }
+file_edit { "path": "main.py", "oldText": "total += sum(range(i))", "newText": "total += i * (i - 1) // 2" } → { "path": "/work/app/main.py", "replacements": 1 }
+profile_start { "command": "python3 main.py" }       → { "tab": 6, "job": 2, … }
+profile_hotspots { "limit": 5 }                       → { "hotspots": [{ "name": "main", … }, …] }   (slow_sum is gone from the top)
+codecraft_execute { "id": "profiler.compare", "params": { "a": "<first snapshot>", "b": "<second snapshot>" } }
+→ { "id": "profiler.compare", "result": { "faster": [{ "name": "slow_sum", … }], "slower": [], … } }
+```
+Cargo and CMake configurations (`profile_start { "config": "Run app" }`) are built first;
+`profile_hotspots` waits for the build, the recording and the snapshot. Rust debug builds are
+flagged in `report.notes` (profile `cargo run --release`).
+
+### Fix lint problems in changed files
+
+```json
+inspect { "scope": "uncommitted", "tools": ["clippy", "ruff"] }
+→ { "scope": "Uncommitted files", "counts": { "warning": 2 }, "total": 2,
+    "tools": [{ "tool": "clippy", "ok": true, "outcome": "1 problem", "commandLine": "cargo clippy --message-format=json …" }, …],
+    "findings": [{ "id": 0, "severity": "Warning", "inspection": "clippy::needless_return", "tool": "clippy", "file": "/work/app/src/lib.rs",
+                   "line": 9, "column": 5, "message": "unneeded `return` statement", "fixes": 1 },
+                 { "id": 1, "severity": "Warning", "inspection": "F401 unused-import", "tool": "ruff", "file": "/work/app/tools/gen.py",
+                   "line": 1, "column": 8, "message": "`os` imported but unused", "fixes": 1 }] }
+codecraft_execute { "id": "analysis.fix", "params": { "id": 0 } }
+→ { "id": "analysis.fix", "result": { "accepted": [0], "conflicts": [], "invalid": [], "stale": 0, "files": 1, "remaining": 1 } }
+codecraft_execute { "id": "analysis.fix", "params": { "rule": "F401" } }   (every problem of a rule)
+codecraft_execute { "id": "analysis.suppress", "params": { "id": 1 } }     (`# noqa: F401`, `#[allow(…)]`, `// NOLINT(…)`)
+problems { "path": "src" }                                                   → { "total": 0, "errors": 0, "problems": [] }
+```
+`scope: "glob"` with `pattern: "src/a.rs, src/b.rs"` inspects an explicit list of files.
+
+### Inspect a database table safely
+
+Reads need only `read`; anything that could change data needs `db-write` (asked in the IDE,
+denied headless unless allowed), and a data source marked *confirm writes* still asks its own
+confirmation.
+```json
+db_sources {}
+→ [{ "id": "ds-1", "name": "Shop", "kind": "postgres", "readOnly": false, "confirmWrites": true, "status": "connected",
+     "schemas": [{ "name": "public", "tables": ["orders", "items"] }] },
+   { "id": null, "name": "local.db", "kind": "sqlite", "path": "/work/app/local.db", "status": "not added", "hint": "…" }]
+db_query { "dataSource": "Shop", "sql": "select column_name, data_type from information_schema.columns where table_name = 'orders'" }
+→ { "dataSource": "ds-1", "results": [{ "columns": [{ "name": "column_name", "typeName": "name" }, …], "rows": [["id", "integer"], ["total", "numeric"], …],
+    "totalRows": 6, "statusLine": "6 rows", "hasMore": false }], "output": ["…"] }
+db_query { "dataSource": "Shop", "sql": "select count(*), max(created_at) from orders" }
+db_query { "dataSource": "Shop", "sql": "select * from orders order by id desc", "limit": 20 }   → 20 rows, "hasMore": true
+```
+Prefer `count(*)`, `limit` and explicit columns; `EXPLAIN` (not `EXPLAIN ANALYZE`, which runs
+the statement) shows a plan as a read.
+
+### Review a branch (analysis + tests)
+
+Run as a **Review** job (its calls act on the job's worktree, the open project is untouched), or
+on a checkout of the branch:
+```json
+codecraft_execute { "id": "vcs.status" }
+→ { "id": "vcs.status", "result": { "branch": "feature/parser", "upstream": "origin/feature/parser", "ahead": 3, "behind": 0, "files": [] } }
+```
+List the files the branch changes with the agent's own `git diff --name-only main...HEAD`, then:
+```json
+inspect { "scope": "glob", "pattern": "src/parse.rs, src/lib.rs, tests/parse.rs" }   → { "total": 1, "findings": [{ "id": 0, "file": "/wt/…/src/parse.rs", "line": 41, … }] }
+problems { "path": "src", "severity": "warning" }                                  → { "total": 1, "errors": 0, "problems": […] }
+test_run {}                                                                          → { "status": "passed", "counts": { "passed": 42, "failed": 0, … }, "failures": [] }
+test_run { "path": "tests/parse.rs" }                                                → the branch's own tests
+```
+Report the findings with their `file:line`; a failing test's `excerpt` and `message` go into the
+review as they are.
+
 ## For developers
 
 - Schemas: `crates/mcp/src/engine_tools.rs`; transports: `crates/mcp/src/{server,stdio,bridge}.rs`.
@@ -371,6 +549,14 @@ reads.
   `test.summary`, `test.runFiltered`, `profiler.hotspots`, `commands.search`, `project.info`):
   `crates/engine/src/agent_tools_cmds.rs`; the policy: `crates/engine/src/agent_access.rs`; the
   stdio server, the bridge and the job's server entry: `crates/engine/src/agent_mcp.rs`.
+- Review jobs' worktree sessions: `crates/engine/src/agent_worktree.rs`; per-CLI MCP delivery
+  (Gemini's settings file, Grok's environment): `crates/agent/src/cli.rs`; client configuration
+  and `--ide` discovery: `crates/engine/src/agent_mcp.rs`; cancellation:
+  `agent_tools::{cancel, client_gone}` and the transports' `Inflight` (`crates/mcp/src/lib.rs`).
 - Tests: `crates/engine/tests/agent_tools.rs` (tools on temp projects, policy, IDE server and
   bridge, real debugpy/lldb-dap/rust-analyzer sessions when installed, a fake profiler),
-  `apps/codecraft-cli/tests/agent_cli.rs` (the built binary over stdio, one-shot commands).
+  `crates/engine/tests/agent_everywhere.rs` (fake Gemini and Grok jobs, job keys, cancellation and
+  disconnects over WebSocket and stdio, a Review job's calls on its worktree),
+  `crates/engine/tests/agent_results_camel_case.rs` (every tool's result keys),
+  `apps/codecraft-cli/tests/agent_cli.rs` and `agent_connect.rs` (the built binary over stdio,
+  one-shot commands, `--print-config`, `--ide`, cancellation).

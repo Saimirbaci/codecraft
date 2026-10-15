@@ -299,6 +299,8 @@ fn handle_event(s: &mut Session, event: ServerEvent) {
         }
         ServerEvent::ToolCall(call) => handle_tool(s, call),
         ServerEvent::Cancelled { client, request } => {
+            // An engine tool waiting for a card, a stop, test results… (M15 AI).
+            crate::agent_tools::cancel(s, &connection(client), &request);
             let Some(r) = &mut s.ide.running else { return };
             let (gone, keep): (Vec<_>, Vec<_>) =
                 r.diffs.drain(..).partition(|d| d.client == client && d.request == request);
@@ -309,6 +311,8 @@ fn handle_event(s: &mut Session, event: ServerEvent) {
             }
         }
         ServerEvent::Disconnected { client } => {
+            // Its waiting engine tools go, and their approval cards with them (M15 AI).
+            crate::agent_tools::client_gone(s, &connection(client));
             let Some(r) = &mut s.ide.running else { return };
             let (gone, keep): (Vec<_>, Vec<_>) = r.diffs.drain(..).partition(|d| d.client == client);
             r.diffs = keep;
@@ -324,6 +328,11 @@ fn handle_event(s: &mut Session, event: ServerEvent) {
 
 // ---------------------------------------------------------------- tools
 
+/// The connection name of an IDE server client in [`crate::agent_tools::CallKey`].
+fn connection(client: ClientId) -> String {
+    format!("ide:{}", client.0)
+}
+
 fn handle_tool(s: &mut Session, call: ToolCall) {
     let ToolCall { client, request, name, arguments, reply } = call;
     let args = if arguments.is_object() { arguments } else { json!({}) };
@@ -331,10 +340,11 @@ fn handle_tool(s: &mut Session, call: ToolCall) {
     if codecraft_mcp::engine_tools::is_engine_tool(&name) {
         let info = s.ide.clients().into_iter().find(|c| c.id == client).map(|c| c.info).unwrap_or_default();
         let caller = crate::agent_tools::Caller::from_client_info(s, &info, APPROVAL_SOURCE);
-        let _ = request;
-        crate::agent_tools::submit(
+        let key = crate::agent_tools::CallKey::new(connection(client), request);
+        crate::agent_tools::submit_call(
             s,
             caller,
+            Some(key),
             &name,
             args,
             Box::new(move |r| {
