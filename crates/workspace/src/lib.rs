@@ -258,6 +258,18 @@ pub struct Settings {
     pub crates_io_lookups: bool,
     /// Code › Code Completion › Enable Command Completion: typing `..` lists IDE actions.
     pub command_completion: bool,
+    // ---- M15 track EA: analysis in the editor
+    /// Settings › Editor › Inspections: analyze a file when it is saved (Ruff for Python, Clippy
+    /// for Rust when `use_clippy` is on and rust-analyzer is not running, clang-tidy/clangd for
+    /// C/C++) with the active inspection profile; findings show in the editor.
+    pub analysis_on_save: bool,
+    /// Languages & Frameworks › Python › Language server: `auto` (the project's virtualenv, then
+    /// the managed basedpyright, then `PATH`), `basedpyright`, `pyright`, `pylsp`, `ty` or `none`.
+    pub python_language_server: String,
+    /// Languages & Frameworks › Python › Type checking (pyright/basedpyright
+    /// `typeCheckingMode`): empty = the project's configuration, else `off`, `basic`,
+    /// `standard`, `strict` (basedpyright also `recommended`, `all`).
+    pub python_type_checking: String,
 }
 
 /// Tab and indent of one language (Settings › Editor › Code Style).
@@ -434,6 +446,9 @@ impl Default for Settings {
             todo_filters: Vec::new(),
             crates_io_lookups: true,
             command_completion: false,
+            analysis_on_save: true,
+            python_language_server: "auto".into(),
+            python_type_checking: String::new(),
         }
     }
 }

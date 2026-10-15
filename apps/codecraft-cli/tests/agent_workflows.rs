@@ -230,7 +230,7 @@ const RS_MAIN: &str = "fn main() {
     println!(\"total {t}\");
     let s = shop::stock();
     println!(\"apples {}\", s[\"apple\"]);
-    let f = shop::fib(36);
+    let f = shop::fib(39);
     println!(\"fib {f}\");
 }
 ";

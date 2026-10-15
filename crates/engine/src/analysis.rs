@@ -17,10 +17,12 @@ pub mod analyzers;
 pub mod baseline;
 pub mod commit_check;
 pub mod cpp;
+pub mod editor;
 pub mod export;
 pub mod glob;
 pub mod install;
 pub mod jobs;
+pub mod on_save;
 pub mod profiles;
 pub mod rust_analyzer;
 pub mod sql;
@@ -157,6 +159,8 @@ pub struct AnalysisState {
     pub commit: commit_check::CommitCheckState,
     /// Managed analyzer installs (M14 CA).
     pub install: install::InstallState,
+    /// Findings shown in the editor and the analysis on save (M15 EA).
+    pub editor: editor::EditorFindings,
 }
 
 impl AnalysisState {
@@ -365,6 +369,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
     v.extend(agent_cmds::specs());
     v.extend(commit_check::specs());
     v.extend(install::specs());
+    // M15 EA.
+    v.extend(editor::specs());
+    v.extend(on_save::specs());
     v
 }
 

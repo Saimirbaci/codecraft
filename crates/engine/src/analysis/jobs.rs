@@ -51,6 +51,8 @@ pub(crate) fn started(s: &mut Session, job: u64) {
     while jobs.len() > KEEP {
         jobs.pop_front();
     }
+    // The open documents' texts the findings will refer to (M15 EA).
+    crate::analysis::editor::job_started(s, job);
 }
 
 /// A run ended: finished (its results are the session's current ones) or cancelled.
@@ -65,6 +67,8 @@ pub(crate) fn ended(s: &mut Session, job: u64, cancelled: bool) {
         rec.results = results;
     }
     crate::analysis::commit_check::job_ended(s, job, cancelled);
+    // Show the findings in the editor (M15 EA).
+    crate::analysis::editor::job_ended(s, job, cancelled);
 }
 
 /// Remember the format a job's results are wanted in.

@@ -447,6 +447,12 @@ fn after_change(s: &mut Session, old: &Settings) {
     {
         s.start_lsp(&root);
     }
+    // Languages & Frameworks › Python › Language server and type checking (M15 EA).
+    if old.python_language_server != s.ws.settings.python_language_server
+        || old.python_type_checking != s.ws.settings.python_type_checking
+    {
+        s.restart_python_server();
+    }
     // Languages & Frameworks › Rust › Crates.io lookups (only where the host allows the network).
     if old.crates_io_lookups != s.ws.settings.crates_io_lookups {
         apply_crates_io_lookups(s);

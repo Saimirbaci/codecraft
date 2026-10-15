@@ -512,6 +512,16 @@ fn emit_node(
     }
 }
 
+/// A test location as the Run tool window shows it: relative to the project (`tests/test_app.py:12`),
+/// absolute outside it; `line` is zero-based (QA M14 #27; agents keep absolute paths).
+pub fn display_location(root: Option<&Path>, path: &Path, line: usize) -> String {
+    let shown = root
+        .and_then(|r| path.strip_prefix(r).ok())
+        .filter(|r| !r.as_os_str().is_empty())
+        .unwrap_or(path);
+    format!("{}:{}", shown.display(), line.saturating_add(1))
+}
+
 /// Parse a test key `s<suite>#<test>`.
 pub fn test_key(key: &str) -> Option<(usize, usize)> {
     let (s, t) = key.strip_prefix('s')?.split_once('#')?;
@@ -1733,6 +1743,15 @@ fn pump_coverage(s: &mut Session) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn locations_are_relative_to_the_project() {
+        let root = Path::new("/w/app");
+        assert_eq!(display_location(Some(root), Path::new("/w/app/tests/test_a.py"), 11), "tests/test_a.py:12");
+        assert_eq!(display_location(Some(root), Path::new("/elsewhere/x.py"), 0), "/elsewhere/x.py:1");
+        assert_eq!(display_location(None, Path::new("/w/app/a.py"), usize::MAX), format!("/w/app/a.py:{}", usize::MAX));
+        assert_eq!(display_location(Some(root), root, 2), "/w/app:3");
+    }
 
     fn cargo_run(text: &str) -> TestRun {
         let inv = CargoInvocation::new(CargoCommand::Test, "/w");

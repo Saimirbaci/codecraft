@@ -82,6 +82,12 @@ impl Kind {
 
 /// Settings › Languages & Frameworks › Python › Formatter.
 pub const PYTHON_FORMATTERS: &[&str] = &["auto", "ruff", "black", "none"];
+/// Settings › Languages & Frameworks › Python › Language server (M15 EA): `auto` = the project's
+/// virtualenv, then the managed basedpyright, then `PATH`.
+pub const PYTHON_LANGUAGE_SERVERS: &[&str] = &["auto", "basedpyright", "pyright", "pylsp", "ty", "none"];
+/// Settings › Languages & Frameworks › Python › Type checking (pyright `typeCheckingMode`;
+/// empty = the project's configuration).
+pub const PYTHON_TYPE_CHECKING: &[&str] = &["", "off", "basic", "standard", "strict", "recommended", "all"];
 
 /// One documented setting.
 #[derive(Clone, Copy, Debug)]
@@ -505,6 +511,27 @@ pub const SETTINGS: &[SettingDef] = &[
         "Optimize imports on save",
         PAGE_PYTHON,
         "Sort imports (Ruff's isort rules, or isort) when Python files are saved",
+        Kind::Bool,
+    ),
+    def(
+        "python_language_server",
+        "Language server",
+        PAGE_PYTHON,
+        "auto (the project's virtualenv, then the basedpyright CodeCraft installed, then PATH), basedpyright, pyright, pylsp, ty or none",
+        Kind::Choice(PYTHON_LANGUAGE_SERVERS),
+    ),
+    def(
+        "python_type_checking",
+        "Type checking",
+        PAGE_PYTHON,
+        "pyright/basedpyright typeCheckingMode: empty = the project's configuration (pyproject.toml, pyrightconfig.json), off, basic, standard, strict, recommended, all",
+        Kind::Choice(PYTHON_TYPE_CHECKING),
+    ),
+    def(
+        "analysis_on_save",
+        "Analyze files on save",
+        PAGE_INSPECTIONS,
+        "Run the active profile's analyzers on a file when it is saved and show the findings in the editor: Ruff for Python, the external linter of Settings › Rust when rust-analyzer is not running, clang-tidy or clangd for C/C++",
         Kind::Bool,
     ),
     def("commit_ai_provider", "Provider", PAGE_VCS, "openrouter, ollama, claude or openai", Kind::Provider),

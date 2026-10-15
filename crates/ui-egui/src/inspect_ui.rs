@@ -199,6 +199,17 @@ pub fn settings_page(ui: &mut Ui, s: &mut Session, st: &mut UiState, cmds: &mut 
         }
     });
     ui.separator();
+    // Analysis on save (M15 EA): a setting of the Settings dialog (applied with OK / Apply).
+    if let Some(draft) = s.prefs.dialog.as_ref().map(|d| d.draft.analysis_on_save) {
+        let mut on = draft;
+        if ui
+            .checkbox(&mut on, "Analyze files on save")
+            .on_hover_text("Run this profile's analyzers on a file when it is saved and show the findings in the editor: Ruff for Python, Clippy for Rust (when Settings › Rust › External linter is Clippy and rust-analyzer is not running), clang-tidy or clangd for C/C++")
+            .changed()
+        {
+            cmds.push(("settings.set", json!({ "key": "analysis_on_save", "value": on })));
+        }
+    }
     if ui
         .checkbox(&mut commit_check, "Analyze code before commit")
         .on_hover_text("The Commit tool window inspects the files being committed with this profile first")
@@ -336,6 +347,16 @@ fn analyzer_options(ui: &mut Ui, p: &InspectionProfile, tool: Tool, cmds: &mut C
         Tool::ClangAnalyzer => text_option(ui, cmds, "clangCheckers", "Extra checkers:", "security, optin.cplusplus.UninitializedObject", p.clang_checkers.join(", ")),
         Tool::ClangTidy => text_option(ui, cmds, "clangTidyChecks", "Checks:", "-*,bugprone-* (empty: .clang-tidy)", p.clang_tidy_checks.clone()),
         Tool::Cppcheck => text_option(ui, cmds, "cppcheckEnable", "Enable:", "warning,style,performance,portability", p.cppcheck_enable.clone()),
+        // QA M14 #21: the advisory database is fetched over the network, so it is opt-in.
+        Tool::CargoAudit | Tool::CargoDeny => {
+            let mut on = p.advisories;
+            let r = ui
+                .checkbox(&mut on, "Security advisories (fetches the RustSec advisory database over the network)")
+                .on_hover_text("cargo audit and `cargo deny check advisories` download the RustSec database on each run. Off: no network; cargo deny still checks licenses, bans and sources offline when the project has a deny.toml. Asking for the tool by name (Tools › Cargo › Audit, `tools: [\"cargo_deny\"]`) always runs it.");
+            if r.changed() {
+                cmds.push(("analysis.profile.setOption", json!({ "option": "advisories", "value": on })));
+            }
+        }
         _ => {}
     }
 }

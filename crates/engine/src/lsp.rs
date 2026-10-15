@@ -125,6 +125,37 @@ pub fn server_kind(language: Language) -> Option<ServerKind> {
     }
 }
 
+/// Why there is no Python language server, and how to get one (M15 EA).
+pub(crate) fn python_server_hint(preference: &str) -> String {
+    let pref = preference.trim().to_ascii_lowercase();
+    match pref.as_str() {
+        "none" | "off" => "The Python language server is turned off (Settings › Languages & Frameworks › Python)".into(),
+        "" | "auto" => "No Python language server was found. Install basedpyright (status bar or Settings › Languages & Frameworks › Python: `uv tool install` into CodeCraft's own tools, never globally), or put basedpyright, pyright, pylsp or ty in the project's virtualenv".into(),
+        other => format!("{other} was not found in the project's virtualenv or on PATH (Settings › Languages & Frameworks › Python › Language server)"),
+    }
+}
+
+/// `workspace/configuration` for the Python servers: the interpreter and the type checking mode
+/// (pyright asks for `python`, `python.analysis` and `basedpyright.analysis`, and CodeCraft
+/// answers every section with the same object, so the keys appear at both levels).
+pub(crate) fn python_config(python: Option<&Path>, type_checking: &str) -> Option<Value> {
+    let mode = type_checking.trim();
+    if python.is_none() && mode.is_empty() {
+        return None;
+    }
+    let mut analysis = json!({ "autoSearchPaths": true });
+    let mut root = json!({ "autoSearchPaths": true });
+    if !mode.is_empty() {
+        analysis["typeCheckingMode"] = json!(mode);
+        root["typeCheckingMode"] = json!(mode);
+    }
+    if let Some(py) = python {
+        root["pythonPath"] = json!(py);
+    }
+    root["analysis"] = analysis;
+    Some(root)
+}
+
 /// rust-analyzer settings (sent as initializationOptions and for `workspace/configuration`).
 fn ra_config(use_clippy: bool, low_memory: bool) -> Value {
     let mut cfg = json!({
@@ -247,12 +278,18 @@ impl Session {
                 .filter(|p| p.exists())
                 .map(|program| codecraft_lsp::ServerCommand { program, args: Vec::new(), name: "rust-analyzer".into() })
                 .or_else(|| codecraft_lsp::find_server(kind, root))
+        } else if kind == ServerKind::Python {
+            // The project's virtualenv, the managed basedpyright, then PATH (M15 EA).
+            let managed = self.managed_tools_bin();
+            codecraft_lsp::find_python_server(root, managed.as_deref(), &self.ws.settings.python_language_server)
         } else {
             codecraft_lsp::find_server(kind, root)
         };
         let Some(command) = command else {
             let hint = if kind == ServerKind::RustAnalyzer {
                 INSTALL_HINT.to_string()
+            } else if kind == ServerKind::Python {
+                python_server_hint(&self.ws.settings.python_language_server)
             } else {
                 format!("{} was not found. Install it with: {}", kind.label(), kind.install_hint())
             };
@@ -271,15 +308,27 @@ impl Session {
                 {
                     *c = json!("fill_arguments");
                 }
+                // The inspection profile's Clippy groups and rules in rust-analyzer's check on
+                // save, when it runs Clippy (M15 EA).
+                if self.ws.settings.use_clippy
+                    && let Ok(profile) = crate::analysis::profiles::resolve(self, None)
+                {
+                    let extra = profile.clippy_args();
+                    if !extra.is_empty()
+                        && let Some(check) = settings.get_mut("check").and_then(Value::as_object_mut)
+                    {
+                        check.insert("extraArgs".into(), json!(["--"].into_iter().map(String::from).chain(extra).collect::<Vec<_>>()));
+                    }
+                }
                 config.initialization_options = Some(settings.clone());
                 config.configuration = Some(settings);
             }
             ServerKind::Python => {
-                // Point pyright/basedpyright at the project's interpreter (selected, else its virtualenv).
+                // Point pyright/basedpyright at the project's interpreter (selected, else its
+                // virtualenv) and the type checking mode of Settings › Python (M15 EA).
                 let venv = crate::python_env::project_python(root);
-                if let Some(py) = venv {
-                    config.configuration = Some(json!({ "pythonPath": py, "analysis": { "autoSearchPaths": true } }));
-                }
+                config.configuration =
+                    python_config(venv.as_deref(), &self.ws.settings.python_type_checking);
             }
             _ => {}
         }
@@ -311,6 +360,32 @@ impl Session {
                 self.set_status(kind, LspStatus::Stopped(msg.clone()));
                 self.ws.notify(NotificationLevel::Error, &name, msg);
             }
+        }
+    }
+
+    /// `$CODECRAFT_HOME/tools/bin`: where Install basedpyright puts the managed copy.
+    pub(crate) fn managed_tools_bin(&self) -> Option<PathBuf> {
+        self.analysis.profiles.home.file("tools").map(|t| t.join("bin"))
+    }
+
+    /// The Python language server CodeCraft would start for the project (M15 EA).
+    pub fn python_server_command(&self) -> Option<codecraft_lsp::ServerCommand> {
+        let root = self.project_root()?;
+        let managed = self.managed_tools_bin();
+        codecraft_lsp::find_python_server(&root, managed.as_deref(), &self.ws.settings.python_language_server)
+    }
+
+    /// The status bar's hint when Python files have no language server: Install basedpyright.
+    pub fn python_server_missing(&self) -> bool {
+        let pref = self.ws.settings.python_language_server.trim().to_ascii_lowercase();
+        pref != "none" && matches!(self.server_status(ServerKind::Python), LspStatus::Unavailable(_))
+    }
+
+    /// Start the Python server again with the current settings and tools, when one was started
+    /// (or found missing) for this project (M15 EA).
+    pub(crate) fn restart_python_server(&mut self) {
+        if self.servers.contains_key(&ServerKind::Python) || self.server_status.contains_key(&ServerKind::Python) {
+            self.restart_server(Some(ServerKind::Python));
         }
     }
 
@@ -546,6 +621,8 @@ impl Session {
                 .ws
                 .problems_for(&path)
                 .into_iter()
+                // The server's own diagnostics (analyzer findings are offered by CodeCraft).
+                .filter(|p| p.source != codecraft_workspace::ProblemSource::Analysis)
                 .filter(|p| p.start <= pos && pos <= p.end)
                 .map(|p| {
                     let s = d.doc.position_to_offset(p.start);
@@ -1149,6 +1226,8 @@ impl Session {
         let items: Vec<ActionItem> = items.into_iter().chain(crate::sql_lang::context_actions(self)).collect();
         // Rust: Show recursive macro expansion on a macro call (M12 RS).
         let items: Vec<ActionItem> = crate::macro_expand::context_actions(self).into_iter().chain(items).collect();
+        // The analyzers' fixes and suppressions at the caret first (M15 EA).
+        let items: Vec<ActionItem> = crate::analysis::editor::context_actions(self).into_iter().chain(items).collect();
         if let Some(Popup::Actions { items: target, pending, .. }) = &mut self.popup {
             if items.is_empty() {
                 self.popup = None;

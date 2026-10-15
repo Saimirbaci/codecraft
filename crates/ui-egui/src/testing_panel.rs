@@ -157,8 +157,10 @@ pub fn show_test_run(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tab: 
     let show_console = output.is_none();
     if let Some(text) = output {
         if let Some(f) = failure {
-            let label = format!("at {}:{}", f.path.display(), f.line + 1);
-            if ui.link(RichText::new(label).color(theme.link)).clicked() {
+            // Relative to the project in the narrow panel; the full path on hover (QA M14 #27).
+            let label = format!("at {}", codecraft_engine::testing::display_location(s.project_root().as_deref(), &f.path, f.line));
+            let full = format!("{}:{}", f.path.display(), f.line + 1);
+            if ui.link(RichText::new(label).color(theme.link)).on_hover_text(full).clicked() {
                 cmds.push(("navigate.openLocation", json!({ "path": f.path, "line": f.line, "column": f.column })));
             }
         }

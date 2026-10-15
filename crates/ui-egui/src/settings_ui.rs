@@ -467,6 +467,7 @@ fn page(
         settings::PAGE_CODE_STYLE_OTHER => pages::code_style_other_page(ui, st, draft, cmds),
         settings::PAGE_TODO => pages::todo_page(ui, st, draft, cmds),
         settings::PAGE_INSPECTIONS => crate::inspect_ui::settings_page(ui, s, st, cmds),
+        settings::PAGE_PYTHON => crate::python_settings_ui::page(ui, s, st, draft, cmds),
         _ => setting_grid(ui, st, page, draft, query, cmds),
     }
 }

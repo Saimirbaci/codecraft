@@ -145,6 +145,12 @@ pub struct InspectionProfile {
     /// cppcheck `--enable` (empty: `warning,style,performance,portability`).
     #[serde(default)]
     pub cppcheck_enable: String,
+    /// Security advisories: `cargo audit` and `cargo deny check advisories` fetch the RustSec
+    /// advisory database over the network, so they run only when this is on (QA M14 #21; off in
+    /// the built-in profiles). Off, cargo deny still checks licenses, bans and sources offline
+    /// when the project has a `deny.toml`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub advisories: bool,
 }
 
 /// Clippy lint groups a profile can turn on.
@@ -178,6 +184,7 @@ impl InspectionProfile {
             clang_checkers: Vec::new(),
             clang_tidy_checks: String::new(),
             cppcheck_enable: String::new(),
+            advisories: false,
         }
     }
 
@@ -711,6 +718,7 @@ fn profile_json(p: &InspectionProfile, scope: ProfileScope, active: &str) -> Val
         "clangCheckers": p.clang_checkers,
         "clangTidyChecks": p.clang_tidy_checks,
         "cppcheckEnable": p.cppcheck_enable,
+        "advisories": p.advisories,
     })
 }
 
@@ -873,6 +881,14 @@ fn string_list(v: &Value) -> Result<Vec<String>, CommandError> {
 fn set_option_cmd(s: &mut Session, p: &Value) -> CmdResult {
     let option = req_str(p, "option")?.to_string();
     let value = p.get("value").cloned().unwrap_or(Value::Null);
+    // Security advisories (network) on or off (M15 EA).
+    if option == "advisories" {
+        let on = value.as_bool().ok_or_else(|| CommandError::BadParams("`advisories` takes true or false".into()))?;
+        let profile = edit(s, opt_str(p, "name"), move |p| p.advisories = on).map_err(CommandError::Failed)?;
+        let active = s.analysis.profiles.active.clone();
+        let scope = s.analysis.profiles.find(&profile.name).map(|(_, sc)| sc).unwrap_or(ProfileScope::Project);
+        return Ok(profile_json(&profile, scope, &active));
+    }
     let list = string_list(&value)?;
     if list.len() > 200 {
         return Err(CommandError::BadParams("too many values".into()));
@@ -894,7 +910,7 @@ fn set_option_cmd(s: &mut Session, p: &Value) -> CmdResult {
         }
         other => {
             return Err(CommandError::BadParams(format!(
-                "unknown option '{other}' (clippyGroups, ruffSelect, clangCheckers, clangTidyChecks, cppcheckEnable, description)"
+                "unknown option '{other}' (clippyGroups, ruffSelect, clangCheckers, clangTidyChecks, cppcheckEnable, advisories, description)"
             )));
         }
     };
@@ -966,7 +982,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "analysis.profile.setOption",
             "Set Inspection Profile Option",
             None,
-            "{option: \"clippyGroups\"|\"ruffSelect\"|\"clangCheckers\"|\"clangTidyChecks\"|\"cppcheckEnable\"|\"description\", value: [string]|string, name?: string}",
+            "{option: \"clippyGroups\"|\"ruffSelect\"|\"clangCheckers\"|\"clangTidyChecks\"|\"cppcheckEnable\"|\"advisories\"|\"description\", value: [string]|string|bool, name?: string} — `advisories: true` lets cargo audit / cargo deny fetch the RustSec advisory database (network)",
             g,
             always,
             set_option_cmd,

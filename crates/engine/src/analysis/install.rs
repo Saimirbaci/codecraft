@@ -137,6 +137,10 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     };
     s.status = message.clone();
     s.notify(if ok { NotificationLevel::Info } else { NotificationLevel::Error }, "Install", message.clone());
+    // The managed basedpyright is the Python language server from now on (M15 EA).
+    if ok && tool == "basedpyright" {
+        s.restart_python_server();
+    }
     s.analysis.install.last = Some(InstallOutcome { tool, ok, message });
     true
 }

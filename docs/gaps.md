@@ -211,8 +211,13 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     basedpyright — `analysis.installTool {tool: "basedpyright", confirm: true}`, a button in the
     Inspection Results and on Settings › Editor › Inspections — runs `uv tool install` into
     `$CODECRAFT_HOME/tools`, never globally, and Inspect Code uses that copy after the project's
-    and `PATH`'s.) Remaining: the Python language server does not pick up the managed
-    `basedpyright-langserver` yet; TypeScript is unchanged.
+    and `PATH`'s.) (M15 track EA, item 57: the managed `basedpyright-langserver` is the Python
+    language server when the project's virtualenv has none, before `PATH`; Settings ›
+    Languages & Frameworks › Python chooses the server (`auto`, basedpyright, pyright, pylsp, ty,
+    none) and the type checking mode; the status bar offers Install basedpyright when Python files
+    have no server, and the server restarts on the managed copy once installed.) Remaining:
+    TypeScript is unchanged; the managed basedpyright was exercised with a stand-in binary only
+    (no real basedpyright or uv run here).
 23. ~~Database: no in-grid editing yet; TLS for PostgreSQL is not supported~~ (2026-10-13: tables
     with a primary key are editable in the grid: edit a cell in place (double-click/Enter/F2, Set
     NULL), add and delete rows, pending changes highlighted, Revert, Preview SQL, Submit as one
@@ -949,7 +954,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     the problems (Review opens them); baselines match problems by line text, so an edit on the
     problem's own line makes it new again; cppcheck, clang-tidy, basedpyright, mypy and uv were
     exercised only through fakes here (clang, clangd, rust-analyzer, Clippy, ruff and git for
-    real).
+    real). (M15 track EA, item 57: findings show in the editor and are analyzed on save;
+    cargo audit / cargo deny's advisory fetch is opt-in per profile.)
 
 55. Profiling for people and agents (track PF): Run › Profile plans the configuration first
     (`engine/src/profiler_plan.rs`): Cargo run/test/bench configurations are built with
@@ -1029,9 +1035,75 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     line and `command_line` in `inspect`'s tool list, no interpreter picker on Settings › Python
     (the hotspot order following the IDE's method sort was fixed by M15 PP, item 59), absolute test locations in the Run window;
     the gallery leaves out the Terminal, Python Console, Rust REPL, a Git repository and remote
-    windows.
+    windows. (M15 track EA, item 57, closed QA #21 — advisories opt-in —, #26 — the interpreter
+    picker on Settings › Python — and #27 — relative test locations in the Run window.)
 
 ## M15 (2026-10-15)
+
+57. Analysis in the editor (track EA). Findings of the analyzers show in the editor like
+    language-server diagnostics (`engine/src/analysis/editor.rs`): a per-file store keeps each
+    finding with a snapshot of the text its positions refer to, maps them through the document's
+    change log on every pump (an edit above moves the underline; an edit inside the flagged text
+    drops the finding until the next analysis) and publishes them as `ProblemSource::Analysis`
+    workspace problems, so the severity underlines (theme tokens), the error stripe, the
+    inspection widget, the Problems tool window and Next/Previous Highlighted Error (F2/Shift+F2)
+    include them; a new gutter mark (a severity dot left of the line number) shows errors and
+    warnings of every source; the hover names the analyzer, rule and message and lists the fixes
+    and the suppression; Alt+Enter offers the analyzer's fixes and its suppression first
+    (`analysis.editorFix {key, fix}`, `analysis.editorSuppress {key}`), with or without a language
+    server. A finding that repeats a language-server diagnostic on the same line (rust-analyzer's
+    flycheck reports Clippy too) is kept for agents but not drawn twice; advisories stay on their
+    Cargo.toml highlighting. Inspect Code's findings arrive when the run ends (mapped from the
+    open documents' texts at its start), leave when fixed or suppressed in Inspection Results,
+    are replaced by the next run of their scope and go when the results are closed. Analysis on
+    save (`analysis/on_save.rs`): saved files are analyzed in the background with the active
+    profile — Ruff for Python; Clippy for Rust when Settings › Rust › External linter is Clippy
+    and rust-analyzer is not running (its own check on save runs Clippy then, now with the
+    profile's lint groups and rules as `check.extraArgs`); clang-tidy for C/C++ when installed
+    plus clangd's diagnostics when the clangd language server is not running — debounced
+    (400 ms; a burst of saves is one run), the run in flight cancelled by a newer save of its files
+    (processes killed), never on the UI thread; the new findings replace the file's findings of
+    the analyzers that ran (a failing analyzer keeps the old ones). Settings › Editor ›
+    Inspections › Analyze files on save (`analysis_on_save`, on by default) turns it off, as does
+    Power Save mode. For agents: `analysis.fileFindings {path?}` (absolute path, 1-based lines,
+    analyzer, rule, severity, fixes, suppressible, source `inspection` with the Inspect Code id or
+    `onSave`, the file's other problems, and whether an analysis is pending or running),
+    `analysis.analyzeFile {path?}` (analyze now), `python.languageServer`; the `problems` MCP
+    tool and `analysis.problems` include on-save findings (with `key`) and skip Inspect Code
+    findings re-analyzed since. Python: the managed basedpyright is the language server after the
+    project's virtualenv and before `PATH` (`codecraft_lsp::find_python_server`), Settings ›
+    Languages & Frameworks › Python has the interpreter picker (detected interpreters, the
+    project default, Detect, Create Virtualenv…, any path with Add Interpreter — the same
+    `python.interpreter.*` commands as the status bar), the language server choice with its
+    status and Install basedpyright, the type checking mode (sent as pyright's
+    `typeCheckingMode`), Ruff (analyze on save, the profile's extra rules) and the formatter
+    settings; changing the server or mode restarts the Python server. cargo audit / cargo deny:
+    the advisory database is fetched only when the inspection profile turns Security advisories
+    on (`analysis.profile.setOption {option: "advisories", value: true}`, a checkbox under the
+    cargo audit / cargo deny analyzers explaining the network use; off in the built-in profiles)
+    or the tool is asked for by name; otherwise cargo deny runs `--offline` on licenses, bans
+    and sources when the project has a `deny.toml`, and the run lists the skipped tool with the
+    reason. The Run window shows a failed test's location relative to the project (full path on
+    hover); `test.summary` keeps absolute paths. Tested: unit tests (mapping through edits,
+    fixes moving or dropping, hostile positions, hover text, duplicate detection, Python server
+    lookup and configuration, cargo deny arguments, test locations), engine tests with the real
+    ruff (on save, moving with edits, F2, Alt+Enter fix), the real cargo clippy (on save without
+    rust-analyzer), the real clangd (C++ on save), fakes for debouncing, cancellation, the
+    setting, Inspect Code findings, suppression and cargo deny/audit
+    (`crates/engine/tests/analysis_editor.rs`, 9), and egui_kittest UI tests: Cmd+S runs ruff,
+    the underline appears, Alt+Enter on it applies ruff's fix; the Python and Inspections pages
+    (`crates/ui-egui/tests/analysis_editor_ui.rs`, 2; `testing_ui.rs` checks the relative
+    location). Remaining: findings move with edits but are not recomputed while typing (only on
+    save; PyCharm's on-the-fly inspections re-run as you type); Python on save runs Ruff only
+    (mypy/pyright findings come from the language server or Inspect Code); Rust on save without
+    rust-analyzer builds the whole workspace with Clippy; clangd on save starts a clangd per run
+    (no index kept); clang-tidy on save reported nothing for a compile error here (clangd did);
+    a closed file's findings keep the positions of the text last seen, so a file changed on disk
+    while closed shows them where they were until it is analyzed again; the duplicate check
+    against language-server diagnostics compares the line and the code or first message line
+    only; the gutter mark is not clickable; the managed basedpyright language server was tested
+    with a stand-in (no real basedpyright here); the type checking mode is not verified against
+    a real pyright.
 
 59. Profiling polish (track PP): **Profile the test at the caret** — the gutter ▶ menu has
     Profile and Profile Memory (`profiler.atCaret {path?, line? (0-based), kind?, tool?,

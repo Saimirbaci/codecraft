@@ -336,6 +336,27 @@ fn read_text(path: &Path) -> Option<String> {
     crate::inspections::read_normalized(path)
 }
 
+/// Why cargo audit did not run (QA M14 #21).
+pub(crate) const NETWORK_SKIPPED: &str = "advisories off: they fetch the RustSec advisory database over the network; turn on Security advisories in the inspection profile (Settings › Editor › Inspections)";
+
+/// The arguments of cargo audit / cargo deny: advisories only when the profile allows the
+/// network fetch; otherwise cargo deny runs `--offline` without the advisories check.
+pub(crate) fn deny_args(tool: Tool, advisories: bool, deny_config: bool) -> Vec<String> {
+    match tool {
+        Tool::CargoAudit => vec!["audit".into(), "--json".into()],
+        _ if !advisories => ["--offline", "--format", "json", "--color", "never", "check", "licenses", "bans", "sources"]
+            .map(String::from)
+            .to_vec(),
+        _ => {
+            let mut a: Vec<String> = ["--format", "json", "--color", "never", "check"].map(String::from).to_vec();
+            if !deny_config {
+                a.push("advisories".into());
+            }
+            a
+        }
+    }
+}
+
 /// Run the advisory tools for an Inspect Code job (on its worker thread).
 pub(crate) fn run(
     spec: &JobSpec,
@@ -358,14 +379,26 @@ pub(crate) fn run(
     let wanted = |t: Tool| spec.tools.as_ref().is_none_or(|l| l.contains(&t));
     let program = |t: Tool| spec.programs.get(&t).cloned().or_else(|| find(t));
     let deny_config = root.join("deny.toml").is_file() || root.join(".deny.toml").is_file();
+    // The advisory database comes from the network: only when the profile turns advisories on
+    // or the tool is asked for by name (QA M14 #21). Without them, cargo deny checks licenses,
+    // bans and sources offline.
+    let advisories = spec.profile.advisories || explicit;
+    let on = |t: Tool| spec.profile.analyzer_enabled(t);
     let mut chosen: Vec<Tool> = Vec::new();
     if explicit {
         chosen.extend([Tool::CargoAudit, Tool::CargoDeny].into_iter().filter(|t| wanted(*t)));
-    } else if program(Tool::CargoDeny).is_some() && deny_config {
+    } else if !advisories {
+        if program(Tool::CargoDeny).is_some() && deny_config && on(Tool::CargoDeny) {
+            chosen.push(Tool::CargoDeny);
+        } else if let Some(t) = [Tool::CargoAudit, Tool::CargoDeny].into_iter().find(|t| program(*t).is_some() && on(*t)) {
+            // Say why the installed tool did not run (not a failure).
+            tools.push(ToolRun { tool: t, command_line: String::new(), outcome: NETWORK_SKIPPED.into(), ok: true });
+        }
+    } else if program(Tool::CargoDeny).is_some() && deny_config && on(Tool::CargoDeny) {
         chosen.push(Tool::CargoDeny);
-    } else if program(Tool::CargoAudit).is_some() {
+    } else if program(Tool::CargoAudit).is_some() && on(Tool::CargoAudit) {
         chosen.push(Tool::CargoAudit);
-    } else if program(Tool::CargoDeny).is_some() {
+    } else if program(Tool::CargoDeny).is_some() && on(Tool::CargoDeny) {
         chosen.push(Tool::CargoDeny);
     }
     if chosen.is_empty() {
@@ -387,16 +420,7 @@ pub(crate) fn run(
             tools.push(ToolRun { tool, command_line: String::new(), outcome: "not installed".into(), ok: false });
             continue;
         };
-        let args: Vec<String> = match tool {
-            Tool::CargoAudit => vec!["audit".into(), "--json".into()],
-            _ => {
-                let mut a: Vec<String> = ["--format", "json", "--color", "never", "check"].map(String::from).to_vec();
-                if !deny_config {
-                    a.push("advisories".into());
-                }
-                a
-            }
-        };
+        let args = deny_args(tool, advisories, deny_config);
         let command_line = format!(
             "{} {}",
             prog.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
