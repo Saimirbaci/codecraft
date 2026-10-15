@@ -62,6 +62,11 @@ pub(crate) struct ProjectWindow {
     pub(crate) session: Session,
     pub(crate) ui: UiState,
     closed: bool,
+    /// Where the window opens (the project's remembered place, else the main window's size).
+    open_pos: Option<[f32; 2]>,
+    open_size: [f32; 2],
+    /// Its last known outer position and inner size `[x, y, w, h]`.
+    rect: Option<[f32; 4]>,
 }
 
 #[derive(Default)]
@@ -93,12 +98,17 @@ impl ProjectWindows {
         session.session_store.autosave = main.session_store.autosave;
         session.session_store.restore_on_open = main.session_store.restore_on_open;
         session.session_store.fallback_dir = main.session_store.fallback_dir.clone();
+        session.hot_exit.enabled = main.hot_exit.enabled;
+        session.hot_exit.fallback_dir = main.hot_exit.fallback_dir.clone();
+        let saved = persisted.saved_window_rect(&codecraft_engine::normalize_path(&path));
+        let open_size = saved.map(|(_, s)| s).or(persisted.saved_window_size()).unwrap_or([1400.0, 900.0]);
+        let open_pos = saved.map(|(p, _)| p);
         let mut ui = UiState::new();
         ui.window_sizes = persisted.window_sizes.clone();
         run_command(&mut session, &mut ui, "file.open", &json!({ "path": path }));
         self.next_id = self.next_id.wrapping_add(1);
         let id = ViewportId::from_hash_of(("codecraft-project-window", self.next_id));
-        self.windows.push(ProjectWindow { id, session, ui, closed: false });
+        self.windows.push(ProjectWindow { id, session, ui, closed: false, open_pos, open_size, rect: None });
     }
 
     /// The index of the focused project window (`None`: the main window or none).
@@ -117,6 +127,11 @@ impl ProjectWindows {
             .filter(|w| !w.closed)
             .filter_map(|w| Some(w.session.ws.project.as_ref()?.root.clone()))
             .collect()
+    }
+
+    /// Each open window's project and its last known position and size.
+    pub(crate) fn rects(&self) -> Vec<(PathBuf, [f32; 4])> {
+        self.windows.iter().filter_map(|w| Some((w.session.ws.project.as_ref()?.root.clone(), w.rect?))).collect()
     }
 
     /// Save every window's project session now.
@@ -163,14 +178,17 @@ impl ProjectWindows {
             return;
         }
         let focused = self.focused(ctx);
-        let size = ctx.input(|i| i.viewport().inner_rect).map(|r| r.size()).unwrap_or(egui::vec2(1400.0, 900.0));
         let mut pending = std::mem::take(&mut self.pending_native);
         for (index, w) in self.windows.iter_mut().enumerate() {
             let fired = if focused == Some(index) { std::mem::take(&mut pending) } else { Vec::new() };
-            let builder = ViewportBuilder::default()
+            // The same place and size every frame, so the builder never moves the window again.
+            let mut builder = ViewportBuilder::default()
                 .with_title(crate::App::window_title(&w.session))
-                .with_inner_size(size)
+                .with_inner_size(w.open_size)
                 .with_min_inner_size([640.0, 400.0]);
+            if let Some(pos) = w.open_pos {
+                builder = builder.with_position(pos);
+            }
             ctx.show_viewport_immediate(w.id, builder, |ui, _class| {
                 let ctx = ui.ctx().clone();
                 if !fired.is_empty() {
@@ -184,11 +202,22 @@ impl ProjectWindows {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     w.closed = true;
                 }
+                let (inner, outer, minimized, full) = ctx.input(|i| {
+                    let v = i.viewport();
+                    (v.inner_rect, v.outer_rect, v.minimized.unwrap_or(false), v.fullscreen.unwrap_or(false))
+                });
+                if let (Some(inner), Some(outer)) = (inner, outer)
+                    && !minimized
+                    && !full
+                {
+                    w.rect = Some([outer.min.x, outer.min.y, inner.width(), inner.height()]);
+                }
             });
             requests.extend(w.ui.window_requests.drain(..).map(|r| (Some(index), r)));
         }
         for w in self.windows.iter_mut().filter(|w| w.closed) {
-            let _ = w.session.save_all();
+            // Hot exit keeps its unsaved buffers (no prompt); off, they are saved.
+            codecraft_engine::hot_exit::quit_save(&mut w.session);
             w.session.shutdown();
         }
         self.windows.retain(|w| !w.closed);
@@ -217,7 +246,7 @@ impl ProjectWindows {
     /// Save and stop every project window's session (app exit).
     pub(crate) fn shutdown(&mut self) {
         for w in &mut self.windows {
-            let _ = w.session.save_all();
+            codecraft_engine::hot_exit::quit_save(&mut w.session);
             w.session.shutdown();
         }
         self.windows.clear();

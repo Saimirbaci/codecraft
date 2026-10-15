@@ -113,6 +113,7 @@ pub mod copyright;
 pub mod data_flow;
 pub mod duplicates;
 pub mod file_templates;
+pub mod hot_exit;
 pub mod inline_completion;
 pub mod layouts;
 pub mod macros;
@@ -265,6 +266,8 @@ pub struct Session {
     pub misc: misc::MiscState,
     /// Session save/restore switches (M10 track A; off unless the app turns it on).
     pub session_store: session_store::SessionStore,
+    /// Hot exit: unsaved buffers kept across restarts (M13 track SR; off unless the app turns it on).
+    pub hot_exit: hot_exit::HotExitState,
     /// View › Appearance modes, Zoom IDE popup, Memory Indicator (M10 track G).
     pub appearance: appearance::AppearanceState,
     /// Edit › Paste › Paste from History… ring (M10 track G).
@@ -372,6 +375,7 @@ impl Session {
             run_store: run_config_store::RunConfigStore::default(),
             misc: misc::MiscState::default(),
             session_store: session_store::SessionStore::default(),
+            hot_exit: hot_exit::HotExitState::default(),
             appearance: appearance::AppearanceState::default(),
             clip_history: paste::ClipHistory::default(),
             usages: usages::UsagesState::default(),
@@ -464,6 +468,11 @@ impl Session {
     pub fn isolate_home(&mut self, dir: &std::path::Path) {
         self.agents.sessions.dir_override = Some(dir.join(agent_sessions::DIR_NAME));
         self.scratch.dir_override = Some(dir.join("scratches"));
+        self.hot_exit.fallback_dir = Some(dir.join("unsaved"));
+        // Review worktrees too, unless a test chose a directory.
+        if self.agents.settings.worktrees_dir.is_none() {
+            self.agents.settings.worktrees_dir = Some(dir.join("worktrees"));
+        }
         self.editing.templates.set_path(dir.join("templates.json"));
         self.profiler.dir_override = Some(dir.join("profiler"));
         self.db.history.set_dir(dir.join("database").join("history"));
@@ -522,6 +531,7 @@ impl Session {
         changed |= inline_completion::pump(self);
         changed |= cpp::pump(self);
         session_store::autosave(self);
+        hot_exit::autosave(self);
         self.ws.sync_views();
         changed
     }
@@ -751,9 +761,18 @@ impl Session {
         let mut saved_paths = Vec::new();
         jupyter::before_save(self);
         local_history::before_save(self);
+        // Restored unsaved changes whose file changed on disk meanwhile wait for the user.
+        let blocked = hot_exit::blocked(&self.hot_exit);
         for od in self.ws.docs_mut() {
             let Some(path) = od.path.clone() else { continue };
             if !od.doc.is_modified() {
+                continue;
+            }
+            if blocked.contains(&od.id) {
+                errors.push(format!(
+                    "{}: it changed on disk after its unsaved changes were kept; compare with disk, then keep or discard them",
+                    path.display()
+                ));
                 continue;
             }
             match misc::encoding::write_document(&path, od) {

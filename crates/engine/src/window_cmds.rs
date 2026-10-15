@@ -60,6 +60,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
 pub(crate) fn close(s: &mut Session, id: EditorId) {
     if let Some(od) = s.ws.close_editor(id) {
         if od.doc.is_modified()
+            && !crate::hot_exit::keep_on_close(s, od.id)
             && let Some(path) = &od.path
             && let Err(e) = crate::misc::encoding::write_document(path, &od)
         {

@@ -81,6 +81,12 @@ pub struct TabSnapshot {
     pub scroll_x: f32,
     /// Start lines of collapsed fold regions.
     pub folded: Vec<usize>,
+    /// The tab's own soft-wrap choice (`None`: the setting).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub soft_wrap: Option<bool>,
+    /// Edit › Column Selection Mode was on in this tab.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub column_mode: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +104,9 @@ pub struct RestoreSummary {
     pub tabs: usize,
     /// Files the snapshot names that could not be opened (missing, unreadable), once each.
     pub skipped: Vec<PathBuf>,
+    /// Restored editors whose tab had column selection mode on (the engine keeps that mode).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub column_mode: Vec<EditorId>,
 }
 
 impl SessionSnapshot {
@@ -136,25 +145,32 @@ struct Build<'a, F> {
     /// Snapshot group index → the group made for it.
     made: BTreeMap<usize, GroupId>,
     tabs: usize,
+    column_mode: Vec<EditorId>,
 }
 
 impl Workspace {
     /// The current editors and layout as a snapshot. Tabs without a file (untitled buffers)
     /// are left out.
     pub fn session_snapshot(&self) -> SessionSnapshot {
+        self.session_snapshot_with(|_| false)
+    }
+
+    /// [`Self::session_snapshot`], with `column_mode` telling which editors are in column
+    /// selection mode (state the engine keeps).
+    pub fn session_snapshot_with(&self, column_mode: impl Fn(EditorId) -> bool) -> SessionSnapshot {
         let leaves = self.split.leaves();
         let index: BTreeMap<GroupId, usize> = leaves.iter().enumerate().map(|(i, g)| (*g, i)).collect();
         SessionSnapshot {
             version: SNAPSHOT_VERSION,
             project: self.project.as_ref().map(|p| p.root.clone()),
             split: remap(&self.split, &index),
-            groups: leaves.iter().map(|g| self.group_snapshot(*g)).collect(),
+            groups: leaves.iter().map(|g| self.group_snapshot(*g, &column_mode)).collect(),
             focused: index.get(&self.focused).copied().unwrap_or(0),
             layout: Some(self.layout.clone()),
         }
     }
 
-    fn group_snapshot(&self, g: GroupId) -> GroupSnapshot {
+    fn group_snapshot(&self, g: GroupId, column_mode: &impl Fn(EditorId) -> bool) -> GroupSnapshot {
         let Some(group) = self.groups.get(&g) else { return GroupSnapshot::default() };
         let mut out = GroupSnapshot::default();
         for id in &group.tabs {
@@ -178,6 +194,8 @@ impl Workspace {
                 scroll_line: finite_non_negative(e.scroll_line),
                 scroll_x: finite_non_negative(e.scroll_x),
                 folded: e.folded.iter().copied().collect(),
+                soft_wrap: e.soft_wrap,
+                column_mode: column_mode(*id),
             });
         }
         out
@@ -198,7 +216,8 @@ impl Workspace {
         let ungrouped: Vec<EditorId> = self.editors.keys().copied().filter(|id| !previous.contains(id)).collect();
         previous.extend(ungrouped);
         self.groups.clear();
-        let mut b = Build { snap, doc_for, docs: BTreeMap::new(), made: BTreeMap::new(), tabs: 0 };
+        let mut b =
+            Build { snap, doc_for, docs: BTreeMap::new(), made: BTreeMap::new(), tabs: 0, column_mode: Vec::new() };
         let tree = self.build_node(&snap.split, 0, &mut b);
         // Restored views of a document replace the old ones.
         let restored: BTreeSet<EditorId> = self.groups.values().flat_map(|g| g.tabs.iter().copied()).collect();
@@ -241,7 +260,7 @@ impl Workspace {
         }
         let mut skipped: Vec<PathBuf> = b.docs.iter().filter(|(_, d)| d.is_none()).map(|(p, _)| p.clone()).collect();
         skipped.sort();
-        RestoreSummary { groups: leaves.len(), tabs: b.tabs, skipped }
+        RestoreSummary { groups: leaves.len(), tabs: b.tabs, skipped, column_mode: b.column_mode }
     }
 
     /// Close `doc` if no editor shows it (a document opened for a restore whose tabs were all
@@ -318,6 +337,9 @@ impl Workspace {
             // One view of a document per group, like the rest of the model.
             let Some(doc) = doc.filter(|d| docs_here.insert(*d)) else { continue };
             let Some(id) = self.restore_editor(doc, tab) else { continue };
+            if tab.column_mode {
+                b.column_mode.push(id);
+            }
             group.tabs.push(id);
             b.tabs += 1;
             // The selected tab, or the nearest restored one before it.
@@ -356,6 +378,7 @@ impl Workspace {
         e.scroll_x = finite_non_negative(tab.scroll_x).min(1.0e7);
         e.folded = folded;
         e.pinned = tab.pinned;
+        e.soft_wrap = tab.soft_wrap;
         // Keep the restored scroll position rather than jumping to the caret.
         e.reveal_caret = false;
         self.view_revs.insert(id, (rev, top));
@@ -469,7 +492,7 @@ mod tests {
         assert_eq!(back, snap);
 
         let (rws, summary) = restore_into(&back, &[("/p/a.rs", 100), ("/p/b.rs", 50), ("/p/c.rs", 10)]);
-        assert_eq!(summary, RestoreSummary { groups: 3, tabs: 5, skipped: vec![] });
+        assert_eq!(summary, RestoreSummary { groups: 3, tabs: 5, skipped: vec![], column_mode: vec![] });
         assert_eq!(rws.session_snapshot(), snap, "restoring and snapshotting again is the identity");
         let groups = rws.group_ids();
         assert_eq!(tab_paths(&rws, groups[0]), ["/p/a.rs"]);
@@ -616,6 +639,40 @@ mod tests {
         // The duplicate leaf is dropped rather than shown twice.
         let (rws, _) = restore_into(&snaps[2], &[("/p/a.rs", 3)]);
         assert!(!rws.is_split());
+    }
+
+    #[test]
+    fn per_tab_soft_wrap_and_column_mode_round_trip() {
+        let mut ws = Workspace::new();
+        let a = ws.add_document(Some("/p/a.rs".into()), &text(10));
+        let b = ws.add_document(Some("/p/b.rs".into()), &text(10));
+        let ea = ws.open_editor(a).unwrap();
+        let eb = ws.open_editor(b).unwrap();
+        ws.editor_mut(ea).unwrap().soft_wrap = Some(true);
+        assert!(ws.soft_wrap_of(ea));
+        assert!(!ws.soft_wrap_of(eb), "b follows the setting");
+        ws.settings.soft_wrap = true;
+        assert!(ws.soft_wrap_of(eb));
+        ws.editor_mut(eb).unwrap().soft_wrap = Some(false);
+        assert!(!ws.soft_wrap_of(eb));
+        let snap = ws.session_snapshot_with(|id| id == eb);
+        let tabs = &snap.groups[0].tabs;
+        assert_eq!((tabs[0].soft_wrap, tabs[0].column_mode), (Some(true), false));
+        assert_eq!((tabs[1].soft_wrap, tabs[1].column_mode), (Some(false), true));
+        // The plain snapshot has no column mode; older files without the fields still load.
+        assert!(ws.session_snapshot().groups[0].tabs.iter().all(|t| !t.column_mode));
+        let json = serde_json::to_string(&snap).unwrap();
+        let back = SessionSnapshot::from_json(&json).unwrap();
+        let (rws, summary) = restore_into(&back, &[("/p/a.rs", 10), ("/p/b.rs", 10)]);
+        assert_eq!(summary.column_mode.len(), 1);
+        let restored_b = rws.editor(summary.column_mode[0]).unwrap();
+        assert_eq!(rws.doc(restored_b.doc).unwrap().path.as_deref(), Some(Path::new("/p/b.rs")));
+        assert_eq!(restored_b.soft_wrap, Some(false));
+        let doc_a = rws.doc_by_path(Path::new("/p/a.rs")).unwrap();
+        let restored_a = rws.editor(rws.editor_for_doc(doc_a).unwrap()).unwrap();
+        assert_eq!(restored_a.soft_wrap, Some(true));
+        let old = SessionSnapshot::from_json(r#"{"groups": [{"tabs": [{"path": "/p/a.rs"}]}]}"#).unwrap();
+        assert_eq!((old.groups[0].tabs[0].soft_wrap, old.groups[0].tabs[0].column_mode), (None, false));
     }
 
     #[test]

@@ -48,6 +48,7 @@ impl Session {
         self.ws.project = Some(Project::new(root.clone()));
         self.ws.note_recent_project(root.clone());
         crate::session_store::restore_on_open(self);
+        crate::hot_exit::restore_on_open(self);
         self.ws.tasks.insert(
             TASK_PROJECT.into(),
             BackgroundTask {
@@ -73,7 +74,8 @@ impl Session {
     /// Close the project: tabs, runs, language server.
     pub fn close_project(&mut self) {
         crate::session_store::save_on_close(self);
-        let _ = self.save_all();
+        // Hot exit keeps unsaved buffers for the next time instead of saving them.
+        crate::hot_exit::quit_save(self);
         crate::runs::stop_all(self);
         self.stop_lsp();
         let tabs = self.ws.all_tabs();

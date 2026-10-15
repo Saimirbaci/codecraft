@@ -119,10 +119,26 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             s.ws.settings.editor_font_size = codecraft_workspace::Settings::default().editor_font_size;
             ok()
         }),
-        spec("view.toggleSoftWrap", "Soft-Wrap", None, "", Context::Global, always, |s, _| {
-            s.ws.settings.soft_wrap = !s.ws.settings.soft_wrap;
-            ok()
-        }),
+        spec(
+            "view.toggleSoftWrap",
+            "Soft-Wrap",
+            None,
+            "{on?: bool} — View › Active Editor › Soft-Wrap: toggle (or set) soft wrap of the active tab (kept \
+             with the tab across restarts); without an editor, the `soft_wrap` setting",
+            Context::Global,
+            always,
+            |s, p| {
+                let Some(id) = s.ws.active_editor() else {
+                    s.ws.settings.soft_wrap = crate::params::bool_or(p, "on", !s.ws.settings.soft_wrap);
+                    return Ok(serde_json::json!({ "on": s.ws.settings.soft_wrap }));
+                };
+                let on = crate::params::bool_or(p, "on", !s.ws.soft_wrap_of(id));
+                if let Some(e) = s.ws.editor_mut(id) {
+                    e.soft_wrap = Some(on);
+                }
+                Ok(serde_json::json!({ "on": on }))
+            },
+        ),
         spec("view.toggleWhitespace", "Show Whitespaces", None, "", Context::Global, always, |s, _| {
             s.ws.settings.show_whitespace = !s.ws.settings.show_whitespace;
             ok()

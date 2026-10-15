@@ -723,7 +723,7 @@ pub(crate) fn motion_hook(s: &mut Session, motion: Motion, extend: bool) -> Opti
         set_block(s, anchor, head);
         return Some(ok());
     }
-    if s.ws.settings.soft_wrap
+    if s.ws.soft_wrap_of(eid)
         && matches!(motion, Motion::Up | Motion::Down)
         && let Some(width) = s.editing.wrap_widths.get(&eid).copied()
     {
