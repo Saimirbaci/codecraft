@@ -5,9 +5,7 @@
 //! `codecraft-profile` in the engine; this draws only the visible rows and rectangles and turns
 //! clicks into `profiler.*` commands.
 
-use egui::{
-    Align, Align2, Color32, FontId, Key, Layout, Pos2, Rect, RichText, ScrollArea, Sense, TextEdit, pos2, vec2,
-};
+use egui::{Align, Align2, Color32, FontId, Key, Layout, Rect, RichText, ScrollArea, Sense, TextEdit, pos2, vec2};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
@@ -56,12 +54,20 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     match &s.profiler.snapshot {
         None => empty_state(ui, s, &theme, &mut cmds),
         Some(snap) => {
-            toolbar(ui, snap, s.profiler.tab, &theme, &mut cmds);
+            toolbar(ui, snap, s.profiler.tab, s.profiler.recent_cached(), &theme, &mut cmds);
+            if let Some(b) = &s.profiler.baseline_loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Loading the baseline {}…", b.display())).color(theme.text_muted));
+                });
+            }
             ui.separator();
             match s.profiler.tab {
-                ProfilerTab::FlameGraph => flame_graph(ui, snap, &theme, &mut cmds),
+                ProfilerTab::FlameGraph => flame_graph(ui, snap, &theme, &mut cmds, false),
+                ProfilerTab::Icicle => flame_graph(ui, snap, &theme, &mut cmds, true),
                 ProfilerTab::CallTree => call_tree(ui, snap, &theme, &mut cmds),
                 ProfilerTab::MethodList => method_list(ui, snap, &theme, &mut cmds),
+                ProfilerTab::Timeline => timeline(ui, snap, &theme, &mut cmds),
             }
         }
     }
@@ -106,8 +112,19 @@ fn empty_state(ui: &mut egui::Ui, s: &Session, theme: &Theme, cmds: &mut Cmds) {
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         let can_profile = s.enabled("run.profile").is_ok();
-        if ui.add_enabled(can_profile, egui::Button::new("Profile 'Run'")).clicked() {
+        if ui
+            .add_enabled(can_profile, egui::Button::new("Profile 'Run'"))
+            .on_hover_text("CPU: where the time goes")
+            .clicked()
+        {
             cmds.push(("run.profile", Value::Null));
+        }
+        if ui
+            .add_enabled(can_profile, egui::Button::new("Profile Memory"))
+            .on_hover_text("Allocations still live at the end (tracemalloc, memray, leaks, heaptrack)")
+            .clicked()
+        {
+            cmds.push(("profiler.profileMemory", Value::Null));
         }
         if ui.button("Attach Profiler to Process…").clicked() {
             cmds.push(("run.attachProfilerToProcess", Value::Null));
@@ -134,13 +151,22 @@ fn empty_state(ui: &mut egui::Ui, s: &Session, theme: &Theme, cmds: &mut Cmds) {
     }
 }
 
-fn toolbar(ui: &mut egui::Ui, snap: &Snapshot, tab: ProfilerTab, theme: &Theme, cmds: &mut Cmds) {
+fn toolbar(
+    ui: &mut egui::Ui,
+    snap: &Snapshot,
+    tab: ProfilerTab,
+    recent: &[std::path::PathBuf],
+    theme: &Theme,
+    cmds: &mut Cmds,
+) {
     let p = &snap.profile;
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (t, label, id) in [
             (ProfilerTab::FlameGraph, "Flame Graph", "flameGraph"),
+            (ProfilerTab::Icicle, "Icicle", "icicle"),
             (ProfilerTab::CallTree, "Call Tree", "callTree"),
             (ProfilerTab::MethodList, "Method List", "methodList"),
+            (ProfilerTab::Timeline, "Timeline", "timeline"),
         ] {
             if ui.selectable_label(tab == t, label).clicked() && tab != t {
                 cmds.push(("profiler.selectTab", json!({ "tab": id })));
@@ -174,9 +200,37 @@ fn toolbar(ui: &mut egui::Ui, snap: &Snapshot, tab: ProfilerTab, theme: &Theme, 
                     .small(),
             );
         }
-        if tab == ProfilerTab::FlameGraph && snap.zoom.is_some() && ui.small_button("Reset Zoom").clicked() {
+        if matches!(tab, ProfilerTab::FlameGraph | ProfilerTab::Icicle | ProfilerTab::CallTree)
+            && snap.zoom.is_some()
+            && ui.small_button("Reset Zoom").on_hover_text("Show the whole profile again (Esc)").clicked()
+        {
             cmds.push(("profiler.resetZoom", Value::Null));
         }
+        // Compare with another snapshot (the diff flame graph).
+        let compare_label = match &snap.baseline {
+            Some(b) => format!(
+                "Δ vs {}",
+                b.path.file_name().map_or_else(|| b.path.display().to_string(), |n| n.to_string_lossy().into_owned())
+            ),
+            None => "Compare with…".to_string(),
+        };
+        egui::ComboBox::from_id_salt("profiler-compare").selected_text(compare_label).width(170.0).show_ui(ui, |ui| {
+            if snap.baseline.is_some() && ui.selectable_label(false, "Stop comparing").clicked() {
+                cmds.push(("profiler.clearBaseline", Value::Null));
+            }
+            let mut any = false;
+            for r in recent.iter().filter(|r| **r != snap.path) {
+                any = true;
+                let name = r.file_name().map_or_else(|| r.display().to_string(), |n| n.to_string_lossy().into_owned());
+                let current = snap.baseline.as_ref().is_some_and(|b| b.path == *r);
+                if ui.selectable_label(current, name).on_hover_text(r.display().to_string()).clicked() {
+                    cmds.push(("profiler.compareWith", json!({ "path": r })));
+                }
+            }
+            if !any {
+                ui.label(RichText::new("No other recent snapshots").color(theme.text_muted).small());
+            }
+        });
         if tab == ProfilerTab::CallTree {
             if ui.small_button("Expand All").clicked() {
                 cmds.push(("profiler.expandAll", Value::Null));
@@ -213,8 +267,8 @@ fn frame_of<'a>(snap: &'a Snapshot, node: &CallNode) -> Option<&'a Frame> {
     snap.profile.frame(node.frame)
 }
 
-/// The hover text for a call node: name, module, location, total and self.
-fn node_tooltip(ui: &mut egui::Ui, snap: &Snapshot, node: &CallNode, theme: &Theme) {
+fn node_tooltip(ui: &mut egui::Ui, snap: &Snapshot, id: u32, theme: &Theme) {
+    let Some(node) = snap.analysis.tree.node(id) else { return };
     let unit = snap.profile.unit;
     let tree = &snap.analysis.tree;
     if let Some(f) = frame_of(snap, node) {
@@ -225,9 +279,25 @@ fn node_tooltip(ui: &mut egui::Ui, snap: &Snapshot, node: &CallNode, theme: &The
         if let Some(loc) = f.location() {
             ui.label(RichText::new(loc).color(theme.link));
         }
+        if let Some(c) = snap.profile.calls_of(node.frame) {
+            ui.label(format!("Calls: {c}"));
+        }
     }
     ui.label(format!("Total: {} ({:.1}%)", unit.format(node.total), tree.percent(node.total)));
     ui.label(format!("Self: {} ({:.1}%)", unit.format(node.self_weight), tree.percent(node.self_weight)));
+    if let Some(b) = &snap.baseline {
+        let base = b.node_weights.get(id as usize).copied().unwrap_or(0);
+        let (was, now) = (b.percent(base), tree.percent(node.total));
+        let delta = now - was;
+        let color = if delta > 0.05 {
+            theme.error
+        } else if delta < -0.05 {
+            theme.success
+        } else {
+            theme.text_muted
+        };
+        ui.label(RichText::new(format!("Baseline: {was:.1}% → now {now:.1}% ({delta:+.1} pts)")).color(color));
+    }
 }
 
 /// A warm flame colour for a name, mixed from theme tokens (stable per name).
@@ -241,13 +311,26 @@ fn flame_color(theme: &Theme, name: &str) -> Color32 {
     base.lerp_to_gamma(theme.panel_bg, ((h >> 10) % 100) as f32 / 400.0)
 }
 
+/// The diff colour of a node: red where it takes a larger share than in the baseline, green
+/// where smaller, neutral where about the same (in percentage points of each total).
+fn diff_color(theme: &Theme, delta_points: f64) -> Color32 {
+    let neutral = theme.panel_bg.lerp_to_gamma(theme.text_muted, 0.45);
+    if delta_points.abs() < 0.1 {
+        return neutral;
+    }
+    let t = ((delta_points.abs() / 5.0) as f32).clamp(0.25, 1.0);
+    let target = if delta_points > 0.0 { theme.error } else { theme.success };
+    neutral.lerp_to_gamma(target, t)
+}
+
 fn text_on_flame(theme: &Theme) -> Color32 {
     if theme.dark { theme.editor_bg } else { theme.text }
 }
 
 // ---------------------------------------------------------------- flame graph
 
-fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
+/// The flame graph (roots at the bottom) or the icicle graph (`icicle`: roots on top).
+fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds, icicle: bool) {
     let tree = &snap.analysis.tree;
     let flame = &snap.analysis.flame;
     if flame.total == 0 {
@@ -260,20 +343,54 @@ fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
     };
     let zoom_path: Vec<u32> = snap.zoom.map(|z| tree.path(z)).unwrap_or_default();
     let searching = !snap.hits.is_empty();
+    let baseline = snap.baseline.as_ref();
+    if let Some(b) = baseline {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("■").color(diff_color(theme, 5.0)));
+            ui.label(RichText::new("larger share than in").small());
+            ui.label(RichText::new("■").color(diff_color(theme, -5.0)));
+            ui.label(RichText::new("smaller share than in").small());
+            ui.label(
+                RichText::new(
+                    b.path
+                        .file_name()
+                        .map_or_else(|| b.path.display().to_string(), |n| n.to_string_lossy().into_owned()),
+                )
+                .small()
+                .strong(),
+            );
+        });
+    }
     let font = FontId::proportional(11.5);
     let depth = flame.depth();
-    ScrollArea::vertical().id_salt("profiler-flame").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+    let scroll = ScrollArea::vertical().id_salt(if icicle { "profiler-icicle" } else { "profiler-flame" });
+    let scroll = if icicle { scroll } else { scroll.stick_to_bottom(true) };
+    scroll.auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         let width = ui.available_width().max(50.0);
         let height = (depth as f32 * FLAME_ROW_H).max(ui.available_height());
         let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
         let painter = ui.painter_at(rect);
         let scale = width as f64 / z_width as f64;
         let x_of = |w: u64| rect.left() + ((w.saturating_sub(z_start)) as f64 * scale) as f32;
-        let first_row = (viewport.min.y / FLAME_ROW_H).floor().max(0.0) as usize;
-        let last_row = ((viewport.max.y / FLAME_ROW_H).ceil().max(0.0) as usize).min(depth);
+        // Row `d` is at the top (icicle) or counted up from the bottom (flame graph).
+        let row_top = |d: usize| {
+            if icicle { rect.top() + d as f32 * FLAME_ROW_H } else { rect.bottom() - (d as f32 + 1.0) * FLAME_ROW_H }
+        };
+        let (first_row, last_row) = if icicle {
+            (
+                (viewport.min.y / FLAME_ROW_H).floor().max(0.0) as usize,
+                (viewport.max.y / FLAME_ROW_H).ceil().max(0.0) as usize,
+            )
+        } else {
+            (
+                ((height - viewport.max.y) / FLAME_ROW_H).floor().max(0.0) as usize,
+                ((height - viewport.min.y) / FLAME_ROW_H).ceil().max(0.0) as usize,
+            )
+        };
+        let last_row = last_row.min(depth);
         let z_end = z_start.saturating_add(z_width);
         for d in first_row..last_row {
-            let y = rect.top() + d as f32 * FLAME_ROW_H;
+            let y = row_top(d);
             let rects = flame.visible(d, z_start, z_end);
             let mut i = 0;
             while let Some(r) = rects.get(i) {
@@ -293,7 +410,13 @@ fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                 }
                 let cell = Rect::from_min_max(pos2(x0, y), pos2(x1 - 0.5, y + FLAME_ROW_H - 1.0));
                 let name = frame_of(snap, node).map_or("", |f| f.name.as_str());
-                let mut color = flame_color(theme, name);
+                let mut color = match baseline {
+                    Some(b) => {
+                        let base = b.node_weights.get(r.node as usize).copied().unwrap_or(0);
+                        diff_color(theme, tree.percent(node.total) - b.percent(base))
+                    }
+                    None => flame_color(theme, name),
+                };
                 if d < z_depth && zoom_path.contains(&r.node) {
                     color = theme.text_disabled;
                 } else if searching {
@@ -305,23 +428,24 @@ fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                 }
                 if cell.width() > 28.0 {
                     let label = fit_text(name, cell.width() - 6.0, 6.2);
+                    let text_color = if baseline.is_some() { theme.text } else { text_on_flame(theme) };
                     painter.with_clip_rect(cell).text(
                         pos2(cell.left() + 3.0, cell.center().y),
                         Align2::LEFT_CENTER,
                         label,
                         font.clone(),
-                        text_on_flame(theme),
+                        text_color,
                     );
                 }
             }
         }
         // Hover and clicks: find the rectangle under the pointer.
-        let hovered = resp.hover_pos().and_then(|p| node_at(snap, rect, p, z_start, z_width, z_depth));
-        if let Some(id) = hovered
-            && let Some(node) = tree.node(id)
-        {
-            let node = node.clone();
-            let resp = resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, snap, &node, theme));
+        let hovered = resp.hover_pos().and_then(|p| {
+            let d = if icicle { (p.y - rect.top()) / FLAME_ROW_H } else { (rect.bottom() - p.y) / FLAME_ROW_H };
+            node_at(snap, rect, p.x, d, z_start, z_width, z_depth)
+        });
+        if let Some(id) = hovered {
+            let resp = resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, snap, id, theme));
             if resp.double_clicked() {
                 cmds.push(("profiler.select", json!({ "node": id })));
                 cmds.push(("profiler.jumpToSource", json!({ "node": id })));
@@ -344,6 +468,13 @@ fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                     cmds.push(("profiler.selectTab", json!({ "tab": "callTree" })));
                     ui.close();
                 }
+                if let Some(frame) = tree.node(id).map(|n| n.frame)
+                    && ui.button("Show in Method List").clicked()
+                {
+                    cmds.push(("profiler.selectMethod", json!({ "frame": frame })));
+                    cmds.push(("profiler.selectTab", json!({ "tab": "methodList" })));
+                    ui.close();
+                }
                 if snap.zoom.is_some() && ui.button("Reset Zoom").clicked() {
                     cmds.push(("profiler.resetZoom", Value::Null));
                     ui.close();
@@ -356,14 +487,13 @@ fn flame_graph(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
     }
 }
 
-/// The call node drawn at a point of the flame graph.
-fn node_at(snap: &Snapshot, rect: Rect, p: Pos2, z_start: u64, z_width: u64, z_depth: usize) -> Option<u32> {
+/// The call node drawn at `x` on row `d` (rows counted from the roots) of the flame graph.
+fn node_at(snap: &Snapshot, rect: Rect, x: f32, d: f32, z_start: u64, z_width: u64, z_depth: usize) -> Option<u32> {
     let flame = &snap.analysis.flame;
-    let d = ((p.y - rect.top()) / FLAME_ROW_H).floor();
-    if d < 0.0 {
+    if d < 0.0 || !d.is_finite() {
         return None;
     }
-    let d = d as usize;
+    let d = d.floor() as usize;
     let row = flame.rows.get(d)?;
     if d < z_depth {
         // Ancestors of the zoomed node span the whole width.
@@ -373,7 +503,7 @@ fn node_at(snap: &Snapshot, rect: Rect, p: Pos2, z_start: u64, z_width: u64, z_d
             .map(|r| r.node)
             .or(row.first().map(|r| r.node));
     }
-    let frac = f64::from((p.x - rect.left()) / rect.width().max(1.0));
+    let frac = f64::from((x - rect.left()) / rect.width().max(1.0));
     let w = z_start.saturating_add((frac.clamp(0.0, 1.0) * z_width as f64) as u64);
     flame.visible(d, w, w.saturating_add(1)).first().map(|r| r.node)
 }
@@ -397,9 +527,23 @@ fn fit_text(text: &str, width: f32, char_w: f32) -> String {
 fn call_tree(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
     let tree = &snap.analysis.tree;
     let unit = snap.profile.unit;
-    // Visible rows: the expanded part of the tree, depth first.
+    // Visible rows: the expanded part of the tree (or of the focused subtree), depth first.
+    let focus = snap.zoom.and_then(|z| tree.node(z).map(|n| (z, n.depth)));
+    if let Some((z, _)) = focus {
+        ui.horizontal(|ui| {
+            let name = tree.node(z).and_then(|n| snap.profile.frame(n.frame)).map_or("", |f| f.name.as_str());
+            ui.label(RichText::new(format!("Focused on {name}")).color(theme.text_muted).small());
+            if ui.small_button("Show All").clicked() {
+                cmds.push(("profiler.resetZoom", Value::Null));
+            }
+        });
+    }
+    let base_depth = focus.map_or(0, |(_, d)| d);
     let mut rows: Vec<u32> = Vec::new();
-    let mut work: Vec<u32> = tree.roots.iter().rev().copied().collect();
+    let mut work: Vec<u32> = match focus {
+        Some((z, _)) => vec![z],
+        None => tree.roots.iter().rev().copied().collect(),
+    };
     while let Some(id) = work.pop() {
         rows.push(id);
         if snap.expanded.contains(&id)
@@ -425,7 +569,7 @@ fn call_tree(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds)
                 } else if resp.hovered() {
                     painter.rect_filled(rect, 0.0, theme.hover);
                 }
-                let indent = rect.left() + 4.0 + node.depth as f32 * 14.0;
+                let indent = rect.left() + 4.0 + node.depth.saturating_sub(base_depth) as f32 * 14.0;
                 let has_kids = !node.children.is_empty();
                 let toggle = Rect::from_min_size(pos2(indent, rect.top()), vec2(14.0, ROW_H));
                 if has_kids {
@@ -495,11 +639,19 @@ fn call_tree(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds)
                 } else if resp.clicked() {
                     cmds.push(("profiler.select", json!({ "node": id })));
                 }
-                let node = node.clone();
-                let resp = resp.on_hover_ui(|ui| node_tooltip(ui, snap, &node, theme));
+                let frame = node.frame;
+                let resp = resp.on_hover_ui(|ui| node_tooltip(ui, snap, *id, theme));
                 resp.context_menu(|ui| {
                     if ui.button("Jump to Source").clicked() {
                         cmds.push(("profiler.jumpToSource", json!({ "node": id })));
+                        ui.close();
+                    }
+                    if ui.button("Focus on Subtree").clicked() {
+                        cmds.push(("profiler.zoom", json!({ "node": id })));
+                        ui.close();
+                    }
+                    if ui.button("Focus on Method").on_hover_text("Its heaviest call").clicked() {
+                        cmds.push(("profiler.focus", json!({ "frame": frame })));
                         ui.close();
                     }
                     if ui.button("Focus in Flame Graph").clicked() {
@@ -578,13 +730,28 @@ fn header(ui: &mut egui::Ui, theme: &Theme, cols: &[&str]) {
 // ---------------------------------------------------------------- method list
 
 fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
+    if snap.method.is_none() {
+        method_rows(ui, snap, theme, cmds);
+        return;
+    }
+    // The list above, the selected method's callers/callees/hot lines below; the list gets its
+    // own rectangle so its rows never sit under (and take clicks from) the lower part.
+    let total_h = ui.available_height();
+    let edges_h = 180f32.min(total_h * 0.45);
+    let list_h = (total_h - edges_h - 8.0).max(60.0);
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), list_h), Layout::top_down(Align::Min), |ui| {
+        ui.set_max_height(list_h);
+        method_rows(ui, snap, theme, cmds);
+    });
+    ui.separator();
+    method_edges(ui, snap, theme, cmds);
+}
+
+fn method_rows(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
     let unit = snap.profile.unit;
     let tree = &snap.analysis.tree;
-    if snap.method.is_some() {
-        egui::Panel::bottom("profiler-method-edges").resizable(true).default_size(160.0).show(ui, |ui| {
-            method_edges(ui, snap, theme, cmds);
-        });
-    }
+    let baseline = snap.baseline.as_ref();
+    let ncols = if baseline.is_some() { 3.0 } else { 2.0 };
     // Sortable header.
     let col_w = 96.0;
     ui.horizontal(|ui| {
@@ -601,6 +768,13 @@ fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
             cmds.push(("profiler.sortMethods", json!({ "column": "name" })));
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if baseline.is_some() {
+                ui.add_sized(
+                    [col_w * 1.6, 16.0],
+                    egui::Label::new(RichText::new("Δ self (pts)").strong().small().color(theme.text)),
+                )
+                .on_hover_text("Change of the self share against the baseline, in percentage points");
+            }
             for (c, label, id) in [(MethodColumn::Total, "Total", "total"), (MethodColumn::SelfWeight, "Self", "self")]
             {
                 let text = RichText::new(format!("{label}{}", arrow(c))).strong().small();
@@ -631,7 +805,7 @@ fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                 let color = if snap.is_hit(m.frame) { theme.accent } else { theme.text };
                 let name_rect = Rect::from_min_max(
                     rect.min + vec2(6.0, 0.0),
-                    pos2(rect.right() - 2.0 * col_w * 1.6, rect.bottom()),
+                    pos2(rect.right() - ncols * col_w * 1.6, rect.bottom()),
                 );
                 painter.with_clip_rect(name_rect).text(
                     pos2(name_rect.left(), rect.center().y),
@@ -640,19 +814,26 @@ fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                     FontId::proportional(13.0),
                     color,
                 );
-                let cols = [
-                    format!("{} ({:.1}%)", unit.format(m.self_weight), tree.percent(m.self_weight)),
-                    format!("{} ({:.1}%)", unit.format(m.total), tree.percent(m.total)),
+                let mut cols = vec![
+                    (format!("{} ({:.1}%)", unit.format(m.self_weight), tree.percent(m.self_weight)), theme.text_muted),
+                    (format!("{} ({:.1}%)", unit.format(m.total), tree.percent(m.total)), theme.text_muted),
                 ];
-                for (k, text) in cols.iter().enumerate() {
-                    let right = rect.right() - (1 - k) as f32 * col_w * 1.6 - 6.0;
-                    painter.text(
-                        pos2(right, rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        text,
-                        FontId::monospace(12.0),
-                        theme.text_muted,
-                    );
+                if let (Some(b), Some(f)) = (baseline, f) {
+                    let (base_self, _) = b.method(f);
+                    let delta = tree.percent(m.self_weight) - b.percent(base_self);
+                    let c = if delta > 0.05 {
+                        theme.error
+                    } else if delta < -0.05 {
+                        theme.success
+                    } else {
+                        theme.text_muted
+                    };
+                    cols.push((format!("{delta:+.1}"), c));
+                }
+                let n = cols.len();
+                for (k, (text, c)) in cols.iter().enumerate() {
+                    let right = rect.right() - (n - 1 - k) as f32 * col_w * 1.6 - 6.0;
+                    painter.text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, text, FontId::monospace(12.0), *c);
                 }
                 if resp.double_clicked() {
                     cmds.push(("profiler.jumpToSource", json!({ "frame": m.frame })));
@@ -660,12 +841,20 @@ fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
                     cmds.push(("profiler.selectMethod", json!({ "frame": m.frame })));
                 }
                 let resp = match f.and_then(Frame::location) {
-                    Some(loc) => resp.on_hover_text(loc),
+                    Some(loc) => match snap.profile.calls_of(m.frame) {
+                        Some(c) => resp.on_hover_text(format!("{loc}\n{c} calls")),
+                        None => resp.on_hover_text(loc),
+                    },
                     None => resp,
                 };
                 resp.context_menu(|ui| {
                     if ui.button("Jump to Source").clicked() {
                         cmds.push(("profiler.jumpToSource", json!({ "frame": m.frame })));
+                        ui.close();
+                    }
+                    if ui.button("Focus on Method").on_hover_text("Zoom into its heaviest call").clicked() {
+                        cmds.push(("profiler.focus", json!({ "frame": m.frame })));
+                        cmds.push(("profiler.selectTab", json!({ "tab": "flameGraph" })));
                         ui.close();
                     }
                     if ui.button("Search in Flame Graph").clicked() {
@@ -680,14 +869,17 @@ fn method_list(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
     );
 }
 
-/// Callers and callees of the selected method.
+/// Callers, callees and hot lines of the selected method.
 fn method_edges(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
     let unit = snap.profile.unit;
     let tree = &snap.analysis.tree;
     let (callers, callees) = &snap.method_edges;
-    ui.columns(2, |cols| {
-        let [left, right] = cols else { return };
-        for (ui, title, edges) in [(left, "Callers", callers), (right, "Callees", callees)] {
+    let lines = snap.method.map_or(&[][..], |f| snap.profile.lines_of(f));
+    let n = if lines.is_empty() { 2 } else { 3 };
+    ui.columns(n, |cols| {
+        let mut it = cols.iter_mut();
+        for (title, edges) in [("Callers", callers), ("Callees", callees)] {
+            let Some(ui) = it.next() else { return };
             ui.label(RichText::new(title).strong().small());
             ScrollArea::vertical().id_salt(title).auto_shrink([false, false]).show(ui, |ui| {
                 if edges.is_empty() {
@@ -710,7 +902,165 @@ fn method_edges(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cm
                 }
             });
         }
+        if let (Some(ui), Some(frame)) = (it.next(), snap.method) {
+            ui.label(RichText::new("Hot lines").strong().small());
+            let mut sorted: Vec<_> = lines.iter().collect();
+            sorted.sort_by(|a, b| b.self_weight.cmp(&a.self_weight).then(b.total.cmp(&a.total)));
+            ScrollArea::vertical().id_salt("hot-lines").auto_shrink([false, false]).show(ui, |ui| {
+                for l in sorted.iter().take(100) {
+                    let text = format!(
+                        "line {}  ·  self {:.1}%  ·  total {:.1}%",
+                        l.line,
+                        tree.percent(l.self_weight),
+                        tree.percent(l.total)
+                    );
+                    if ui.selectable_label(false, RichText::new(text).small()).clicked() {
+                        cmds.push(("profiler.openLine", json!({ "frame": frame, "line": l.line })));
+                    }
+                }
+            });
+        }
     });
+}
+
+// ---------------------------------------------------------------- timeline
+
+/// Thread activity over time: one strip per thread, darker where more was sampled.
+fn timeline(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
+    let p = &snap.profile;
+    let Some(duration) = p.duration_ns else {
+        ui.label(
+            RichText::new("This snapshot has no sample times (Instruments / xctrace recordings have them).")
+                .color(theme.text_muted),
+        );
+        // Keep the tool window's height (a bottom panel shrinks to short content).
+        ui.allocate_space(ui.available_size());
+        return;
+    };
+    let max = p.threads.iter().flat_map(|t| t.activity.iter().copied()).max().unwrap_or(0).max(1);
+    ui.label(
+        RichText::new(format!(
+            "{:.2} s · {} threads · click a thread to show only it",
+            duration as f64 / 1e9,
+            p.threads.len()
+        ))
+        .color(theme.text_muted)
+        .small(),
+    );
+    let label_w = 200.0;
+    ScrollArea::vertical().id_salt("profiler-timeline").auto_shrink([false, false]).show_rows(
+        ui,
+        ROW_H,
+        p.threads.len(),
+        |ui, range| {
+            for i in range {
+                let Some(t) = p.threads.get(i) else { continue };
+                let width = ui.available_width().max(label_w + 100.0);
+                let (rect, resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+                let painter = ui.painter_at(rect);
+                if snap.analysis.thread == Some(i) {
+                    painter.rect_filled(rect, 0.0, theme.list_selection);
+                } else if resp.hovered() {
+                    painter.rect_filled(rect, 0.0, theme.hover);
+                }
+                let name_rect =
+                    Rect::from_min_max(rect.min + vec2(6.0, 0.0), pos2(rect.left() + label_w, rect.bottom()));
+                painter.with_clip_rect(name_rect).text(
+                    pos2(name_rect.left(), rect.center().y),
+                    Align2::LEFT_CENTER,
+                    &t.name,
+                    FontId::proportional(12.5),
+                    theme.text,
+                );
+                let strip = Rect::from_min_max(
+                    pos2(rect.left() + label_w + 4.0, rect.top() + 3.0),
+                    pos2(rect.right() - 6.0, rect.bottom() - 3.0),
+                );
+                painter.rect_filled(strip, 0.0, theme.panel_bg.lerp_to_gamma(theme.text_muted, 0.12));
+                let n = t.activity.len().max(1) as f32;
+                let w = strip.width() / n;
+                for (k, a) in t.activity.iter().enumerate() {
+                    if *a == 0 {
+                        continue;
+                    }
+                    let x = strip.left() + k as f32 * w;
+                    let cell = Rect::from_min_max(pos2(x, strip.top()), pos2(x + w.max(1.0), strip.bottom()));
+                    let level = (*a as f32 / max as f32).clamp(0.08, 1.0);
+                    painter.rect_filled(cell, 0.0, theme.panel_bg.lerp_to_gamma(theme.accent, level));
+                }
+                let resp = resp.on_hover_text(format!("{} · {}", t.name, p.unit.format(t.total())));
+                if resp.clicked() {
+                    let same = snap.analysis.thread == Some(i);
+                    cmds.push(("profiler.selectThread", if same { Value::Null } else { json!({ "thread": i }) }));
+                }
+            }
+        },
+    );
+}
+
+// ---------------------------------------------------------------- editor gutter
+
+/// Per-line weights of the open snapshot for one editor (a heat bar in the gutter and the
+/// share at the end of the line, like CLion's line-level profiler hints).
+#[derive(Default)]
+pub(crate) struct GutterHits {
+    lines: std::collections::HashMap<usize, (u64, u64)>,
+    total: u64,
+    max: u64,
+}
+
+impl GutterHits {
+    pub(crate) fn collect(s: &Session, path: &std::path::Path) -> Self {
+        let Some(snap) = &s.profiler.snapshot else { return Self::default() };
+        let Some(hits) = snap.lines.for_path(path) else { return Self::default() };
+        let total = snap.profile.total();
+        let lines: std::collections::HashMap<usize, (u64, u64)> =
+            hits.iter().filter_map(|h| Some(((h.line as usize).checked_sub(1)?, (h.self_weight, h.total)))).collect();
+        let max = lines.values().map(|(_, t)| *t).max().unwrap_or(0);
+        Self { lines, total, max }
+    }
+
+    /// The share of a line (0-based), as "total% (self%)".
+    pub(crate) fn label(&self, line: usize) -> Option<String> {
+        let (own, all) = self.lines.get(&line)?;
+        if self.total == 0 {
+            return None;
+        }
+        let pct = |w: u64| w as f64 * 100.0 / self.total as f64;
+        Some(if own == all {
+            format!("{:.1}%", pct(*all))
+        } else {
+            format!("{:.1}% (self {:.1}%)", pct(*all), pct(*own))
+        })
+    }
+
+    /// A heat bar at `x` and the share right-aligned at `right`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn paint(
+        &self,
+        painter: &egui::Painter,
+        theme: &Theme,
+        line: usize,
+        y: f32,
+        line_h: f32,
+        x: f32,
+        right: f32,
+    ) {
+        let Some((_, all)) = self.lines.get(&line) else { return };
+        let level = (*all as f32 / self.max.max(1) as f32).clamp(0.15, 1.0);
+        let color = theme.warning.lerp_to_gamma(theme.error, level);
+        let bar = Rect::from_min_size(pos2(x, y + 1.0), vec2(3.0, line_h - 2.0));
+        painter.rect_filled(bar, 0.0, color.gamma_multiply(0.4 + 0.6 * level));
+        if let Some(text) = self.label(line) {
+            painter.text(
+                pos2(right, y + line_h * 0.5),
+                Align2::RIGHT_CENTER,
+                text,
+                FontId::proportional((line_h * 0.62).clamp(9.0, 12.0)),
+                theme.inlay_text,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------- attach
@@ -762,7 +1112,7 @@ fn attach_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     let Some(p) = picker.processes.get(*index) else { continue };
                     let kind = match p.kind {
                         codecraft_engine::debug::ProcessKind::Python => "Python (py-spy)",
-                        _ => "Native (samply)",
+                        _ => "Native (xctrace / samply)",
                     };
                     let text = format!("{:>7}  {}  ·  {kind}", p.pid, p.name);
                     let resp = ui.selectable_label(row == picker.selected, text).on_hover_text(&p.command);
@@ -776,7 +1126,7 @@ fn attach_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             });
             ui.separator();
             ui.label(
-                RichText::new("On macOS, attaching needs `samply setup` once; py-spy may need root.")
+                RichText::new("On macOS the Time Profiler (xctrace) attaches to your own processes; samply needs `samply setup` once; py-spy needs root.")
                     .color(theme.text_muted)
                     .small(),
             );
@@ -869,10 +1219,27 @@ mod tests {
         s.execute("profiler.search", &json!({ "query": "g1" })).unwrap();
         s.execute("profiler.selectMethod", &json!({ "frame": 0 })).unwrap();
         s.execute("profiler.expandAll", &Value::Null).unwrap();
-        for tab in ["flameGraph", "callTree", "methodList"] {
+        for tab in ["flameGraph", "icicle", "callTree", "methodList", "timeline"] {
             s.execute("profiler.selectTab", &json!({ "tab": tab })).unwrap();
             frame(&mut s, &mut st);
         }
+        // Compared against itself: the diff colours, the Δ column.
+        s.execute("profiler.compareWith", &json!({ "path": path })).unwrap();
+        while s.profiler.baseline_loading.is_some() {
+            assert!(start.elapsed().as_secs() < 20);
+            s.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(s.profiler.snapshot.as_ref().unwrap().baseline.is_some());
+        s.execute("profiler.focus", &json!({ "name": "g1" })).unwrap();
+        for tab in ["flameGraph", "icicle", "callTree", "methodList"] {
+            s.execute("profiler.selectTab", &json!({ "tab": tab })).unwrap();
+            frame(&mut s, &mut st);
+        }
+        s.execute("profiler.clearBaseline", &Value::Null).unwrap();
+        // Collapsed stacks have no lines: no gutter numbers.
+        let hits = GutterHits::collect(&s, &path);
+        assert!(hits.label(0).is_none());
         s.execute("run.attachProfilerToProcess", &Value::Null).unwrap();
         frame(&mut s, &mut st);
         s.execute("profiler.close", &Value::Null).unwrap();

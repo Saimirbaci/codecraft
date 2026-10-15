@@ -405,12 +405,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 34. Profiler (track P): Run › Profile (samply, `perf` on Linux, py-spy for Python), Attach
     Profiler to Process…, Open Profiler Snapshot (samply/Firefox, Gecko, speedscope, collapsed
     stacks, `perf script`, DTrace; gzip), and a Profiler tool window with flame graph, call tree,
-    method list and thread filter. Remaining: profiling a Cargo configuration records `cargo
-    run`, including build time; the Run window's Stop sends SIGTERM, so samply may not save (the
-    Profiler window's Stop works); no symbolication; snapshots are parsed whole into memory; no
-    profiling on Docker/SSH targets; no timeline, memory profiling, snapshot diff or Chrome trace
-    format; macOS attach needs `samply setup` and py-spy may need root; speedscope files with
-    mixed units keep only the first unit's profiles.
+    method list and thread filter. M14 track PF (item 55) closed: Cargo and CMake configurations
+    are built first and only the program is recorded; the Run window's Stop stops a recording
+    like Ctrl+C; xctrace (macOS) and `sample`/`atos` reports are symbolicated to file:line;
+    timeline, memory profiling and snapshot diff exist; macOS attach works through xctrace.
+    Remaining: samply's `--save-only` snapshots stay unsymbolicated (no symbol files read);
+    snapshots are parsed whole into memory; no profiling on Docker/SSH targets; no Chrome trace
+    format; py-spy needs root on macOS; speedscope files with mixed units keep only the first
+    unit's profiles (memray's: the bytes, not the allocation counts).
 35. SQL in Rust strings (track Q): SQL detected in sqlx/diesel/rusqlite/postgres calls and after
     `// language=SQL`, highlighted, completed from the chosen data source (alias-aware) and
     checked for unknown tables/columns; an SQL formatter for `.sql` files, consoles and injected
@@ -764,3 +766,57 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     directory (no per-configuration profile); the gutter run menu has no "Run with Coverage";
     `zig`, `tsc`, jest and the AI provider were exercised only through fakes (fake
     scripts, a 127.0.0.1 server).
+
+## M14 (2026-10-15)
+
+55. Profiling for people and agents (track PF): Run › Profile plans the configuration first
+    (`engine/src/profiler_plan.rs`): Cargo run/test/bench configurations are built with
+    `--no-run` JSON messages in a Build tab and only the executable is recorded (a debug build
+    is flagged in reports), the build part of a shell chain (CMake Application: `cmake --build …
+    && cd dir && ./app`) runs first, Python commands become `python [opts] (script | -m mod)`,
+    `pytest` uses the project interpreter. CPU: Instruments' Time Profiler through `xctrace
+    record --launch`/`--attach` on macOS (no install; exported with `xctrace export` and parsed
+    by a small tolerant XML reader, `crates/profile/src/{xml,xctrace}.rs`, with function, binary,
+    file and line per frame and sample times), samply, perf on Linux, py-spy (default off macOS,
+    where it needs root), cProfile always (`python -m cProfile -o`, converted by a helper script
+    run by the program's own interpreter, call tree rebuilt from the call graph with call
+    counts). Memory: tracemalloc through the same helper (live allocations by traceback when the
+    program ends, with `qualname`s from the AST, peak in the notes), memray when installed
+    (`memray run` then `memray transform speedscope`), `leaks --atExit` + `malloc_history
+    -callTree` on macOS with the program's frames symbolicated by `atos -fullPath`, heaptrack on
+    Linux (`heaptrack_print` collapsed stacks); macOS `sample` reports open too. Frames that carry
+    the line a sample was at are folded into functions plus per-line statistics. Views: flame
+    graph (roots at the bottom) and icicle, call tree with Focus on Subtree, method list with
+    callers/callees and the method's hot lines (click to open), threads timeline (activity per
+    time slice; click a thread to filter), Compare with… a recent snapshot (diff flame graph: red
+    = larger share, green = smaller; Δ self column), Focus on Method, per-line numbers in the
+    editor gutter (heat bar + share at the line end) for the open file; the Run window's Stop
+    stops a recording like Ctrl+C. Every run is a job: `profiler.record {config|command|pid,
+    kind: cpu|memory, tool?, seconds?}` → job id, `profiler.job`/`profiler.jobs`, and compact
+    agent reports (`engine/src/profiler_agent_cmds.rs`, `profiler_report.rs`):
+    `profiler.report {snapshot, top?, lines?, focus?}` (top functions by self and total %,
+    file:line, calls, hottest lines with the code on them, focus callers/callees/inside,
+    notes about missing symbols, debug builds, units), `profiler.compare {a, b}`
+    (slower/faster/added/removed), `profiler.lineHits {path}`, `profiler.timeline`,
+    `profiler.load`; reports on unloaded snapshots answer `{pending, job}`. Install puts py-spy
+    and samply in `$CODECRAFT_HOME/tools` (uv tool / cargo --root) and memray in the project's
+    interpreter, only on request. Verified for real here: cProfile and tracemalloc on a Python
+    script, xctrace on a C program and on a `cargo test` (Rust functions with lib.rs:line), leaks
+    on a C program, and memray through an opt-in test (`CODECRAFT_TEST_PYTHON_WITH_MEMRAY`, run
+    here with a throwaway venv) (`crates/engine/tests/profiler_real.rs`, skipping without the
+    tools).
+    Remaining: xctrace's Allocations template hangs when launched non-interactively here, so
+    native memory on macOS is "live at exit" from `leaks` (no allocation history, no peak); the
+    Time Profiler needs about half a second to start sampling, so very short programs get no
+    samples; tracemalloc takes one snapshot when the program ends (no periodic snapshots or
+    peak snapshot; diff two runs with `profiler.compare`); cProfile's call tree is
+    reconstructed (times are split by edge, recursion is cut) and the deterministic overhead
+    inflates small functions; per-line statistics and the gutter cover all threads (not the
+    thread filter), and timelines exist only for xctrace snapshots (Gecko sample times are not
+    read); no time-range selection on the timeline; diff colours compare shares of each total
+    (not absolute time) and match paths by function name; Cargo test targets with several
+    executables (`cargo test` without `--lib`/`--test`) must be narrowed first; profiling a
+    test or bench at the caret (gutter) is not offered yet (agents pass a `cargo test name` or
+    `pytest` command); py-spy, heaptrack and perf were exercised only through fakes (py-spy
+    needs root on macOS; heaptrack and perf are Linux-only); the memray test doesn't run by
+    default; no Docker/SSH targets.

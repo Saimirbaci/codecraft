@@ -698,6 +698,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         .unwrap_or_default();
     let marks = path.as_deref().map(|p| DebugMarks::collect(s, p)).unwrap_or_default();
     let tests = path.as_deref().map(|p| crate::testing_panel::GutterTests::collect(s, p)).unwrap_or_default();
+    // M14 track PF: samples per line from the open profiler snapshot.
+    let hot = path.as_deref().map(|p| crate::profiler_ui::GutterHits::collect(s, p)).unwrap_or_default();
     let vcs = crate::vcs_panels::GutterVcs::collect(s, editor.doc);
     let bookmark_lines = path.as_deref().map(|p| s.bookmarks.lines_in(p)).unwrap_or_default();
     // Live template variables (current one highlighted), column mode, breadcrumbs.
@@ -1177,6 +1179,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         }
         vcs.paint_line(&painter, &theme, *line, *y, line_h, gutter, ann_rect, &num_font);
         tests.paint_coverage(&painter, &theme, *line, *y, line_h, gutter.left() + 15.0);
+        hot.paint(&painter, &theme, *line, *y, line_h, gutter.left() + 1.0, rect.right() - STRIPE_W - 8.0);
         if run_lines.contains(line) {
             let x = gutter.left() + 9.0;
             let tri = vec![pos2(x - 4.0, cy - 5.0), pos2(x + 5.0, cy), pos2(x - 4.0, cy + 5.0)];

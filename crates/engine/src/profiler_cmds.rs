@@ -3,14 +3,12 @@
 
 use serde_json::{Value, json};
 
-use codecraft_cargo::{CargoCommand, CargoInvocation};
 use codecraft_dap::processes::ProcessKind;
 use codecraft_workspace::{RunTabId, ToolWindowId};
 
 use crate::commands::{CmdResult, CommandSpec, Context, always, ok, spec};
 use crate::params::{bool_or, opt_path, opt_str, opt_usize, req_str, req_usize};
 use crate::profiler::{self, MethodColumn, ProfilerTab, ProfilerTool, Snapshot};
-use crate::runs::RunConfig;
 use crate::{CommandError, Session};
 
 /// Nodes returned by `profiler.callTree` at most.
@@ -22,9 +20,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.profile",
             "Profile 'Run'",
             None,
-            "{config?: int} — run the selected (or given) run configuration under a sampling profiler (samply; perf \
-             on Linux without samply; py-spy for Python) in a Run tab, then open the snapshot in the Profiler tool \
-             window",
+            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number} — run the selected (or given) \
+             run configuration under a profiler in a Run tab (Cargo targets and CMake chains are built first, then \
+             only the program is recorded; CPU: xctrace on macOS, samply, perf on Linux, cProfile or py-spy for \
+             Python; memory: leaks on macOS, heaptrack on Linux, tracemalloc or memray for Python), then open the \
+             snapshot in the Profiler tool window → {tab, job, config, tool}",
             Context::Global,
             can_profile,
             profile_selected,
@@ -33,10 +33,25 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.profileRun.profile",
             "Profile 'Run'",
             None,
-            "{config?: int} — same as run.profile",
+            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number} — same as run.profile",
             Context::Global,
             can_profile,
             profile_selected,
+        ),
+        spec(
+            "profiler.profileMemory",
+            "Profile Memory 'Run'",
+            None,
+            "{config?: int|name, tool?: string} — run.profile with kind memory",
+            Context::Global,
+            can_profile,
+            |s, p| {
+                let mut p = if p.is_object() { p.clone() } else { json!({}) };
+                if let Some(o) = p.as_object_mut() {
+                    o.insert("kind".into(), json!("memory"));
+                }
+                profile_selected(s, &p)
+            },
         ),
         spec(
             "run.attachProfilerToProcess",
@@ -144,7 +159,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.tools",
             "Profiler Tools",
             None,
-            "→ [{tool, path, installed, hint}] — which profilers are installed",
+            "→ [{tool, kind, path, installed, builtin, pythonOnly, hint}] — which profilers are installed",
             Context::Global,
             always,
             |s, _| Ok(tools(s)),
@@ -153,10 +168,40 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.install",
             "Install Profiler",
             None,
-            "{tool: samply|py-spy} — run the install command in a Terminal tab",
+            "{tool: samply|py-spy|memray} — run the install command in a Terminal tab (py-spy and samply into \
+             $CODECRAFT_HOME/tools; memray into the project's interpreter with uv)",
             Context::Global,
             always,
             install,
+        ),
+        // ----- comparison and focus
+        spec(
+            "profiler.compareWith",
+            "Compare with Snapshot…",
+            None,
+            "{path: string} — compare the open snapshot against another (the baseline): the flame graph colours \
+             what got slower (more of the total) and faster, the method list gets a Δ column",
+            Context::Global,
+            has_snapshot,
+            |s, p| {
+                let path = opt_path(p, "path").ok_or_else(|| CommandError::BadParams("`path` is required".into()))?;
+                profiler::set_baseline(s, &path)?;
+                ok()
+            },
+        ),
+        spec("profiler.clearBaseline", "Stop Comparing", None, "", Context::Global, has_snapshot, |s, _| {
+            snapshot_mut(s)?.baseline = None;
+            ok()
+        }),
+        spec(
+            "profiler.focus",
+            "Focus on Method",
+            None,
+            "{frame?: int, name?: string} — zoom the flame graph and the call tree into the heaviest call of a \
+             method (by frame id or name substring); without either, reset",
+            Context::Global,
+            has_snapshot,
+            focus,
         ),
         spec(
             "profiler.status",
@@ -190,7 +235,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "profiler.selectTab",
             "Select Profiler View",
             None,
-            "{tab: flameGraph|callTree|methodList}",
+            "{tab: flameGraph|icicle|callTree|methodList|timeline}",
             Context::Global,
             always,
             |s, p| {
@@ -354,6 +399,26 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             jump_to_source,
         ),
         spec(
+            "profiler.openLine",
+            "Open Hot Line",
+            None,
+            "{frame: int, line: int} — open a line of a method's source file (a hot line)",
+            Context::Global,
+            has_snapshot,
+            |s, p| {
+                let frame = req_node(p, "frame")?;
+                let line = u32::try_from(req_usize(p, "line")?)
+                    .map_err(|_| CommandError::BadParams("`line` is out of range".into()))?;
+                let snap = snapshot_mut(s)?;
+                let f =
+                    snap.profile.frame(frame).ok_or_else(|| CommandError::BadParams(format!("no frame {frame}")))?;
+                let file =
+                    f.file.clone().ok_or_else(|| CommandError::Failed(format!("no source file for {}", f.name)))?;
+                profiler::jump_to_location(s, &file, Some(line))?;
+                ok()
+            },
+        ),
+        spec(
             "profiler.callTree",
             "Profiler Call Tree",
             None,
@@ -398,7 +463,7 @@ fn picker_open(s: &Session) -> Result<(), String> {
 }
 
 fn recording(s: &Session) -> Result<(), String> {
-    if s.profiler.recordings.is_empty() { Err("no profiler is recording".into()) } else { Ok(()) }
+    if s.profiler.recording_active() { Ok(()) } else { Err("no profiler is recording".into()) }
 }
 
 fn snapshot_mut(s: &mut Session) -> Result<&mut Snapshot, CommandError> {
@@ -419,26 +484,61 @@ fn req_node(p: &Value, key: &str) -> Result<u32, CommandError> {
 // ---------------------------------------------------------------- run
 
 fn profile_selected(s: &mut Session, p: &Value) -> CmdResult {
-    if let Some(i) = opt_usize(p, "config")? {
-        if i >= s.run_configs.len() {
-            return Err(CommandError::BadParams(format!("no run configuration {i}")));
-        }
-        s.selected_run_config = i;
-    }
-    if let Some(name) = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()) {
-        crate::run_config_store::prepare_run(s, &name).map_err(CommandError::Failed)?;
-    }
-    let config = match s.run_configs.get(s.selected_run_config) {
-        Some(c) => c.clone(),
-        None if is_cargo_project(s) => {
-            let root = s.project_root().ok_or_else(|| CommandError::Disabled("no project is open".into()))?;
-            RunConfig::cargo("cargo run", CargoInvocation::new(CargoCommand::Run, root))
-        }
-        None => return Err(CommandError::Disabled("no run configuration to profile".into())),
+    let p = if p.is_object() { p.clone() } else { json!({}) };
+    let kind = match opt_str(&p, "kind") {
+        Some(k) => profiler::ProfileKind::from_name(k)
+            .ok_or_else(|| CommandError::BadParams(format!("unknown kind `{k}` (cpu|memory)")))?,
+        None => profiler::ProfileKind::Cpu,
     };
-    let tab = profiler::profile_config(s, &config)?;
-    let tool = s.profiler.recording(tab).map(|r| r.tool);
-    Ok(json!({ "tab": tab.0, "config": config.name, "tool": tool }))
+    let tool = crate::profiler_agent_cmds::tool_param(&p)?;
+    let seconds = crate::profiler_agent_cmds::seconds_param(&p)?;
+    let config = crate::profiler_agent_cmds::config_for(s, &p)?;
+    let python = profiler::project_python(s);
+    let plan = crate::profiler_plan::plan_config(&config, python.as_deref()).map_err(CommandError::Failed)?;
+    let job = profiler::record(s, profiler::RecordRequest { plan, kind, tool, seconds })?;
+    let j = s.profiler.job(job);
+    Ok(json!({
+        "tab": j.and_then(|j| j.tab).map(|t| t.0),
+        "job": job,
+        "config": config.name,
+        "tool": j.and_then(|j| j.tool),
+        "state": j.map(|j| j.state),
+    }))
+}
+
+fn focus(s: &mut Session, p: &Value) -> CmdResult {
+    let frame = opt_node(p, "frame")?;
+    let name = opt_str(p, "name").map(str::to_lowercase).filter(|n| !n.trim().is_empty());
+    let snap = snapshot_mut(s)?;
+    let frame = match (frame, name) {
+        (Some(f), _) => Some(f),
+        (None, Some(n)) => {
+            // The matching method with the most total weight.
+            let methods = &snap.analysis.methods;
+            let best = methods
+                .iter()
+                .filter(|m| snap.profile.frame(m.frame).is_some_and(|f| f.name.to_lowercase().contains(&n)))
+                .max_by_key(|m| m.total)
+                .map(|m| m.frame);
+            Some(best.ok_or_else(|| CommandError::Failed(format!("no method matches `{n}`")))?)
+        }
+        (None, None) => None,
+    };
+    let Some(frame) = frame else {
+        snap.zoom = None;
+        return ok();
+    };
+    snap.profile.frame(frame).ok_or_else(|| CommandError::BadParams(format!("no frame {frame}")))?;
+    let node =
+        snap.heaviest_node(frame).ok_or_else(|| CommandError::Failed("the method has no samples here".into()))?;
+    snap.zoom = Some(node);
+    snap.selected = Some(node);
+    let path = snap.analysis.tree.path(node);
+    for n in path {
+        snap.expanded.insert(n);
+    }
+    snap.select_method(frame);
+    Ok(json!({ "node": node }))
 }
 
 fn attach_profiler(s: &mut Session, p: &Value) -> CmdResult {
@@ -475,10 +575,16 @@ fn attach_list(s: &Session) -> Value {
 }
 
 fn stop(s: &mut Session, p: &Value) -> CmdResult {
+    let newest_job = s
+        .profiler
+        .jobs
+        .iter()
+        .rev()
+        .find(|j| matches!(j.state, profiler::JobState::Building | profiler::JobState::Recording));
     let tab = match opt_usize(p, "tab")? {
         Some(t) => RunTabId(t as u64),
-        None => match s.profiler.recordings.last() {
-            Some(r) => r.tab,
+        None => match newest_job.and_then(|j| j.tab).or(s.profiler.recordings.last().map(|r| r.tab)) {
+            Some(t) => t,
             None => return Err(CommandError::Disabled("no profiler is recording".into())),
         },
     };
@@ -493,7 +599,10 @@ fn tools(s: &Session) -> Value {
         .iter()
         .map(|t| {
             let path = s.profiler.find_tool(*t);
-            json!({ "tool": t, "path": path, "installed": path.is_some(), "hint": t.install_hint() })
+            json!({
+                "tool": t, "kind": t.kind(), "path": path, "installed": path.is_some() || t.builtin(),
+                "builtin": t.builtin(), "pythonOnly": t.python_only(), "hint": t.install_hint(),
+            })
         })
         .collect();
     json!(list)
@@ -503,14 +612,14 @@ fn install(s: &mut Session, p: &Value) -> CmdResult {
     let name = req_str(p, "tool")?;
     let tool =
         ProfilerTool::from_name(name).ok_or_else(|| CommandError::BadParams(format!("unknown profiler `{name}`")))?;
-    let Some((program, args)) = tool.install_command() else {
+    let python = profiler::project_python(s);
+    let Some((program, args)) = s.profiler.install_command(tool, python.as_deref()) else {
         return Err(CommandError::Failed(tool.install_hint().to_string()));
     };
-    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
     let id =
-        crate::terminal::open_command(s, &format!("Install {}", tool.program()), program, &args, s.project_root())?;
+        crate::terminal::open_command(s, &format!("Install {}", tool.program()), &program, &args, s.project_root())?;
     s.profiler.missing = None;
-    Ok(json!({ "terminal": id }))
+    Ok(json!({ "terminal": id, "command": format!("{program} {}", args.join(" ")) }))
 }
 
 fn open_snapshot(s: &mut Session, p: &Value) -> CmdResult {
@@ -555,8 +664,13 @@ fn status(s: &Session) -> Value {
             "selected": snap.selected,
             "search": snap.search,
             "matched": snap.matched,
+            "lines": p.lines.len(),
+            "durationMs": p.duration_ns.map(|d| d / 1_000_000),
+            "notes": p.notes,
+            "baseline": snap.baseline.as_ref().map(|b| json!({ "path": b.path, "total": b.total })),
         })
     });
+    let jobs: Vec<Value> = pr.jobs.iter().rev().take(5).map(crate::profiler_agent_cmds::job_json).collect();
     let recordings: Vec<Value> = pr
         .recordings
         .iter()
@@ -574,6 +688,8 @@ fn status(s: &Session) -> Value {
         "error": pr.error,
         "missing": pr.missing.map(|t| json!({ "tool": t, "hint": t.install_hint() })),
         "recordings": recordings,
+        "jobs": jobs,
+        "baselineLoading": pr.baseline_loading,
     })
 }
 
@@ -681,6 +797,7 @@ mod tests {
 
     use super::*;
     use crate::runs::ProcessCommand;
+    use crate::runs::RunConfig;
 
     const COLLAPSED: &str = "main;compute;inner 30\nmain;compute 10\nmain;io 5\n";
     const SPEEDSCOPE: &str = r#"{"$schema":"https://www.speedscope.app/file-format-schema.json",
@@ -721,6 +838,7 @@ mod tests {
         s.profiler.dir_override = Some(dir.join("profiler"));
         s.profiler.tool_dirs = Some(vec![bin]);
         s.profiler.perf_allowed = Some(false);
+        s.profiler.xctrace_allowed = Some(false);
         s
     }
 
@@ -751,12 +869,13 @@ mod tests {
         assert_eq!(s.profiler.missing, Some(ProfilerTool::Samply));
         assert!(s.ws.layout.is_visible(ToolWindowId::Profiler));
         s.run_configs = vec![RunConfig::process("py", ProcessCommand::new("python3", &["run.py"], dir.path()))];
-        let err = s.execute("run.profileRun.profile", &Value::Null).unwrap_err().to_string();
-        assert!(err.contains("pip install py-spy"), "{err}");
+        let err = s.execute("run.profileRun.profile", &json!({ "tool": "py-spy" })).unwrap_err().to_string();
+        assert!(err.contains("uv tool install py-spy"), "{err}");
         let tools = s.execute("profiler.tools", &Value::Null).unwrap();
-        assert_eq!(tools.as_array().unwrap().len(), 3);
-        assert!(tools.as_array().unwrap().iter().all(|t| t["installed"] == false));
+        assert_eq!(tools.as_array().unwrap().len(), ProfilerTool::ALL.len());
+        assert!(tools.as_array().unwrap().iter().all(|t| t["installed"] == t["builtin"]));
         assert!(s.execute("run.profile", &json!({ "config": 5 })).is_err());
+        assert!(s.execute("run.profile", &json!({ "kind": "gpu" })).is_err());
     }
 
     #[test]
@@ -792,7 +911,9 @@ mod tests {
         let bin = dir.path().join("bin");
         fake_tool(&bin, "py-spy", SPEEDSCOPE, false);
         s.run_configs = vec![RunConfig::process("script", ProcessCommand::new("python3", &["run.py"], dir.path()))];
-        let r = s.execute("run.profile", &Value::Null).unwrap();
+        // py-spy is the default where it doesn't need root (not macOS).
+        let p = if cfg!(target_os = "macos") { json!({ "tool": "py-spy" }) } else { Value::Null };
+        let r = s.execute("run.profile", &p).unwrap();
         assert_eq!(r["tool"], "pySpy");
         pump_until(&mut s, loaded);
         assert!(calls(&bin).contains("py-spy record --format speedscope -o "));
@@ -975,6 +1096,8 @@ mod tests {
             .iter()
             .map(|c| c.id)
             .filter(|id| (id.starts_with("profiler.") || id.contains("rofil")) && *id != "profiler.install")
+            // These start real profilers (profiler_agent_cmds tests drive them with fakes).
+            .filter(|id| !matches!(*id, "profiler.record" | "profiler.profileMemory"))
             .collect();
         assert!(ids.len() > 25, "{ids:?}");
         for id in ids {
