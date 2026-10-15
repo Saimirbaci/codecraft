@@ -97,6 +97,8 @@ pub(crate) enum ActionRequest {
     RustValue { slot: super::rust_values::Slot, stage: super::rust_values::Stage },
     /// A Python value's summary (a DataFrame's shape, an object's attributes).
     PythonValue { slot: super::python_values::Slot, stage: super::python_values::Stage },
+    /// What a C/C++ reference refers to.
+    CppValue { slot: super::cpp_values::Slot },
 }
 
 impl ActionRequest {
@@ -110,6 +112,7 @@ impl ActionRequest {
                 | Self::JumpCommand { .. }
                 | Self::RustValue { .. }
                 | Self::PythonValue { .. }
+                | Self::CppValue { .. }
         )
     }
 }
@@ -750,6 +753,7 @@ pub(crate) fn on_response(s: &mut Session, current: bool, request: ActionRequest
         }
         ActionRequest::RustValue { slot, stage } => super::rust_values::on_response(s, current, slot, stage, result),
         ActionRequest::PythonValue { slot, stage } => super::python_values::on_response(s, current, slot, stage, result),
+        ActionRequest::CppValue { slot } => super::cpp_values::on_response(s, current, slot, result),
         ActionRequest::AgentChildren { token, mut value } => {
             let rust = s.debug.rt.as_ref().is_some_and(super::Runtime::is_rust);
             let children: Vec<Value> = match result {

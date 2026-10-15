@@ -41,14 +41,20 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "debug.waitForStop",
             "Wait for the Debugger to Stop",
             None,
-            "{timeoutMs?: int (30000, max 600000)} | {token: int} — the stop summary when the program is paused \
-             (stack and locals read) or the session is over; otherwise {pending: true, token}: call again with the \
-             token (or debug.poll) after the IDE has pumped events → summary | {pending: true} | {timedOut: true}",
+            "{timeoutMs?: int (30000, max 600000), session?: id|name} | {token: int} — the stop summary when the \
+             program is paused (stack and locals read) or the session is over; otherwise {pending: true, token}: call \
+             again with the token (or debug.poll) after the IDE has pumped events → summary | {pending: true} | \
+             {timedOut: true}. With several sessions and no `session`: the first session that stops (or the end of \
+             all); with `session`: that one or one of its subprocess sessions. The summary's `sessionId` says which \
+             stopped and `sessions` lists them all",
             Context::Global,
             always,
             |s, p| match token_param(p)? {
                 Some(token) => agent::poll(s, token),
-                None => Ok(agent::wait_for_stop(s, agent::timeout_param(p)?)),
+                None if p.get("session").is_some_and(|v| !v.is_null()) => {
+                    Ok(agent::wait_for_stop(s, agent::timeout_param(p)?))
+                }
+                None => Ok(agent::wait_for_any(s, agent::timeout_param(p)?)),
             },
         ),
         spec(
@@ -70,7 +76,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             None,
             "{configuration?: string (a run configuration's name) | target?: {kind, …} (see debug.launch) | path?: \
              string, line?: int (1-based: the test or main at that line), timeoutMs?} — start a debug session \
-             → {name, status, token} (token: wait for the first stop with debug.waitForStop)",
+             → {name, session (its id), status, token} (token: wait for the first stop with debug.waitForStop). \
+             Other sessions keep running; debugging a configuration that is being debugged restarts it",
             Context::Global,
             always,
             start,
@@ -340,6 +347,7 @@ fn start(s: &mut Session, p: &Value) -> CmdResult {
     let token = agent::wait_for_stop(s, timeout);
     let mut out = json!({
         "name": s.debug.session.as_ref().map(|x| x.name.clone()),
+        "session": s.debug.selected_id(),
         "status": status_name(s),
     });
     if let Some(map) = out.as_object_mut() {

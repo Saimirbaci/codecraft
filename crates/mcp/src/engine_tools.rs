@@ -83,6 +83,13 @@ fn position_props() -> Value {
     })
 }
 
+/// The debug session a debug tool acts on (M15 track DM).
+fn session_ref() -> Value {
+    json!({ "description": "The debug session: its id (`sessionId` of debug_start or a stop summary) or name; \
+                            default the selected one (debug_wait_for_stop: any session)",
+            "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "string" }] })
+}
+
 fn config_ref() -> Value {
     json!({ "description": "A run configuration: its name, or its index from run_configurations",
             "oneOf": [{ "type": "string" }, { "type": "integer", "minimum": 0 }] })
@@ -236,7 +243,9 @@ pub fn engine_tools() -> Vec<ToolDef> {
             DEBUG_START,
             "Start debugging (lldb-dap/CodeLLDB for Rust, C and C++; debugpy for Python). Give one of: `config`; `file` \
              (a Python/Zig file, or the Rust test or main at `file`+`line`); `program` (a native executable); `pid` \
-             (attach). Breakpoints set before stay. Then call debug_wait_for_stop",
+             (attach). Breakpoints set before stay. Other debug sessions keep running (debugging a configuration that \
+             is being debugged restarts it); the result's `sessionId` is the new session's, for the `session` argument \
+             of the other debug tools. Then call debug_wait_for_stop",
             json!({
                 "config": config_ref(),
                 "file": path("A file to debug, or the file of the test/main to debug"),
@@ -291,6 +300,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "wait": { "type": "boolean" },
                 "timeoutMs": timeout(30_000),
                 "frames": { "type": "integer", "minimum": 1, "maximum": 50, "default": 5 },
+                "session": session_ref(),
             }),
             &["action"],
         ),
@@ -298,10 +308,13 @@ pub fn engine_tools() -> Vec<ToolDef> {
             DEBUG_WAIT_FOR_STOP,
             "Wait until the debugged program stops (breakpoint, step, exception, pause) or exits. Returns a stop \
              summary: {state, reason, thread, frames: [{index, name, file, line, excerpt}], locals: [{name, value, type, \
-             ref}]}; `ref` > 0 can be expanded with debug_variables. On timeout: {state: running, timedOut: true}",
+             ref}], sessionId}; `ref` > 0 can be expanded with debug_variables. On timeout: {state: running, timedOut: \
+             true}. With several debug sessions the summary lists them all (`sessions`: [{id, name, state, reason?}]) \
+             and `sessionId` says which one stopped; without `session` it waits for the first one that stops",
             json!({
                 "timeoutMs": timeout(30_000),
                 "frames": { "type": "integer", "minimum": 1, "maximum": 50, "default": 5, "description": "Frames to include" },
+                "session": session_ref(),
             }),
             &[],
         ),
@@ -312,6 +325,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "threadId": { "type": "integer" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 30 },
                 "timeoutMs": timeout(10_000),
+                "session": session_ref(),
             }),
             &[],
         ),
@@ -324,6 +338,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "frame": { "type": "integer", "minimum": 0, "description": "Frame index (0 = top); selects that frame" },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
                 "timeoutMs": timeout(10_000),
+                "session": session_ref(),
             }),
             &[],
         ),
@@ -334,6 +349,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "expression": { "type": "string" },
                 "frame": { "type": "integer", "minimum": 0, "description": "Frame index (0 = top)" },
                 "timeoutMs": timeout(10_000),
+                "session": session_ref(),
             }),
             &["expression"],
         ),

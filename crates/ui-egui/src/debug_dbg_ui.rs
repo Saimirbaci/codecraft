@@ -8,7 +8,7 @@ use egui::{Align2, FontId, Key, Pos2, RichText, TextEdit, Ui, vec2};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_engine::debug::{DebugSession, DebugState};
+use codecraft_engine::debug::{DebugSession, DebugState, DebugStatus};
 
 use crate::theme::Theme;
 use crate::{UiState, run_command};
@@ -306,6 +306,98 @@ pub fn stop_details(ui: &mut Ui, session: &DebugSession, theme: &Theme) {
             }
             ui.label(RichText::new(value).color(theme.text).font(mono()));
         });
+    }
+}
+
+/// The colour of a session's state (running green, paused amber, failed red).
+fn status_color(status: &DebugStatus, theme: &Theme) -> egui::Color32 {
+    match status {
+        DebugStatus::Running => theme.success,
+        DebugStatus::Stopped { .. } => theme.warning,
+        DebugStatus::Failed { .. } => theme.error,
+        _ => theme.text_muted,
+    }
+}
+
+/// The session tabs at the top of the Debug tool window when there are several debug sessions
+/// (M15 track DM): one tab per session (subprocess sessions marked `↳`) with its state's colour,
+/// a close button, and Stop All while two or more run. Clicking a tab selects that session: its
+/// threads, frames, variables, watches and console, and its execution point in the editor.
+pub fn session_tabs(ui: &mut Ui, s: &Session, theme: &Theme) -> Cmds {
+    let mut cmds = Vec::new();
+    let sessions = s.debug.sessions();
+    if sessions.len() < 2 {
+        return cmds;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for x in &sessions {
+            let (dot, _) = ui.allocate_exact_size(vec2(8.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.5, status_color(&x.status, theme));
+            let mut label: String = x.name.chars().take(40).collect();
+            if x.name.chars().count() > 40 {
+                label.push('…');
+            }
+            if x.parent.is_some() {
+                label = format!("↳ {label}");
+            }
+            let text = RichText::new(label).color(if x.selected { theme.text } else { theme.text_muted });
+            let pid = x.pid.map(|p| format!(" (pid {p})")).unwrap_or_default();
+            let tip = format!("{}{pid} — {}", x.name, x.status.label());
+            let resp = ui.add(egui::Button::new(text).selected(x.selected).frame(x.selected)).on_hover_text(tip);
+            if resp.clicked() && !x.selected {
+                cmds.push(("debug.selectSession", json!({ "session": x.id })));
+            }
+            let close = ui
+                .add(egui::Button::new(RichText::new("×").color(theme.text_muted)).frame(false).small())
+                .on_hover_text(if x.live { "Stop and close this session" } else { "Close this session" });
+            if close.clicked() {
+                cmds.push(("debug.closeSession", json!({ "session": x.id })));
+            }
+            ui.add_space(6.0);
+        }
+        if sessions.iter().filter(|x| x.live).count() >= 2
+            && ui
+                .add(egui::Button::new(RichText::new("■ Stop All").color(theme.error)).small())
+                .on_hover_text("Stop every debug session")
+                .clicked()
+        {
+            cmds.push(("debug.stopAll", Value::Null));
+        }
+    });
+    cmds
+}
+
+/// The status bar's debugger widget: the running session's name, or how many sessions run;
+/// clicking it shows the Debug tool window.
+pub fn status_widget(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
+    let sessions = s.debug.sessions();
+    let live: Vec<_> = sessions.iter().filter(|x| x.live).collect();
+    let text = match live.as_slice() {
+        [] => return,
+        [only] => format!("Debugging {}", only.name.chars().take(30).collect::<String>()),
+        many => {
+            let paused = many.iter().filter(|x| matches!(x.status, DebugStatus::Stopped { .. })).count();
+            if paused > 0 {
+                format!("{} debug sessions ({paused} paused)", many.len())
+            } else {
+                format!("{} debug sessions", many.len())
+            }
+        }
+    };
+    let color = if live.iter().any(|x| matches!(x.status, DebugStatus::Stopped { .. })) {
+        st.theme.warning
+    } else {
+        st.theme.text_muted
+    };
+    let tip: Vec<String> = live.iter().map(|x| format!("{} — {}", x.name, x.status.label())).collect();
+    let resp = ui
+        .add(egui::Label::new(RichText::new(text).size(12.0).color(color)).sense(egui::Sense::click()))
+        .on_hover_text(tip.join("\n"));
+    if resp.clicked()
+        && let Some(id) = s.debug.selected_id()
+    {
+        run_command(s, st, "debug.selectSession", &json!({ "session": id }));
     }
 }
 

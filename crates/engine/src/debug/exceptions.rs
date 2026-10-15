@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use codecraft_dap::{self as dap, AdapterKind, DapClient};
+use codecraft_dap::{self as dap, AdapterKind};
 
 use super::{Pending, Runtime, RunSpec};
 use crate::{CommandError, Session};
@@ -139,13 +139,6 @@ pub(super) fn send(rt: &mut Runtime, settings: &ExceptionBreakpoints, break_on_p
     }
 }
 
-/// The same configuration for a child connection (debugpy subprocesses).
-pub(crate) fn send_to(client: &DapClient, kind: AdapterKind, capabilities: &dap::Capabilities, settings: &ExceptionBreakpoints) {
-    if !capabilities.exception_breakpoint_filters.is_empty() {
-        let _ = client.set_exception_breakpoints(&filters_for(kind, capabilities, settings, false));
-    }
-}
-
 /// The answer to the panic breakpoint: when `rust_panic` could not be set (no such symbol), try
 /// `rust_begin_unwind` once.
 pub(crate) fn on_panic_breakpoint(s: &mut Session, fallback: bool, result: Result<Value, String>) {
@@ -214,17 +207,17 @@ pub(crate) fn update(s: &mut Session, p: &Value) -> Result<Value, CommandError> 
     Ok(state(s))
 }
 
-/// Send the current settings to a configured session (after a change).
+/// Send the current settings to every configured session (after a change).
 pub(crate) fn resend(s: &mut Session) {
-    let settings = s.debug.exceptions.clone();
-    let on_panic = s.debug.break_on_panic;
-    let Some(rt) = s.debug.rt.as_mut() else { return };
-    if !rt.configured || rt.client().is_none() {
-        return;
-    }
-    send(rt, &settings, on_panic);
-    let (kind, capabilities) = (rt.kind, rt.capabilities.clone());
-    rt.children.each_configured(|client| send_to(client, kind, &capabilities, &settings));
+    super::for_each_live(s, |s| {
+        let settings = s.debug.exceptions.clone();
+        let on_panic = s.debug.break_on_panic;
+        let Some(rt) = s.debug.rt.as_mut() else { return };
+        if !rt.configured || rt.client().is_none() {
+            return;
+        }
+        send(rt, &settings, on_panic);
+    });
 }
 
 #[cfg(test)]

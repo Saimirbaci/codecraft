@@ -616,12 +616,23 @@ fn python_subprocesses_are_debugged_too() {
     assert_eq!(top_line(&stop), line_of(CHILD, "@child") as u64, "{stop}");
     assert_eq!(local(&stop, "secret"), "42");
     assert!(stop["process"].as_str().unwrap().starts_with("Subprocess"), "{stop}");
+    // The subprocess is a debug session of its own (M15 track DM), next to its parent.
+    let child = stop["sessionId"].as_u64().unwrap();
+    let parent = stop["parentSession"].as_u64().unwrap();
+    let sessions = stop["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2, "{stop}");
+    assert!(sessions.iter().any(|x| x["id"] == json!(parent) && x["state"] == json!("running")), "{stop}");
     let end = step(&mut s, "continue");
-    // The child ends; the session follows the parent to its end.
-    let end = if end["state"] == json!("exited") { end } else { wait_stop(&mut s) };
-    assert_eq!(end["state"], json!("exited"), "{end}");
-    let out = console(&s);
-    assert!(out.contains("child says 42") && out.contains("child exited 0"), "{out}");
+    // The child's session ends; the parent runs to its end. debugpy sends the program's output
+    // (the subprocess's too: it shares the parent's stdout) on the parent's connection.
+    assert_eq!((end["state"].clone(), end["sessionId"].clone()), (json!("exited"), json!(child)), "{end}");
+    let v = s.execute("debug.waitForStop", &json!({ "session": parent, "timeoutMs": WAIT.as_millis() as u64 })).unwrap();
+    let end = resolve(&mut s, v);
+    assert_eq!((end["state"].clone(), end["sessionId"].clone()), (json!("exited"), json!(parent)), "{end}");
+    let parent_state = s.execute("debug.state", &json!({ "session": parent })).unwrap();
+    let out = parent_state["console"].to_string();
+    // The subprocess finished by itself (it is never killed when its connection closes).
+    assert!(out.contains("child says 42") && out.contains("child exited 0"), "{parent_state}");
     pump_until(&mut s, "the adapter to go away", |s| !s.debug.busy());
     s.shutdown();
 }

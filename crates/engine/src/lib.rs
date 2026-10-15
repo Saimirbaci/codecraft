@@ -453,6 +453,14 @@ impl Session {
 
     /// Run a command by id. Never panics: a panic inside a command is caught and reported.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
+        // Debug commands act on the session their `session` param names (M15 track DM).
+        if let Some(session) = debug::session_scope(self, id, params)? {
+            return debug::with_session(self, session, |s| s.execute_here(id, params));
+        }
+        self.execute_here(id, params)
+    }
+
+    fn execute_here(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
         let reg = registry();
         let Some(spec) = reg.get(id) else {
             return Err(CommandError::Unknown(id.to_string()));
