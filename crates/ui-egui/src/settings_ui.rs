@@ -56,9 +56,11 @@ impl PrefsUi {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct RunForm {
+pub(crate) struct RunForm {
     index: usize,
-    name: String,
+    /// Editing this kind's template instead of a configuration (M13 track RC).
+    template: Option<RunKind>,
+    pub(crate) name: String,
     kind: RunKind,
     command: String,
     env: String,
@@ -66,6 +68,59 @@ struct RunForm {
     working_dir: String,
     /// Where it runs (M11: Local, Docker, SSH).
     target: codecraft_engine::run_targets::RunTarget,
+    /// M13 track RC: before-launch tasks, debugger options, project file, CMake executable.
+    pub(crate) before_launch: Vec<codecraft_engine::run_config_store::BeforeLaunchTask>,
+    pub(crate) debugger_init: String,
+    pub(crate) debugger_stop: bool,
+    pub(crate) debugger_env: String,
+    store_as_project_file: bool,
+    executable: String,
+}
+
+impl RunForm {
+    fn new(c: &UserRunConfig, index: usize, template: Option<RunKind>) -> Self {
+        Self {
+            index,
+            template,
+            name: c.name.clone(),
+            kind: c.kind,
+            command: c.command.clone(),
+            env: env_text(&c.env),
+            env_file: c.env_file.clone(),
+            working_dir: c.working_dir.clone(),
+            target: c.target.clone(),
+            before_launch: c.before_launch.clone(),
+            debugger_init: c.debugger.init_commands.join("\n"),
+            debugger_stop: c.debugger.stop_at_entry,
+            debugger_env: env_text(&c.debugger.env),
+            store_as_project_file: c.store_as_project_file,
+            executable: c.executable.clone(),
+        }
+    }
+
+    /// `runConfig.update` / `runConfig.template.update` params.
+    fn params(&self) -> Value {
+        let mut p = json!({
+            "command": self.command,
+            "env": self.env,
+            "envFile": self.env_file,
+            "workingDir": self.working_dir,
+            "target": self.target,
+            "beforeLaunch": self.before_launch,
+            "debugger": { "initCommands": self.debugger_init, "stopAtEntry": self.debugger_stop, "env": self.debugger_env },
+            "storeAsProjectFile": self.store_as_project_file,
+            "executable": self.executable,
+        });
+        match self.template {
+            Some(kind) => p["kind"] = json!(kind.id()),
+            None => {
+                p["index"] = json!(self.index);
+                p["name"] = json!(self.name);
+                p["kind"] = json!(self.kind.id());
+            }
+        }
+        p
+    }
 }
 
 // ---------------------------------------------------------------- applying settings
@@ -891,25 +946,27 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     let root = s.run_store.root().map(std::path::Path::to_path_buf).unwrap_or_default();
     let derived: Vec<(String, String)> =
         s.run_store.derived.iter().map(|c| (c.name.clone(), c.command_line())).collect();
-    // The form follows the selected user configuration.
+    // The form follows the selected user configuration (or the template shown).
     let selected_user = dialog.selected.filter(|sel| !sel.derived).map(|sel| sel.index);
-    match (selected_user, &st.prefs.run_form) {
-        (Some(i), Some(f)) if f.index == i => {}
-        (Some(i), _) => {
-            st.prefs.run_form = dialog.draft.get(i).map(|c| RunForm {
-                index: i,
-                name: c.name.clone(),
-                kind: c.kind,
-                command: c.command.clone(),
-                env: env_text(&c.env),
-                env_file: c.env_file.clone(),
-                working_dir: c.working_dir.clone(),
-                target: c.target.clone(),
-            });
+    let wanted = match dialog.template {
+        Some(k) => Some((Some(k), 0)),
+        None => selected_user.map(|i| (None, i)),
+    };
+    match (wanted, &st.prefs.run_form) {
+        (Some((t, i)), Some(f)) if f.template == t && f.index == i => {}
+        (Some((Some(k), _)), _) => {
+            let t = codecraft_engine::run_config_store::template_in(&dialog.templates, k);
+            st.prefs.run_form = Some(RunForm::new(&t, 0, Some(k)));
+            st.prefs.run_error = None;
+        }
+        (Some((None, i)), _) => {
+            st.prefs.run_form = dialog.draft.get(i).map(|c| RunForm::new(c, i, None));
             st.prefs.run_error = None;
         }
         (None, _) => st.prefs.run_form = None,
     }
+    let config_names: Vec<String> =
+        dialog.draft.iter().map(|c| c.name.clone()).chain(derived.iter().map(|(n, _)| n.clone())).collect();
     let theme = st.theme.clone();
     let mut open = true;
     let mut cmds: Cmds = Vec::new();
@@ -965,11 +1022,8 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             ui.horizontal(|ui| {
                 ui.menu_button("+ Add", |ui| {
                     for kind in RunKind::ALL {
-                        if ui.button(kind.label()).on_hover_text(format!("New {} configuration", kind.label())).clicked() {
-                            cmds.push((
-                                "runConfig.create",
-                                json!({ "name": kind.label(), "kind": run_kind_id(kind), "command": kind.default_command() }),
-                            ));
+                        if ui.button(kind.label()).on_hover_text(format!("New {} configuration (from its template)", kind.label())).clicked() {
+                            cmds.push(("runConfig.create", json!({ "name": kind.label(), "kind": kind.id() })));
                             ui.close();
                         }
                     }
@@ -1039,6 +1093,21 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                         cmds.push(("runConfig.select", json!({ "index": i, "derived": true })));
                     }
                 }
+                // Templates: the defaults of new configurations (M13 track RC).
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(RichText::new("Edit configuration templates…").color(theme.text_muted))
+                    .id_salt("run-config-templates")
+                    .default_open(dialog.template.is_some())
+                    .show(ui, |ui| {
+                        for kind in RunKind::ALL {
+                            let sel = dialog.template == Some(kind);
+                            let custom = dialog.templates.iter().any(|t| t.kind == kind);
+                            let label = if custom { format!("🔧 {} *", kind.label()) } else { format!("🔧 {}", kind.label()) };
+                            if ui.add(egui::Button::selectable(sel, label).frame_when_inactive(false)).clicked() {
+                                cmds.push(("runConfig.template.select", json!({ "kind": kind.id() })));
+                            }
+                        }
+                    });
             });
         });
         ui.add_space(4.0);
@@ -1047,8 +1116,21 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
             return;
         }
         match (dialog.selected, form.as_mut()) {
+            (_, Some(f)) if f.template.is_some() => {
+                ui.label(
+                    RichText::new(format!("Template: {}  (new {} configurations start from it)", f.kind.label(), f.kind.label()))
+                        .strong(),
+                );
+                if dialog.templates.iter().any(|t| Some(t.kind) == f.template)
+                    && ui.small_button("Reset to Default").clicked()
+                {
+                    cmds.push(("runConfig.template.update", json!({ "kind": f.kind.id(), "reset": true })));
+                }
+                ui.add_space(4.0);
+                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names);
+            }
             (Some(Selection { derived: false, .. }), Some(f)) => {
-                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref());
+                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names);
             }
             (Some(Selection { derived: true, index }), _) => {
                 if let Some((name, line)) = derived.get(index) {
@@ -1078,17 +1160,8 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
     if let (Some(new), Some(old)) = (&form, &st.prefs.run_form)
         && new != old
     {
-        let params = json!({
-            "index": new.index,
-            "name": new.name,
-            "kind": run_kind_id(new.kind),
-            "command": new.command,
-            "env": new.env,
-            "envFile": new.env_file,
-            "workingDir": new.working_dir,
-            "target": new.target,
-        });
-        st.prefs.run_error = s.execute("runConfig.update", &params).err().map(|e| e.to_string());
+        let id = if new.template.is_some() { "runConfig.template.update" } else { "runConfig.update" };
+        st.prefs.run_error = s.execute(id, &new.params()).err().map(|e| e.to_string());
         st.prefs.run_form = form;
     }
     if !open {
@@ -1227,33 +1300,32 @@ fn run_target_row(ui: &mut egui::Ui, target: &mut codecraft_engine::run_targets:
     }
 }
 
-/// The id `runConfig.create/update` take for a kind.
-fn run_kind_id(kind: RunKind) -> &'static str {
-    match kind {
-        RunKind::Cargo => "cargo",
-        RunKind::Command => "command",
-        RunKind::Python => "python",
-        RunKind::Cpp => "cpp",
-        RunKind::Zig => "zig",
-        RunKind::Npm => "npm",
-        RunKind::Django => "django",
-        RunKind::FastApi => "fastapi",
-        RunKind::Flask => "flask",
-        RunKind::Dockerfile => "dockerfile",
-        RunKind::DockerCompose => "compose",
-    }
-}
-
-fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path::Path, error: Option<&str>) {
+fn run_form(
+    ui: &mut egui::Ui,
+    theme: &Theme,
+    f: &mut RunForm,
+    root: &std::path::Path,
+    error: Option<&str>,
+    config_names: &[String],
+) {
+    let is_template = f.template.is_some();
     egui::Grid::new("run-config-form").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
         ui.label("Name:");
-        ui.add(TextEdit::singleline(&mut f.name).desired_width(f32::INFINITY));
+        ui.horizontal(|ui| {
+            ui.add_enabled(!is_template, TextEdit::singleline(&mut f.name).desired_width(ui.available_width() - 170.0));
+            ui.checkbox(&mut f.store_as_project_file, "Store as project file").on_hover_text(format!(
+                "Save it as .codecraft/runConfigurations/{} to share it (commit it with the project)",
+                codecraft_engine::run_config_store::project_file_name(&f.name)
+            ));
+        });
         ui.end_row();
         ui.label("Type:");
-        egui::ComboBox::from_id_salt("run-config-kind").selected_text(f.kind.label()).show_ui(ui, |ui| {
-            for kind in RunKind::ALL {
-                ui.selectable_value(&mut f.kind, kind, kind.label());
-            }
+        ui.add_enabled_ui(!is_template, |ui| {
+            egui::ComboBox::from_id_salt("run-config-kind").selected_text(f.kind.label()).show_ui(ui, |ui| {
+                for kind in RunKind::ALL {
+                    ui.selectable_value(&mut f.kind, kind, kind.label());
+                }
+            });
         });
         ui.end_row();
         ui.label("Command:");
@@ -1280,8 +1352,19 @@ fn run_form(ui: &mut egui::Ui, theme: &Theme, f: &mut RunForm, root: &std::path:
             TextEdit::singleline(&mut f.working_dir).hint_text(root.display().to_string()).desired_width(f32::INFINITY),
         );
         ui.end_row();
+        if f.kind == RunKind::CMake {
+            ui.label("Executable:");
+            ui.add(
+                TextEdit::singleline(&mut f.executable)
+                    .hint_text("the target's own (from the CMake File API)")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.end_row();
+        }
     });
     run_target_row(ui, &mut f.target);
+    crate::rc_ui::before_launch_section(ui, theme, f, config_names);
+    crate::rc_ui::debugger_section(ui, theme, f);
     ui.add_space(6.0);
     let probe =
         UserRunConfig { name: "preview".into(), kind: f.kind, command: f.command.clone(), ..Default::default() };

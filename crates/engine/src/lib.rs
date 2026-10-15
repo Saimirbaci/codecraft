@@ -21,6 +21,11 @@ pub mod agents;
 pub mod app_cmds;
 pub mod approvals;
 pub mod catalog;
+pub mod before_launch;
+pub mod command_completion;
+pub mod modify_code;
+pub mod typescript_tool;
+pub mod zig_tool;
 pub mod cargo_audit;
 pub mod cargo_deps;
 mod code_cmds;
@@ -134,6 +139,7 @@ pub mod terminal;
 mod terminal_cmds;
 pub mod testing;
 mod testing_cmds;
+pub mod test_file;
 pub mod vcs;
 mod vcs_cmds;
 mod vcs_ext_cmds;
@@ -321,6 +327,14 @@ pub struct Session {
     pub inline: inline_completion::InlineState,
     /// CLion features: CMake, C++ tests, Valgrind, sanitizers, Conan/vcpkg (M12 track CL).
     pub cpp: cpp::CppState,
+    /// A Run/Debug waiting for its configuration's before-launch tasks (M13 track RC).
+    pub launch: before_launch::LaunchState,
+    /// The Zig tool window's build steps (M13 track RC).
+    pub zig: zig_tool::ZigState,
+    /// The TypeScript tool window: tsc errors and tsconfig files (M13 track RC).
+    pub typescript: typescript_tool::TsState,
+    /// Code › Modify Selected Code… (M13 track RC).
+    pub modify: modify_code::ModifyState,
     /// Previous selections for Shrink Selection (per editor, most recent last).
     selection_stack: Vec<(EditorId, SelectionSet)>,
     /// Last edit location (Navigate › Last Edit Location).
@@ -405,6 +419,10 @@ impl Session {
             tasks: tasks_contexts::TasksState::default(),
             inline: inline_completion::InlineState::default(),
             cpp: cpp::CppState::default(),
+            launch: before_launch::LaunchState::default(),
+            zig: zig_tool::ZigState::default(),
+            typescript: typescript_tool::TsState::default(),
+            modify: modify_code::ModifyState::default(),
             selection_stack: Vec::new(),
             last_edit: None,
             servers: Default::default(),
@@ -490,6 +508,9 @@ impl Session {
         self.copyright.set_home(dir.to_path_buf());
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
         self.cpp.isolated = true;
+        // zig and tsc too (M13 track RC).
+        self.zig.isolated = true;
+        self.typescript.isolated = true;
         // Never the real GitHub CLI (it acts on the user's account): tests point it at a fake.
         self.vcs.gh_program = dir.join("gh-isolated");
         // Font scans look only in `dir/fonts`, never at the user's fonts.
@@ -537,6 +558,10 @@ impl Session {
         changed |= tasks_contexts::pump(self);
         changed |= inline_completion::pump(self);
         changed |= cpp::pump(self);
+        changed |= before_launch::pump(self);
+        changed |= zig_tool::pump(self);
+        changed |= typescript_tool::pump(self);
+        changed |= modify_code::pump(self);
         session_store::autosave(self);
         hot_exit::autosave(self);
         self.ws.sync_views();
@@ -569,6 +594,10 @@ impl Session {
             || self.data_flow.busy()
             || self.inline.busy()
             || self.cpp.busy()
+            || self.launch.busy()
+            || self.zig.busy()
+            || self.typescript.busy()
+            || self.modify.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.
@@ -583,6 +612,9 @@ impl Session {
             || self.duplicates.busy()
             || self.data_flow.busy()
             || self.cpp.busy()
+            || self.launch.busy()
+            || self.zig.busy()
+            || self.typescript.busy()
     }
 
     /// Stop the language server and running processes (window closing).

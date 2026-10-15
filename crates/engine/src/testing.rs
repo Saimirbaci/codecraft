@@ -8,10 +8,12 @@
 //! loads the coverage report of a "Run with Coverage" run.
 
 pub mod cpp;
+pub mod js;
 mod junit;
 mod lcov;
 mod locate;
 mod parse;
+pub mod ra;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,7 +26,9 @@ use serde_json::json;
 use codecraft_cargo::{CargoCommand, CargoInvocation, TargetSelector};
 use codecraft_workspace::{ConsoleKind, NotificationLevel, RunStatus, RunTabId, ToolWindowId};
 
-pub use lcov::{CoverageReport, CoverageRow, FileCoverage, percent as coverage_percent};
+pub use lcov::{
+    CoverageColumn, CoverageReport, CoverageRow, CoverageSort, FileCoverage, percent as coverage_percent, sort_rows,
+};
 
 use crate::runs::ProcessCommand;
 use crate::{CommandError, Session};
@@ -61,6 +65,9 @@ pub enum Framework {
     Catch2,
     Doctest,
     BoostTest,
+    /// JavaScript/TypeScript (M13 track RC): the JSON report fills the tree when the run ends.
+    Jest,
+    Vitest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,6 +613,8 @@ pub struct TestingState {
     pub coverage: Option<CoverageReport>,
     /// Coverage marks in the editor gutter.
     pub coverage_in_editor: bool,
+    /// The Coverage table's order (M13 track RC).
+    pub coverage_sort: CoverageSort,
     /// Path → (0-based line → last status) of located tests, newest run last.
     gutter: HashMap<PathBuf, BTreeMap<usize, TestStatus>>,
     locate_jobs: Vec<LocateJob>,
@@ -613,6 +622,8 @@ pub struct TestingState {
     coverage_loads: Vec<CoverageLoad>,
     /// Navigate to this test once its location is known.
     pending_nav: Option<(RunTabId, usize, usize)>,
+    /// Files asked rust-analyzer for runnables, per run (M13 track RC).
+    ra_requested: std::collections::HashSet<(RunTabId, PathBuf)>,
 }
 
 impl Default for TestingState {
@@ -625,11 +636,13 @@ impl Default for TestingState {
             import_requested: false,
             coverage: None,
             coverage_in_editor: true,
+            coverage_sort: CoverageSort::default(),
             gutter: HashMap::new(),
             locate_jobs: Vec::new(),
             coverage_runs: Vec::new(),
             coverage_loads: Vec::new(),
             pending_nav: None,
+            ra_requested: Default::default(),
         }
     }
 }
@@ -723,6 +736,9 @@ pub(crate) fn process_framework(cmd: &ProcessCommand) -> Option<Framework> {
     if let Some(fw) = cpp::framework_of(cmd) {
         return Some(fw);
     }
+    if let Some(fw) = js::framework_of(cmd) {
+        return Some(fw);
+    }
     let program = basename(&cmd.program);
     let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
     if program == "sh" || program == "bash" || program == "zsh" {
@@ -763,6 +779,10 @@ pub(crate) fn instrument_process(cmd: &ProcessCommand) -> (ProcessCommand, Optio
     // C++ test binaries write their framework's report (GoogleTest JSON, Catch2/doctest/Boost XML).
     if let Some(fw) = cpp::framework_of(cmd) {
         return cpp::instrument(cmd, fw);
+    }
+    // jest and vitest write their JSON report (M13 track RC).
+    if let Some(fw) = js::framework_of(cmd) {
+        return js::instrument(cmd, fw);
     }
     let program = basename(&cmd.program);
     let direct = !matches!(program, "sh" | "bash" | "zsh");
@@ -851,6 +871,12 @@ fn on_finished(s: &mut Session, tab: RunTabId) {
     {
         cpp::merge_report(run, &path);
     }
+    // jest/vitest's JSON report.
+    if let Some(run) = s.testing.run_mut(tab).filter(|r| r.framework.is_js())
+        && let Some(path) = run.junit.take()
+    {
+        js::merge_report(run, &path);
+    }
     // pytest's JUnit report.
     if let Some(run) = s.testing.run_mut(tab)
         && let Some(path) = run.junit.take()
@@ -884,6 +910,8 @@ fn on_finished(s: &mut Session, tab: RunTabId) {
         let _ = step_failed(s, tab, true);
     }
     start_locate(s, tab);
+    // rust-analyzer's runnables refine Rust test locations (open files now, located ones later).
+    ra::request(s, tab);
 }
 
 /// Resolve test definitions and failure locations of `tab`'s run on a worker thread.
@@ -982,6 +1010,7 @@ fn pump_locate(s: &mut Session) -> bool {
             }
         }
         s.testing.rebuild_gutter();
+        ra::request(s, tab);
         if let Some((ptab, si, ti)) = s.testing.pending_nav
             && ptab == tab
         {
@@ -1300,6 +1329,7 @@ pub fn rerun_failed_origin(run: &TestRun) -> Result<TestOrigin, String> {
             Ok(TestOrigin::Process(cmd))
         }
         (fw, TestOrigin::Process(cmd)) if fw.is_cpp() => cpp::rerun_failed(fw, cmd, &failed).map(TestOrigin::Process),
+        (fw, TestOrigin::Process(cmd)) if fw.is_js() => js::rerun_failed(cmd, &failed).map(TestOrigin::Process),
         (Framework::Zig, TestOrigin::Process(cmd))
             if basename(&cmd.program) == "zig" && cmd.args.first().is_some_and(|a| a == "test") =>
         {

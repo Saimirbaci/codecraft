@@ -530,6 +530,8 @@ pub struct DebugState {
     pub break_on_panic: bool,
     /// The last target debugged (Rerun).
     pub last_target: Option<DebugTarget>,
+    /// The run configuration's debugger options of the last session (M13 track RC).
+    pub last_options: crate::run_config_store::DebuggerOptions,
     /// Run › Attach to Process…'s process list while it is open.
     pub attach: Option<AttachPicker>,
     /// Memory, Disassembly, Registers, watchpoints and the console history.
@@ -562,6 +564,7 @@ impl Default for DebugState {
             form: None,
             break_on_panic: true,
             last_target: None,
+            last_options: Default::default(),
             attach: None,
             views: crate::debug_views::DebugViews::default(),
             asm: crate::asm::AsmState::default(),
@@ -837,6 +840,8 @@ struct Runtime {
     canonical_root: Option<PathBuf>,
     /// `launch` arguments, sent once `initialize` answers.
     launch_args: Option<Value>,
+    /// The run configuration's debugger options (init commands, stop at entry, debuggee env).
+    options: crate::run_config_store::DebuggerOptions,
 }
 
 impl Runtime {
@@ -861,6 +866,7 @@ impl Runtime {
             project_root,
             canonical_root,
             launch_args: None,
+            options: Default::default(),
         }
     }
 
@@ -1194,8 +1200,27 @@ fn pick_artifact(pick: &ArtifactPick, executables: &[(String, PathBuf)]) -> Resu
     }
 }
 
+/// The plan with a configuration's debuggee environment added (it wins over the plan's).
+fn with_options(mut plan: LaunchPlan, options: &crate::run_config_store::DebuggerOptions) -> LaunchPlan {
+    for (k, v) in &options.env {
+        plan.env.retain(|(o, _)| o != k);
+        plan.env.push((k.clone(), v.clone()));
+    }
+    plan
+}
+
 /// Runs on a worker thread: find the adapter, work out launch arguments, spawn it.
-fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, String> {
+fn prepare(
+    plan: &LaunchPlan,
+    program: Option<PathBuf>,
+    options: &crate::run_config_store::DebuggerOptions,
+) -> Result<Prepared, String> {
+    let extra_init = |mut init: Vec<String>, kind: AdapterKind| {
+        if matches!(kind, AdapterKind::LldbDap | AdapterKind::CodeLldb) {
+            init.extend(options.init_commands.iter().cloned());
+        }
+        init
+    };
     let (adapter, launch) = match &plan.run {
         RunSpec::Native { program: fixed, rust } => {
             let program = program.or_else(|| fixed.clone()).ok_or("nothing to debug: no executable")?;
@@ -1207,6 +1232,7 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
             } else {
                 Vec::new()
             };
+            let init_commands = extra_init(init_commands, adapter.kind);
             let launch = dap::launch::native(
                 adapter.kind,
                 &dap::launch::NativeLaunch {
@@ -1216,7 +1242,7 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
                     cwd: plan.cwd.clone(),
                     env: plan.env.clone(),
                     init_commands,
-                    stop_on_entry: false,
+                    stop_on_entry: options.stop_at_entry,
                     source_languages: if *rust { vec!["rust".into()] } else { Vec::new() },
                 },
             );
@@ -1233,7 +1259,7 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
                 env: plan.env.clone(),
                 python: python.clone(),
                 just_my_code: *just_my_code,
-                stop_on_entry: false,
+                stop_on_entry: options.stop_at_entry,
             });
             (adapter, launch)
         }
@@ -1250,6 +1276,7 @@ fn prepare(plan: &LaunchPlan, program: Option<PathBuf>) -> Result<Prepared, Stri
             } else {
                 Vec::new()
             };
+            let init_commands = extra_init(init_commands, adapter.kind);
             let args = dap::launch::native_attach(adapter.kind, &plan.name, *pid, &init_commands);
             (adapter, args)
         }
@@ -1324,6 +1351,45 @@ pub fn rust_value(raw: String) -> String {
 
 /// Start debugging `target` (stopping a session that is still running).
 pub(crate) fn start(s: &mut Session, target: DebugTarget) -> Result<(), CommandError> {
+    start_with(s, target, Default::default())
+}
+
+/// Run › Debugging Actions › Compile and Reload Modified Files. Rust and C/C++ can't swap new
+/// code into a running program (no hot swap), so the session's target is rebuilt and the session
+/// restarted with the same debugger options; breakpoints, watches and expanded nodes are kept.
+/// Returns the status message.
+pub(crate) fn compile_and_reload(s: &mut Session) -> Result<String, CommandError> {
+    let target =
+        s.debug.last_target.clone().ok_or_else(|| CommandError::Disabled("there is no debug session".into()))?;
+    let plan = plan_for(&target).map_err(CommandError::Failed)?;
+    if matches!(plan.run, RunSpec::Attach { .. } | RunSpec::Core { .. } | RunSpec::Remote { .. } | RunSpec::AttachWait { .. })
+    {
+        return Err(CommandError::Failed(format!(
+            "{}: CodeCraft didn't start this program (attached, core dump or remote), so it can't rebuild and restart it",
+            target.name()
+        )));
+    }
+    let rebuilds = plan.build.is_some();
+    let name = target.name().to_owned();
+    let options = s.debug.last_options.clone();
+    start_with(s, target, options)?;
+    let message = if rebuilds {
+        format!(
+            "{name}: rebuilding and restarting — Rust and C/C++ have no hot swap, so the debug session restarts with the new build (breakpoints kept)"
+        )
+    } else {
+        format!("{name}: restarted with the modified files (no build step; breakpoints kept)")
+    };
+    s.status = message.clone();
+    Ok(message)
+}
+
+/// Start debugging `target` with a run configuration's debugger options.
+pub(crate) fn start_with(
+    s: &mut Session,
+    target: DebugTarget,
+    options: crate::run_config_store::DebuggerOptions,
+) -> Result<(), CommandError> {
     let plan = plan_for(&target).map_err(CommandError::Failed)?;
     if s.debug.rt.is_some() {
         stop(s);
@@ -1343,6 +1409,7 @@ pub(crate) fn start(s: &mut Session, target: DebugTarget) -> Result<(), CommandE
     s.debug.choosing = false;
     s.debug.views.reset();
     s.debug.last_target = Some(target.clone());
+    s.debug.last_options = options.clone();
     s.debug.console.clear();
     s.debug.session = Some(DebugSession { name: plan.name.clone(), ..DebugSession::default() });
     s.ws.layout.show(ToolWindowId::Debug);
@@ -1363,18 +1430,24 @@ pub(crate) fn start(s: &mut Session, target: DebugTarget) -> Result<(), CommandE
         }
         None => {
             set_status(s, DebugStatus::Starting);
-            Phase::Prepare { rx: spawn_prepare(plan.clone(), None) }
+            Phase::Prepare { rx: spawn_prepare(plan.clone(), None, options.clone()) }
         }
     };
-    s.debug.rt = Some(Runtime::new(plan, phase, root));
+    let mut rt = Runtime::new(plan, phase, root);
+    rt.options = options;
+    s.debug.rt = Some(rt);
     s.status = format!("Debugging {}", target.name());
     Ok(())
 }
 
-fn spawn_prepare(plan: LaunchPlan, program: Option<PathBuf>) -> Receiver<Result<Prepared, String>> {
+fn spawn_prepare(
+    plan: LaunchPlan,
+    program: Option<PathBuf>,
+    options: crate::run_config_store::DebuggerOptions,
+) -> Receiver<Result<Prepared, String>> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new().name("debug-prepare".into()).spawn(move || {
-        let result = prepare(&plan, program);
+        let result = prepare(&with_options(plan, &options), program, &options);
         // A dropped receiver (session cancelled) drops — and so kills — the client.
         let _ = tx.send(result);
     });
@@ -1555,7 +1628,8 @@ fn on_build_event(s: &mut Session, event: RunEvent) {
             match pick_artifact(&build.pick, executables) {
                 Ok(program) => {
                     let plan = rt.plan.clone();
-                    rt.phase = Phase::Prepare { rx: spawn_prepare(plan, Some(program.clone())) };
+                    let options = rt.options.clone();
+                    rt.phase = Phase::Prepare { rx: spawn_prepare(plan, Some(program.clone()), options) };
                     s.debug.info(format!("Debugging {}", program.display()));
                     set_status(s, DebugStatus::Starting);
                 }

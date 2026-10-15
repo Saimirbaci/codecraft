@@ -256,6 +256,8 @@ pub struct Settings {
     pub todo_filters: Vec<TodoFilter>,
     /// Languages & Frameworks › Rust: ask crates.io for crate names and versions in Cargo.toml.
     pub crates_io_lookups: bool,
+    /// Code › Code Completion › Enable Command Completion: typing `..` lists IDE actions.
+    pub command_completion: bool,
 }
 
 /// Tab and indent of one language (Settings › Editor › Code Style).
@@ -431,6 +433,7 @@ impl Default for Settings {
             todo_patterns: default_todo_patterns(),
             todo_filters: Vec::new(),
             crates_io_lookups: true,
+            command_completion: false,
         }
     }
 }

@@ -65,7 +65,8 @@ pub(crate) fn run(job: Job) -> Vec<Located> {
             Framework::Cargo => locate_rust(&job, r, &mut files),
             Framework::Pytest => locate_pytest(&job, r, &mut files),
             Framework::Zig => locate_zig(&job, r, &mut files),
-            Framework::CTest => None,
+            // CTest has no locations; jest/vitest locations come with their report.
+            Framework::CTest | Framework::Jest | Framework::Vitest => None,
             Framework::GoogleTest | Framework::Catch2 | Framework::Doctest | Framework::BoostTest => {
                 super::cpp::locate(job.framework, &cpp_sources, &r.suite_name, &r.name, &mut |p| {
                     files.get(p).map(str::to_string)

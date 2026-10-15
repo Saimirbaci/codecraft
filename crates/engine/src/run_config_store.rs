@@ -54,6 +54,11 @@ pub enum RunKind {
     /// `down`; default `up`) (M11 track D).
     #[serde(rename = "compose")]
     DockerCompose,
+    /// CLion's CMake Application: `command` is a CMake target, then optionally `--` and program
+    /// arguments; the target is built in the active profile's build directory, then
+    /// `executable` (empty = the target's artifact from the File API) runs (M13 track RC).
+    #[serde(rename = "cmake")]
+    CMake,
 }
 
 impl RunKind {
@@ -70,8 +75,9 @@ impl RunKind {
             "flask" => Ok(Self::Flask),
             "dockerfile" | "docker" => Ok(Self::Dockerfile),
             "compose" | "docker-compose" | "dockercompose" => Ok(Self::DockerCompose),
+            "cmake" | "cmake application" | "cmakeapplication" => Ok(Self::CMake),
             other => Err(format!(
-                "unknown configuration type `{other}` (cargo, command, python, cpp, zig, npm, django, fastapi, flask, dockerfile or compose)"
+                "unknown configuration type `{other}` (cargo, command, python, cpp, zig, npm, django, fastapi, flask, dockerfile, compose or cmake)"
             )),
         }
     }
@@ -89,11 +95,30 @@ impl RunKind {
             Self::Flask => "Flask",
             Self::Dockerfile => "Dockerfile",
             Self::DockerCompose => "Docker Compose",
+            Self::CMake => "CMake Application",
+        }
+    }
+
+    /// The id `runConfig.create/update` take (`kind` param), as in the JSON files.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::Command => "command",
+            Self::Python => "python",
+            Self::Cpp => "cpp",
+            Self::Zig => "zig",
+            Self::Npm => "npm",
+            Self::Django => "django",
+            Self::FastApi => "fastapi",
+            Self::Flask => "flask",
+            Self::Dockerfile => "dockerfile",
+            Self::DockerCompose => "compose",
+            Self::CMake => "cmake",
         }
     }
 
     /// Every kind, in the order the UI offers them.
-    pub const ALL: [RunKind; 11] = [
+    pub const ALL: [RunKind; 12] = [
         Self::Cargo,
         Self::Command,
         Self::Python,
@@ -105,6 +130,7 @@ impl RunKind {
         Self::Flask,
         Self::Dockerfile,
         Self::DockerCompose,
+        Self::CMake,
     ];
 
     /// What the Command field of a new configuration of this kind starts with.
@@ -121,6 +147,7 @@ impl RunKind {
             Self::Flask => "--app app run --debug",
             Self::Dockerfile => "Dockerfile",
             Self::DockerCompose => "compose.yaml up",
+            Self::CMake => "app",
         }
     }
 
@@ -138,6 +165,7 @@ impl RunKind {
             Self::Flask => "--app app run --debug",
             Self::Dockerfile => "Dockerfile -p 8080:80 -- app --port 80",
             Self::DockerCompose => "compose.yaml up web   or   down",
+            Self::CMake => "my_target -- --arg",
         }
     }
 }
@@ -161,6 +189,157 @@ pub struct UserRunConfig {
     /// compile gets `-fsanitize=<list> -fno-omit-frame-pointer -g` (M12 track CL).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub sanitizers: String,
+    /// Tasks run in order before the configuration starts (RustRover's "Before launch"); a
+    /// failing task stops the launch (M13 track RC).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub before_launch: Vec<BeforeLaunchTask>,
+    /// Debugger options used by Run › Debug (M13 track RC).
+    #[serde(skip_serializing_if = "DebuggerOptions::is_default")]
+    pub debugger: DebuggerOptions,
+    /// Saved as its own shareable file, `.codecraft/runConfigurations/<name>.json`, instead of in
+    /// `.codecraft/run-configurations.json` (RustRover's "Store as project file").
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub store_as_project_file: bool,
+    /// CMake Application only: the program to run (relative = from the project); empty = the
+    /// target's artifact.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub executable: String,
+}
+
+/// One "Before launch" task of a run configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum BeforeLaunchTask {
+    /// Build: the configuration's own build (`cargo build` of its package and target, the CMake
+    /// target, the C/C++ compile), else the project's build (Build › Build Project).
+    Build,
+    /// Run another configuration and wait for it to finish.
+    #[serde(rename_all = "camelCase")]
+    RunConfiguration { name: String },
+    /// Run an external tool: a command line (shell-style quoting), in `working_dir` (empty = the
+    /// project; relative = from the project).
+    #[serde(rename_all = "camelCase")]
+    External {
+        command: String,
+        #[serde(default)]
+        working_dir: String,
+    },
+}
+
+impl BeforeLaunchTask {
+    /// How the task reads in Edit Configurations and in launch messages.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Build => "Build".into(),
+            Self::RunConfiguration { name } => format!("Run '{name}'"),
+            Self::External { command, .. } => format!("Run '{}'", command.trim()),
+        }
+    }
+
+    /// Parse `{kind: build}`, `{kind: runConfiguration, name}`, `{kind: external, command,
+    /// workingDir?}` or the short forms `"build"`, `"run:<name>"`, `"exec:<command line>"`.
+    pub fn from_value(v: &Value) -> Result<Self, String> {
+        if let Some(s) = v.as_str() {
+            let s = s.trim();
+            if s.eq_ignore_ascii_case("build") {
+                return Ok(Self::Build);
+            }
+            if let Some(name) = s.strip_prefix("run:") {
+                return Ok(Self::RunConfiguration { name: name.trim().to_string() });
+            }
+            if let Some(command) = s.strip_prefix("exec:") {
+                return Ok(Self::External { command: command.trim().to_string(), working_dir: String::new() });
+            }
+            return Err(format!("bad before-launch task `{s}` (build, run:<configuration> or exec:<command>)"));
+        }
+        let kind = v.get("kind").and_then(Value::as_str).unwrap_or("");
+        let text = |key: &str| v.get(key).and_then(Value::as_str).map(|t| t.trim().to_string());
+        match kind {
+            "build" => Ok(Self::Build),
+            "runConfiguration" | "run" => Ok(Self::RunConfiguration {
+                name: text("name").ok_or("a runConfiguration task needs a `name`")?,
+            }),
+            "external" | "exec" | "tool" => Ok(Self::External {
+                command: text("command").ok_or("an external task needs a `command`")?,
+                working_dir: text("workingDir").unwrap_or_default(),
+            }),
+            other => Err(format!("unknown before-launch task kind `{other}` (build, runConfiguration, external)")),
+        }
+    }
+
+    fn validate(&self, owner: &str) -> Result<(), String> {
+        match self {
+            Self::Build => Ok(()),
+            Self::RunConfiguration { name } if name.trim().is_empty() => {
+                Err(format!("`{owner}`: a Run Another Configuration task needs a configuration"))
+            }
+            Self::RunConfiguration { name } if name.trim() == owner => {
+                Err(format!("`{owner}`: a configuration can't run itself before launch"))
+            }
+            Self::RunConfiguration { .. } => Ok(()),
+            Self::External { command, .. } => match split_words(command) {
+                Ok(w) if !w.is_empty() => Ok(()),
+                Ok(_) => Err(format!("`{owner}`: an external tool task needs a command")),
+                Err(e) => Err(format!("`{owner}`: external tool: {e}")),
+            },
+        }
+    }
+}
+
+/// Per-configuration debugger options (Run › Debug).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DebuggerOptions {
+    /// LLDB commands run before the program starts (lldb-dap `initCommands`, after the Rust
+    /// formatters), e.g. `settings set target.x86-disassembly-flavor intel`.
+    pub init_commands: Vec<String>,
+    /// Stop at the program's entry point.
+    pub stop_at_entry: bool,
+    /// Extra environment for the debuggee only (on top of the configuration's).
+    pub env: Vec<(String, String)>,
+}
+
+impl DebuggerOptions {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// From `{initCommands?: [string] | "a\nb", stopAtEntry?: bool, env?: …}` (absent fields keep
+    /// their values).
+    pub fn fill(&mut self, v: &Value) -> Result<(), String> {
+        if v.is_null() {
+            *self = Self::default();
+            return Ok(());
+        }
+        if !v.is_object() {
+            return Err("`debugger` must be an object".into());
+        }
+        if let Some(c) = v.get("initCommands") {
+            self.init_commands = match c {
+                Value::Null => Vec::new(),
+                Value::String(s) => s.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect(),
+                Value::Array(items) => items
+                    .iter()
+                    .map(|i| i.as_str().map(|t| t.trim().to_string()))
+                    .collect::<Option<Vec<_>>>()
+                    .ok_or("`initCommands` must be text lines")?
+                    .into_iter()
+                    .filter(|l| !l.is_empty())
+                    .collect(),
+                _ => return Err("`initCommands` must be a list of LLDB commands".into()),
+            };
+            if self.init_commands.len() > 200 || self.init_commands.iter().any(|c| c.contains('\0')) {
+                return Err("too many or bad LLDB init commands".into());
+            }
+        }
+        if let Some(b) = v.get("stopAtEntry") {
+            self.stop_at_entry = b.as_bool().ok_or("`stopAtEntry` must be true or false")?;
+        }
+        if let Some(e) = v.get("env") {
+            self.env = parse_env(e)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -168,6 +347,26 @@ pub struct UserRunConfig {
 struct ConfigFile {
     version: u32,
     configurations: Vec<UserRunConfig>,
+    /// Defaults per kind for new configurations (Edit Configurations › Templates).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    templates: Vec<UserRunConfig>,
+}
+
+/// Where configurations stored as project files live, one `<name>.json` each.
+pub const PROJECT_FILES_DIR: &str = ".codecraft/runConfigurations";
+
+/// The file name of a configuration stored as a project file: its name with path separators and
+/// characters some file systems reject replaced by `_`.
+pub fn project_file_name(name: &str) -> String {
+    let cleaned: String = name
+        .trim()
+        .chars()
+        .take(120)
+        .map(|c| if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') { '_' } else { c })
+        .collect();
+    let cleaned = cleaned.trim_start_matches(['.', ' ']).trim_end_matches(['.', ' ']);
+    let stem = if cleaned.is_empty() { "configuration" } else { cleaned };
+    format!("{stem}.json")
 }
 
 // ---------------------------------------------------------------- parsing
@@ -479,7 +678,45 @@ impl UserRunConfig {
         {
             return Err(format!("`{name}`: environment file {} does not exist", path.display()));
         }
+        if self.before_launch.len() > 20 {
+            return Err(format!("`{name}`: at most 20 before-launch tasks"));
+        }
+        for task in &self.before_launch {
+            task.validate(name)?;
+        }
         self.to_run_config(project, project).map(|_| ())
+    }
+
+    /// The program arguments after `--` and the words before it.
+    fn split_dashes(words: &[String]) -> (&[String], &[String]) {
+        match words.iter().position(|w| w == "--") {
+            Some(i) => (words.get(..i).unwrap_or_default(), words.get(i + 1..).unwrap_or_default()),
+            None => (words, &[][..]),
+        }
+    }
+
+    /// CMake Application: the target, its executable and the program arguments; the build
+    /// directory and the configure command come from the active CMake profile.
+    pub fn cmake_parts(&self, project: &Path) -> Result<CmakeApp, String> {
+        let name = self.name.trim();
+        let words = split_words(&self.command).map_err(|e| format!("`{name}`: {e}"))?;
+        let (head, args) = Self::split_dashes(&words);
+        let target = head.first().cloned().ok_or_else(|| format!("`{name}`: no CMake target"))?;
+        if head.len() > 1 {
+            return Err(format!("`{name}`: one CMake target, then `--` and the program's arguments"));
+        }
+        let (dir, configure) = crate::cpp::cmake::configure_script(project);
+        let build_dir = if Path::new(&dir).is_absolute() { PathBuf::from(&dir) } else { project.join(&dir) };
+        let exe = self.executable.trim();
+        let executable = if !exe.is_empty() {
+            let p = PathBuf::from(exe);
+            if p.is_absolute() { p } else { project.join(p) }
+        } else {
+            crate::cpp::cmake::cached_codemodel(project)
+                .and_then(|m| m.targets.iter().find(|t| t.name == target).and_then(|t| t.executable().cloned()))
+                .unwrap_or_else(|| build_dir.join(&target))
+        };
+        Ok(CmakeApp { target, executable, args: args.to_vec(), build_dir, configure })
     }
 
     /// The runnable configuration; Cargo runs default to `cargo_root`.
@@ -554,6 +791,30 @@ impl UserRunConfig {
                 let cmd = crate::docker::run::compose_command(&words()?, project, &self.cwd(project, project), &env);
                 Ok(RunConfig::process(name, cmd))
             }
+            RunKind::CMake => {
+                let app = self.cmake_parts(project)?;
+                let q = |p: &Path| codecraft_cargo::shell_quote(&p.display().to_string());
+                let mut run = vec![app.executable.display().to_string()];
+                run.extend(app.args.iter().cloned());
+                // The build directory is configured once (a later build reconfigures by itself);
+                // configuring runs in the project, the program in its working directory.
+                let cd = if self.working_dir.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("cd {} && ", q(&self.cwd(project, project)))
+                };
+                let script = format!(
+                    "{{ test -f {cache} || {configure}; }} && cmake --build {dir} --target {target} && {cd}{run}",
+                    cache = q(&app.build_dir.join("CMakeCache.txt")),
+                    configure = app.configure,
+                    dir = q(&app.build_dir),
+                    target = codecraft_cargo::shell_quote(&app.target),
+                    run = join_words(&run),
+                );
+                let mut cmd = ProcessCommand::shell(script, project);
+                cmd.env = env;
+                Ok(RunConfig::process(name, cmd))
+            }
             RunKind::Cpp => {
                 let words = words()?;
                 let (build, args) = match words.iter().position(|w| w == "--") {
@@ -607,7 +868,7 @@ impl UserRunConfig {
                 env_file: String::new(),
                 working_dir: rel(&cmd.cwd),
                 target: c.target.clone(),
-                sanitizers: String::new(),
+                ..Default::default()
             };
         }
         let mut quiet = c.invocation.clone();
@@ -620,9 +881,21 @@ impl UserRunConfig {
             env_file: String::new(),
             working_dir: rel(&c.invocation.cwd),
             target: c.target.clone(),
-            sanitizers: String::new(),
+            ..Default::default()
         }
     }
+}
+
+/// The pieces of a CMake Application configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CmakeApp {
+    pub target: String,
+    pub executable: PathBuf,
+    pub args: Vec<String>,
+    /// Absolute.
+    pub build_dir: PathBuf,
+    /// The configure command line (runs in the project root).
+    pub configure: String,
 }
 
 /// A configuration name as a file name (letters, digits, `-_.`; the rest becomes `_`).
@@ -633,6 +906,29 @@ fn build_file_name(name: &str) -> String {
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') { c } else { '_' })
         .collect();
     if s.is_empty() { "program".into() } else { s }
+}
+
+/// The template of `kind` in `templates`, else the kind's built-in default (its default command,
+/// nothing else). A template's name is the kind's label.
+pub fn template_in(templates: &[UserRunConfig], kind: RunKind) -> UserRunConfig {
+    templates.iter().find(|t| t.kind == kind).cloned().unwrap_or_else(|| UserRunConfig {
+        name: kind.label().into(),
+        kind,
+        command: kind.default_command().into(),
+        ..Default::default()
+    })
+}
+
+/// A new configuration of `kind` from its template (environment, working directory, before-launch
+/// tasks, debugger options, target, "store as project file").
+pub fn from_template(templates: &[UserRunConfig], kind: RunKind) -> UserRunConfig {
+    let mut c = template_in(templates, kind);
+    c.name = String::new();
+    c.kind = kind;
+    if c.command.trim().is_empty() {
+        c.command = kind.default_command().into();
+    }
+    c
 }
 
 /// `base`, or `base (2)`, `base (3)`… not used by `taken`.
@@ -680,6 +976,12 @@ pub struct RunConfigDialog {
     pub draft: Vec<UserRunConfig>,
     pub selected: Option<Selection>,
     pub error: Option<String>,
+    /// The templates being edited (one per kind that has been changed).
+    #[serde(default)]
+    pub templates: Vec<UserRunConfig>,
+    /// The template shown instead of a configuration (Edit configuration templates…).
+    #[serde(default)]
+    pub template: Option<RunKind>,
 }
 
 #[derive(Debug, Default)]
@@ -695,6 +997,11 @@ pub struct RunConfigStore {
     pub dialog: Option<RunConfigDialog>,
     /// Generated configurations (Edit Configurations › Generate, and on project open).
     pub generate: crate::run_config_gen::GenState,
+    /// Saved templates: the defaults of new configurations, one per kind.
+    pub templates: Vec<UserRunConfig>,
+    /// Project files (`.codecraft/runConfigurations/*.json`) loaded or written last: the ones a
+    /// save may remove when their configuration is gone or no longer stored as a project file.
+    project_files: Vec<PathBuf>,
 }
 
 impl RunConfigStore {
@@ -710,32 +1017,92 @@ impl RunConfigStore {
     fn load(&mut self, root: &Path) {
         self.root = Some(root.to_path_buf());
         self.user.clear();
+        self.templates.clear();
+        self.project_files.clear();
         self.error = None;
         self.corrupt = false;
         let path = root.join(FILE);
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-            Err(e) => {
-                self.error = Some(format!("cannot read {}: {e}", path.display()));
-                return;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<ConfigFile>(&text) {
+                Ok(f) => {
+                    self.user = f
+                        .configurations
+                        .into_iter()
+                        .filter(|c| !c.name.trim().is_empty())
+                        .map(|mut c| {
+                            c.store_as_project_file = false;
+                            c
+                        })
+                        .take(MAX_CONFIGS)
+                        .collect();
+                    for t in f.templates {
+                        if !self.templates.iter().any(|o| o.kind == t.kind) {
+                            self.templates.push(t);
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.error = Some(format!("ignoring corrupt {}: {e}", path.display()));
+                    self.corrupt = true;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => self.error = Some(format!("cannot read {}: {e}", path.display())),
+        }
+        self.load_project_files(root);
+    }
+
+    /// Configurations stored as project files, in file-name order; a configuration whose name is
+    /// already taken (by the main file or an earlier file) is skipped with a warning.
+    fn load_project_files(&mut self, root: &Path) {
+        let dir = root.join(PROJECT_FILES_DIR);
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let mut files: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json") && p.is_file())
+            .take(MAX_CONFIGS)
+            .collect();
+        files.sort();
+        let mut problems = Vec::new();
+        for file in files {
+            let parsed = std::fs::metadata(&file)
+                .map_err(|e| e.to_string())
+                .and_then(|m| if m.len() > 1024 * 1024 { Err("larger than 1 MB".to_string()) } else { Ok(()) })
+                .and_then(|_| std::fs::read_to_string(&file).map_err(|e| e.to_string()))
+                .and_then(|t| serde_json::from_str::<UserRunConfig>(&t).map_err(|e| e.to_string()));
+            let shown = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match parsed {
+                Ok(mut c) => {
+                    if c.name.trim().is_empty() {
+                        c.name = file.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    }
+                    c.store_as_project_file = true;
+                    if self.user.iter().any(|o| o.name.trim() == c.name.trim()) {
+                        problems.push(format!("{shown}: a configuration named `{}` already exists", c.name.trim()));
+                    } else if self.user.len() < MAX_CONFIGS {
+                        self.user.push(c);
+                    }
+                    self.project_files.push(file);
+                }
+                Err(e) => problems.push(format!("ignoring {shown}: {e}")),
             }
-        };
-        match serde_json::from_str::<ConfigFile>(&text) {
-            Ok(f) => {
-                self.user =
-                    f.configurations.into_iter().filter(|c| !c.name.trim().is_empty()).take(MAX_CONFIGS).collect()
-            }
-            Err(e) => {
-                self.error = Some(format!("ignoring corrupt {}: {e}", path.display()));
-                self.corrupt = true;
-            }
+        }
+        if !problems.is_empty() {
+            let text = format!("{}: {}", dir.display(), problems.join("; "));
+            self.error = Some(match self.error.take() {
+                Some(e) => format!("{e}; {text}"),
+                None => text,
+            });
         }
     }
 
-    /// Write `user` to the project's file.
+    /// Write `user` and the templates to the project's file; configurations stored as project
+    /// files go to `.codecraft/runConfigurations/<name>.json` (files of configurations that were
+    /// deleted, renamed or moved back are removed).
     pub fn save(&mut self) -> Result<PathBuf, String> {
         let path = self.path().ok_or("no project is open")?;
+        let root = self.root.clone().ok_or("no project is open")?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
@@ -745,12 +1112,43 @@ impl RunConfigStore {
             let _ = std::fs::rename(&path, PathBuf::from(bad));
             self.corrupt = false;
         }
-        let file = ConfigFile { version: 1, configurations: self.user.clone() };
+        let shared: Vec<&UserRunConfig> = self.user.iter().filter(|c| c.store_as_project_file).collect();
+        let mut written: Vec<PathBuf> = Vec::new();
+        if !shared.is_empty() {
+            let dir = root.join(PROJECT_FILES_DIR);
+            std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            for c in shared {
+                let base = project_file_name(&c.name);
+                let mut file = dir.join(&base);
+                let mut n = 2;
+                while written.contains(&file) && n < 1000 {
+                    file = dir.join(format!("{} ({n}).json", base.trim_end_matches(".json")));
+                    n += 1;
+                }
+                let text = serde_json::to_string_pretty(c).map_err(|e| e.to_string())?;
+                codecraft_fs::write_text_file_atomic(&file, &text)
+                    .map_err(|e| format!("cannot save {}: {e}", file.display()))?;
+                written.push(file);
+            }
+        }
+        let configurations = self.user.iter().filter(|c| !c.store_as_project_file).cloned().collect();
+        let file = ConfigFile { version: 1, configurations, templates: self.templates.clone() };
         let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())?;
         codecraft_fs::write_text_file_atomic(&path, &text)
             .map_err(|e| format!("cannot save {}: {e}", path.display()))?;
+        for old in std::mem::take(&mut self.project_files) {
+            if !written.contains(&old) {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        self.project_files = written;
         self.error = None;
         Ok(path)
+    }
+
+    /// The template of `kind`: the saved one, else the kind's built-in default.
+    pub fn template(&self, kind: RunKind) -> UserRunConfig {
+        template_in(&self.templates, kind)
     }
 
     fn clear(&mut self) {

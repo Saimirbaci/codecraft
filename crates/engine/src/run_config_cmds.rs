@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_project, ok, simple, spec};
 use crate::params::{bool_or, opt_str, opt_usize, req_usize};
 use crate::run_config_store::{
-    self, RunConfigDialog, RunKind, Selection, UserRunConfig, check_unique, env_text, parse_env, unique_name,
+    self, BeforeLaunchTask, RunConfigDialog, RunKind, Selection, UserRunConfig, check_unique, env_text, parse_env,
+    unique_name,
 };
 use crate::{CommandError, Session};
 
@@ -20,10 +21,14 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.create",
             "New Run Configuration",
             None,
-            "{name?: string, kind?: cargo|command|python|cpp|zig|npm, command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, \
-             envFile?: string (a .env file, relative to the project), workingDir?: string} → {index}. \
-             Cargo commands omit `cargo` (`run --bin app -- --port 80`); python: `main.py --arg` or `-m pytest`; \
-             cpp: sources and flags, then `-- args` (compiled and run); zig: `build run`; npm: `run dev`.",
+            "{name?: string, kind?: cargo|command|python|cpp|zig|npm|django|fastapi|flask|dockerfile|compose|cmake, \
+             command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, envFile?: string (a .env file, relative to the project), \
+             workingDir?: string, beforeLaunch?: [{kind: build}|{kind: runConfiguration, name}|{kind: external, \
+             command, workingDir?}], debugger?: {initCommands?: [string], stopAtEntry?: bool, env?}, \
+             storeAsProjectFile?: bool, executable?: string (cmake)} → {index}. A new configuration starts from \
+             its kind's template (runConfig.template.update). Cargo commands omit `cargo` (`run --bin app -- --port 80`); \
+             python: `main.py --arg` or `-m pytest`; cpp: sources and flags, then `-- args` (compiled and run); \
+             zig: `build run`; npm: `run dev`; cmake: a CMake target, then `-- args` (built, then its executable runs).",
             Context::Global,
             has_project,
             create,
@@ -41,7 +46,9 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.update",
             "Edit Run Configuration",
             None,
-            "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?, target?: {kind: local|docker|ssh, …}|null} — change a user configuration",
+            "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?, target?: {kind: local|docker|ssh, …}|null, \
+             beforeLaunch?: [task]|null, debugger?: {initCommands?, stopAtEntry?, env?}|null, storeAsProjectFile?: bool, \
+             executable?: string} — change a user configuration (see runConfig.create)",
             Context::Global,
             has_project,
             update,
@@ -66,6 +73,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 let sel = selection(s, p)?;
                 if let Some(d) = &mut s.run_store.dialog {
                     d.selected = Some(sel);
+                    d.template = None;
                 }
                 ok()
             },
@@ -110,6 +118,55 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             crate::run_config_gen::cancel(s);
             ok()
         }),
+        simple("runConfig.templates.list", "List Run Configuration Templates", has_project, |s, _| {
+            let templates = s.run_store.dialog.as_ref().map(|d| &d.templates).unwrap_or(&s.run_store.templates);
+            let root = project(s)?;
+            Ok(json!(
+                RunKind::ALL
+                    .iter()
+                    .map(|k| {
+                        let t = run_config_store::template_in(templates, *k);
+                        let mut v = describe(&t, &root);
+                        v["customized"] = json!(templates.iter().any(|o| o.kind == *k));
+                        v
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        }),
+        spec(
+            "runConfig.template.update",
+            "Edit Run Configuration Template",
+            None,
+            "{kind: string, command?, env?, envFile?, workingDir?, target?, beforeLaunch?, debugger?, \
+             storeAsProjectFile?, executable?, reset?: bool} — change the defaults new configurations of that kind \
+             start from (in the dialog's draft while Edit Configurations is open)",
+            Context::Global,
+            has_project,
+            template_update,
+        ),
+        spec(
+            "runConfig.template.select",
+            "Show Run Configuration Template",
+            None,
+            "{kind: string|null} — show a kind's template in Edit Configurations (null: back to the configurations)",
+            Context::Global,
+            has_dialog,
+            |s, p| {
+                let kind = match p.get("kind") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        RunKind::parse(
+                            v.as_str().ok_or_else(|| CommandError::BadParams("`kind` must be text".into()))?,
+                        )
+                        .map_err(CommandError::BadParams)?,
+                    ),
+                };
+                if let Some(d) = &mut s.run_store.dialog {
+                    d.template = kind;
+                }
+                ok()
+            },
+        ),
         simple("runConfig.apply", "Run Configurations: Apply", has_dialog, |s, _| apply(s).map(|_| Value::Null)),
         simple("runConfig.ok", "Run Configurations: OK", has_dialog, |s, _| {
             apply(s)?;
@@ -239,7 +296,8 @@ fn open(s: &mut Session, _: &Value) -> CmdResult {
     } else {
         None
     };
-    s.run_store.dialog = Some(RunConfigDialog { draft, selected, error: None });
+    let templates = s.run_store.templates.clone();
+    s.run_store.dialog = Some(RunConfigDialog { draft, selected, error: None, templates, template: None });
     ok()
 }
 
@@ -255,6 +313,14 @@ fn describe(c: &UserRunConfig, root: &std::path::Path) -> Value {
         "workingDir": c.working_dir,
         "commandLine": line,
         "error": error,
+        "beforeLaunch": c.before_launch,
+        "beforeLaunchLabels": c.before_launch.iter().map(BeforeLaunchTask::label).collect::<Vec<_>>(),
+        "debugger": c.debugger,
+        "storeAsProjectFile": c.store_as_project_file,
+        "executable": c.executable,
+        "projectFile": c.store_as_project_file.then(|| {
+            format!("{}/{}", run_config_store::PROJECT_FILES_DIR, run_config_store::project_file_name(&c.name))
+        }),
     })
 }
 
@@ -336,21 +402,101 @@ fn fill(c: &mut UserRunConfig, p: &Value) -> Result<(), String> {
             v => serde_json::from_value(v.clone()).map_err(|e| format!("bad `target`: {e}"))?,
         };
     }
+    // M13 track RC: before-launch tasks, debugger options, project file, CMake executable.
+    if let Some(v) = p.get("beforeLaunch") {
+        c.before_launch = match v {
+            Value::Null => Vec::new(),
+            Value::Array(items) => {
+                if items.len() > 20 {
+                    return Err("at most 20 before-launch tasks".into());
+                }
+                items.iter().map(BeforeLaunchTask::from_value).collect::<Result<_, _>>()?
+            }
+            _ => return Err("`beforeLaunch` must be a list of tasks".into()),
+        };
+    }
+    if let Some(v) = p.get("debugger") {
+        c.debugger.fill(v)?;
+    }
+    if let Some(v) = p.get("storeAsProjectFile") {
+        c.store_as_project_file = v.as_bool().ok_or("`storeAsProjectFile` must be true or false")?;
+    }
+    if let Some(v) = p.get("executable") {
+        c.executable = match v {
+            Value::Null => String::new(),
+            v => v.as_str().ok_or("`executable` must be text")?.trim().to_string(),
+        };
+    }
     Ok(())
+}
+
+/// Change a kind's template (the dialog's draft while it is open, else saved at once).
+fn template_update(s: &mut Session, p: &Value) -> CmdResult {
+    let kind = RunKind::parse(crate::params::req_str(p, "kind")?).map_err(CommandError::BadParams)?;
+    let root = project(s)?;
+    let reset = bool_or(p, "reset", false);
+    let mut templates = match &s.run_store.dialog {
+        Some(d) => d.templates.clone(),
+        None => s.run_store.templates.clone(),
+    };
+    if reset {
+        templates.retain(|t| t.kind != kind);
+    } else {
+        let mut t = run_config_store::template_in(&templates, kind);
+        // A template's kind and name are fixed.
+        let mut fields = p.clone();
+        if let Some(o) = fields.as_object_mut() {
+            o.remove("kind");
+            o.remove("name");
+        }
+        fill(&mut t, &fields).map_err(CommandError::BadParams)?;
+        t.kind = kind;
+        t.name = kind.label().into();
+        if t.command.trim().is_empty() {
+            t.command = kind.default_command().into();
+        }
+        // Checked like a configuration, except that what it names may not exist yet.
+        if let Err(e) = t.validate(&root)
+            && !e.contains("does not exist")
+            && !e.contains("CMake target")
+        {
+            return Err(CommandError::BadParams(e));
+        }
+        templates.retain(|o| o.kind != kind);
+        templates.push(t);
+    }
+    if let Some(d) = &mut s.run_store.dialog {
+        d.templates = templates;
+        return ok();
+    }
+    let previous = std::mem::replace(&mut s.run_store.templates, templates);
+    if let Err(e) = s.run_store.save() {
+        s.run_store.templates = previous;
+        return Err(CommandError::Failed(e));
+    }
+    ok()
 }
 
 fn select_user(s: &mut Session, index: usize) {
     if let Some(d) = &mut s.run_store.dialog {
         d.selected = Some(Selection { derived: false, index });
+        d.template = None;
     }
 }
 
 fn create(s: &mut Session, p: &Value) -> CmdResult {
+    // A new configuration starts from its kind's template.
+    let kind = match p.get("kind").and_then(Value::as_str) {
+        Some(k) => RunKind::parse(k).map_err(CommandError::BadParams)?,
+        None => RunKind::default(),
+    };
+    let templates =
+        s.run_store.dialog.as_ref().map(|d| d.templates.clone()).unwrap_or_else(|| s.run_store.templates.clone());
     let index = edit(s, |list| {
         if list.len() >= 500 {
             return Err("too many run configurations".into());
         }
-        let mut c = UserRunConfig::default();
+        let mut c = run_config_store::from_template(&templates, kind);
         fill(&mut c, p)?;
         if c.command.is_empty() {
             c.command = c.kind.default_command().into();
@@ -429,6 +575,7 @@ fn selection(s: &Session, p: &Value) -> Result<Selection, CommandError> {
 /// Save the dialog's draft.
 fn apply(s: &mut Session) -> Result<(), CommandError> {
     let Some(draft) = s.run_store.dialog.as_ref().map(|d| d.draft.clone()) else { return Ok(()) };
+    let templates = s.run_store.dialog.as_ref().map(|d| d.templates.clone()).unwrap_or_default();
     let root = project(s)?;
     let checked = check_unique(&draft).and_then(|_| draft.iter().try_for_each(|c| c.validate(&root)));
     if let Err(e) = checked {
@@ -438,6 +585,7 @@ fn apply(s: &mut Session) -> Result<(), CommandError> {
         return Err(CommandError::BadParams(e));
     }
     let previous = std::mem::replace(&mut s.run_store.user, draft);
+    let previous_templates = std::mem::replace(&mut s.run_store.templates, templates);
     match s.run_store.save() {
         Ok(path) => {
             run_config_store::rebuild(s);
@@ -446,6 +594,7 @@ fn apply(s: &mut Session) -> Result<(), CommandError> {
         }
         Err(e) => {
             s.run_store.user = previous;
+            s.run_store.templates = previous_templates;
             if let Some(d) = &mut s.run_store.dialog {
                 d.error = Some(e.clone());
             }

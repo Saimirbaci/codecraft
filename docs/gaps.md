@@ -123,18 +123,23 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     and Npm configurations; every configuration can load a `.env` file (re-read on each run;
     explicit variables win); `codecraft-cli configs <project> list|add|update|copy|delete|run`
     lets agents manage them without JSON.
-    Remaining: no before-launch tasks, no templates, no "store as project file" choice, no
-    per-configuration debugger options.
+    ~~Remaining: no before-launch tasks, no templates, no "store as project file" choice, no
+    per-configuration debugger options~~ (RC, 2026-10-15: see item 51). Remaining: before-launch
+    tasks run one after another (a "Run Another Configuration" that never ends, like a server,
+    holds the launch until it is stopped); no "Show this page", "Activate tool window" or "Allow
+    multiple instances" options; RustRover's own `.run/*.run.xml` files are not imported.
 12. ~~Test results show as a summary + console~~ (M6, 2026-10-13: test tree beside the Run
     console for cargo/libtest, pytest (live `-v` lines + JUnit report), CTest and `zig test`, with
     per-test output, failure points and navigation, Rerun Failed Tests, Show Passed/Ignored, sort by
     duration, previous/next failed, test history in `.codecraft/test-history.json`, export/import
     (JSON, JUnit XML), Run with Coverage via `cargo llvm-cov` / pytest-cov, Coverage tool window,
-    gutter coverage marks, Manage Coverage Reports). Remaining: libtest prints no per-test
-    durations on stable (only with `--report-time`, nightly), so cargo tests show suite durations
-    only; Rust test locations come from a module-path walk, not rust-analyzer runnables; no
-    jest/vitest parser; `zig build test` cannot rerun only the failed tests; no branch coverage
-    view, and the coverage table has no sorting.
+    gutter coverage marks, Manage Coverage Reports). ~~Rust test locations come from a
+    module-path walk, not rust-analyzer runnables; no jest/vitest parser; the coverage table has
+    no sorting~~ (RC, 2026-10-15: see item 51). Remaining: libtest prints no per-test durations on
+    stable (only with `--report-time`, nightly), so cargo tests show suite durations only; `zig
+    build test` cannot rerun only the failed tests; no branch coverage view; jest/vitest trees
+    fill when the run ends (no live progress) and `describe` blocks show as `a › b` names rather
+    than nested nodes.
 13. ~~Settings dialog covers a handful of options~~ (M8, 2026-10-13: searchable tree with
     Appearance (theme Dark/Light/High Contrast, UI font size), Keymap (editor), Editor
     (General, Font, Color Scheme with a token editor for user schemes, Code Style, Live
@@ -531,8 +536,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `<project>/.codecraft/analysis.json`); tasks have no
     issue-tracker servers or changelists (a branch per task instead); macro shortcuts bypass the
     keymap editor; inline completion only on request, multi-line proposals shown as one line;
-    Markdown export is HTML only; no Zig / TypeScript tool windows; the "Edit 'Default task'"
-    menu label isn't dynamic yet (`tasks_contexts::edit_label`).
+    Markdown export is HTML only; ~~no Zig / TypeScript tool windows~~ (RC, 2026-10-15: item 51);
+    the "Edit 'Default task'" menu label isn't dynamic yet (`tasks_contexts::edit_label`).
 45. CLion (track CL): GoogleTest, Catch2, doctest and Boost.Test in the test runner (gutter runs,
     report files, rerun failed with each framework's filter); CMake presets and profiles driving
     the build directory and a CMake tool window on the File API (reload log, targets, cache,
@@ -541,9 +546,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     C/C++ configurations; Conan/vcpkg install with the toolchain passed to CMake; Attach to an
     Unstarted Process, Reset Frame, Manage Targets (run targets: local, SSH, Docker). Remaining:
     Catch2/doctest/Boost trees fill when the run ends (no live progress), no Catch2 JSON
-    reporter, no gutter Debug for tests or "all tests in file"; framework detection relies on
-    includes in a target's sources; CTest names only list and back up unconfigured projects;
-    no CMake run configuration kind, cache edits need a reload, multi-config generators use the
+    reporter, ~~no gutter Debug for tests or "all tests in file"~~ (RC, 2026-10-15: item 51);
+    framework detection relies on includes in a target's sources; CTest names only list and back
+    up unconfigured projects; ~~no CMake run configuration kind~~ (RC: CMake Application, item
+    51), cache edits need a reload, multi-config generators use the
     first configuration, build presets only for Build, no profile editor, sanitizer flags only
     in Debug/Release; Valgrind is Linux-only Memcheck without suppressions; no Conan/vcpkg
     dependency tree or updates, no vcpkg classic mode; Reset Frame via `thread return` doesn't
@@ -710,3 +716,51 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     kill-ring or prefix arguments) and Eclipse, NetBeans, Sublime Text, Xcode and Visual Studio
     keymaps are not provided; TODO filters are global, not per project, and TODO colours/icons
     per pattern are not configurable.
+
+51. Run configurations, tests and the last menus (track RC): per-configuration Before launch
+    tasks (Build — the configuration's own `cargo build` of its package/target, the CMake
+    target, else Build Project —, Run Another Configuration with its own tasks first, Run
+    External Tool with a working directory), run in order in Run/Build tabs before Run or Debug;
+    a failed or stopped task stops the launch with a notification naming it, loops and unknown
+    configurations are refused up front (`runConfig.beforeLaunch.state/cancel/preview`, `run.run
+    {beforeLaunch: false}`); configuration templates per kind (Edit configuration templates… in
+    the dialog, `runConfig.template.update`, saved in `run-configurations.json`, new
+    configurations start from them); "Store as project file" saves a configuration as
+    `.codecraft/runConfigurations/<name>.json` (loaded with the main file, renamed/removed with
+    the configuration, unreadable files reported); debugger options (LLDB init commands, stop at
+    entry, debuggee environment) passed to lldb-dap/debugpy; a CMake Application kind (target,
+    optional executable, configured once, `cmake --build --target` then the program; Debug
+    builds then debugs it); jest and vitest result trees from their JSON reporters (suites per
+    file, `describe › test` names, durations, failure messages and stack locations, locations
+    from `--testLocationInResults` or the `test("…"` line, Rerun Failed Tests through `-t`),
+    also behind `npm test`/`npm run <script>`; Rust test locations from rust-analyzer's
+    `experimental/runnables` for the run's files and open files (the module walk stays as the
+    fallback); right-click on a gutter ▶: Run, Debug, Run/Debug All Tests in File (Rust tests by
+    exact name, a C/C++ file's GoogleTest/Catch2/doctest/Boost tests in one filter, pytest, jest,
+    vitest and Zig files) and Debug for C/C++ tests (target built, then the executable with the
+    test's filter under lldb-dap); sortable Coverage columns (`coverage.sort`). The last five
+    menu items: View › Tool Windows › Zig (`zig build -l` steps on a worker, run a step, debug
+    `run`/`install`), View › Tool Windows › TypeScript (`tsc --noEmit -p <tsconfig> --pretty
+    false` on a worker with the project's or PATH's tsc, errors by file with navigation, tsconfig
+    files and options with comments and trailing commas, Restart TypeScript Service), Code ›
+    Modify Selected Code… (Cmd+\: a prompt over the selection or the caret's line, sent with the
+    surrounding code to the configured AI provider, the rewrite shown as a line diff to Accept —
+    one undo step, refused if the code changed meanwhile — or Reject), Code Completion › Enable
+    Command Completion (a checkmark toggle; `..` lists the enabled Code/Refactor/Navigate/Edit
+    actions, filtered as you type, Enter removes `..` and runs one) and Run › Debugging Actions ›
+    Compile and Reload Modified Files (rebuild and restart the debug session with the same
+    breakpoints and debugger options; the status says Rust and C/C++ have no hot swap; refused for
+    attached processes, core dumps and remote targets). In-scope parity is 407/407. Remaining:
+    Modify Selected Code uses the AI provider only (not an agent CLI backend), has no streaming,
+    no follow-up refinement of a proposal and no per-hunk accept; command completion offers menu
+    actions, not context-aware postfix-style ones, and runs them without parameters; the Zig
+    window debugs only the newest `zig-out/bin` executable after a plain `zig build` (not the
+    chosen step's artifact) and has no step dependencies; the TypeScript window checks one
+    tsconfig at a time, doesn't follow project references or watch mode, and its errors don't go
+    to the Problems view; Compile and Reload restarts the session (no hot swap exists for these
+    languages) and loses the program's state; jest/vitest trees have no live progress and vitest
+    locations come from the source scan; rust-analyzer runnables are asked for at most 24 files
+    per run and only when it is ready; the CMake Application kind uses the active profile's build
+    directory (no per-configuration profile); the gutter run menu has no "Run with Coverage";
+    `zig`, `tsc`, jest and the AI provider were exercised only through fakes (fake
+    scripts, a 127.0.0.1 server).

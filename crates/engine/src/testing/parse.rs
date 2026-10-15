@@ -42,6 +42,8 @@ impl Parser {
             Framework::GoogleTest => super::cpp::gtest::feed(&mut self.gtest, suites, line),
             // Catch2, doctest and Boost.Test results come from their XML report at the end.
             Framework::Catch2 | Framework::Doctest | Framework::BoostTest => {}
+            // jest and vitest results come from their JSON report at the end (M13 track RC).
+            Framework::Jest | Framework::Vitest => {}
         }
     }
 

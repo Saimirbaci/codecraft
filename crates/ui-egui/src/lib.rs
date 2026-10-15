@@ -50,6 +50,7 @@ mod profiler_ui;
 mod project_windows;
 mod pull_requests_ui;
 mod python_ui;
+mod rc_ui;
 mod redis_ui;
 mod refactor_ui;
 mod remote_ui;
@@ -416,6 +417,8 @@ impl App {
             || python_ui::wants_keyboard(s)
             || database_editor_ui::wants_keyboard(s)
             || ed_ui::wants_keyboard(s)
+            || rc_ui::wants_keyboard(s)
+            || rc_ui::gutter_menu_open(ctx)
         {
             return;
         }
@@ -665,6 +668,7 @@ impl App {
         appearance_ui::windows(ui, s, st);
         database_data_ui::windows(ui, s, st);
         ed_ui::windows(ui, s, st);
+        rc_ui::windows(ui, s, st);
         redis_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);

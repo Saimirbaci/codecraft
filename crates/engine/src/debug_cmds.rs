@@ -38,6 +38,16 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             choose_and_debug,
         ),
         spec(
+            "run.debuggingActions.compileAndReloadModifiedFiles",
+            "Compile and Reload Modified Files",
+            None,
+            "Rebuild the debugged target and restart the session with the same breakpoints and debugger options \
+             (Rust and C/C++ have no hot swap) → {message}",
+            Context::Global,
+            active,
+            |s, _| Ok(json!({ "message": debug::compile_and_reload(s)? })),
+        ),
+        spec(
             "debug.atCaret",
             "Debug Context Configuration",
             Some("Ctrl+Shift+D"),
@@ -546,7 +556,7 @@ fn check_line(s: &Session, path: &Path, line: usize) -> Result<(), CommandError>
 
 // ---------------------------------------------------------------- starting
 
-fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(i) = opt_usize(p, "config")? {
         if i >= s.run_configs.len() {
             return Err(CommandError::BadParams(format!("no run configuration {i}")));
@@ -554,8 +564,15 @@ fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
         s.selected_run_config = i;
     }
     s.popup = None;
-    if let Some(name) = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone()) {
-        crate::run_config_store::prepare_run(s, &name).map_err(CommandError::Failed)?;
+    let selected = s.run_configs.get(s.selected_run_config).map(|c| c.name.clone());
+    if let Some(name) = &selected {
+        crate::run_config_store::prepare_run(s, name).map_err(CommandError::Failed)?;
+        // Before-launch tasks first (M13 track RC); the debug session starts when they succeed.
+        if bool_or(p, "beforeLaunch", true)
+            && let Some(v) = crate::before_launch::begin(s, name, crate::before_launch::LaunchMode::Debug)?
+        {
+            return Ok(v);
+        }
     }
     let target = match s.run_configs.get(s.selected_run_config) {
         Some(c) => match (c.cargo_invocation(), &c.command) {
@@ -574,7 +591,12 @@ fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
         }
     };
     let name = target.name().to_owned();
-    debug::start(s, target)?;
+    let options = selected
+        .as_deref()
+        .and_then(|n| s.run_store.user.iter().find(|c| c.name.trim() == n))
+        .map(|c| c.debugger.clone())
+        .unwrap_or_default();
+    debug::start_with(s, target, options)?;
     started(s, &name)
 }
 
@@ -735,7 +757,7 @@ fn context_target(s: &Session, path: &Path, line: usize) -> Option<DebugTarget> 
 /// What to debug for a plain process run configuration: `zig build …`, `python script.py` /
 /// `python -m module`, `pytest`, `node file.js`, a program path, or a `sh -c "build && ./program"`
 /// chain (the steps before the program become the build). `None` if nothing debuggable runs.
-fn process_target(name: &str, cmd: &crate::runs::ProcessCommand) -> Option<DebugTarget> {
+pub(crate) fn process_target(name: &str, cmd: &crate::runs::ProcessCommand) -> Option<DebugTarget> {
     let base = Path::new(&cmd.program).file_name()?.to_string_lossy().into_owned();
     let path_like = |p: &str| p.contains('/');
     let in_cwd = |p: &str| crate::normalize_path(&cmd.cwd.join(p));
@@ -810,6 +832,22 @@ fn project_python(root: &Path) -> Option<PathBuf> {
 
 fn debug_at_caret(s: &mut Session, p: &Value) -> CmdResult {
     let (path, line) = location(s, p)?;
+    // C/C++: the test at the line (its CMake target built first), else the program's `main`
+    // (M13 track RC: gutter Debug for C++ tests).
+    if matches!(Language::from_path(&path), Language::C | Language::Cpp) {
+        return match crate::test_file::cpp_debug_target(s, &path, line, false) {
+            Some(Ok(target)) => {
+                let name = target.name().to_owned();
+                debug::start(s, target)?;
+                started(s, &name)
+            }
+            Some(Err(e)) => Err(CommandError::Failed(e)),
+            None => {
+                s.status = "Nothing to debug here".into();
+                Ok(Value::Null)
+            }
+        };
+    }
     let Some(target) = context_target(s, &path, line) else {
         s.status = "Nothing to debug here".into();
         return Ok(Value::Null);

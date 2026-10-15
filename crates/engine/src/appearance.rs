@@ -164,6 +164,7 @@ fn checked_in(set: &Settings, a: &AppearanceState, id: &str) -> Option<bool> {
         "view.appearance.navigationBar.showMembers" => set.navigation_bar_members,
         "view.appearance.toolWindowBars" => set.show_tool_window_bars,
         "view.appearance.statusBar" => set.show_status_bar,
+        "code.codeCompletion.enableCommandCompletion" => set.command_completion,
         _ => return None,
     })
 }

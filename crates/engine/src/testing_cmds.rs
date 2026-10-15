@@ -204,7 +204,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             |s, p| {
                 let root = project_root(s)?;
                 let report = testing::open_report(&root, req_str(p, "id")?)?;
-                let summary = coverage_json(&report, &root);
+                let summary = coverage_json(&report, &root, s.testing.coverage_sort);
                 s.testing.coverage = Some(report);
                 s.ws.layout.show(ToolWindowId::Coverage);
                 Ok(summary)
@@ -255,8 +255,30 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         ),
         simple("coverage.summary", "Coverage Summary", crate::commands::always, |s, _| {
             let root = s.project_root().unwrap_or_default();
-            Ok(s.testing.coverage.as_ref().map(|c| coverage_json(c, &root)).unwrap_or(Value::Null))
+            let sort = s.testing.coverage_sort;
+            Ok(s.testing.coverage.as_ref().map(|c| coverage_json(c, &root, sort)).unwrap_or(Value::Null))
         }),
+        spec(
+            "coverage.sort",
+            "Sort Coverage Table",
+            None,
+            "{column: name|line|function, descending?: bool} — order the Coverage tool window's rows (within \
+             each directory); the same column again without `descending` flips the order → {column, descending}",
+            Context::Global,
+            crate::commands::always,
+            |s, p| {
+                let column = testing::CoverageColumn::parse(req_str(p, "column")?)
+                    .ok_or_else(|| CommandError::BadParams("`column` is name, line or function".into()))?;
+                let current = s.testing.coverage_sort;
+                let descending = match p.get("descending").and_then(Value::as_bool) {
+                    Some(d) => d,
+                    None if current.column == column => !current.descending,
+                    None => false,
+                };
+                s.testing.coverage_sort = testing::CoverageSort { column, descending };
+                Ok(json!(s.testing.coverage_sort))
+            },
+        ),
     ]
 }
 
@@ -277,10 +299,9 @@ fn toggle(p: &Value, current: bool) -> bool {
     p.get("value").and_then(Value::as_bool).unwrap_or(!current)
 }
 
-fn coverage_json(report: &testing::CoverageReport, root: &std::path::Path) -> Value {
+fn coverage_json(report: &testing::CoverageReport, root: &std::path::Path, sort: testing::CoverageSort) -> Value {
     let (hit, found) = report.totals();
-    let rows: Vec<Value> = report
-        .rows(root)
+    let rows: Vec<Value> = testing::sort_rows(report.rows(root), sort)
         .into_iter()
         .map(|r| {
             json!({
@@ -301,6 +322,7 @@ fn coverage_json(report: &testing::CoverageReport, root: &std::path::Path) -> Va
         "linesHit": hit,
         "linesFound": found,
         "linePercent": report.line_percent(),
+        "sort": sort,
         "rows": rows,
     })
 }
@@ -414,7 +436,7 @@ fn import_lcov(s: &mut Session, p: &Value) -> CmdResult {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "coverage".into());
     let (report, _) = testing::store_report(&root, &root, &text, &name, &format!("Imported {}", path.display()))
         .map_err(CommandError::Failed)?;
-    let summary = coverage_json(&report, &root);
+    let summary = coverage_json(&report, &root, s.testing.coverage_sort);
     s.testing.coverage = Some(report);
     s.ws.layout.show(ToolWindowId::Coverage);
     Ok(summary)

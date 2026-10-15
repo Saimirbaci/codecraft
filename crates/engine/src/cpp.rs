@@ -10,7 +10,7 @@
 //! start real ones.
 
 pub mod cmake;
-mod cmake_cmds;
+pub(crate) mod cmake_cmds;
 pub mod debugging;
 pub mod deps;
 pub mod jobs;

@@ -73,6 +73,8 @@ impl Framework {
             Self::Pytest => "pytest",
             Self::CTest => "CTest",
             Self::Zig => "Zig",
+            Self::Jest => "Jest",
+            Self::Vitest => "Vitest",
         }
     }
 }

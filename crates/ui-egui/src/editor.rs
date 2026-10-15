@@ -1467,6 +1467,17 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     {
         response = response.on_hover_text_at_pointer(tip);
     }
+    // Right-click on a ▶ run icon: Run / Debug / all tests in the file (M13 track RC).
+    let mut run_menu = None;
+    if let Some(pos) = response.hover_pos()
+        && response.secondary_clicked()
+        && gutter.contains(pos)
+        && pos.x < gutter.left() + 18.0
+        && let Some(line) = map.line((((pos.y - rect.top()) / line_h) + scroll).floor().max(0.0) as usize)
+        && run_lines.contains(&line)
+    {
+        run_menu = Some((pos, line));
+    }
     let mut gutter_menu_breakpoint = None;
     if let Some(pos) = response.hover_pos()
         && gutter.contains(pos)
@@ -1516,6 +1527,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     if let Some(id) = gutter_menu_breakpoint {
         crate::debug_panel::select_breakpoint(s, st, id);
     }
+    crate::rc_ui::gutter_run_menu(ui, s, st, path.as_deref(), run_menu);
     if crumbs_shown {
         crate::navbar::breadcrumbs(ui, s, st, eid, crumb_rect);
     }
