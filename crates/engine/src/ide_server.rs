@@ -223,7 +223,9 @@ fn reconcile(s: &mut Session) -> bool {
     {
         folders.push(real);
     }
-    let config = ServerConfig::claude_code(IDE_NAME, folders, Some(lock_dir));
+    let mut config = ServerConfig::claude_code(IDE_NAME, folders, Some(lock_dir));
+    // CodeCraft's engine tools next to Claude Code's IDE tools (M14 track AX).
+    config.tools.extend(codecraft_mcp::engine_tools::engine_tools());
     match IdeServer::start(config) {
         Ok((server, events)) => {
             s.ide.last_error = None;
@@ -325,6 +327,22 @@ fn handle_event(s: &mut Session, event: ServerEvent) {
 fn handle_tool(s: &mut Session, call: ToolCall) {
     let ToolCall { client, request, name, arguments, reply } = call;
     let args = if arguments.is_object() { arguments } else { json!({}) };
+    // Engine tools (debugging, analysis, profiling, …) go through the access policy (M14 AX).
+    if codecraft_mcp::engine_tools::is_engine_tool(&name) {
+        let info = s.ide.clients().into_iter().find(|c| c.id == client).map(|c| c.info).unwrap_or_default();
+        let caller = crate::agent_tools::Caller::from_client_info(s, &info, APPROVAL_SOURCE);
+        let _ = request;
+        crate::agent_tools::submit(
+            s,
+            caller,
+            &name,
+            args,
+            Box::new(move |r| {
+                reply.send(r);
+            }),
+        );
+        return;
+    }
     let result = match name.as_str() {
         tools::OPEN_DIFF => return open_diff(s, client, request, &args, reply),
         tools::OPEN_FILE => open_file(s, &args),
@@ -359,7 +377,7 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// A path from a tool argument: absolute, or relative to the project; `file://` URIs accepted.
-fn resolve_path(s: &Session, raw: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_path(s: &Session, raw: &str) -> Option<PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;

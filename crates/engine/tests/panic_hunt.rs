@@ -106,6 +106,8 @@ fn skip(id: &str, params: &Value) -> bool {
                 | "debug.testsInFile"
                 | "zig.runStep"
                 | "zig.debugStep"
+                // M14 AX: `cargo test <name>` / `pytest -k <name>`.
+                | "test.runFiltered"
         );
     spawns && !params.is_null()
 }

@@ -9,6 +9,11 @@
 //! per connection. The server core answers the protocol methods itself; every `tools/call`
 //! reaches the host as a [`ServerEvent::ToolCall`] carrying a [`Reply`] handle, which the host
 //! may answer at any time later (`openDiff` waits for the user).
+//!
+//! Besides Claude Code's IDE tools ([`tools`]) the server can advertise CodeCraft's engine tools
+//! ([`engine_tools`]: debugging, analysis, profiling, tests, runs, databases). [`StdioServer`]
+//! serves the same protocol over stdin/stdout (the headless `codecraft-cli mcp`), and
+//! [`bridge`] connects a stdio client to a running IDE server.
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -18,9 +23,12 @@
     clippy::unreachable
 )]
 
+pub mod bridge;
+pub mod engine_tools;
 pub mod lockfile;
 mod rpc;
 mod server;
+mod stdio;
 pub mod tools;
 
 use std::path::PathBuf;
@@ -29,6 +37,7 @@ use crossbeam_channel::Sender;
 use serde_json::{Value, json};
 
 pub use server::IdeServer;
+pub use stdio::{STDIO_CLIENT, StdioServer};
 /// The WebSocket implementation, re-exported for clients and tests that talk to the server.
 pub use tungstenite;
 

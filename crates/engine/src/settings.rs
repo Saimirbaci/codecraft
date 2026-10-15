@@ -116,6 +116,8 @@ pub const PAGE_PYTHON: &str = "Languages & Frameworks › Python";
 pub const PAGE_SQL: &str = "Languages & Frameworks › SQL";
 pub const PAGE_VCS: &str = "Version Control › Commit Message Generation";
 pub const PAGE_TOOLS: &str = "Tools › AI Agents";
+/// What agents connected over MCP may do (M14 track AX; `agentAccess.*` commands).
+pub const PAGE_AGENT_ACCESS: &str = "Tools › Agent Access";
 pub const PAGE_OTHER: &str = "Other";
 
 /// The Settings tree, in display order (`›` separates levels).
@@ -141,6 +143,7 @@ pub const PAGES: &[&str] = &[
     PAGE_SQL,
     PAGE_VCS,
     PAGE_TOOLS,
+    PAGE_AGENT_ACCESS,
 ];
 
 pub const THEMES: [&str; 3] = ["Dark", "Light", "High Contrast"];

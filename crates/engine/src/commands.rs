@@ -224,6 +224,9 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::typescript_tool::specs());
         specs.extend(crate::modify_code::specs());
         specs.extend(crate::command_completion::specs());
+        // M14 track AX: agent control plane (access policy, agent-readable views).
+        specs.extend(crate::agent_access::specs());
+        specs.extend(crate::agent_tools_cmds::specs());
         // Routes come last so they wrap every registered command. SQL files and SQL in strings:
         // navigation commands handle SQL (track DC).
         crate::database_cmds::sql_editor::route(&mut specs);

@@ -7,6 +7,7 @@
 //! - [`acp`]: a client for the Agent Client Protocol (JSON-RPC 2.0 over the agent's stdio), used
 //!   when every change needs approval.
 //! - [`git`]: per-job git worktrees for review mode, and the list of files a job changed.
+//! - [`mcp`]: MCP servers handed to agents (CodeCraft's tools), per backend.
 //! - [`diff`]: line diffs (unified and side by side) on top of the `similar` crate.
 #![deny(
     clippy::unwrap_used,
@@ -23,11 +24,13 @@ pub mod cli;
 pub mod diff;
 pub mod event;
 pub mod git;
+pub mod mcp;
 pub mod parse;
 pub mod process;
 
 pub use backend::{Backend, BackendInfo};
 pub use event::{AgentEvent, ChangeKind, PlanEntry};
+pub use mcp::McpServer;
 pub use process::AgentProcess;
 
 #[derive(Debug, thiserror::Error)]

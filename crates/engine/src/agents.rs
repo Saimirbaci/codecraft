@@ -661,12 +661,17 @@ fn launch(
     job.turn_reported_duration = false;
     job.stop_requested = false;
     job.status = JobStatus::Running;
+    // CodeCraft's own tools (debugging, analysis, profiling, tests…) through the IDE server
+    // (M14 track AX); the access policy and the job's mode decide what the agent may do.
+    let mcp_servers: Vec<codecraft_agent::McpServer> =
+        crate::agent_mcp::job_mcp_server(s, job.id).into_iter().collect();
     match job.mode {
         AgentMode::Ask => {
             let launch =
                 info.acp.clone().ok_or_else(|| CommandError::Failed(info.ask_unavailable().unwrap_or_default()))?;
             let cmd = cli::acp_command(job.backend, &launch.program, &launch.args, &job.cwd, scrub);
-            let resume = acp_resume.unwrap_or_default();
+            let mut resume = acp_resume.unwrap_or_default();
+            resume.mcp_servers = mcp_servers;
             let client = acp::start_resumed(cmd, &job.cwd, prompt, resume, job.events_tx.clone(), job.host_tx.clone())
                 .map_err(|e| CommandError::Failed(e.to_string()))?;
             job.runner = Runner::Acp(client);
@@ -682,6 +687,7 @@ fn launch(
                 resume: if follow_up { job.session_id.clone() } else { None },
                 continue_last: follow_up && job.session_id.is_none() && job.backend == Backend::Grok,
                 scrub_api_keys: scrub,
+                mcp_servers,
             };
             let process = codecraft_agent::process::spawn_cli(&req, job.events_tx.clone())
                 .map_err(|e| CommandError::Failed(e.to_string()))?;
@@ -754,7 +760,11 @@ pub(crate) fn follow_up(s: &mut Session, id: JobId, prompt: &str) -> Result<(), 
         _ if job.mode == AgentMode::Ask => {
             // A new agent process continuing the session (`session/load`, else the transcript).
             job.push(Activity::Info { text: "Resuming the agent session…".into() });
-            let resume = acp::Resume { session_id: job.session_id.clone(), fallback_preamble: Some(preamble) };
+            let resume = acp::Resume {
+                session_id: job.session_id.clone(),
+                fallback_preamble: Some(preamble),
+                ..Default::default()
+            };
             launch(s, &mut job, &info, prompt.to_string(), false, Some(resume))
         }
         _ if job.mode == AgentMode::Review && job.worktree.is_none() => {

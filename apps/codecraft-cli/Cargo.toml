@@ -16,5 +16,9 @@ codecraft-workspace.workspace = true
 serde_json.workspace = true
 env_logger.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+crossbeam-channel.workspace = true
+
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
 //! Agent Client Protocol client (<https://agentclientprotocol.com>, protocol version 1):
 //! JSON-RPC 2.0, one message per line, over the agent's stdio.
 //!
-//! The client sends `initialize`, `session/new {cwd, mcpServers: []}`, then one `session/prompt`
+//! The client sends `initialize`, `session/new {cwd, mcpServers}`, then one `session/prompt`
 //! per turn (`session/cancel` to stop a turn). To continue an earlier session ([`start_resumed`])
 //! it sends `session/load {sessionId, cwd, mcpServers: []}` instead when the agent advertises
 //! `agentCapabilities.loadSession` (the history the agent replays is dropped: the host has it),
@@ -143,6 +143,9 @@ pub struct Resume {
     /// Put before the first prompt when the session is not loaded (a transcript of it), so the
     /// agent still has the context.
     pub fallback_preamble: Option<String>,
+    /// MCP servers offered to the agent's session (`mcpServers` of `session/new` and
+    /// `session/load`): CodeCraft's tools.
+    pub mcp_servers: Vec<crate::McpServer>,
 }
 
 /// A request from the agent the host must answer.
@@ -405,6 +408,7 @@ fn drive(
     events: &Sender<AgentEvent>,
 ) -> std::result::Result<(), String> {
     let mut queued = std::collections::VecDeque::from([first]);
+    let mcp_servers: Vec<Value> = resume.mcp_servers.iter().map(crate::McpServer::acp_json).collect();
     let mut stop_handshake = || {};
     let init = rpc.call(
         "initialize",
@@ -431,7 +435,7 @@ fn drive(
     let mut session = None;
     if let Some(old) = resume.session_id.as_deref().filter(|id| !id.is_empty()) {
         if can_load {
-            let params = json!({ "sessionId": old, "cwd": cwd, "mcpServers": [] });
+            let params = json!({ "sessionId": old, "cwd": cwd, "mcpServers": mcp_servers });
             // The agent replays the conversation as updates before it answers; the host already
             // has it, so those updates are dropped.
             replaying.store(true, Ordering::SeqCst);
@@ -459,7 +463,7 @@ fn drive(
         if let (Some(pre), Some(first)) = (&resume.fallback_preamble, queued.front_mut()) {
             *first = format!("{pre}{first}");
         }
-        let params = json!({ "cwd": cwd, "mcpServers": [] });
+        let params = json!({ "cwd": cwd, "mcpServers": mcp_servers });
         match open_session(rpc, ctl, &mut queued, "session/new", &params, &auth_methods)? {
             Opened::Shutdown => return Ok(()),
             Opened::Done(v) => session = v.get("sessionId").and_then(Value::as_str).map(str::to_string),

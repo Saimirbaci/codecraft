@@ -22,6 +22,9 @@ pub struct CliRequest {
     /// Remove `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` so Claude Code uses the subscription
     /// login rather than a (possibly empty) API key.
     pub scrub_api_keys: bool,
+    /// MCP servers to give the agent (CodeCraft's tools). Claude Code and Codex take them on the
+    /// command line; Grok and Gemini only through ACP (Ask mode).
+    pub mcp_servers: Vec<crate::McpServer>,
 }
 
 /// A prompt that no argument parser mistakes for a flag.
@@ -48,8 +51,18 @@ pub fn args(req: &CliRequest) -> Vec<String> {
                 push("--resume");
                 push(id);
             }
+            if !req.mcp_servers.is_empty() {
+                push("--mcp-config");
+                push(&crate::McpServer::claude_config(&req.mcp_servers));
+            }
         }
         Backend::Codex => {
+            // Config overrides go before the subcommand (they apply to every subcommand).
+            for server in &req.mcp_servers {
+                for o in server.codex_overrides() {
+                    push(&o);
+                }
+            }
             push("exec");
             if req.resume.is_some() {
                 push("resume");
@@ -138,6 +151,7 @@ mod tests {
             resume: None,
             continue_last: false,
             scrub_api_keys: true,
+            mcp_servers: Vec::new(),
         }
     }
 
@@ -188,6 +202,41 @@ mod tests {
             args(&req(Backend::Gemini)),
             ["--output-format", "stream-json", "--approval-mode", "yolo", "--skip-trust", "-p", "fix it"]
         );
+    }
+
+    #[test]
+    fn mcp_servers_reach_claude_and_codex() {
+        let server = crate::McpServer {
+            name: "codecraft".into(),
+            command: PathBuf::from("/bin/codecraft"),
+            args: vec!["--mcp-bridge".into(), "--port".into(), "9".into()],
+            env: Vec::new(),
+        };
+        let mut r = req(Backend::Claude);
+        r.mcp_servers = vec![server.clone()];
+        let a = args(&r);
+        let i = a.iter().position(|x| x == "--mcp-config").unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&a[i + 1]).unwrap();
+        assert_eq!(cfg["mcpServers"]["codecraft"]["command"], "/bin/codecraft");
+        let mut r = req(Backend::Codex);
+        r.mcp_servers = vec![server.clone()];
+        let a = args(&r);
+        assert_eq!(
+            &a[..4],
+            [
+                "-c",
+                "mcp_servers.codecraft.command=\"/bin/codecraft\"",
+                "-c",
+                "mcp_servers.codecraft.args=[\"--mcp-bridge\", \"--port\", \"9\"]"
+            ]
+        );
+        assert_eq!(a[4], "exec");
+        // Grok and Gemini headless get none (they take MCP servers through ACP).
+        for b in [Backend::Grok, Backend::Gemini] {
+            let mut r = req(b);
+            r.mcp_servers = vec![server.clone()];
+            assert_eq!(args(&r), args(&req(b)));
+        }
     }
 
     #[test]
