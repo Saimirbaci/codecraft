@@ -42,6 +42,7 @@ mod sessions_tests;
 pub use actions::{CompletionEntry, Completions, ExceptionStop, StepTarget, StepTargets, call_candidates};
 pub use children::ProcessEntry;
 pub use exceptions::ExceptionBreakpoints;
+pub(crate) use python_values::is_grouping_node;
 
 /// The debug console keeps at most this many lines.
 pub const MAX_CONSOLE_LINES: usize = 20_000;
@@ -844,6 +845,11 @@ impl DebugState {
     /// The selected session's id.
     pub fn selected_id(&self) -> Option<u64> {
         self.session.as_ref().map(|x| x.id)
+    }
+
+    /// The selected session debugs a Rust program under LLDB.
+    pub fn rust_session(&self) -> bool {
+        self.rt.as_ref().is_some_and(Runtime::is_rust)
     }
 
     /// Embedders and tests: add a session without an adapter (it is listed, can be selected and

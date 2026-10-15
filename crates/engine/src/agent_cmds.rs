@@ -134,7 +134,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
              `codecraft-cli mcp <project>`. Nothing is written to the clients' files.",
             Context::Global,
             always,
-            |s, _| Ok(crate::agent_mcp::connect_snippets(s)),
+            |s, _| {
+                let v = crate::agent_mcp::connect_snippets(s);
+                s.agents.connect_shown = Some(v.clone());
+                Ok(v)
+            },
         ),
         spec(
             "agent.settings",

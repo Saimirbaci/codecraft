@@ -357,6 +357,9 @@ pub struct AgentsState {
     cleanups: usize,
     /// Saved sessions of the open project, and the switches for saving them.
     pub sessions: crate::agent_sessions::SessionsState,
+    /// What `agent.connectExternal` returned, for the UI to show in the Connect an External
+    /// Agent window (so Find Action and the menus open it too, not only the ⇄ button).
+    pub connect_shown: Option<serde_json::Value>,
 }
 
 impl Default for AgentsState {
@@ -371,6 +374,7 @@ impl Default for AgentsState {
             work_rx,
             cleanups: 0,
             sessions: crate::agent_sessions::SessionsState::default(),
+            connect_shown: None,
         }
     }
 }

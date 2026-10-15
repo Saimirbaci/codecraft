@@ -84,7 +84,7 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
             if &v != d {
                 cmds.push(("sql.fileSettings", json!({ "dialects": { path.as_str(): v } })));
             }
-            if ui.small_button("✕").on_hover_text("Use the data source's dialect").clicked() {
+            if ui.small_button("✖").on_hover_text("Use the data source's dialect").clicked() {
                 cmds.push(("sql.fileSettings", json!({ "dialects": { path.as_str(): null } })));
             }
             ui.end_row();
@@ -123,7 +123,7 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
             if &v != d {
                 cmds.push(("sql.fileSettings", json!({ "dataSources": { path.as_str(): v } })));
             }
-            if ui.small_button("✕").on_hover_text("Remove").clicked() {
+            if ui.small_button("✖").on_hover_text("Remove").clicked() {
                 cmds.push(("sql.fileSettings", json!({ "dataSources": { path.as_str(): null } })));
             }
             ui.end_row();

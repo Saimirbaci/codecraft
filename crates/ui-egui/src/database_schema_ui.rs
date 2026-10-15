@@ -423,7 +423,7 @@ fn columns_tab(ui: &mut egui::Ui, theme: &Theme, kind: DbKind, t: &mut TableDef)
                     swap = Some((i, i + 1));
                 }
             });
-            if ui.button("✕").on_hover_text("Remove the column").clicked() {
+            if ui.button("✖").on_hover_text("Remove the column").clicked() {
                 remove = Some(i);
             }
             ui.end_row();
@@ -476,7 +476,7 @@ fn keys_tab(ui: &mut egui::Ui, theme: &Theme, t: &mut TableDef, cols: &[String])
             if unique != idx.unique {
                 idx.constraint = false;
             }
-            if ui.button("✕").clicked() {
+            if ui.button("✖").clicked() {
                 remove = Some(i);
             }
             ui.end_row();
@@ -536,7 +536,7 @@ fn fks_tab(
             }
             fk_action(ui, ("db-te-fk-del", i), &mut f.on_delete);
             fk_action(ui, ("db-te-fk-upd", i), &mut f.on_update);
-            if ui.button("✕").clicked() {
+            if ui.button("✖").clicked() {
                 remove = Some(i);
             }
             ui.end_row();
@@ -560,7 +560,7 @@ fn checks_tab(ui: &mut egui::Ui, theme: &Theme, t: &mut TableDef) {
         for (i, c) in t.checks.iter_mut().enumerate() {
             ui.add(TextEdit::singleline(&mut c.name).desired_width(160.0).hint_text("unnamed"));
             ui.add(TextEdit::singleline(&mut c.expression).desired_width(380.0).hint_text("price > 0"));
-            if ui.button("✕").clicked() {
+            if ui.button("✖").clicked() {
                 remove = Some(i);
             }
             ui.end_row();

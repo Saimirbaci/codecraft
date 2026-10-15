@@ -228,6 +228,9 @@ pub(crate) fn file_text(s: &Session, path: &Path) -> Result<(String, bool), Comm
     codecraft_fs::read_text_file(path).map(|t| (t, false)).map_err(|e| failed(format!("{}: {e}", path.display())))
 }
 
+/// The message format CodeCraft adds to Cargo runs to read their diagnostics.
+const CARGO_JSON: &str = "--message-format=json-diagnostic-rendered-ansi";
+
 /// Flags whose value is the next word (a report file CodeCraft adds goes with them).
 const VALUE_FLAGS: &[&str] =
     &["--out", "--output", "--output-junit", "--junitxml", "--outputFile", "--log_sink", "--export-fixes", "-o"];
@@ -268,6 +271,16 @@ fn temp_prefixes() -> Vec<String> {
 /// JSON, clang-tidy fixes) and the arguments that go with them are left out; they are internal
 /// and gone after the run.
 pub(crate) fn public_command_line(cl: &str) -> String {
+    // Cargo's JSON messages are how CodeCraft reads a run (QA M15: `test_run` answered
+    // `cargo test --message-format=json-diagnostic-rendered-ansi -- name`; run as written, that
+    // prints JSON). The user's own `--message-format` in a configuration stays.
+    let owned;
+    let cl = if cl.starts_with("cargo ") && cl.contains(CARGO_JSON) {
+        owned = cl.split(' ').filter(|w| *w != CARGO_JSON).collect::<Vec<_>>().join(" ");
+        owned.as_str()
+    } else {
+        cl
+    };
     let temps = temp_prefixes();
     let is_temp = |w: &str| temps.iter().any(|t| w.contains(&format!("{t}/codecraft")));
     let words: Vec<&str> = cl.split(' ').collect();
@@ -772,7 +785,10 @@ pub(crate) fn stop_summary(s: &Session, frames: usize, context: usize) -> Value 
             let locals_scope = session.scopes.iter().find(|sc| !sc.expensive);
             match locals_scope.and_then(|sc| session.variables.get(&sc.reference)) {
                 Some(vars) => {
-                    let list: Vec<Value> = vars.iter().take(50).map(variable_json).collect();
+                    // Without debugpy's grouping nodes (`special variables`, …).
+                    let vars: Vec<&VariableInfo> =
+                        vars.iter().filter(|v| !crate::debug::is_grouping_node(&v.name, &v.value)).collect();
+                    let list: Vec<Value> = vars.iter().take(50).map(|v| variable_json(v)).collect();
                     out.insert("locals".into(), json!(list));
                     if vars.len() > 50 {
                         out.insert(
@@ -1736,6 +1752,13 @@ mod tests {
         let user = "pytest -o junit_logging=all --junitxml=out/report.xml --json";
         assert_eq!(public_command_line(user), user);
         assert_eq!(public_command_line(""), "");
+        // QA M15: Cargo's JSON message format is CodeCraft's, not the agent's.
+        assert_eq!(
+            public_command_line("cargo test --message-format=json-diagnostic-rendered-ansi -- parses_empty"),
+            "cargo test -- parses_empty"
+        );
+        let mine = "cargo build --message-format=json";
+        assert_eq!(public_command_line(mine), mine, "a user's own format stays");
     }
 
     #[test]

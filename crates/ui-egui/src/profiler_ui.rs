@@ -51,6 +51,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             ui.label(RichText::new(format!("Loading {}…", p.display())).color(theme.text_muted));
         });
     }
+    let root = s.project_root();
     match &s.profiler.snapshot {
         None => empty_state(ui, s, &theme, &mut cmds),
         Some(snap) => {
@@ -68,7 +69,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 ProfilerTab::CallTree => call_tree(ui, snap, &theme, &mut cmds),
                 ProfilerTab::MethodList => method_list(ui, snap, &theme, &mut cmds),
                 ProfilerTab::Timeline => timeline(ui, snap, &theme, &mut cmds),
-                ProfilerTab::Memory => memory_view(ui, snap, &theme, &mut cmds),
+                ProfilerTab::Memory => memory_view(ui, snap, root.as_deref(), &theme, &mut cmds),
             }
         }
     }
@@ -261,7 +262,7 @@ fn toolbar(
         let summary = format!("{} · {} · {}", snap.title(), p.format.label(), p.unit.format(snap.analysis.tree.total));
         let needed = crate::panels::text_width(ui, &summary, egui::TextStyle::Small) + 90.0;
         crate::panels::trailing(ui, needed, |ui| {
-            if ui.small_button("✕").on_hover_text("Close the snapshot").clicked() {
+            if ui.small_button("✖").on_hover_text("Close the snapshot").clicked() {
                 cmds.push(("profiler.close", Value::Null));
             }
             if ui.small_button("Open…").on_hover_text("Open Profiler Snapshot").clicked() {
@@ -1112,7 +1113,7 @@ fn ms_text(ns: u64) -> String {
 
 /// Memory over time (traced memory per sample, the peak marked) and the allocation sites live at
 /// the snapshot nearest the peak (tracemalloc with periodic snapshots).
-fn memory_view(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmds) {
+fn memory_view(ui: &mut egui::Ui, snap: &Snapshot, root: Option<&std::path::Path>, theme: &Theme, cmds: &mut Cmds) {
     let Some(m) = &snap.profile.memory else {
         ui.label(RichText::new("This snapshot has no memory timeline (profile memory with tracemalloc).").color(theme.text_muted));
         ui.allocate_space(ui.available_size());
@@ -1170,27 +1171,63 @@ fn memory_view(ui: &mut egui::Ui, snap: &Snapshot, theme: &Theme, cmds: &mut Cmd
         _ => "Live at the peak".to_string(),
     };
     ui.label(RichText::new(title).strong().small());
-    header(ui, theme, &["Size", "Count", "Function", "Location"]);
+    // Columns like the Method List: where it was allocated on the left, Size and Count on the
+    // right (QA M15: the rows were one dotted line under a four-column header).
+    header(ui, theme, &["Allocated at", "Size", "Count"]);
     let whole = m.peak_snapshot_bytes.unwrap_or(m.peak).max(1);
+    let col_w = 84.0;
     ScrollArea::vertical().id_salt("profiler-memory").auto_shrink([false, false]).show_rows(ui, ROW_H, m.at_peak.len(), |ui, range| {
         for i in range {
             let Some(a) = m.at_peak.get(i) else { continue };
-            let location = match (&a.file, a.line) {
-                (Some(f), Some(l)) => format!("{f}:{l}"),
-                (Some(f), None) => f.clone(),
-                _ => String::new(),
-            };
-            let text = format!(
-                "{} ({:.1}%)   ·   {}   ·   {}   ·   {}",
-                bytes.format(a.size),
-                a.size as f64 * 100.0 / whole as f64,
-                a.count,
-                a.name,
-                location
+            let location = a.file.as_deref().map(|f| {
+                // Relative to the project like the Run window's test locations (full path in
+                // the tooltip).
+                let shown = root
+                    .and_then(|r| std::path::Path::new(f).strip_prefix(r).ok())
+                    .map_or_else(|| f.to_string(), |p| p.display().to_string());
+                match a.line {
+                    Some(l) => format!("{shown}:{l}"),
+                    None => shown,
+                }
+            });
+            let width = ui.available_width().max(200.0);
+            let (rect, mut resp) = ui.allocate_exact_size(vec2(width, ROW_H), Sense::click());
+            let painter = ui.painter_at(rect);
+            if resp.hovered() {
+                painter.rect_filled(rect, 0.0, theme.hover);
+            }
+            let name_rect = Rect::from_min_max(rect.min + vec2(6.0, 0.0), pos2(rect.right() - 2.0 * col_w, rect.bottom()));
+            let mut job = egui::text::LayoutJob::default();
+            job.wrap.max_width = name_rect.width().max(10.0);
+            job.wrap.max_rows = 1;
+            job.wrap.break_anywhere = true;
+            let fmt = |color: Color32| egui::TextFormat { font_id: FontId::proportional(13.0), color, ..Default::default() };
+            job.append(&a.name, 0.0, fmt(theme.text));
+            if let Some(loc) = &location {
+                job.append(&format!("  {loc}"), 0.0, fmt(theme.text_muted));
+            }
+            let galley = ui.fonts_mut(|f| f.layout_job(job));
+            painter.with_clip_rect(name_rect).galley(
+                pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
+                galley,
+                theme.text,
             );
-            let mut resp = ui.selectable_label(false, RichText::new(text).small());
+            let cols = [
+                format!("{} ({:.1}%)", bytes.format(a.size), a.size as f64 * 100.0 / whole as f64),
+                a.count.to_string(),
+            ];
+            for (k, text) in cols.iter().enumerate() {
+                let right = rect.right() - col_w * (cols.len() - 1 - k) as f32 - 4.0;
+                painter.text(pos2(right, rect.center().y), Align2::RIGHT_CENTER, text, FontId::monospace(12.0), theme.text_muted);
+            }
+            let label = format!("{} {} {} {}", a.name, location.as_deref().unwrap_or(""), cols[0], cols[1]);
+            resp.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
+            let mut tip = a.file.as_deref().map(|f| format!("{f}{}", a.line.map(|l| format!(":{l}")).unwrap_or_default())).unwrap_or_default();
             if !a.callers.is_empty() {
-                resp = resp.on_hover_text(format!("Called from:\n{}", a.callers.join("\n")));
+                tip.push_str(&format!("\nCalled from:\n{}", a.callers.join("\n")));
+            }
+            if !tip.is_empty() {
+                resp = resp.on_hover_text(tip);
             }
             if resp.clicked()
                 && let Some(f) = &a.file

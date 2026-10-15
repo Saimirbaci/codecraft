@@ -416,7 +416,7 @@ fn watchpoint_row(ui: &mut Ui, w: &Watchpoint, theme: &Theme, cmds: &mut Vec<Cmd
                 ui.close();
             }
         });
-        if ui.small_button("✕").on_hover_text("Remove watchpoint").clicked() {
+        if ui.small_button("✖").on_hover_text("Remove watchpoint").clicked() {
             cmds.push(("debug.watchpoint.remove", json!({ "id": w.id })));
         }
     });

@@ -119,7 +119,7 @@ fn profiler_toolbar_fits_a_900px_window() {
     settle(&mut h, "the snapshot", |a| a.session.profiler.snapshot.is_some() && a.session.profiler.loading.is_none());
     only(&mut h, ToolWindowId::Profiler);
     let right_stripe = 900.0 - 38.0;
-    for label in ["Open…", "✕"] {
+    for label in ["Open…", "✖"] {
         let r = h.get_by_label(label).rect();
         assert!(r.max.x <= right_stripe, "`{label}` ends at {} (the panel ends at {right_stripe})", r.max.x);
     }

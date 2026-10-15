@@ -547,6 +547,11 @@ impl Session {
         self.typescript.isolated = true;
         // Never the real GitHub CLI (it acts on the user's account): tests point it at a fake.
         self.vcs.gh_program = dir.join("gh-isolated");
+        // Nor the user's Docker (QA M15: a UI test showing Services › Docker would have listed the
+        // real daemon's containers); tests that want Docker point `docker.program` at a fake.
+        self.docker.program = dir.join("docker-isolated").display().to_string();
+        self.docker.devcontainer_program = dir.join("devcontainer-isolated").display().to_string();
+        self.docker.config_dir = Some(dir.join("docker"));
         // Font scans look only in `dir/fonts`, never at the user's fonts.
         self.prefs_services.fonts.dirs_override = Some(vec![dir.join("fonts")]);
     }
@@ -780,6 +785,7 @@ impl Session {
                     od.language = language;
                 }
                 self.lsp_did_open(id);
+                analysis::on_save::after_open(self, &path);
                 id
             }
         };

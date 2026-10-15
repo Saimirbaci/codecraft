@@ -189,7 +189,7 @@ fn toolbar(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Vec<(&'static str
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("✕").on_hover_text("Close").clicked() {
+            if ui.small_button("✖").on_hover_text("Close").clicked() {
                 cmds.push(("inspections.close", Value::Null));
             }
             let fixable = s.inspections.results.as_ref().is_some_and(|r| r.open().any(|f| f.safe_fix().is_some()));

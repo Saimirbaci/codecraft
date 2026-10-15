@@ -69,8 +69,8 @@ fn edit_configurations_before_launch_project_file_and_templates() {
     assert!(h.query_by_label("▶ Run 'Gen'").is_some());
     assert!(h.query_by_label("Debugger").is_some(), "the debugger options section");
 
-    // Remove the Build task (the first ✕): the draft follows.
-    h.query_all_by_label("✕").next().unwrap().click();
+    // Remove the Build task (the first ✖): the draft follows.
+    h.query_all_by_label("✖").next().unwrap().click();
     h.run_steps(3);
     let draft = &h.state().session.run_store.dialog.as_ref().unwrap().draft;
     assert_eq!(draft[1].before_launch, vec![BeforeLaunchTask::RunConfiguration { name: "Gen".into() }]);

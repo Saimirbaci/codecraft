@@ -199,7 +199,11 @@ needs for it (`blocked` = agents may not run it).
 ```
 
 **`codecraft_execute`** — any command by id. The capability depends on the command (and, for
-`db.execute` with `sql`, on whether the SQL writes).
+`db.execute` with `sql`, on whether the SQL writes). Queries are reads: `vcs.status`,
+`vcs.changelists`, `vcs.shelves`, `vcs.worktrees`, `analysis.fileFindings`, `debug.sessions`,
+`profiler.report`/`memory`/`lineHits`/`compare`/`job`; `analysis.analyzeFile` runs an analyzer
+(`run`). Right after the server starts, repository commands (`vcs.*`, `git.*`) and `inspect
+{scope: "uncommitted"}` wait until the Git repository has been read.
 ```json
 { "id": "cargo.check" }                       → { "id": "cargo.check", "result": { "tab": 3 } }
 { "id": "debug.state" }                       → { "id": "debug.state", "result": { "active": false, … } }
@@ -305,6 +309,8 @@ A log message makes a logpoint (logs, doesn't stop). **`debug_breakpoint_remove`
     "locals": [{ "name": "i", "value": "3", "type": "int" }, { "name": "n", "value": "5", "type": "int" },
                { "name": "total", "value": "3", "type": "int" }] }
 ```
+Python `locals` leave out debugpy's grouping nodes (`special variables`, `function variables`;
+they are still in `debug_variables` of the scope's `ref`).
 Other states: `none`, `building`, `starting`, `running` (with `timedOut: true` after the timeout),
 `exited` (`exitCode`, `output`: the last console lines), `failed` (`message`, `output`).
 A crash stops with `reason: "exception"` and an `exception` object (`EXC_BAD_ACCESS (code=1,
@@ -391,9 +397,9 @@ the first sample; xctrace and samply snapshots) to look at one thread or one pha
 `path`+`line`, or a name filter (`name`). Waits for the end.
 ```json
 { "name": "parse" }
-→ { "tab": 7, "title": "Tests matching 'parse'", "commandLine": "cargo test parse", "finished": true, "status": "failed",
+→ { "tab": 7, "title": "Tests matching 'parse'", "commandLine": "cargo test -- parse", "finished": true, "status": "failed",
     "counts": { "passed": 4, "failed": 1, "ignored": 0, "running": 0 }, "durationMs": 1830,
-    "failures": [{ "name": "tests::parses_empty", "suite": "app", "message": "assertion `left == right` failed: empty\n  left: 1\n right: 0",
+    "failures": [{ "name": "tests::parses_empty", "suite": "app: src/lib.rs", "message": "assertion `left == right` failed: empty\n  left: 1\n right: 0",
                    "file": "/work/app/src/lib.rs", "line": 16, "excerpt": "> 16 |         assert_eq!(…)", "output": "…" }] }
 ```
 **`test_results`** — the latest (or `tab`) run; `includePassed` lists every test.
@@ -418,7 +424,8 @@ SQLite files in the project that no data source points at are listed too, as
 is a data source's id or name, or the path of a SQLite file in the project: a file no data source points at yet
 is added as one first (like dropping it on the Database tool window; that changes the project's
 settings, so it needs `write`), and the result says so in `added`. SQL the database refuses is a
-tool error with the database's message.
+tool error with the database's message. `limit` (default 200) caps the rows returned; when a
+result has more rows than it returns, `hasMore` is true and a `note` says how many there are.
 ```json
 { "dataSource": "Shop", "sql": "select name from items order by id", "limit": 100 }
 → { "dataSource": "ds-1", "results": [{ "sql": "select name from items order by id", "columns": [{ "name": "name", … }],
@@ -441,17 +448,17 @@ shortened with `…`; paths are absolute and lines 1-based in the real answers.
 1. Find the failure:
    ```json
    test_run { "name": "parses_empty" }
-   → { "tab": 7, "title": "Tests matching 'parses_empty'", "commandLine": "cargo test parses_empty", "finished": true,
+   → { "tab": 7, "title": "Tests matching 'parses_empty'", "commandLine": "cargo test -- parses_empty", "finished": true,
        "status": "failed", "counts": { "passed": 0, "failed": 1, "ignored": 0, "running": 0 }, "durationMs": 1830,
-       "failures": [{ "name": "tests::parses_empty", "suite": "shop", "file": "/work/shop/src/lib.rs", "line": 16,
-                      "message": "assertion `left == right` failed\n  left: 1\n right: 0",
+       "failures": [{ "name": "tests::parses_empty", "file": "/work/shop/src/lib.rs", "line": 16,
+                      "suite": "shop: src/lib.rs", "message": "assertion `left == right` failed\n  left: 1\n right: 0",
                       "excerpt": "  15 |         let v = parse(\"\");\n> 16 |         assert_eq!(v.len(), 0);\n  17 |     }" }] }
    ```
 2. Stop in the code under test and start the test under the debugger (`file` + `line` debugs the
    test at that line; Python: `pytest file::test` under debugpy):
    ```json
-   debug_breakpoint_set { "path": "src/lib.rs", "line": 4 }      → { "id": 1, "file": "/work/shop/src/lib.rs", "line": 4, "enabled": true, "verified": true }
-   debug_start { "file": "src/lib.rs", "line": 14 }              → { "state": "building", "started": true, "breakpoints": 1, "next": "call debug_wait_for_stop" }
+   debug_breakpoint_set { "path": "src/lib.rs", "line": 4 }      → { "id": 1, "file": "/work/shop/src/lib.rs", "line": 4, "enabled": true }
+   debug_start { "file": "src/lib.rs", "line": 14 }              → { "state": "building", "started": true, "session": "Test parses_empty", "sessionId": 1, "breakpoints": 1, "next": "call debug_wait_for_stop" }
    debug_wait_for_stop { "timeoutMs": 120000 }
    → { "state": "stopped", "reason": "breakpoint", "thread": { "id": 1, "name": "tests::parses_empty" },
        "frames": [{ "index": 0, "name": "shop::parse", "file": "/work/shop/src/lib.rs", "line": 4, "excerpt": "…" }, …],
@@ -460,10 +467,14 @@ shortened with `…`; paths are absolute and lines 1-based in the real answers.
 3. Look closer, step, and finish:
    ```json
    debug_variables { "ref": 1003 }                → { "ref": 1003, "variables": [{ "name": "[0]", "value": "\"\"", "type": "&str" }] }
-   debug_evaluate { "expression": "input.is_empty()" } → { "expression": "input.is_empty()", "value": "true", "type": "bool" }
+   debug_evaluate { "expression": "input.length == 0" } → { "expression": "input.length == 0", "value": "true", "type": "bool" }
    debug_control { "action": "stepOver" }        → { "state": "stopped", "reason": "step", "frames": [{ "line": 5, … }], "locals": […] }
-   debug_control { "action": "stop" }            → { "state": "none" }
+   debug_control { "action": "stop" }            → { "state": "exited", "exitCode": null, "output": […], "sessionId": 1, … }
    ```
+   Rust and C++ expressions are evaluated by LLDB: fields, indexing and comparisons work
+   (`input.length == 0` for a `&str`/`String`, `parts.len` and `parts[0]` for a `Vec`,
+   `item.name`), Rust method calls (`is_empty()`, `len()`) don't — the error says so and lists
+   what to use. Python expressions are evaluated by Python (anything goes).
 4. Fix (`file_edit`), then `test_run { "name": "parses_empty" }` again → `"status": "passed"`.
 
 ### Find a hotspot and verify the fix
@@ -471,25 +482,32 @@ shortened with `…`; paths are absolute and lines 1-based in the real answers.
 ```json
 profile_start { "command": "python3 main.py" }       → { "tab": 5, "job": 1, "tool": "cProfile", "state": "recording", "next": "…" }
 profile_hotspots { "limit": 5 }
-→ { "snapshot": "…/profiler/snapshots/main-….json", "unit": "…", "total": …,
-    "hotspots": [{ "name": "slow_sum", "selfPercent": 81.3, "totalPercent": 81.3, "file": "/work/app/main.py", "line": 12, "inProject": true }, …],
-    "report": { "hotLines": [{ "file": "/work/app/main.py", "line": 14, "percent": 64.0, "code": "total += sum(range(i))" }, …] } }
+→ { "snapshot": "…/profiler/snapshots/python3-main-py-….pstats.json", "unit": "nanoseconds", "total": 31519708, "sort": "self", …,
+    "hotspots": [{ "name": "<built-in method builtins.sum>", "module": "builtins", "selfPercent": 98.5, "totalPercent": 98.5, … },
+                 { "name": "slow_sum", "selfPercent": 1.4, "totalPercent": 99.9, "file": "/work/app/main.py", "line": 12, "inProject": true }, …],
+    "projectHotspots": [{ "name": "slow_sum", "totalPercent": 99.9, "file": "/work/app/main.py", "line": 12, "inProject": true }, …],
+    "report": { "hotLines": [], "notes": ["…", "Python cProfile has no per-line samples; hotLines is empty"], … } }
 file_read { "path": "main.py", "startLine": 10, "endLine": 16 }
 file_edit { "path": "main.py", "oldText": "total += sum(range(i))", "newText": "total += i * (i - 1) // 2" } → { "path": "/work/app/main.py", "replacements": 1 }
 profile_start { "command": "python3 main.py" }       → { "tab": 6, "job": 2, … }
-profile_hotspots { "limit": 5 }                       → { "hotspots": [{ "name": "main", … }, …] }   (slow_sum is gone from the top)
+profile_hotspots { "limit": 5 }                       → { "hotspots": [{ "name": "slow_sum", … }, …] }   (the builtin `sum` is gone from the top)
 codecraft_execute { "id": "profiler.compare", "params": { "a": "<first snapshot>", "b": "<second snapshot>" } }
-→ { "id": "profiler.compare", "result": { "faster": [{ "name": "slow_sum", … }], "slower": [], … } }
+→ { "id": "profiler.compare", "result": { "faster": [{ "name": "<built-in method builtins.sum>", … }, …], "slower": […], … } }
 ```
-Cargo and CMake configurations (`profile_start { "config": "Run app" }`) are built first;
-`profile_hotspots` waits for the build, the recording and the snapshot. Rust debug builds are
-flagged in `report.notes` (profile `cargo run --release`).
+cProfile times calls, not lines: the time of a builtin a function calls (`sum`, `sorted`, a C
+extension) is that builtin's *self* time, so look at the project's functions by `totalPercent`
+(`projectHotspots` lists them when library code fills the top), and `hotLines` is empty (a note
+says so). Per-line hot spots come from the sampling profilers: xctrace and samply for native
+code (Rust, C/C++), py-spy for Python where it can run (not on macOS). Cargo and CMake
+configurations (`profile_start { "config": "Run app" }`) are built first; `profile_hotspots`
+waits for the build, the recording and the snapshot. Rust debug builds are flagged in
+`report.notes` (profile `cargo run --release`).
 
 ### Fix lint problems in changed files
 
 ```json
 inspect { "scope": "uncommitted", "tools": ["clippy", "ruff"] }
-→ { "scope": "Uncommitted files", "counts": { "warning": 2 }, "total": 2,
+→ { "scope": "Uncommitted files (2)", "counts": { "warning": 2 }, "total": 2,
     "tools": [{ "tool": "clippy", "ok": true, "outcome": "1 problem", "commandLine": "cargo clippy --message-format=json …" }, …],
     "findings": [{ "id": 0, "severity": "Warning", "inspection": "clippy::needless_return", "tool": "clippy", "file": "/work/app/src/lib.rs",
                    "line": 9, "column": 5, "message": "unneeded `return` statement", "fixes": 1 },
@@ -517,7 +535,8 @@ db_query { "dataSource": "Shop", "sql": "select column_name, data_type from info
 → { "dataSource": "ds-1", "results": [{ "columns": [{ "name": "column_name", "typeName": "name" }, …], "rows": [["id", "integer"], ["total", "numeric"], …],
     "totalRows": 6, "statusLine": "6 rows", "hasMore": false }], "output": ["…"] }
 db_query { "dataSource": "Shop", "sql": "select count(*), max(created_at) from orders" }
-db_query { "dataSource": "Shop", "sql": "select * from orders order by id desc", "limit": 20 }   → 20 rows, "hasMore": true
+db_query { "dataSource": "Shop", "sql": "select * from orders order by id desc", "limit": 20 }
+→ 20 rows, "totalRows": 30, "hasMore": true, "note": "20 of 30 rows; raise `limit` or narrow the query (WHERE, LIMIT)"
 ```
 Prefer `count(*)`, `limit` and explicit columns; `EXPLAIN` (not `EXPLAIN ANALYZE`, which runs
 the statement) shows a plan as a read.
@@ -559,4 +578,6 @@ review as they are.
   disconnects over WebSocket and stdio, a Review job's calls on its worktree),
   `crates/engine/tests/agent_results_camel_case.rs` (every tool's result keys),
   `apps/codecraft-cli/tests/agent_cli.rs` and `agent_connect.rs` (the built binary over stdio,
-  one-shot commands, `--print-config`, `--ide`, cancellation).
+  one-shot commands, `--print-config`, `--ide`, cancellation), `agent_playbook.rs` (every
+  playbook above run as written, two sessions, cancelling a wait, `--print-config` against this
+  page; keep the examples and that test in step) and `agent_workflows.rs` (the M14 QA flows).
