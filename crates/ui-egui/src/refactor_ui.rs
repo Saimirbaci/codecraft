@@ -392,7 +392,7 @@ pub fn show_hierarchy(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.small_button("✕").on_hover_text("Close").clicked() {
+            if ui.small_button("✖").on_hover_text("Close").clicked() {
                 action = Some(("hierarchy.close", Value::Null));
             }
         });

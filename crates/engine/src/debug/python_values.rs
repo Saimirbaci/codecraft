@@ -94,6 +94,14 @@ fn unquote(text: &str) -> String {
     t.to_owned()
 }
 
+/// debugpy's grouping nodes (`special variables`, `function variables`, `class variables`,
+/// `protected variables`): structure for the Variables view, noise in an agent's `locals` (QA
+/// M15: every Python stop summary started with `{"name": "special variables", "value": ""}`).
+pub(crate) fn is_grouping_node(name: &str, value: &str) -> bool {
+    value.is_empty()
+        && matches!(name, "special variables" | "function variables" | "class variables" | "protected variables")
+}
+
 /// `Point(x=1, y=2)` from an object's children (without debugpy's grouping nodes and dunders).
 pub fn attributes_summary(class: &str, children: &[(String, String)]) -> String {
     let attributes: Vec<String> = children
@@ -178,5 +186,13 @@ mod tests {
         assert!(attributes_summary("Big", &many).ends_with("…)"));
         assert_eq!(unquote("'3 rows × 2'"), "3 rows × 2");
         assert_eq!(shorten("a\nb"), "a b");
+    }
+
+    #[test]
+    fn grouping_nodes_are_recognised() {
+        assert!(is_grouping_node("special variables", ""));
+        assert!(is_grouping_node("function variables", ""));
+        assert!(!is_grouping_node("special variables", "1"), "a real variable with that name");
+        assert!(!is_grouping_node("x", ""));
     }
 }

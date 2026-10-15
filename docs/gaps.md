@@ -1302,3 +1302,40 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     through (older commands such as `debug.state` keep snake_case fields); the language-server
     tools' result keys are checked only where rust-analyzer runs (`agent_tools.rs`), not by the
     walker; Connect an External Agent has no UI test of its own (the command is tested).
+
+61. QA hands-on pass 2 (track QB, `docs/qa-m15.md`): a second gallery
+    (`ui-egui/tests/qa_gallery_m15_ui.rs`, PNGs with `CODECRAFT_QA_RENDER_DIR`) painted the
+    Terminal, Python Console, Rust REPL (stand-in evcxr), a real Git repository (log, changelists,
+    shelf, a real conflict in the merge editor), Remote Host / File Transfer / Deployment over a
+    fake `ssh`, Services › Docker over a fake `docker`, and the M15 additions (Ruff's underline and
+    Alt+Enter, Settings › Python, two debug sessions, a profiler time range, the Memory view,
+    Connect an External Agent) at 1280×800 and 900×700 in both themes, and both galleries now flag
+    glyphs drawn as empty boxes (`tests/support/glyphs.rs`); the M15 features were walked as a
+    person on sample projects with the real tools (`engine/tests/qa_m15.rs`) and every playbook of
+    `docs/agents.md` was run as written over the built `codecraft-cli mcp`
+    (`apps/codecraft-cli/tests/agent_playbook.rs`, with two sessions, cancellation and
+    `--print-config`). Fixed: profiling a C++ test at the caret (and Run › Profile of C++ test
+    configurations) launched `exec` (the build-then-run wrapper's program is in its positional
+    arguments); agents' `inspect {scope: "uncommitted"}` and `codecraft_execute vcs.*` right
+    after the start said "not under Git" (they wait for the repository); `vcs.status`,
+    `analysis.fileFindings` and other documented queries needed `write`/`debug`/`profile` (now
+    reads; `analysis.analyzeFile` is `run`); `db_query` with `limit` said `hasMore: false` with
+    rows left out (now true, with a note); CodeCraft's Cargo `--message-format` in `test_run`'s
+    command line; Rust method calls in `debug_evaluate` failing with LLDB's C++ error (a hint says
+    what works; the docs used `input.is_empty()`); debugpy's `special variables` in agents'
+    locals; the playbook's sample results (cProfile hot lines and self time, `stop` → `exited`,
+    scope labels, suites) corrected in `docs/agents.md`; Python files showed no Ruff underline
+    until edited and saved (now analyzed when they open); CodeCraft's `.codecraft/` state listed
+    as unversioned files to commit (a `.codecraft/.gitignore` like `.idea/.gitignore`); empty-box
+    glyphs on macOS (stripe icons, Agents' ⇄, Reset Frame, ✕ buttons, ↶/↵/◆/⊘: the platform's
+    monospace and symbol fonts are now fallbacks, ✕ → ✖, 🛢 → 🗄, 🦀 → "Rs"); the Python
+    Console's Variables panel taking the width at 900 px; Connect an External Agent doing nothing
+    from Find Action; the Memory view's rows not lining up with its header (and absolute paths);
+    `isolate_home` not isolating Docker. Remaining: evcxr, samply, py-spy, js-debug and
+    basedpyright aren't installed here (the REPL was painted with a stand-in); analysis on open is
+    Python only; a C++ test profiled at the caret shows the test report flag on its build step's
+    command line; `.codecraft/.gitignore` itself is a new file to commit; Low polish listed in
+    `docs/qa-m15.md` (log graph gaps, the range marker over its axis label, tight session-tab
+    close buttons, "1 threads", a short program's two-sample memory chart, Cmd+F1 without the
+    analyzer's name, `/var` vs `/private/var` in snapshot paths); Docker, remote hosts and GitHub
+    only through fakes.

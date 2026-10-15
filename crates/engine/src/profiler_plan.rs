@@ -234,7 +234,18 @@ fn plan_process(name: &str, cmd: &ProcessCommand, python: Option<&Path>) -> Resu
         let script = cmd.args.get(1).ok_or("`sh -c` without a script")?;
         let mut steps: Vec<&str> = script.split("&&").map(str::trim).filter(|s| !s.is_empty()).collect();
         let last = steps.pop().ok_or("the shell command is empty")?;
-        let words = shell_split(last).ok_or_else(|| format!("cannot split `{last}` into words"))?;
+        // `sh -c '<build> && exec "$@"' <arg0> <program> <args…>` (CMake targets, C++ tests at
+        // the caret): the program is in the positional arguments. QA M15: profiling a GoogleTest
+        // test launched `exec` itself ("Path not found 'exec'").
+        let words = if matches!(last, "exec \"$@\"" | "\"$@\"" | "exec \"${@}\"") {
+            let positional = cmd.args.get(3..).unwrap_or(&[]).to_vec();
+            if positional.is_empty() {
+                return Err("the shell command runs no program (`exec \"$@\"` without arguments)".into());
+            }
+            positional
+        } else {
+            shell_split(last).ok_or_else(|| format!("cannot split `{last}` into words"))?
+        };
         let mut cwd = cmd.cwd.clone();
         if let Some(prev) = steps.last()
             && let Some(dir) = shell_split(prev).and_then(|w| match w.as_slice() {
@@ -670,6 +681,22 @@ mod tests {
             p.target,
             Target::Native { program: Some(PathBuf::from("/proj/run/b/app")), args: vec!["a b".into()] }
         );
+        // QA M15: the build-then-run wrapper of CMake targets and C++ tests at the caret
+        // (`sh -c '<build> && exec "$@"' arg0 <exe> <args…>`) profiled `exec` itself.
+        let wrapper = ProcessCommand::new(
+            "sh",
+            &["-c", "cmake --build b --target t && exec \"$@\"", "codecraft-test", "/proj/b/t", "--gtest_filter=Perf.Phases"],
+            "/proj",
+        );
+        let p = plan_process("t", &wrapper, None).unwrap();
+        let Some(BuildStep::Shell(b)) = &p.build else { panic!("{p:?}") };
+        assert_eq!(b.args[1], "cmake --build b --target t");
+        assert_eq!(
+            p.target,
+            Target::Native { program: Some(PathBuf::from("/proj/b/t")), args: vec!["--gtest_filter=Perf.Phases".into()] }
+        );
+        let empty = ProcessCommand::new("sh", &["-c", "make && exec \"$@\"", "x"], "/proj");
+        assert!(plan_process("t", &empty, None).is_err());
         let p = plan_process("n", &ProcessCommand::new("./app", &["1"], "/p"), None).unwrap();
         assert_eq!(p.target, Target::Native { program: Some(PathBuf::from("/p/app")), args: vec!["1".into()] });
         assert!(plan_process("e", &ProcessCommand::shell("", "/p"), None).is_err());

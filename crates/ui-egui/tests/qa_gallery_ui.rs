@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "support/glyphs.rs"]
+mod glyphs;
+
 use egui_kittest::Harness;
 use serde_json::{Value, json};
 
@@ -43,6 +46,11 @@ fn shoot(h: &mut Harness<'_, App>, name: &str) {
             h.state_mut().session.ws.settings.theme = theme.to_string();
             h.set_size(egui::vec2(w, ht));
             h.run_steps(4);
+            if w == SIZES[0].0 && theme == THEMES[0] {
+                for (text, missing) in glyphs::missing_glyphs(h) {
+                    eprintln!("tofu in {name}: {missing:?} in {text:?}");
+                }
+            }
             if let Some(dir) = &dir {
                 let _ = std::fs::create_dir_all(dir);
                 let file = dir.join(format!("{name}-{}x{}-{}.png", w as u32, ht as u32, theme.to_lowercase()));

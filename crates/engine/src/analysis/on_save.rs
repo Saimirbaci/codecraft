@@ -187,6 +187,28 @@ pub(crate) fn after_save(s: &mut Session, saved: &[PathBuf]) {
     }
 }
 
+/// A file was opened in an editor: a Python file without findings yet is analyzed right away
+/// (Ruff takes milliseconds), so its problems are underlined without an edit and a save, as
+/// PyCharm's inspections are when a file opens (QA M15: Cmd+S on an unmodified file saves
+/// nothing, so there was no way to see them short of an edit or Inspect Code). Rust and C/C++
+/// wait for a save: Clippy builds the workspace, and their language servers report as they go.
+pub(crate) fn after_open(s: &mut Session, path: &Path) {
+    if !s.ws.settings.analysis_on_save || s.power_save() {
+        return;
+    }
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if !inspections::PY_EXTS.contains(&ext) || !s.analysis.editor.of(path).is_empty() {
+        return;
+    }
+    let Some(root) = s.project_root() else { return };
+    if !path.strip_prefix(&root).is_ok_and(|r| !inspections::in_build_output(r)) {
+        return;
+    }
+    queue(s, path);
+    let st = &mut s.analysis.editor.on_save;
+    st.due = Some(Instant::now() + st.debounce);
+}
+
 fn queue(s: &mut Session, path: &Path) {
     let at = s.ws.doc_by_path(path).and_then(|id| s.ws.doc(id)).map(|d| (d.doc.revision(), d.doc.snapshot()));
     let st = &mut s.analysis.editor.on_save;

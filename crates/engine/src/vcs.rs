@@ -497,6 +497,8 @@ pub struct VcsState {
     discovering: bool,
     refreshing: bool,
     refresh_again: Option<bool>,
+    /// `.codecraft/.gitignore` was checked this session (see `ignore_workspace_state`).
+    state_ignore_checked: bool,
     show_conflicts_after_refresh: bool,
     git_env: Vec<(OsString, OsString)>,
     tx: Sender<Event>,
@@ -560,6 +562,7 @@ impl Default for VcsState {
             discovering: false,
             refreshing: false,
             refresh_again: None,
+            state_ignore_checked: false,
             show_conflicts_after_refresh: false,
             git_env: Vec::new(),
             tx,
@@ -608,6 +611,12 @@ impl VcsState {
 
     pub fn is_repo(&self) -> bool {
         self.repo.is_some()
+    }
+
+    /// The repository of the project at `root` is not known yet, or its status is being read
+    /// (agents' `inspect {scope: "uncommitted"}` right after the start waits for it).
+    pub fn settling_for(&self, root: &Path) -> bool {
+        self.discovered_for.as_deref() != Some(root) || self.discovering || (self.repo.is_some() && self.refreshing)
     }
 
     /// Background work is in flight (the UI keeps repainting).
@@ -825,6 +834,42 @@ fn discover_if_needed(s: &mut Session) -> bool {
         let _ = tx.send(Event::Discovered { root, result });
     });
     true
+}
+
+/// What `.codecraft/.gitignore` keeps out of the repository: CodeCraft's per-user workspace
+/// state, like IntelliJ's `.idea/.gitignore` (`/workspace.xml`, `/shelf/`). Shared project
+/// settings (run configurations, data sources, inspection profiles and baseline, deployment,
+/// code style) stay versionable.
+pub const STATE_GITIGNORE: &str = "# CodeCraft's per-user state (like .idea/workspace.xml); shared settings stay versioned\n\
+/changelists.json\n/shelf/\n/breakpoints.json\n/bookmarks.json\n/tasks.json\n/local-history/\n\
+/test-history.json\n/build/\n/coverage/\n/profiler/\n/cache/\n/consoles/\n/scratches/\n/feedback/\n";
+
+/// QA M15: the first changelist, shelf, breakpoint or bookmark wrote `.codecraft/…` into the
+/// project and it showed in the Commit tool window as an unversioned file to add. When a status
+/// lists untracked files under the project's `.codecraft/` and it has no `.gitignore`, one is
+/// written (once per session, so a user who deletes it keeps it deleted) and status is read
+/// again.
+fn ignore_workspace_state(s: &mut Session) {
+    if s.vcs.state_ignore_checked {
+        return;
+    }
+    let (Some(repo), Some(project)) = (s.vcs.repo.as_ref(), s.project_root()) else { return };
+    let dir = project.join(".codecraft");
+    let Some(prefix) = repo.rel(&dir) else { return };
+    let prefix = format!("{prefix}/");
+    let untracked = s.vcs.status.files.iter().any(|f| f.untracked && !f.ignored && f.path.starts_with(&prefix));
+    if !untracked {
+        return;
+    }
+    s.vcs.state_ignore_checked = true;
+    let file = dir.join(".gitignore");
+    if file.exists() {
+        return;
+    }
+    match std::fs::write(&file, STATE_GITIGNORE) {
+        Ok(()) => request_refresh(s, false),
+        Err(e) => log::warn!("cannot write {}: {e}", file.display()),
+    }
 }
 
 /// Re-read status (and with `full`, branches, tags, remotes and stashes) in the background.
@@ -1097,6 +1142,7 @@ fn apply_snapshot(s: &mut Session, snap: Snapshot) {
     let refs_changed = snap.refs.is_some();
     s.vcs.status = snap.status;
     s.vcs.state = snap.state;
+    ignore_workspace_state(s);
     changelists::sync(s);
     if let Some((branches, tags, remotes, stashes)) = snap.refs {
         s.vcs.branches = branches;

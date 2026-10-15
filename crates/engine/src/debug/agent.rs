@@ -404,7 +404,7 @@ pub(crate) fn stop_summary(s: &Session, max_frames: usize, max_locals: usize) ->
         let mut locals = Vec::new();
         for scope in &session.scopes {
             let Some(vars) = session.variables.get(&scope.reference) else { continue };
-            for v in vars {
+            for v in vars.iter().filter(|v| !super::is_grouping_node(&v.name, &v.value)) {
                 if locals.len() >= max_locals {
                     break;
                 }

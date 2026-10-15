@@ -164,7 +164,7 @@ pub(crate) fn before_launch_section(
                 }
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Remove").clicked() {
+                if ui.small_button("✖").on_hover_text("Remove").clicked() {
                     action = Some((i, 0));
                 }
                 if ui.add_enabled(i + 1 < len, egui::Button::new("↓").small()).on_hover_text("Move Down").clicked() {

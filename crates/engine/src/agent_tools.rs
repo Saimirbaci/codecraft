@@ -372,6 +372,7 @@ fn sort_arg(args: &Value) -> Option<String> {
 /// Read-only commands outside the read-only namespaces.
 const READ_COMMANDS: &[&str] = &[
     "agentAccess.get",
+    "analysis.fileFindings",
     "analysis.problems",
     "commands.search",
     "coverage.summary",
@@ -388,18 +389,25 @@ const READ_COMMANDS: &[&str] = &[
     "debug.stopSummary",
     "debug.agentSummary",
     "debug.variablesOf",
+    "debug.sessions",
     "files.read",
     "inspections.results",
     "lsp.query",
     "lsp.queryResult",
     "lsp.status",
     "profiler.callTree",
+    "profiler.compare",
     "profiler.hotspots",
+    "profiler.job",
+    "profiler.lineHits",
+    "profiler.memory",
     "profiler.methods",
+    "profiler.report",
     "profiler.recent",
     "profiler.status",
     "profiler.tools",
     "project.info",
+    "python.languageServer",
     "run.configurations",
     "run.output",
     "run.testHistory",
@@ -408,6 +416,12 @@ const READ_COMMANDS: &[&str] = &[
     "runConfig.templates.list",
     "test.summary",
     "test.tree",
+    // QA M15: the playbook's `vcs.status` (and the other repository queries) needed `write`.
+    "vcs.changelists",
+    "vcs.merge.state",
+    "vcs.shelves",
+    "vcs.status",
+    "vcs.worktrees",
 ];
 
 /// Commands in run-like namespaces that change files.
@@ -491,7 +505,7 @@ pub fn command_capability(id: &str) -> Option<Capability> {
     let run = ["run.", "cargo.", "build.", "test.", "coverage.", "terminal.", "zig.", "docker.", "inspections."]
         .iter()
         .any(|p| id.starts_with(p))
-        || id == "code.inspectCode";
+        || matches!(id, "code.inspectCode" | "analysis.analyzeFile");
     if run {
         return Some(Capability::Run);
     }
@@ -897,6 +911,33 @@ const NEED_LOADED_PROJECT: &[&str] = &[
     t::DB_QUERY,
 ];
 
+/// `inspect {scope: "uncommitted"}` and the repository commands (`codecraft_execute
+/// vcs.status`) need the repository's status: right after the start they said "the project is
+/// not under Git" / "not a Git repository" (QA M15) while the repository was still being found.
+fn repo_pending(s: &Session, name: &str, args: &Value) -> bool {
+    let wants_repo = match name {
+        t::INSPECT => args.get("scope").and_then(Value::as_str) == Some("uncommitted"),
+        t::EXECUTE => {
+            args.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with("vcs.") || id.starts_with("git."))
+        }
+        _ => false,
+    };
+    wants_repo && s.ws.project.as_ref().is_some_and(|p| s.vcs.settling_for(&p.root))
+}
+
+/// QA M15: the playbook's `input.is_empty()` fails in a Rust session — LLDB evaluates C-like
+/// expressions over Rust values (fields, indexing, comparisons), not method calls. Say what
+/// works instead of leaving the agent with "no member named 'is_empty' in '&str'".
+fn rust_eval_hint(s: &Session, error: &str) -> &'static str {
+    let method = error.contains("no member named") || error.contains("is not a function");
+    if s.debug.rust_session() && method {
+        "\nLLDB can't call Rust methods; use fields, indexing and comparisons: `s.length == 0` (&str/String), \
+         `v.len` (Vec), `v[0]`, `opt` (shown as Some(…)/None), `x.field`"
+    } else {
+        ""
+    }
+}
+
 /// How long a call waits for the project to load.
 const PROJECT_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -905,7 +946,7 @@ fn start(s: &mut Session, caller: Caller, key: Option<CallKey>, name: &str, args
         let step = forward(s, &caller, name, &args);
         return settle_step(s, caller, key, name.to_string(), step, respond);
     }
-    if s.project_loading() && NEED_LOADED_PROJECT.contains(&name) {
+    if (s.project_loading() && NEED_LOADED_PROJECT.contains(&name)) || (name == t::INSPECT && repo_pending(s, name, &args)) {
         let wait = Wait::ProjectLoad { tool: name.to_string(), args };
         return settle_step(s, caller, key, name.to_string(), Step::Wait(wait, PROJECT_LOAD_TIMEOUT), respond);
     }
@@ -1113,7 +1154,7 @@ fn on_timeout(s: &mut Session, name: &str, wait: &Wait) -> ToolResult {
 fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
     match wait {
         Wait::ProjectLoad { tool, args } => {
-            if s.project_loading() {
+            if s.project_loading() || repo_pending(s, tool, args) {
                 return None;
             }
             let (tool, args) = (tool.clone(), args.clone());
@@ -1183,7 +1224,7 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                     }
                     done_json(Value::Object(o))
                 }
-                Err(e) => done_err(format!("cannot evaluate `{expression}`: {e}")),
+                Err(e) => done_err(format!("cannot evaluate `{expression}`: {e}{}", rust_eval_hint(s, e))),
             })
         }
         Wait::LspReady { server, kind, args, limit, then } => {
@@ -1424,8 +1465,9 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
                 // `runConfig.create` right after `codecraft-cli mcp` started said "no project is
                 // open").
                 Err(e)
-                    if s.project_loading()
-                        && (matches!(e, CommandError::Disabled(_)) || e.to_string().contains("no project is open")) =>
+                    if (s.project_loading()
+                        && (matches!(e, CommandError::Disabled(_)) || e.to_string().contains("no project is open")))
+                        || (matches!(e, CommandError::Disabled(_)) && repo_pending(s, name, args)) =>
                 {
                     let wait = Wait::ProjectLoad { tool: name.to_string(), args: args.clone() };
                     Step::Wait(wait, PROJECT_LOAD_TIMEOUT)
@@ -2199,6 +2241,17 @@ fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usiz
                         o.insert(key.into(), x);
                     }
                 }
+                // QA M15: `limit: 20` on 30 rows answered 20 rows with `hasMore: false` (it
+                // only meant "the server has more than were fetched").
+                let shown = o.get("rows").and_then(Value::as_array).map_or(0, Vec::len);
+                let total = o.get("totalRows").and_then(Value::as_u64).unwrap_or(0);
+                if (shown as u64) < total {
+                    o.insert("hasMore".into(), json!(true));
+                    o.insert(
+                        "note".into(),
+                        json!(format!("{shown} of {total} rows; raise `limit` or narrow the query (WHERE, LIMIT)")),
+                    );
+                }
                 results.push(Value::Object(o));
             }
             Err(e) => results.push(json!({ "error": e.to_string() })),
@@ -2369,6 +2422,33 @@ mod tests {
         }
         assert_eq!(command_capability("db.commit"), Some(Capability::DbWrite));
         assert_eq!(command_capability("db.removeDataSource"), Some(Capability::DbWrite));
+    }
+
+    /// QA M15: commands the agent docs name as reads needed `write` (`vcs.status`,
+    /// `analysis.fileFindings`) or `profile`/`debug` (reports and listings); analyzing a file
+    /// runs an analyzer.
+    #[test]
+    fn documented_queries_are_reads() {
+        for id in [
+            "vcs.status",
+            "vcs.changelists",
+            "vcs.shelves",
+            "analysis.fileFindings",
+            "python.languageServer",
+            "debug.sessions",
+            "profiler.report",
+            "profiler.memory",
+            "profiler.lineHits",
+            "profiler.compare",
+            "profiler.job",
+        ] {
+            assert!(crate::registry().get(id).is_some(), "{id} is a command");
+            assert_eq!(command_capability(id), Some(Capability::Read), "{id}");
+        }
+        assert_eq!(command_capability("analysis.analyzeFile"), Some(Capability::Run));
+        assert_eq!(command_capability("analysis.fix"), Some(Capability::Write));
+        assert_eq!(command_capability("vcs.commit"), Some(Capability::Write));
+        assert_eq!(command_capability("profiler.record"), Some(Capability::Profile));
     }
 
     #[test]

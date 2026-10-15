@@ -63,33 +63,43 @@ pub fn show_console(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     });
     ui.separator();
 
-    // Variables on the right.
-    egui::Panel::right("python-console-vars").resizable(true).default_size(240.0).show(ui, |ui| {
-        ui.label(RichText::new("Variables").strong().small());
-        ScrollArea::vertical().id_salt("python-console-vars-scroll").auto_shrink([false, false]).show(ui, |ui| {
-            if s.python.console.vars.is_empty() {
-                ui.label(RichText::new("No variables").color(theme.text_muted).small());
-            }
-            egui::Grid::new("python-console-vars-grid").num_columns(2).striped(true).show(ui, |ui| {
-                for v in &s.python.console.vars {
-                    ui.label(RichText::new(&v.name).monospace()).on_hover_text(&v.type_name);
-                    ui.horizontal(|ui| {
-                        if v.viewable && ui.small_button("⊞ View").on_hover_text("View as DataFrame / Array").clicked() {
-                            cmds.push(("python.dataframe.view", json!({ "expression": v.name, "source": "console" })));
-                        }
-                        let shape = v.shape.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
-                        ui.label(
-                            RichText::new(format!("{{{}{shape}}} {}", v.type_name, v.value))
-                                .monospace()
-                                .color(theme.text_muted),
-                        )
-                        .on_hover_text(&v.value);
-                    });
-                    ui.end_row();
+    // Variables on the right, at most half the window: a long value is cut (the whole value is
+    // in its tooltip) instead of widening the panel over the transcript (QA M15).
+    let width = ui.available_width();
+    let max_vars = (width * 0.5).max(160.0);
+    egui::Panel::right("python-console-vars")
+        .resizable(true)
+        .default_size(240f32.min(max_vars))
+        .size_range(140f32.min(max_vars)..=max_vars)
+        .show(ui, |ui| {
+            ui.label(RichText::new("Variables").strong().small());
+            ScrollArea::vertical().id_salt("python-console-vars-scroll").auto_shrink([false, false]).show(ui, |ui| {
+                if s.python.console.vars.is_empty() {
+                    ui.label(RichText::new("No variables").color(theme.text_muted).small());
                 }
+                egui::Grid::new("python-console-vars-grid").num_columns(2).striped(true).show(ui, |ui| {
+                    for v in &s.python.console.vars {
+                        ui.label(RichText::new(&v.name).monospace()).on_hover_text(&v.type_name);
+                        ui.horizontal(|ui| {
+                            if v.viewable && ui.small_button("⊞ View").on_hover_text("View as DataFrame / Array").clicked() {
+                                cmds.push(("python.dataframe.view", json!({ "expression": v.name, "source": "console" })));
+                            }
+                            let shape = v.shape.as_deref().map(|s| format!(" {s}")).unwrap_or_default();
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("{{{}{shape}}} {}", v.type_name, v.value))
+                                        .monospace()
+                                        .color(theme.text_muted),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&v.value);
+                        });
+                        ui.end_row();
+                    }
+                });
             });
         });
-    });
 
     // Input at the bottom.
     let input_id = Id::new("python-console-input");

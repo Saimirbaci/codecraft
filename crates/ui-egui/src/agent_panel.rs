@@ -397,6 +397,10 @@ pub(crate) fn open_connect(s: &mut Session, st: &mut UiState) {
 /// Connect an External Agent: per client, the entry that reaches this IDE and the headless
 /// server, to copy into the client's configuration (CodeCraft never edits those files).
 pub(crate) fn connect_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    // `agent.connectExternal` from anywhere (Find Action, a menu, the ⇄ button) opens it.
+    if let Some(v) = s.agents.connect_shown.take() {
+        st.agent.connect = Some(v);
+    }
     let Some(info) = st.agent.connect.clone() else { return };
     let theme = st.theme.clone();
     let clients = info.get("clients").and_then(Value::as_array).cloned().unwrap_or_default();

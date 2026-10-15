@@ -75,7 +75,40 @@ pub fn base_definitions() -> (FontDefinitions, String) {
         defs.font_data.insert(name.clone(), Arc::new(data));
         defs.families.entry(FontFamily::Proportional).or_default().insert(0, name);
     }
+    add_symbol_fallbacks(&mut defs, &mono_name);
     (defs, mono_name)
+}
+
+/// The platform's symbol font (arrows, ⊶, ⤺…), searched after everything else.
+fn symbol_candidates() -> Vec<(PathBuf, u32)> {
+    vec![
+        ("/System/Library/Fonts/Apple Symbols.ttf".into(), 0),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf".into(), 0),
+        ("C:\\Windows\\Fonts\\seguisym.ttf".into(), 0),
+    ]
+}
+
+/// Glyphs the UI uses for buttons and icons (`⇄`, `↶`, `↵`, `◆`, `⊘`, `⊶`, `⤺`) are in the
+/// platform's monospace and symbol fonts but not in its UI font or egui's: without these
+/// fallbacks they were drawn as empty boxes (QA M15). The monospace font goes at the end of the
+/// proportional family, the symbol font at the end of both.
+fn add_symbol_fallbacks(defs: &mut FontDefinitions, mono_name: &str) {
+    if defs.font_data.contains_key(mono_name) {
+        let prop = defs.families.entry(FontFamily::Proportional).or_default();
+        if !prop.iter().any(|n| n == mono_name) {
+            prop.push(mono_name.to_string());
+        }
+    }
+    if let Some((path, data)) = symbol_candidates().into_iter().find_map(|(p, i)| load(&p, i).map(|d| (p, d))) {
+        let name = format!("symbols-{}", path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        defs.font_data.insert(name.clone(), Arc::new(data));
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            let list = defs.families.entry(family).or_default();
+            if !list.contains(&name) {
+                list.push(name.clone());
+            }
+        }
+    }
 }
 
 /// Install the built-in fonts; returns them and the monospace font's name.
