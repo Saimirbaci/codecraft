@@ -46,7 +46,10 @@ codecraft-cli mcp /path/to/project [--allow run,debug,profile,write,db-write] [-
 
 An MCP server over stdio (one JSON-RPC message per line) with a long-lived session: the project
 is opened once, language servers start as in the IDE, and debug sessions, profiles, test runs and
-database connections live across calls until the client disconnects. Reading is always allowed;
+database connections live across calls until the client disconnects. Calls that need the
+project's run configurations or Cargo targets (`project_info`, `run_configurations`, `debug_start`,
+`profile_start`, `test_run`, `run_start`, `inspect`, `db_*`) wait while the project is still
+loading right after the start (up to 2 minutes). Reading is always allowed;
 the other capabilities must be listed in `--allow` (`all` allows everything): nobody is there to
 approve them, so they are denied with a message naming the flag. `codecraft-cli mcp --help`
 prints these snippets with the real path of the binary:
@@ -160,21 +163,31 @@ Open editors get one undo step and are saved.
 
 ### Analysis
 
-**`problems`** — what the IDE knows now (language servers, cargo, inspections), errors first.
+**`problems`** — what the IDE knows now (language servers, cargo, the open findings of the last
+`inspect`), errors first. Findings of the last analysis carry `source: "analysis"`, the
+`analyzer`, and the `id` that `analysis.fix` / `analysis.suppress` take (`fixable` when a
+quick-fix exists).
 ```json
 { "path": "src", "severity": "warning" }
-→ { "total": 1, "errors": 0, "problems": [{ "file": "/work/app/src/main.rs", "line": 2, "column": 9,
-    "endLine": 2, "severity": "warning", "message": "unused variable: `unused`", "source": "language-server" }] }
+→ { "total": 2, "errors": 0, "problems": [{ "file": "/work/app/src/main.rs", "line": 2, "column": 9,
+    "endLine": 2, "severity": "warning", "message": "unused variable: `unused`", "source": "language-server" },
+    { "file": "/work/app/src/util.py", "line": 1, "column": 8, "endLine": 1, "severity": "warning",
+      "message": "`os` imported but unused", "source": "analysis", "analyzer": "ruff", "code": "F401", "id": 0, "fixable": true }] }
 ```
 
 **`inspect`** (run) — Inspect Code on a scope (`file`, `directory`, `project`, `uncommitted`) and
-wait for the findings.
+wait for the findings. Build output (`cmake-build-*`, `CMakeFiles`, `node_modules`, `__pycache__`,
+virtual environments) is not part of a directory or project scope. Rust projects get `cargo
+check` unless `tools` asks for `clippy` (or Settings › Rust turns Clippy on).
 ```json
 { "scope": "file", "path": "mod.py", "tools": ["ruff"] }
-→ { "scope": "mod.py", "tools": ["ruff"], "counts": { "Warning": 1 }, "total": 1,
+→ { "scope": "File mod.py", "counts": { "warning": 1 }, "total": 1,
+    "tools": [{ "tool": "ruff", "ok": true, "outcome": "1 problem", "command_line": "ruff check --output-format=json …" }],
     "findings": [{ "id": 0, "severity": "Warning", "inspection": "F401 unused-import", "tool": "ruff",
     "code": "F401", "file": "/work/app/mod.py", "line": 1, "column": 8, "message": "`os` imported but unused", "fixes": 1 }] }
 ```
+Then `codecraft_execute` `analysis.fix {id}` (or `{rule}` for all of a kind), `analysis.suppress
+{id}` (`# noqa: F401`, `#[allow(…)]`, `// NOLINT(…)`), `analysis.export {format: "sarif", path}`.
 
 **`definition`**, **`references`**, **`hover`** — a position is `path` + `line` + either `column` or
 `symbol` (an identifier on that line).
@@ -225,6 +238,9 @@ A log message makes a logpoint (logs, doesn't stop). **`debug_breakpoint_remove`
 ```
 Other states: `none`, `building`, `starting`, `running` (with `timedOut: true` after the timeout),
 `exited` (`exitCode`, `output`: the last console lines), `failed` (`message`, `output`).
+A crash stops with `reason: "exception"` and an `exception` object (`EXC_BAD_ACCESS (code=1,
+address=0x0)`, a panic message, a Python exception). Long C++ signatures are shortened to
+`name(…)` in frame names (`std::__1::` becomes `std::`); the frame's `file` and `line` locate it.
 
 **`debug_control`** (debug) — `continue`, `stepOver`, `stepInto`, `stepOut`, `pause`, `stop`,
 `runToLine` (+ `path`, `line`). Waits for the next stop by default and returns its summary.
@@ -247,16 +263,28 @@ A failing expression is a tool error with the debugger's message.
 
 ### Profiling
 
-**`profile_start`** (profile) — `{ "config": "Run app" }` → `{ "tab": 5, "config": "Run app", "tool": "samply", "next": "…" }`
+**`profile_start`** (profile) — a run configuration (`config`) or a command line (`command`:
+`python3 main.py`, `cargo run --release`, `pytest -k slow`, `./build/app`), CPU by default or
+`kind: "memory"`, optionally a `tool` and `seconds`. Cargo and CMake targets are built first.
+```json
+{ "config": "Run app" }                         → { "tab": 5, "job": 1, "config": "Run app", "tool": "xctrace", "state": "building", "next": "…" }
+{ "command": "python3 main.py", "kind": "memory" } → { "tab": 6, "job": 2, "tool": "tracemalloc", "state": "recording", "next": "…" }
+```
 
 **`profile_stop`** (profile) — stops the recording, waits for the snapshot, returns the hotspots.
-**`profile_hotspots`** — the hotspots of the open snapshot (waits while recording or loading).
+**`profile_hotspots`** — the hotspots of the newest profile (waits while its target builds, it
+records or its snapshot loads; a profile that failed is a tool error naming the Run tab with its
+output). Rust names are demangled. `inProject` marks the project's own functions; when library
+code (the standard library, Python's import machinery) fills the top of the list,
+`projectHotspots` lists the project's functions separately. For memory profiles the unit is
+`bytes` and the percentages are shares of the allocated bytes.
 ```json
 { "limit": 3 }
 → { "snapshot": "/home/me/.codecraft/profiler/snapshots/app-….json", "unit": "samples", "samples": 4521, "total": 4521,
     "hotspots": [{ "name": "app::parse_line", "module": "app", "selfPercent": 41.2, "totalPercent": 55.0, "self": 1863,
-                   "total": 2487, "file": "/work/app/src/parse.rs", "line": 88 }, …],
-    "note": "selfPercent: time in the function itself; totalPercent: including what it calls" }
+                   "total": 2487, "file": "/work/app/src/parse.rs", "line": 88, "inProject": true }, …],
+    "note": "selfPercent: time in the function itself; totalPercent: including what it calls",
+    "report": { "hotLines": […], "topByTotal": […], "notes": ["A Cargo debug build was profiled: …"] } }
 ```
 
 ### Tests
@@ -284,14 +312,26 @@ A failing expression is a tool error with the debugger's message.
 
 ### Databases
 
-**`db_sources`** — `{}` → `[{ "id": "ds-1", "name": "Shop", "kind": "sqlite", "readOnly": false, "confirmWrites": false, "status": "connected", "schemas": [{ "name": "main", "tables": ["items"] }] }]`
+**`db_sources`** — `{}` → `[{ "id": "ds-1", "name": "Shop", "kind": "sqlite", "readOnly": false, "confirmWrites": false, "status": "connected", "schemas": [{ "name": "main", "tables": ["items"] }] }]`.
+SQLite files in the project that no data source points at are listed too, as
+`{ "id": null, "name": "shop.db", "kind": "sqlite", "path": "/work/app/data/shop.db", "status": "not added", "hint": "…" }`.
 
-**`db_query`** — read-only SQL needs `read`; SQL that modifies data needs `db-write`.
+**`db_query`** — read-only SQL needs `read`; SQL that modifies data needs `db-write`. `dataSource`
+is a data source's id or name, or the path of a SQLite file in the project: a file no data source points at yet
+is added as one first (like dropping it on the Database tool window; that changes the project's
+settings, so it needs `write`), and the result says so in `added`. SQL the database refuses is a
+tool error with the database's message.
 ```json
 { "dataSource": "Shop", "sql": "select name from items order by id", "limit": 100 }
 → { "dataSource": "ds-1", "results": [{ "sql": "select name from items order by id", "columns": [{ "name": "name", … }],
     "rows": [["apple"], ["pear"], ["plum"]], "totalRows": 3, "statusLine": "3 rows", "hasMore": false }], "output": ["…"] }
+{ "dataSource": "data/shop.db", "sql": "select count(*) from items" }
+→ { "dataSource": "shop-db", "added": { "id": "shop-db", "name": "shop.db", "path": "/work/app/data/shop.db" },
+    "note": "the SQLite file is now data source `shop-db` …", "results": [{ "rows": [[3]], … }], … }
 ```
+Through `codecraft_execute`, adding or editing a data source (`db.addDataSource`,
+`db.editDataSource`) needs `write`; connecting, refreshing, row counts and the query history are
+reads.
 
 ## For developers
 

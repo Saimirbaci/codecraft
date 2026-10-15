@@ -177,6 +177,7 @@ fn toolbar(
             Some(t) => t.name.clone(),
             None => "All threads".to_string(),
         };
+        crate::panels::room_for(ui, 196.0);
         egui::ComboBox::from_id_salt("profiler-thread").selected_text(current).width(180.0).show_ui(ui, |ui| {
             if ui.selectable_label(snap.analysis.thread.is_none(), "All threads").clicked() {
                 cmds.push(("profiler.selectThread", Value::Null));
@@ -189,6 +190,7 @@ fn toolbar(
             }
         });
         let mut query = snap.search.clone();
+        crate::panels::room_for(ui, 176.0);
         let field = ui.add(TextEdit::singleline(&mut query).hint_text("Search").desired_width(160.0));
         if field.changed() {
             cmds.push(("profiler.search", json!({ "query": query })));
@@ -214,6 +216,7 @@ fn toolbar(
             ),
             None => "Compare with…".to_string(),
         };
+        crate::panels::room_for(ui, 186.0);
         egui::ComboBox::from_id_salt("profiler-compare").selected_text(compare_label).width(170.0).show_ui(ui, |ui| {
             if snap.baseline.is_some() && ui.selectable_label(false, "Stop comparing").clicked() {
                 cmds.push(("profiler.clearBaseline", Value::Null));
@@ -239,24 +242,17 @@ fn toolbar(
                 cmds.push(("profiler.collapseAll", Value::Null));
             }
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let summary = format!("{} · {} · {}", snap.title(), p.format.label(), p.unit.format(snap.analysis.tree.total));
+        let needed = crate::panels::text_width(ui, &summary, egui::TextStyle::Small) + 90.0;
+        crate::panels::trailing(ui, needed, |ui| {
             if ui.small_button("✕").on_hover_text("Close the snapshot").clicked() {
                 cmds.push(("profiler.close", Value::Null));
             }
             if ui.small_button("Open…").on_hover_text("Open Profiler Snapshot").clicked() {
                 cmds.push(("run.openProfilerSnapshot", Value::Null));
             }
-            ui.label(
-                RichText::new(format!(
-                    "{} · {} · {}",
-                    snap.title(),
-                    p.format.label(),
-                    p.unit.format(snap.analysis.tree.total)
-                ))
-                .color(theme.text_muted)
-                .small(),
-            )
-            .on_hover_text(snap.path.display().to_string());
+            ui.label(RichText::new(summary).color(theme.text_muted).small())
+                .on_hover_text(snap.path.display().to_string());
         });
     });
 }

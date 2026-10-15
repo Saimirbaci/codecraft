@@ -430,7 +430,13 @@ impl ProfileBuilder {
     }
 
     /// The id of a frame (added on first use).
-    pub fn frame(&mut self, frame: Frame) -> Result<u32, ProfileError> {
+    pub fn frame(&mut self, mut frame: Frame) -> Result<u32, ProfileError> {
+        // Rust names as people read them (QA M14: Instruments leaves v0-mangled `_RNv…` names).
+        if (frame.name.starts_with('_') || frame.name.contains("::h"))
+            && let Some(name) = crate::demangle::demangle(&frame.name)
+        {
+            frame.name = name;
+        }
         if let Some(id) = self.frame_ids.get(&frame) {
             return Ok(*id);
         }

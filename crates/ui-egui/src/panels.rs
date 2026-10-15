@@ -48,15 +48,21 @@ fn icon(tw: ToolWindowId) -> &'static str {
     }
 }
 
-fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId) {
+/// A stripe button's side at full size.
+const STRIPE_BUTTON: f32 = 30.0;
+/// The smallest a stripe button gets before the stripe scrolls.
+const STRIPE_BUTTON_MIN: f32 = 22.0;
+
+fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId, size: f32) {
     let visible = s.ws.layout.is_visible(tw);
     let color = if visible { st.theme.text } else { st.theme.text_muted };
     let mut tip = tw.title().to_string();
     if let Some(sc) = keymap::shortcut_label(&format!("view.toolWindows.{}", tw.key())) {
         tip = format!("{tip} ({sc})");
     }
+    let glyph = (16.0 * size / STRIPE_BUTTON).max(12.0);
     let resp = ui
-        .add(egui::Button::new(RichText::new(icon(tw)).size(16.0).color(color)).frame(false).min_size(vec2(30.0, 30.0)))
+        .add(egui::Button::new(RichText::new(icon(tw)).size(glyph).color(color)).frame(false).min_size(vec2(size, size)))
         .on_hover_text(tip);
     if visible {
         ui.painter().rect_filled(resp.rect.shrink(1.0), CornerRadius::same(6), Color32::from_white_alpha(14));
@@ -74,35 +80,75 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         .stroke(Stroke::new(1.0, st.theme.border));
     let width = if s.ws.settings.compact_mode { 32.0 } else { 38.0 };
     egui::Panel::left("stripe-left").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Left) {
-                stripe_button(ui, s, st, tw);
-            }
-            ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
-                for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().rev().filter(|t| t.side() == Side::Bottom) {
-                    stripe_button(ui, s, st, tw);
+        let top: Vec<ToolWindowId> = IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Left).collect();
+        // Bottom tool windows sit low on the stripe, the last one lowest.
+        let mut bottom: Vec<ToolWindowId> =
+            IMPLEMENTED_TOOL_WINDOWS.into_iter().rev().filter(|t| t.side() == Side::Bottom).collect();
+        // CMake projects get the CMake tool window (track CL).
+        if s.cpp.cmake.is_cmake {
+            bottom.push(ToolWindowId::CMake);
+        }
+        // Zig and TypeScript projects get their tool windows (M13 track RC).
+        if is_project_of(ui, s, "zig", codecraft_engine::zig_tool::is_zig_project) {
+            bottom.push(ToolWindowId::Zig);
+        }
+        if is_project_of(ui, s, "typescript", codecraft_engine::typescript_tool::is_typescript_project) {
+            bottom.push(ToolWindowId::TypeScript);
+        }
+        // The two groups overlapped in a 700 px window (QA M14): buttons shrink to fit, and when
+        // even small ones don't fit, the stripe is one list that scrolls.
+        let (size, fits) = stripe_fit(ui, top.len() + bottom.len());
+        if fits {
+            ui.vertical_centered(|ui| {
+                for tw in top {
+                    stripe_button(ui, s, st, tw, size);
                 }
-                // CMake projects get the CMake tool window (track CL).
-                if s.cpp.cmake.is_cmake {
-                    stripe_button(ui, s, st, ToolWindowId::CMake);
-                }
-                // Zig and TypeScript projects get their tool windows (M13 track RC).
-                if is_project_of(ui, s, "zig", codecraft_engine::zig_tool::is_zig_project) {
-                    stripe_button(ui, s, st, ToolWindowId::Zig);
-                }
-                if is_project_of(ui, s, "typescript", codecraft_engine::typescript_tool::is_typescript_project) {
-                    stripe_button(ui, s, st, ToolWindowId::TypeScript);
-                }
+                ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
+                    for tw in bottom {
+                        stripe_button(ui, s, st, tw, size);
+                    }
+                });
             });
-        });
+        } else {
+            ScrollArea::vertical()
+                .id_salt("stripe-left-scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        for tw in top {
+                            stripe_button(ui, s, st, tw, size);
+                        }
+                        ui.separator();
+                        for tw in bottom.into_iter().rev() {
+                            stripe_button(ui, s, st, tw, size);
+                        }
+                    });
+                });
+        }
     });
     egui::Panel::right("stripe-right").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
-        ui.vertical_centered(|ui| {
-            for tw in IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right) {
-                stripe_button(ui, s, st, tw);
-            }
-        });
+        let right: Vec<ToolWindowId> = IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right).collect();
+        let (size, _) = stripe_fit(ui, right.len());
+        ScrollArea::vertical()
+            .id_salt("stripe-right-scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    for tw in right {
+                        stripe_button(ui, s, st, tw, size);
+                    }
+                });
+            });
     });
+}
+
+/// The button size for `count` stripe buttons in the stripe's height, and whether they fit.
+pub(crate) fn stripe_fit(ui: &egui::Ui, count: usize) -> (f32, bool) {
+    let n = count.max(1) as f32;
+    let gap = ui.spacing().item_spacing.y;
+    let room = ui.available_height() - 8.0;
+    let size = (room / n - gap).clamp(STRIPE_BUTTON_MIN, STRIPE_BUTTON);
+    (size, n * (size + gap) <= room)
 }
 
 fn header(ui: &mut egui::Ui, st: &UiState, title: &str) -> bool {
@@ -121,6 +167,43 @@ fn header(ui: &mut egui::Ui, st: &UiState, title: &str) -> bool {
     });
     ui.add_space(2.0);
     hide
+}
+
+/// The right-aligned end of a toolbar row: on this row when `needed` points fit, else on a row
+/// of its own (the row must be `horizontal_wrapped`). A right-to-left group in a full row drew
+/// over the row's buttons and fields at small widths (QA M14: the Debug and Profiler toolbars at
+/// 900 px).
+pub(crate) fn trailing(ui: &mut egui::Ui, needed: f32, add: impl FnOnce(&mut egui::Ui)) {
+    if ui.available_size_before_wrap().x < needed && ui.layout().main_wrap() {
+        ui.end_row();
+    }
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+}
+
+/// Start a new row of a `horizontal_wrapped` toolbar unless `width` points are left on this one.
+/// Combo boxes and fixed-width fields don't wrap by themselves: they ran past the panel's edge
+/// and pushed the rest of the row out of view (QA M14).
+pub(crate) fn room_for(ui: &mut egui::Ui, width: f32) {
+    if ui.available_size_before_wrap().x < width && ui.layout().main_wrap() {
+        ui.end_row();
+    }
+}
+
+/// The width `text` takes in `style` (to decide whether a trailing group fits).
+pub(crate) fn text_width(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let font = style.resolve(ui.style());
+    ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::WHITE).size().x
+}
+
+/// Claim the rest of a tool window panel. egui sizes a panel's frame by its contents (at least
+/// the panel's minimum), and the size is remembered: a tool window with little to show (an
+/// empty Run, "Nothing to debug") shrank to the 80 px minimum and every bottom tool window
+/// opened that small afterwards (QA M14).
+fn fill_panel(ui: &mut egui::Ui) {
+    let rest = ui.available_size_before_wrap();
+    if rest.x > 0.0 && rest.y > 0.0 {
+        ui.allocate_space(rest);
+    }
 }
 
 pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
@@ -148,6 +231,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 s.ws.layout.hide(tw);
             }
             tool_window(ui, s, st, tw);
+            fill_panel(ui);
         });
         if maximized != Some(tw) {
             s.ws.layout.bottom_height = resp.response.rect.height();
@@ -169,6 +253,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 s.ws.layout.hide(tw);
             }
             tool_window(ui, s, st, tw);
+            fill_panel(ui);
         });
         if maximized != Some(tw) {
             s.ws.layout.left_width = resp.response.rect.width();
@@ -190,6 +275,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 s.ws.layout.hide(tw);
             }
             tool_window(ui, s, st, tw);
+            fill_panel(ui);
         });
         if maximized != Some(tw) {
             s.ws.layout.right_width = resp.response.rect.width();

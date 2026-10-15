@@ -98,6 +98,13 @@ pub fn parse(stdout: &str, base: &Path, read: &dyn Fn(&Path) -> Option<String>) 
             ("SyntaxError", None) => ("syntax-error".to_string(), None),
             (k, None) => (k.to_string(), None),
         };
+        // Code behind a `#[cfg]` that is off (`#[cfg(test)] mod tests` in every crate: the
+        // command analyses without `cfg(test)`) is faded in the editor, not a problem (QA M14:
+        // every Rust project reported its test module).
+        if matches!(rule.as_str(), "inactive-code" | "inactive_code") {
+            continuing = false;
+            continue;
+        }
         let mut f = Finding::new(Tool::RustAnalyzer, rule.clone(), severity, path, start);
         f.end = end;
         f.message = c.name("msg").map_or("", |m| m.as_str()).chars().take(MAX_MESSAGE).collect();
@@ -169,5 +176,17 @@ at crate r1, file x.rs: Error Weird( from LineCol { line: 99999999999999999999, 
         assert_eq!(f[4].url.as_deref(), Some("https://rust-analyzer.github.io/book/diagnostics.html#unlinked-file"));
         assert_eq!(f[5].inspection, "syntax-error");
         assert!(parse("", Path::new("/w"), &read).is_empty());
+    }
+
+    /// QA M14: `#[cfg(test)] mod tests` came back as an Info problem in every Rust project.
+    #[test]
+    fn inactive_code_is_not_a_problem() {
+        let out = "at crate shop, file /w/src/lib.rs: WeakWarning Ra(\"inactive-code\", WeakWarning) from LineCol { line: 26, col: 0 } to LineCol { line: 39, col: 1 }: code is inactive due to #[cfg] directives: test is disabled
+at crate shop, file /w/src/lib.rs: WeakWarning Ra(\"inactive_code\", WeakWarning) from LineCol { line: 26, col: 0 } to LineCol { line: 39, col: 1 }: code is inactive
+at crate shop, file /w/src/lib.rs: Warning RustcLint(\"unused_variables\") from LineCol { line: 1, col: 8 } to LineCol { line: 1, col: 9 }: unused variable: `x`
+";
+        let f = parse(out, Path::new("/w"), &|_| None);
+        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|f| &f.inspection).collect::<Vec<_>>());
+        assert_eq!(f[0].inspection, "unused_variables");
     }
 }

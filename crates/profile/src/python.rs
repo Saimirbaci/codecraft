@@ -51,6 +51,11 @@ fn python_frame(name: &str, file: &str, line: u64) -> Frame {
     }
 }
 
+/// The cumulative time a function's calls of others took (recursion excluded).
+fn out_time(f: &Func, index: usize) -> f64 {
+    f.callees.iter().filter(|(c, _, _)| *c != index).map(|(_, _, ct)| ct).sum()
+}
+
 /// A call tree node to expand: (function, weight in seconds, own seconds, parent stack, path).
 type Pending = (usize, f64, f64, Option<u32>, Vec<usize>);
 
@@ -67,8 +72,15 @@ pub fn parse_cprofile(v: &Value) -> Result<Profile, ProfileError> {
         let file = f.get("file").and_then(Value::as_str).unwrap_or("");
         let line = f.get("line").and_then(Value::as_u64).unwrap_or(0);
         let frame = b.frame(python_frame(name, file, line))?;
-        b.add_calls(frame, f.get("calls").and_then(Value::as_u64).unwrap_or(0));
-        funcs.push(Func { frame, tt: num(f.get("tt")), ct: num(f.get("ct")), callees: Vec::new(), has_callers: false });
+        let calls = f.get("calls").and_then(Value::as_u64).unwrap_or(0);
+        b.add_calls(frame, calls);
+        funcs.push(Func {
+            frame,
+            tt: num(f.get("tt")),
+            ct: num(f.get("ct")),
+            callees: Vec::new(),
+            has_callers: false,
+        });
     }
     // Edges: each function lists its callers as [callerIndex, calls, primitiveCalls, tt, ct].
     for (callee, f) in list.iter().take(MAX_FUNCTIONS).enumerate() {
@@ -92,16 +104,38 @@ pub fn parse_cprofile(v: &Value) -> Result<Profile, ProfileError> {
             }
         }
     }
-    let roots: Vec<usize> = (0..funcs.len()).filter(|i| funcs.get(*i).is_some_and(|f| !f.has_callers)).collect();
-    let grand: f64 = roots.iter().filter_map(|r| funcs.get(*r)).map(|f| f.ct).sum();
+    // Roots: functions nobody called. Under `python -m cProfile` the program's top level is
+    // `exec`, which the import machinery calls again for every module (a cycle), so it has
+    // callers and only the profiler's own `disable` looked like a root (QA M14). When the roots
+    // cover less than half of the longest cumulative time, the function with that time (the
+    // outermost call: cProfile's cumulative time counts only primitive calls) is the top.
+    let mut roots: Vec<(usize, f64)> =
+        funcs.iter().enumerate().filter(|(_, f)| !f.has_callers).map(|(i, f)| (i, f.ct)).collect();
+    let covered: f64 = roots.iter().map(|(_, w)| w).sum();
+    let top = funcs
+        .iter()
+        .enumerate()
+        .fold(None::<(usize, f64)>, |best, (i, f)| match best {
+            Some((_, ct)) if ct >= f.ct => best,
+            _ => Some((i, f.ct)),
+        });
+    if let Some((i, ct)) = top
+        && ct > 0.0
+        && covered < ct * 0.5
+        && !roots.iter().any(|(r, _)| *r == i)
+    {
+        roots.push((i, ct));
+    }
+    let grand: f64 = roots.iter().map(|(_, w)| w).sum();
     let thread = b.thread("Main thread")?;
     let cutoff = grand * 1e-5;
     let mut nodes = 0usize;
     // (function, weight in seconds, own seconds, parent stack, path of function indices)
     let mut work: Vec<Pending> = Vec::new();
-    for r in roots.iter().rev() {
+    for (r, w) in roots.iter().rev() {
         if let Some(f) = funcs.get(*r) {
-            work.push((*r, f.ct, f.tt, None, Vec::new()));
+            let own = if f.ct > 0.0 { f.tt * (w / f.ct).min(1.0) } else { f.tt };
+            work.push((*r, *w, own, None, Vec::new()));
         }
     }
     while let Some((fi, weight, own, parent, mut path)) = work.pop() {
@@ -118,7 +152,10 @@ pub fn parse_cprofile(v: &Value) -> Result<Profile, ProfileError> {
         let deep = path.len() >= MAX_DEPTH;
         for (callee, tt, ct) in &f.callees {
             let child_weight = ct * scale;
-            if path.contains(callee) || deep || child_weight < cutoff {
+            // cProfile can record a tiny cumulative time for a frame whose callees took long
+            // (`<string>` → `run_module` under `-m`): keep it when what it calls is not small.
+            let reach = funcs.get(*callee).map_or(0.0, |c| out_time(c, *callee) * scale);
+            if path.contains(callee) || deep || (child_weight < cutoff && reach < cutoff) {
                 // Recursion, too deep or too small: keep its time here.
                 if !path.contains(callee) {
                     own += child_weight;
@@ -226,6 +263,62 @@ mod tests {
         assert_eq!(p.calls_of(get("leaf").frame), Some(5));
         assert_eq!(p.frame(get("work").frame).unwrap().location().as_deref(), Some("app.py:20"));
         assert!(!p.notes.is_empty());
+    }
+
+    /// `python -m cProfile -o out main.py`: the top level is `exec`, which the import machinery
+    /// calls again for each module imported, so every function has a caller (a cycle) and only
+    /// the profiler's own `disable` looked like a root (QA M14: the report showed nothing else).
+    #[test]
+    fn cprofile_top_level_exec_in_an_import_cycle() {
+        let doc = json!({
+            "codecraft": "cprofile", "totalTime": 0.088,
+            "functions": [
+                { "name": "<built-in method builtins.exec>", "file": "~", "line": 0, "calls": 3, "primcalls": 1,
+                  "tt": 0.000002, "ct": 0.088, "callers": [[3, 2, 2, 0.000001, 0.000002]] },
+                { "name": "<module>", "file": "main.py", "line": 1, "calls": 1, "tt": 0.000008, "ct": 0.088,
+                  "callers": [[0, 1, 1, 0.000008, 0.088]] },
+                { "name": "slow_primes", "file": "core.py", "line": 15, "calls": 1, "tt": 0.087, "ct": 0.087,
+                  "callers": [[1, 1, 1, 0.087, 0.087]] },
+                { "name": "_call_with_frames_removed", "file": "<frozen importlib._bootstrap>", "line": 241, "calls": 2,
+                  "tt": 0.000001, "ct": 0.000003, "callers": [[1, 2, 2, 0.000001, 0.000003]] },
+                { "name": "<method 'disable' of '_lsprof.Profiler' objects>", "file": "~", "line": 0, "calls": 1,
+                  "tt": 0.0000005, "ct": 0.0000005, "callers": [] }
+            ]
+        });
+        let p = parse_cprofile(&doc).unwrap();
+        let a = crate::Analysis::new(&p, None);
+        let get = |n: &str| a.methods.iter().find(|m| p.frame(m.frame).unwrap().name == n).copied().unwrap();
+        let slow = get("slow_primes");
+        assert!(slow.self_weight > p.total() * 9 / 10, "{} of {}", slow.self_weight, p.total());
+        assert!(get("<module>").total > p.total() * 9 / 10);
+
+        // `python -m cProfile -m pytest`: exec → <string> → run_module → _run_code → exec (the
+        // edges' cumulative times exceed exec's own, as cProfile records them for recursion).
+        let doc = json!({
+            "codecraft": "cprofile", "totalTime": 0.316,
+            "functions": [
+                { "name": "<built-in method builtins.exec>", "file": "~", "line": 0, "calls": 27, "primcalls": 1,
+                  "tt": 0.0002, "ct": 0.316, "callers": [[3, 1, 1, 0.000003, 0.222], [4, 25, 25, 0.0002, 0.151]] },
+                { "name": "<module>", "file": "<string>", "line": 1, "calls": 1, "tt": 0.0, "ct": 0.0000002,
+                  "callers": [[0, 1, 1, 0.0000002, 0.0000002]] },
+                { "name": "run_module", "file": "runpy.py", "line": 199, "calls": 1, "tt": 0.000002, "ct": 0.3165,
+                  "callers": [[1, 1, 1, 0.000002, 0.3165]] },
+                { "name": "_run_code", "file": "runpy.py", "line": 86, "calls": 1, "tt": 0.000002, "ct": 0.2225,
+                  "callers": [[2, 1, 1, 0.000002, 0.2225]] },
+                { "name": "_call_with_frames_removed", "file": "<frozen importlib._bootstrap>", "line": 241, "calls": 25,
+                  "tt": 0.00002, "ct": 0.151, "callers": [[2, 25, 25, 0.00002, 0.151]] },
+                { "name": "<method 'disable' of '_lsprof.Profiler' objects>", "file": "~", "line": 0, "calls": 1,
+                  "tt": 0.0000001, "ct": 0.0000001, "callers": [] },
+                { "name": "<module>", "file": "pytest/__main__.py", "line": 1, "calls": 1, "tt": 0.00001, "ct": 0.2225,
+                  "callers": [[0, 1, 1, 0.00001, 0.2225]] },
+                { "name": "run_tests", "file": "pytest/main.py", "line": 10, "calls": 1, "tt": 0.2, "ct": 0.2,
+                  "callers": [[6, 1, 1, 0.2, 0.2]] }
+            ]
+        });
+        let p = parse_cprofile(&doc).unwrap();
+        let a = crate::Analysis::new(&p, None);
+        let hottest = a.methods.iter().max_by_key(|m| m.self_weight).unwrap();
+        assert_eq!(p.frame(hottest.frame).unwrap().name, "run_tests", "the program is under the top-level exec");
     }
 
     #[test]

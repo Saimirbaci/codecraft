@@ -1000,3 +1000,34 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `pytest` command); py-spy, heaptrack and perf were exercised only through fakes (py-spy
     needs root on macOS; heaptrack and perf are Linux-only); the memray test doesn't run by
     default; no Docker/SSH targets.
+
+56. QA hands-on pass (track QA, `docs/qa-m14.md`): every tool window, the main dialogs and the
+    M14 settings pages painted at 1280×800 and 900×700 in both themes with realistic content
+    (`ui-egui/tests/qa_gallery_ui.rs`, PNGs with `CODECRAFT_QA_RENDER_DIR`), and the daily flows
+    walked on Rust, CMake C++, Python and SQLite sample projects with the real tools, as a person
+    and as an agent over `codecraft-cli mcp` (`apps/codecraft-cli/tests/agent_workflows.rs`).
+    Fixed: cProfile profiles of programs that import anything showed only the profiler's own
+    `disable` (the top-level `exec` sits in an import cycle); the test at a line in `src/lib.rs`
+    ran and debugged as `--bin` when the package has `src/main.rs`; Rust v0-mangled names in
+    native profiles (a demangler in `crates/profile`); agent tools racing the project load;
+    `profile_hotspots` failing while a Cargo/CMake target built, answering from older snapshots
+    and saying nothing about failed profiles; CMake configurations listed twice with "CMake:
+    Build" selected (Debug refused, Profile profiled the build); bottom tool windows shrinking to
+    80 px for good after being shown empty; SQLite files unusable by agents without a data source
+    (`db_sources` lists them, `db_query` takes a path, adding a data source needs `write` not
+    `db-write`); SQL errors returned as empty successes; `problems` ignoring the last analysis;
+    `profile_start` limited to configurations (now `command`, `kind`, `tool`, `seconds`);
+    project hotspots hidden under library frames (`inProject`, `projectHotspots`); CMake build
+    directories and other build output inside Inspect Code scopes; rust-analyzer's inactive
+    `cfg(test)` code reported as a problem; overlapping left-stripe buttons in a 700 px window;
+    the Debug and Profiler toolbars overflowing at 900 px; the Agent Access page's squeezed
+    labels; 500-character C++ frame names in stop summaries; the engine's panic hunt running
+    `pip install y` against the machine's Python and asking PyPI for outdated packages (it now
+    skips `python.packages.*`). Remaining (Low): the Python Console's Stop waits for the process
+    on the UI thread (seconds in the panic hunt); cargo-deny's
+    network fetch in the default Rust profile, LLDB's "no plugin for rust" line in Rust debug
+    output, C++ reference locals showing addresses, the JUnit temp path in `test_run`'s command
+    line and `command_line` in `inspect`'s tool list, hotspot order following the IDE's method
+    sort, no interpreter picker on Settings › Python, absolute test locations in the Run window;
+    the gallery leaves out the Terminal, Python Console, Rust REPL, a Git repository and remote
+    windows.

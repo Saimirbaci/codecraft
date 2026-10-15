@@ -186,6 +186,8 @@ enum Wait {
     },
     Profile {
         limit: usize,
+        /// The newest profile's snapshot was opened (it was not the one shown).
+        reopened: bool,
     },
     RunDone {
         args: Value,
@@ -195,6 +197,14 @@ enum Wait {
         before: Vec<u64>,
         output_before: usize,
         limit: usize,
+        /// A SQLite file this call added as a data source.
+        added: Option<Value>,
+    },
+    /// The project to finish loading (scan, Cargo metadata), then run the tool: its run
+    /// configurations and targets are not known before.
+    ProjectLoad {
+        tool: String,
+        args: Value,
     },
 }
 
@@ -255,8 +265,15 @@ const READ_COMMANDS: &[&str] = &[
     "analysis.problems",
     "commands.search",
     "coverage.summary",
+    "db.connect",
+    "db.disconnect",
+    "db.expand",
+    "db.getHistory",
     "db.getResult",
     "db.listDataSources",
+    "db.refresh",
+    "db.rowCount",
+    "db.testConnection",
     "debug.state",
     "debug.stopSummary",
     "debug.agentSummary",
@@ -284,8 +301,17 @@ const READ_COMMANDS: &[&str] = &[
 ];
 
 /// Commands in run-like namespaces that change files.
-const WRITE_COMMANDS: &[&str] =
-    &["inspections.fix", "inspections.fixAll", "inspections.suppress", "test.export", "test.clearHistory"];
+/// Adding or editing a data source changes the project's settings, not a database (QA M14: it
+/// needed `db-write`).
+const WRITE_COMMANDS: &[&str] = &[
+    "inspections.fix",
+    "inspections.fixAll",
+    "inspections.suppress",
+    "test.export",
+    "test.clearHistory",
+    "db.addDataSource",
+    "db.editDataSource",
+];
 
 /// Commands that act outside this machine or can't be taken back: publishing code (push, GitHub
 /// and GitLab sharing, gists, pull requests, fork sync), changing deployed servers, pruning
@@ -365,8 +391,78 @@ pub fn command_capability(id: &str) -> Option<Capability> {
     Some(Capability::Write)
 }
 
-/// The data source an agent named (by id or name).
+/// File extensions of SQLite databases (an empty file with one of these is a new database).
+const SQLITE_EXTENSIONS: &[&str] = &["db", "sqlite", "sqlite3", "db3"];
+
+/// Whether `path` is a SQLite database: the file header, or an empty file named like one.
+pub(crate) fn is_sqlite_file(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    if !meta.is_file() {
+        return false;
+    }
+    if meta.len() == 0 {
+        let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+        return SQLITE_EXTENSIONS.contains(&ext.as_str());
+    }
+    let mut head = [0u8; 16];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"SQLite format 3\0"
+}
+
+/// A SQLite file an agent named as `dataSource` that no data source points at yet (QA M14:
+/// "what's in this table" on a project's `.db` file needed the agent to find `db.addDataSource`).
+fn unconfigured_sqlite(s: &Session, wanted: &str) -> Option<std::path::PathBuf> {
+    let path = crate::ide_server::resolve_path(s, wanted)?;
+    // Only the project's own files; other databases are added by the user.
+    let inside = s.project_root().is_some_and(|root| path.starts_with(&root));
+    if !inside || !is_sqlite_file(&path) {
+        return None;
+    }
+    let known = source_for_file(s, &path).is_some();
+    (!known).then_some(path)
+}
+
+/// A data source's file path as an absolute path (data sources keep project files relative).
+fn source_path(s: &Session, p: &Path) -> std::path::PathBuf {
+    match s.db.project_root() {
+        Some(root) if p.is_relative() => crate::normalize_path(&root.join(p)),
+        _ => crate::normalize_path(p),
+    }
+}
+
+/// The data source pointing at a SQLite file (by path).
+fn source_for_file(s: &Session, path: &Path) -> Option<String> {
+    s.db.sources
+        .iter()
+        .find(|d| d.config.path.as_ref().is_some_and(|p| source_path(s, p) == path))
+        .map(|d| d.config.id.clone())
+}
+
+/// SQLite files in the project that no data source points at (at most `max`).
+fn sqlite_candidates(s: &Session, max: usize) -> Vec<std::path::PathBuf> {
+    let Some(project) = s.ws.project.as_ref() else { return Vec::new() };
+    project
+        .tree
+        .files()
+        .filter(|n| {
+            n.path.extension().and_then(|e| e.to_str()).is_some_and(|e| SQLITE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+        })
+        .map(|n| n.path.clone())
+        .filter(|p| is_sqlite_file(p) && source_for_file(s, p).is_none())
+        .take(max)
+        .collect()
+}
+
+/// The data source an agent named (by id or name, or a SQLite file a data source points at).
 fn find_source(s: &Session, wanted: &str) -> Option<String> {
+    if let Some(id) = find_source_by_name(s, wanted) {
+        return Some(id);
+    }
+    let path = crate::ide_server::resolve_path(s, wanted)?;
+    source_for_file(s, &path)
+}
+
+fn find_source_by_name(s: &Session, wanted: &str) -> Option<String> {
     let w = wanted.trim();
     s.db.sources
         .iter()
@@ -381,7 +477,10 @@ fn find_source(s: &Session, wanted: &str) -> Option<String> {
 /// `PRAGMA` without `=`) and calls no function known to change state; session changes (`SET`,
 /// `BEGIN`, `PREPARE`, …) need db-write too.
 fn sql_writes(s: &Session, source: &str, sql: &str) -> bool {
-    let dialect = s.db.dialect_for(None, Some(source));
+    sql_writes_in(s.db.dialect_for(None, Some(source)), sql)
+}
+
+fn sql_writes_in(dialect: codecraft_db::Dialect, sql: &str) -> bool {
     codecraft_db::split_statements(sql, dialect)
         .iter()
         .any(|st| codecraft_db::is_modifying(&st.text, dialect) || !agent_reads_only(&st.text, dialect))
@@ -521,10 +620,19 @@ fn required_capability(s: &Session, name: &str, args: &Value) -> Result<Capabili
         }
         t::DB_QUERY => {
             let sql = args.get("sql").and_then(Value::as_str).unwrap_or_default();
-            let source = args.get("dataSource").and_then(Value::as_str).and_then(|d| find_source(s, d));
-            match source {
+            let wanted = args.get("dataSource").and_then(Value::as_str).unwrap_or_default();
+            match find_source(s, wanted) {
                 Some(src) if sql_writes(s, &src, sql) => Capability::DbWrite,
-                _ => Capability::Read,
+                Some(_) => Capability::Read,
+                // A SQLite file becomes a data source first: that changes the project's settings.
+                None if unconfigured_sqlite(s, wanted).is_some() => {
+                    if sql_writes_in(codecraft_db::DbKind::Sqlite.dialect(), sql) {
+                        Capability::DbWrite
+                    } else {
+                        Capability::Write
+                    }
+                }
+                None => Capability::Read,
             }
         }
         _ => static_capability(name).ok_or_else(|| format!("unknown tool `{name}`"))?,
@@ -593,7 +701,28 @@ pub fn submit(s: &mut Session, caller: Caller, name: &str, args: Value, respond:
     }
 }
 
+/// Tools that need the project's run configurations, targets or files (QA M14: right after
+/// `codecraft-cli mcp` started, `run_configurations` answered `[]` while Cargo metadata loaded).
+const NEED_LOADED_PROJECT: &[&str] = &[
+    t::PROJECT_INFO,
+    t::RUN_CONFIGURATIONS,
+    t::DEBUG_START,
+    t::PROFILE_START,
+    t::TEST_RUN,
+    t::RUN_START,
+    t::INSPECT,
+    t::DB_SOURCES,
+    t::DB_QUERY,
+];
+
+/// How long a call waits for the project to load.
+const PROJECT_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
 fn start(s: &mut Session, caller: Caller, name: &str, args: Value, respond: Respond) {
+    if s.project_loading() && NEED_LOADED_PROJECT.contains(&name) {
+        let wait = Wait::ProjectLoad { tool: name.to_string(), args };
+        return settle_step(s, caller, name.to_string(), Step::Wait(wait, PROJECT_LOAD_TIMEOUT), respond);
+    }
     let step = run_tool(s, &caller, name, &args);
     settle_step(s, caller, name.to_string(), step, respond);
 }
@@ -687,6 +816,9 @@ fn on_timeout(s: &mut Session, name: &str, wait: &Wait) -> ToolResult {
                 Err(e) => ToolResult::error(e.to_string()),
             }
         }
+        Wait::ProjectLoad { .. } => ToolResult::error(format!(
+            "{name}: the project is still loading (scanning files, reading Cargo metadata); try again in a moment"
+        )),
         _ => ToolResult::error(format!("{name}: timed out; the IDE is still working on it, try again later")),
     }
 }
@@ -694,6 +826,13 @@ fn on_timeout(s: &mut Session, name: &str, wait: &Wait) -> ToolResult {
 /// `Some` once the wait is over.
 fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
     match wait {
+        Wait::ProjectLoad { tool, args } => {
+            if s.project_loading() {
+                return None;
+            }
+            let (tool, args) = (tool.clone(), args.clone());
+            Some(run_tool(s, caller, &tool, &args))
+        }
         Wait::Approval { rx, cap, tool, args, .. } => match rx.try_recv() {
             Ok(Decision::Allow) => Some(run_tool(s, caller, tool, args)),
             Ok(Decision::AllowAlways) => {
@@ -823,9 +962,41 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 None => None,
             }
         }
-        Wait::Profile { limit } => {
-            if !s.profiler.recordings.is_empty() || s.profiler.loading.is_some() {
+        Wait::Profile { limit, reopened } => {
+            use crate::profiler::JobState;
+            // A profile still building its target (Cargo, CMake), recording or loading (QA M14:
+            // profile_hotspots right after profile_start of a Cargo target said "no snapshot").
+            let busy = !s.profiler.recordings.is_empty()
+                || s.profiler.loading.is_some()
+                || s.profiler
+                    .jobs
+                    .iter()
+                    .any(|j| matches!(j.state, JobState::Building | JobState::Recording | JobState::Loading));
+            if busy {
                 return None;
+            }
+            // The newest profile failed (the build broke, the profiler is missing…): say why
+            // instead of answering from an older snapshot.
+            if let Some(j) = s.profiler.jobs.iter().max_by_key(|j| j.id).filter(|j| j.state == JobState::Failed) {
+                let why = j.error.clone().unwrap_or_else(|| "the profiler stopped without a snapshot".into());
+                let mut msg = format!("profiling `{}` failed: {why}", j.title);
+                if let Some(tab) = j.tab {
+                    msg.push_str(&format!(" (the output: run_output {{\"tab\": {}}})", tab.0));
+                }
+                return Some(done_err(msg));
+            }
+            // Profiles that ended out of order leave an older snapshot open: answer for the
+            // newest one.
+            let newest = s.profiler.jobs.iter().max_by_key(|j| j.id).and_then(|j| j.snapshot.clone());
+            let shown = s.profiler.snapshot.as_ref().map(|snap| snap.path.clone());
+            if !*reopened
+                && let Some(path) = newest
+                && shown.as_ref() != Some(&path)
+            {
+                *reopened = true;
+                if s.execute("run.openProfilerSnapshot", &json!({ "path": path })).is_ok() {
+                    return None;
+                }
             }
             Some(match s.execute("profiler.hotspots", &json!({ "limit": limit })) {
                 Ok(mut v) => {
@@ -860,11 +1031,11 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 Err(e) => cmd_err(e),
             })
         }
-        Wait::Db { source, before, output_before, limit } => {
+        Wait::Db { source, before, output_before, limit, added } => {
             if s.db.confirm.is_some() || s.db.running() {
                 return None;
             }
-            Some(db_outcome(s, source, before, *output_before, *limit))
+            Some(db_outcome(s, source, before, *output_before, *limit, added.take()))
         }
     }
 }
@@ -899,7 +1070,16 @@ fn config_index(s: &Session, config: &Value) -> Result<usize, String> {
             .iter()
             .position(|c| c.name == *name)
             .or_else(|| s.run_configs.iter().position(|c| c.name.eq_ignore_ascii_case(name)))
-            .ok_or_else(|| format!("no run configuration named `{name}`; have: {}", names())),
+            .ok_or_else(|| {
+                if s.run_configs.is_empty() {
+                    format!(
+                        "no run configuration named `{name}`: the project has none (debug_start takes `file` or \
+                         `program`, profile_start `command`)"
+                    )
+                } else {
+                    format!("no run configuration named `{name}`; have: {}", names())
+                }
+            }),
         _ => Err("`config` must be a configuration name or index".into()),
     }
 }
@@ -970,13 +1150,28 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
         t::DEBUG_EVALUATE => debug_evaluate(s, args),
         t::PROFILE_START => {
             let mut p = json!({});
+            let command = args.get("command").filter(|c| !c.is_null());
             if let Some(c) = args.get("config") {
                 match config_index(s, c) {
                     Ok(i) => p = json!({ "config": i }),
                     Err(e) => return done_err(e),
                 }
+            } else if let Some(c) = command {
+                p = json!({ "command": c });
+            } else if s.run_configs.is_empty() {
+                return done_err(
+                    "the project has no run configurations; pass `command` (e.g. \"python3 main.py\", \"cargo run --release\", \"./build/app\")",
+                );
             }
-            match s.execute("run.profile", &p) {
+            if let Some(o) = p.as_object_mut() {
+                for key in ["kind", "tool", "seconds"] {
+                    if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
+                        o.insert(key.into(), v.clone());
+                    }
+                }
+            }
+            let id = if command.is_some() && args.get("config").is_none() { "profiler.record" } else { "run.profile" };
+            match s.execute(id, &p) {
                 Ok(mut v) => {
                     if let Some(o) = v.as_object_mut() {
                         o.insert(
@@ -996,11 +1191,11 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
             {
                 return step;
             }
-            Step::Wait(Wait::Profile { limit }, timeout_arg(args, 120_000))
+            Step::Wait(Wait::Profile { limit, reopened: false }, timeout_arg(args, 120_000))
         }
         t::PROFILE_HOTSPOTS => {
             let limit = usize_arg(args, "limit", 20, 200);
-            Step::Wait(Wait::Profile { limit }, timeout_arg(args, 120_000))
+            Step::Wait(Wait::Profile { limit, reopened: false }, timeout_arg(args, 120_000))
         }
         t::TEST_RUN => test_run(s, args),
         t::TEST_RESULTS => exec_done(s, "test.summary", args.clone()),
@@ -1028,7 +1223,21 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
         },
         t::RUN_STOP => exec_done(s, "run.stopTab", args.clone()),
         t::DB_SOURCES => match s.execute("db.listDataSources", &Value::Null) {
-            Ok(v) => done_json(v.get("dataSources").cloned().unwrap_or(json!([]))),
+            Ok(v) => {
+                let mut list = match v.get("dataSources") {
+                    Some(Value::Array(a)) => a.clone(),
+                    _ => Vec::new(),
+                };
+                // SQLite files no data source points at yet: db_query takes their path.
+                for path in sqlite_candidates(s, 20) {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    list.push(json!({
+                        "id": null, "name": name, "kind": "sqlite", "path": path, "status": "not added",
+                        "hint": "a SQLite file in the project: pass its path as db_query's `dataSource` (adds it as a data source)",
+                    }));
+                }
+                done_json(Value::Array(list))
+            }
             Err(e) => cmd_err(e),
         },
         t::DB_QUERY => db_query(s, args),
@@ -1420,7 +1629,7 @@ fn stack_json(s: &Session, limit: usize) -> Value {
         .map(|(i, f)| {
             let mut o = Map::new();
             o.insert("index".into(), json!(i));
-            o.insert("name".into(), json!(f.name));
+            o.insert("name".into(), json!(crate::agent_tools_cmds::short_frame_name(&f.name)));
             if let Some(p) = &f.path {
                 o.insert("file".into(), json!(p));
                 o.insert("line".into(), json!(f.line + 1));
@@ -1547,13 +1756,47 @@ fn test_run(s: &mut Session, args: &Value) -> Step {
 
 fn db_query(s: &mut Session, args: &Value) -> Step {
     let wanted = args.get("dataSource").and_then(Value::as_str).unwrap_or_default();
-    let _ = s.execute("db.listDataSources", &Value::Null);
-    let Some(source) = find_source(s, wanted) else {
-        let have: Vec<String> = s.db.sources.iter().map(|d| format!("{} ({})", d.config.name, d.config.id)).collect();
-        return done_err(format!("no data source `{wanted}`; have: {}", have.join(", ")));
-    };
     let Some(sql) = args.get("sql").and_then(Value::as_str).filter(|q| !q.trim().is_empty()) else {
         return done_err("`sql` is required");
+    };
+    let _ = s.execute("db.listDataSources", &Value::Null);
+    let mut added = None;
+    let source = match find_source(s, wanted) {
+        Some(source) => source,
+        None => match unconfigured_sqlite(s, wanted) {
+            // Like dropping a .db file on DataGrip's Database tool window: add it, then query.
+            Some(path) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| wanted.to_string());
+                let v = match s.execute("db.addDataSource", &json!({ "kind": "sqlite", "name": name, "path": path })) {
+                    Ok(v) => v,
+                    Err(e) => return cmd_err(e),
+                };
+                let Some(id) = v.get("dataSource").and_then(Value::as_str).map(str::to_string) else {
+                    return done_err(format!("could not add {} as a data source", path.display()));
+                };
+                added = Some(json!({ "id": id, "name": name, "path": path }));
+                id
+            }
+            None => {
+                let have: Vec<String> =
+                    s.db.sources.iter().map(|d| format!("{} ({})", d.config.name, d.config.id)).collect();
+                let files: Vec<String> = sqlite_candidates(s, 5).iter().map(|p| p.display().to_string()).collect();
+                let mut msg = if have.is_empty() {
+                    format!("no data source `{wanted}`: the project has no data sources")
+                } else {
+                    format!("no data source `{wanted}`; have: {}", have.join(", "))
+                };
+                if !files.is_empty() {
+                    msg.push_str(&format!(". SQLite files in the project (pass one as `dataSource`): {}", files.join(", ")));
+                } else if have.is_empty() {
+                    msg.push_str(
+                        ". Pass a SQLite file's path as `dataSource`, or add a server with codecraft_execute \
+                         db.addDataSource {kind, name, host, port, database, user}",
+                    );
+                }
+                return done_err(msg);
+            }
+        },
     };
     let limit = usize_arg(args, "limit", 200, 5000);
     let before: Vec<u64> = s.db.results.iter().map(|r| r.id).collect();
@@ -1576,10 +1819,10 @@ fn db_query(s: &mut Session, args: &Value) -> Step {
     if v.is_null() {
         return done_err("nothing to execute");
     }
-    Step::Wait(Wait::Db { source, before, output_before, limit }, timeout_arg(args, 60_000))
+    Step::Wait(Wait::Db { source, before, output_before, limit, added }, timeout_arg(args, 60_000))
 }
 
-fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usize, limit: usize) -> Step {
+fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usize, limit: usize, added: Option<Value>) -> Step {
     let owner = format!("query:{source}");
     let new_ids: Vec<u64> =
         s.db.results.iter().filter(|r| r.owner == owner && !before.contains(&r.id)).map(|r| r.id).collect();
@@ -1602,7 +1845,33 @@ fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usiz
     if results.is_empty() && output.is_empty() {
         return done_err("the query was not run (cancelled by the user, or nothing to execute)");
     }
-    done_json(json!({ "dataSource": source, "results": results, "output": output }))
+    // The database's errors (QA M14: `no such table` came back as an empty success).
+    let errors: Vec<String> = s
+        .db
+        .output
+        .iter()
+        .skip(output_before)
+        .filter(|l| l.level == crate::database::OutputLevel::Error)
+        .map(|l| l.text.clone())
+        .take(10)
+        .collect();
+    if results.is_empty() && !errors.is_empty() {
+        return done_err(format!("the database refused the SQL: {}", errors.join("; ")));
+    }
+    let mut v = json!({ "dataSource": source, "results": results, "output": output });
+    if !errors.is_empty()
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("errors".into(), json!(errors));
+    }
+    if let (Some(a), Some(o)) = (added, v.as_object_mut()) {
+        o.insert("added".into(), a);
+        o.insert(
+            "note".into(),
+            json!(format!("the SQLite file is now data source `{source}` (Database tool window); use that id next time")),
+        );
+    }
+    done_json(v)
 }
 
 // ---------------------------------------------------------------- helpers for embedders
@@ -1686,5 +1955,33 @@ mod tests {
         }
         assert_eq!(command_capability("git.gitHub.shareProjectOnGitHub"), None);
         assert_eq!(command_capability("tools.deployment.uploadToDefaultServer"), None);
+    }
+
+    /// QA M14: adding a data source needed `db-write`, and reading the query history too.
+    #[test]
+    fn data_source_settings_and_metadata_are_not_database_writes() {
+        assert_eq!(command_capability("db.addDataSource"), Some(Capability::Write));
+        assert_eq!(command_capability("db.editDataSource"), Some(Capability::Write));
+        for id in ["db.getHistory", "db.connect", "db.refresh", "db.rowCount", "db.listDataSources"] {
+            assert_eq!(command_capability(id), Some(Capability::Read), "{id}");
+        }
+        assert_eq!(command_capability("db.commit"), Some(Capability::DbWrite));
+        assert_eq!(command_capability("db.removeDataSource"), Some(Capability::DbWrite));
+    }
+
+    #[test]
+    fn sqlite_files_are_recognised_by_their_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("x.data");
+        std::fs::write(&db, b"SQLite format 3\0rest of the page").unwrap();
+        assert!(is_sqlite_file(&db), "the header, whatever the name");
+        let empty = dir.path().join("new.sqlite");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(is_sqlite_file(&empty), "an empty file named like a database");
+        let text = dir.path().join("notes.db");
+        std::fs::write(&text, b"not a database at all").unwrap();
+        assert!(!is_sqlite_file(&text));
+        assert!(!is_sqlite_file(dir.path()), "a directory");
+        assert!(!is_sqlite_file(&dir.path().join("missing.db")));
     }
 }

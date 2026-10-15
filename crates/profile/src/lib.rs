@@ -12,6 +12,7 @@
 mod analysis;
 pub mod callgraph;
 pub mod collapsed;
+pub mod demangle;
 pub mod gecko;
 mod model;
 pub mod perf;

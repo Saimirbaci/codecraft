@@ -11,6 +11,9 @@ use codecraft_engine::agent_access::{Capability, Level};
 use crate::UiState;
 use crate::settings_ui::Cmds;
 
+/// Width of the Off / Ask / Allow buttons.
+const CONTROLS_W: f32 = 170.0;
+
 pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut Cmds) {
     let theme = &st.theme;
     ui.label(
@@ -22,9 +25,14 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
     );
     ui.add_space(8.0);
     let policy = s.agent_access.to_json();
-    egui::Grid::new("agent-access-grid").num_columns(2).spacing([18.0, 10.0]).striped(false).show(ui, |ui| {
-        for cap in Capability::ALL {
+    // One row per capability: the text takes the width the Off/Ask/Allow buttons leave (a grid
+    // sized its first column from the previous frame and squeezed the labels to a word per line
+    // in a 900 px window; QA M14).
+    for cap in Capability::ALL {
+        ui.horizontal(|ui| {
+            let text_w = (ui.available_width() - CONTROLS_W - 12.0).max(160.0);
             ui.vertical(|ui| {
+                ui.set_width(text_w);
                 ui.label(cap.label());
                 ui.label(RichText::new(cap.description()).small().color(theme.text_muted));
             });
@@ -42,9 +50,9 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
                     }
                 }
             });
-            ui.end_row();
-        }
-    });
+        });
+        ui.add_space(8.0);
+    }
     ui.add_space(10.0);
     let approvals = policy["sessionApprovals"].as_array().cloned().unwrap_or_default();
     if approvals.is_empty() {

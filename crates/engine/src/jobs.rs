@@ -40,6 +40,12 @@ const TASK_PROJECT: &str = "project-load";
 const TASK_FIND: &str = "find-in-files";
 
 impl Session {
+    /// The project is still being scanned (or its Cargo metadata read): its run configurations
+    /// and Cargo targets are not known yet.
+    pub fn project_loading(&self) -> bool {
+        self.jobs.project.is_some()
+    }
+
     /// Open a directory as the project: scan it and read Cargo metadata in the background,
     /// then start rust-analyzer.
     pub fn open_project(&mut self, root: &Path) {
@@ -215,6 +221,11 @@ fn on_project_loaded(s: &mut Session, load: ProjectLoad) {
         }
     }
     let mut start_lsp = false;
+    // Derived configurations are rebuilt from scratch here (QA M14: when the CMake model was
+    // read before the scan finished, `cmake_cmds::refresh_run_configs` had already set them and
+    // "CMake: Build" and "Run app" were listed twice).
+    s.run_configs = Vec::new();
+    s.selected_run_config = 0;
     match load.cargo {
         Some(Ok(meta)) => {
             s.run_configs = crate::runs::derive_configs(&meta);
@@ -243,6 +254,14 @@ fn on_project_loaded(s: &mut Session, load: ProjectLoad) {
     s.run_configs.extend(crate::run_configs::derive_polyglot(&load.root));
     // User configurations (Run › Edit Configurations…) come first.
     crate::run_config_store::project_loaded(s, &load.root);
+    // Like CLion, a CMake project starts with its executable selected, not the build-only
+    // configuration (QA M14: Debug and Profile of the default configuration ran `cmake --build`).
+    let build_only = |c: &crate::RunConfig| c.command.as_ref().is_some_and(|cmd| cmd.build);
+    if s.run_configs.get(s.selected_run_config).is_some_and(build_only)
+        && let Some(i) = s.run_configs.iter().position(|c| !build_only(c) && c.name.starts_with("Run "))
+    {
+        s.selected_run_config = i;
+    }
     s.status = format!("Opened {}", load.root.display());
     if start_lsp {
         s.start_lsp(&load.root);
