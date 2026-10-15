@@ -158,7 +158,7 @@ fn block_of(s: &Session, editor: EditorId) -> Option<ColumnBlock> {
     let b = s.editing.block.filter(|b| b.editor == editor)?;
     let e = s.ws.editor(editor)?;
     let d = s.ws.doc(e.doc)?;
-    let tab = s.ws.settings.tab_size.max(1);
+    let tab = s.tab_width_of(e.doc);
     (b.revision == d.doc.revision() && box_selection(&d.doc, b.anchor, b.head, tab) == e.selections).then_some(b)
 }
 
@@ -180,7 +180,7 @@ impl Session {
 /// them with spaces first, so it lands in a straight column. `None` = ordinary typing applies.
 pub(crate) fn type_in_virtual_box(s: &mut Session, text: &str) -> Option<CmdResult> {
     let block = current_block(s)?;
-    let tab = s.ws.settings.tab_size.max(1);
+    let tab = s.active_tab_width();
     let (_, d) = s.ws.active()?;
     let (edit, column) = type_in_box(&d.doc, block.anchor, block.head, tab, text)?;
     if let Err(e) = s.edit_active(EditGroup::Typing, move |_, _, _| edit) {

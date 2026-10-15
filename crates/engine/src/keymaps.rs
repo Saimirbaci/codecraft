@@ -3,45 +3,114 @@
 //! `macOS` is RustRover's macOS keymap: each command's own shortcut, else the observed catalog
 //! shortcut. `Windows/Linux` is RustRover's default (Ctrl-based) keymap: the bindings JetBrains
 //! documents publicly for Windows/Linux where they differ from macOS, and `Cmd` → `Ctrl` for the
-//! rest. User overrides (per keymap, per command) live in [`Settings::keymap_overrides`] and
-//! replace a command's whole shortcut list.
+//! rest. `VS Code (macOS)`, `VS Code` and `Emacs` come from those editors' public
+//! default-keybinding references (`settings/keymap_tables.rs`, `docs/keymaps.md`): their own
+//! bindings for the actions CodeCraft has, and their parent keymap's for the rest minus the keys
+//! they take. User keymaps ([`Settings::user_keymaps`], Settings › Keymap › Duplicate) inherit
+//! their parent's shortcuts, the parent's overrides included. User overrides (per keymap, per
+//! command) live in [`Settings::keymap_overrides`] and replace a command's whole shortcut list.
 //!
 //! Shortcuts are text in RustRover's notation (`Shift+Cmd+F`, `Ctrl+Alt+L`, `F2`, `Shift Shift`
-//! for a double press); [`normalize`] canonicalises them (modifiers in the order Ctrl, Alt,
-//! Shift, Cmd), so equal shortcuts compare equal.
+//! for a double press, `Cmd+K Cmd+C` for a two-stroke chord); [`normalize`] canonicalises them
+//! (modifiers in the order Ctrl, Alt, Shift, Cmd), so equal shortcuts compare equal.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::OnceLock;
 
-use codecraft_workspace::Settings;
+use codecraft_workspace::{Settings, UserKeymap};
 
 use crate::commands::{Context, registry};
+use crate::settings::keymap_tables;
 
 pub const MACOS: &str = "macOS";
 pub const WINDOWS_LINUX: &str = "Windows/Linux";
+pub const VSCODE_MAC: &str = "VS Code (macOS)";
+pub const VSCODE: &str = "VS Code";
+pub const EMACS: &str = "Emacs";
 /// Every built-in keymap.
-pub const NAMES: [&str; 2] = [MACOS, WINDOWS_LINUX];
+pub const NAMES: [&str; 5] = [MACOS, WINDOWS_LINUX, VSCODE_MAC, VSCODE, EMACS];
 /// The double-Shift gesture (Search Everywhere).
 pub const DOUBLE_SHIFT: &str = "Shift Shift";
+/// Longest parent chain followed (user keymaps are validated to stay within it).
+pub const MAX_DEPTH: usize = 8;
 
 /// The keymap a fresh install uses on this platform.
 pub fn platform_default() -> &'static str {
     if cfg!(target_os = "macos") { MACOS } else { WINDOWS_LINUX }
 }
 
-/// The built-in keymap called `name` (case-insensitive; `mac`, `windows`, `linux`, `default` work).
+/// The built-in keymap called `name` (case-insensitive; `mac`, `windows`, `linux`, `default`,
+/// `vscode`, `emacs` work).
 pub fn canonical_name(name: &str) -> Option<&'static str> {
     let n = name.trim().to_ascii_lowercase();
     match n.as_str() {
         "macos" | "mac" | "mac os x" | "macos keymap" => Some(MACOS),
         "windows/linux" | "windows" | "linux" | "default" | "windows / linux" | "pc" => Some(WINDOWS_LINUX),
+        "vs code (macos)" | "vscode (macos)" | "vscode mac" | "vs code mac" | "vscode-macos" => Some(VSCODE_MAC),
+        "vs code" | "vscode" | "vs code (windows/linux)" | "vscode (windows/linux)" => Some(VSCODE),
+        "emacs" | "gnu emacs" => Some(EMACS),
         _ => None,
     }
 }
 
+/// The user keymap called `name` (exact name, surrounding spaces ignored).
+pub fn user_keymap<'a>(settings: &'a Settings, name: &str) -> Option<&'a UserKeymap> {
+    let name = name.trim();
+    settings.user_keymaps.iter().find(|u| u.name == name)
+}
+
+/// A keymap name as stored: a user keymap's exact name, else a built-in's canonical name.
+pub fn resolve_name(settings: &Settings, name: &str) -> Option<String> {
+    if let Some(u) = user_keymap(settings, name) {
+        return Some(u.name.clone());
+    }
+    canonical_name(name).map(String::from)
+}
+
+/// Every keymap: the built-ins, then the user's.
+pub fn all_names(settings: &Settings) -> Vec<String> {
+    NAMES.iter().map(|n| (*n).to_string()).chain(settings.user_keymaps.iter().map(|u| u.name.clone())).collect()
+}
+
 /// The active keymap of `settings` (an empty or unknown name means the platform default).
-pub fn active(settings: &Settings) -> &'static str {
-    canonical_name(&settings.keymap).unwrap_or_else(platform_default)
+pub fn active(settings: &Settings) -> String {
+    resolve_name(settings, &settings.keymap).unwrap_or_else(|| platform_default().to_string())
+}
+
+/// The keymap `name` inherits from: a user keymap's parent, a derived built-in's base.
+pub fn parent_of(settings: &Settings, name: &str) -> Option<String> {
+    if let Some(u) = user_keymap(settings, name) {
+        return resolve_name(settings, &u.parent);
+    }
+    canonical_name(name).and_then(derived).map(|d| d.parent.to_string())
+}
+
+/// `name` and the keymaps it inherits from, nearest first (cycles cut, at most
+/// [`MAX_DEPTH`] + 1 entries).
+pub fn chain(settings: &Settings, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = resolve_name(settings, name);
+    while let Some(c) = cur {
+        if out.contains(&c) || out.len() > MAX_DEPTH {
+            break;
+        }
+        cur = parent_of(settings, &c);
+        out.push(c);
+    }
+    if out.is_empty() {
+        out.push(platform_default().to_string());
+    }
+    out
+}
+
+/// The root of a keymap's chain, `macOS` or `Windows/Linux` (Ctrl-based keymaps show their
+/// shortcuts as text rather than macOS glyphs).
+pub fn base(settings: &Settings, name: &str) -> &'static str {
+    chain(settings, name)
+        .iter()
+        .rev()
+        .find_map(|n| canonical_name(n).filter(|b| *b == MACOS || *b == WINDOWS_LINUX))
+        .unwrap_or_else(platform_default)
 }
 
 // ---------------------------------------------------------------- shortcut text
@@ -124,16 +193,40 @@ fn join(ctrl: bool, alt: bool, shift: bool, cmd: bool, key: &str) -> String {
     out
 }
 
-/// Canonical form of a shortcut (`cmd+shift+f` → `Shift+Cmd+F`), or why it is not one.
-pub fn normalize(s: &str) -> Result<String, String> {
-    if s.split_whitespace().collect::<Vec<_>>() == ["Shift", "Shift"] {
-        return Ok(DOUBLE_SHIFT.into());
-    }
-    if s.trim().contains(' ') {
-        return Err(format!("`{}` is not a shortcut (use `+` between keys)", s.trim()));
-    }
+fn stroke(s: &str) -> Result<String, String> {
     let (ctrl, alt, shift, cmd, key) = parts(s)?;
     Ok(join(ctrl, alt, shift, cmd, &key))
+}
+
+/// Canonical form of a shortcut (`cmd+shift+f` → `Shift+Cmd+F`; `cmd+k  cmd+c` → `Cmd+K Cmd+C`
+/// for a two-stroke chord), or why it is not one.
+pub fn normalize(s: &str) -> Result<String, String> {
+    let words: Vec<&str> = s.split_whitespace().collect();
+    match words.as_slice() {
+        ["Shift", "Shift"] => Ok(DOUBLE_SHIFT.into()),
+        [] => Err("empty shortcut".into()),
+        [one] => stroke(one),
+        [first, second] => Ok(format!("{} {}", stroke(first)?, stroke(second)?)),
+        _ => Err(format!("`{}` has more than two keystrokes", s.trim())),
+    }
+}
+
+/// Whether a (normalized) shortcut is a two-stroke chord.
+pub fn is_chord(sc: &str) -> bool {
+    sc != DOUBLE_SHIFT && sc.contains(' ')
+}
+
+/// The keystrokes of a (normalized) shortcut: one, or two for a chord.
+pub fn strokes(sc: &str) -> Vec<&str> {
+    if sc == DOUBLE_SHIFT { vec![sc] } else { sc.split(' ').collect() }
+}
+
+/// Whether two (normalized) shortcuts cannot both work: equal, or one is the first keystroke of
+/// the other (a chord's prefix shadows a single key and vice versa).
+pub fn clashes(a: &str, b: &str) -> bool {
+    a == b
+        || (is_chord(a) && strokes(a).first() == Some(&b))
+        || (is_chord(b) && strokes(b).first() == Some(&a))
 }
 
 /// The Windows/Linux equivalent of a macOS shortcut when it is a mechanical `Cmd` → `Ctrl`
@@ -143,11 +236,15 @@ fn translate(mac: &str) -> Option<String> {
     if mac == DOUBLE_SHIFT {
         return Some(DOUBLE_SHIFT.into());
     }
-    let (ctrl, alt, shift, cmd, key) = parts(mac).ok()?;
-    if ctrl {
-        return None;
+    let mut out: Vec<String> = Vec::new();
+    for s in strokes(mac) {
+        let (ctrl, alt, shift, cmd, key) = parts(s).ok()?;
+        if ctrl {
+            return None;
+        }
+        out.push(join(cmd, alt, shift, false, &key));
     }
-    Some(join(cmd, alt, shift, false, &key))
+    Some(out.join(" "))
 }
 
 // ---------------------------------------------------------------- built-in keymaps
@@ -282,11 +379,50 @@ fn windows_explicit() -> &'static HashSet<String> {
     T.get_or_init(|| WINDOWS.iter().flat_map(|(_, scs)| scs.iter()).filter_map(|s| normalize(s).ok()).collect())
 }
 
-/// The built-in shortcuts of a command in `keymap` (no user overrides).
+/// A built-in keymap made of its own bindings over a parent keymap (VS Code, Emacs).
+pub(crate) struct Derived {
+    pub parent: &'static str,
+    /// Command → its shortcuts (normalized, canonical command ids).
+    table: HashMap<&'static str, Vec<String>>,
+    /// Every shortcut the table assigns: the parent's shortcuts that clash with one are dropped.
+    taken: Vec<String>,
+}
+
+/// The derived built-in keymap `name` (`None` for macOS and Windows/Linux).
+pub(crate) fn derived(name: &str) -> Option<&'static Derived> {
+    static T: OnceLock<HashMap<&'static str, Derived>> = OnceLock::new();
+    let all = T.get_or_init(|| {
+        keymap_tables::DERIVED
+            .iter()
+            .map(|(name, parent, entries)| {
+                let mut table: HashMap<&'static str, Vec<String>> = HashMap::new();
+                for (id, scs) in entries.iter() {
+                    let list = dedup(scs.iter().filter_map(|s| normalize(s).ok()));
+                    table.entry(registry().canonical(id)).or_default().extend(list);
+                }
+                let mut taken: Vec<String> = table.values().flatten().cloned().collect();
+                taken.sort();
+                taken.dedup();
+                (*name, Derived { parent, table, taken })
+            })
+            .collect()
+    });
+    all.get(canonical_name(name)?)
+}
+
+/// The built-in shortcuts of a command in `keymap` (no user overrides). An unknown keymap name
+/// means the platform default.
 pub fn defaults(keymap: &str, id: &str) -> Vec<String> {
     let id = registry().canonical(id);
+    let keymap = canonical_name(keymap).unwrap_or_else(platform_default);
+    if let Some(d) = derived(keymap) {
+        if let Some(list) = d.table.get(id) {
+            return list.clone();
+        }
+        return defaults(d.parent, id).into_iter().filter(|s| !d.taken.iter().any(|t| clashes(s, t))).collect();
+    }
     let mac = registry().shortcuts(id);
-    if canonical_name(keymap) == Some(MACOS) {
+    if keymap == MACOS {
         return dedup(mac.iter().filter_map(|s| normalize(s).ok()));
     }
     if let Some(explicit) = windows_table().get(id) {
@@ -318,45 +454,73 @@ fn override_for<'a>(o: &'a BTreeMap<String, Vec<String>>, id: &str) -> Option<&'
     o.get(id).or_else(|| registry().aliases_of(id).into_iter().find_map(|a| o.get(a)))
 }
 
-/// The effective shortcuts of a command in the active keymap (overrides applied).
-pub fn shortcuts(settings: &Settings, id: &str) -> Vec<String> {
-    let keymap = active(settings);
+/// A command's shortcuts in `keymap` (its overrides, else what it inherits).
+fn effective(settings: &Settings, keymap: &str, id: &str, depth: usize) -> Vec<String> {
     match overrides(settings, keymap).and_then(|o| override_for(o, id)) {
         Some(list) => dedup(list.iter().filter_map(|s| normalize(s).ok())),
+        None => inherited_in(settings, keymap, id, depth),
+    }
+}
+
+/// What a command's shortcuts in `keymap` are without that keymap's own overrides: a user
+/// keymap's parent's (overrides included), else the built-in defaults.
+fn inherited_in(settings: &Settings, keymap: &str, id: &str, depth: usize) -> Vec<String> {
+    match user_keymap(settings, keymap) {
+        Some(u) if depth < MAX_DEPTH => {
+            let parent = resolve_name(settings, &u.parent).unwrap_or_else(|| platform_default().to_string());
+            effective(settings, &parent, id, depth + 1)
+        }
+        Some(_) => defaults(platform_default(), id),
         None => defaults(keymap, id),
     }
 }
 
+/// A command's shortcuts in the active keymap without its own overrides (what Reset restores).
+pub fn inherited(settings: &Settings, id: &str) -> Vec<String> {
+    inherited_in(settings, &active(settings), id, 0)
+}
+
+/// The effective shortcuts of a command in the active keymap (overrides applied).
+pub fn shortcuts(settings: &Settings, id: &str) -> Vec<String> {
+    effective(settings, &active(settings), id, 0)
+}
+
 /// Whether the user changed this command's shortcuts in the active keymap.
 pub fn is_overridden(settings: &Settings, id: &str) -> bool {
-    overrides(settings, active(settings)).is_some_and(|o| override_for(o, id).is_some())
+    overrides(settings, &active(settings)).is_some_and(|o| override_for(o, id).is_some())
 }
 
 /// One bound shortcut.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyBinding {
+    /// A single keystroke, `Shift Shift`, or a two-stroke chord (`Cmd+K Cmd+C`).
     pub shortcut: String,
     pub id: &'static str,
     pub context: Context,
 }
 
 /// Every binding of the active keymap, in match order. For one key in one context the first
-/// wins: user overrides, then commands' own shortcuts (and the explicit Windows/Linux table),
-/// then catalog shortcuts (so e.g. Backspace is the editor's backspace, not Edit › Delete).
+/// wins: user overrides (anywhere in the keymap's chain), then commands' own shortcuts (and the
+/// explicit Windows/Linux, VS Code and Emacs tables), then catalog shortcuts (so e.g. Backspace
+/// is the editor's backspace, not Edit › Delete).
 pub fn bindings(settings: &Settings) -> Vec<KeyBinding> {
     let keymap = active(settings);
-    let user = overrides(settings, keymap);
-    let windows = keymap == WINDOWS_LINUX;
+    let chain = chain(settings, &keymap);
+    let user: Vec<&BTreeMap<String, Vec<String>>> = chain.iter().filter_map(|k| overrides(settings, k)).collect();
+    let windows = base(settings, &keymap) == WINDOWS_LINUX;
+    let tables: Vec<&Derived> = chain.iter().filter_map(|k| canonical_name(k).and_then(derived)).collect();
     let rank = |spec: &crate::CommandSpec| {
-        if user.is_some_and(|o| override_for(o, spec.id).is_some()) {
+        if user.iter().any(|o| override_for(o, spec.id).is_some()) {
             0
+        } else if tables.iter().any(|d| d.table.contains_key(spec.id)) {
+            1
         } else if spec.shortcut.is_some()
             || !spec.alt_shortcuts.is_empty()
             || (windows && windows_table().contains_key(spec.id))
         {
-            1
-        } else {
             2
+        } else {
+            3
         }
     };
     let mut specs: Vec<(u8, &crate::CommandSpec)> = registry().all().iter().map(|s| (rank(s), s)).collect();
@@ -364,7 +528,7 @@ pub fn bindings(settings: &Settings) -> Vec<KeyBinding> {
     let mut out: Vec<KeyBinding> = Vec::new();
     let mut seen: HashSet<(String, bool)> = HashSet::new();
     for (_, spec) in specs {
-        for sc in shortcuts(settings, spec.id) {
+        for sc in effective(settings, &keymap, spec.id, 0) {
             if seen.insert((sc.clone(), spec.context == Context::Editor)) {
                 out.push(KeyBinding { shortcut: sc, id: spec.id, context: spec.context });
             }
@@ -373,25 +537,28 @@ pub fn bindings(settings: &Settings) -> Vec<KeyBinding> {
     out
 }
 
-/// Commands other than `except` that have `shortcut` in the active keymap.
+/// Commands other than `except` whose shortcuts in the active keymap clash with `shortcut`
+/// (the same keys, or a chord starting with it, or the first keystroke of it).
 pub fn conflicts(settings: &Settings, shortcut: &str, except: &str) -> Vec<&'static str> {
     let Ok(sc) = normalize(shortcut) else { return Vec::new() };
     let except = registry().canonical(except);
+    let keymap = active(settings);
     registry()
         .all()
         .iter()
-        .filter(|spec| spec.id != except && shortcuts(settings, spec.id).contains(&sc))
+        .filter(|spec| spec.id != except && effective(settings, &keymap, spec.id, 0).iter().any(|s| clashes(s, &sc)))
         .map(|spec| spec.id)
         .collect()
 }
 
 /// Every command's shortcut list in the active keymap (only commands that have one).
 pub fn table(settings: &Settings) -> HashMap<&'static str, Vec<String>> {
+    let keymap = active(settings);
     registry()
         .all()
         .iter()
         .filter_map(|spec| {
-            let list = shortcuts(settings, spec.id);
+            let list = effective(settings, &keymap, spec.id, 0);
             (!list.is_empty()).then_some((spec.id, list))
         })
         .collect()
@@ -399,8 +566,8 @@ pub fn table(settings: &Settings) -> HashMap<&'static str, Vec<String>> {
 
 // ---------------------------------------------------------------- editing overrides
 
-/// Replace a command's shortcuts in the active keymap (validated; an override equal to the
-/// defaults is dropped). Unknown commands and malformed shortcuts are errors.
+/// Replace a command's shortcuts in the active keymap (validated; an override equal to what the
+/// keymap inherits is dropped). Unknown commands and malformed shortcuts are errors.
 pub fn set_shortcuts(settings: &mut Settings, id: &str, list: &[String]) -> Result<Vec<String>, String> {
     if !registry().contains(id) {
         return Err(format!("unknown command `{id}`"));
@@ -409,23 +576,24 @@ pub fn set_shortcuts(settings: &mut Settings, id: &str, list: &[String]) -> Resu
     let list = list.iter().map(|s| normalize(s)).collect::<Result<Vec<_>, _>>()?;
     let list = dedup(list.into_iter());
     let keymap = active(settings);
-    let entry = settings.keymap_overrides.entry(keymap.to_string()).or_default();
+    let same = list == inherited(settings, id);
+    let entry = settings.keymap_overrides.entry(keymap.clone()).or_default();
     for old in registry().aliases_of(id) {
         entry.remove(old);
     }
-    if list == defaults(keymap, id) {
+    if same {
         entry.remove(id);
     } else {
         entry.insert(id.to_string(), list.clone());
     }
     if entry.is_empty() {
-        settings.keymap_overrides.remove(keymap);
+        settings.keymap_overrides.remove(&keymap);
     }
     Ok(list)
 }
 
 /// Add a shortcut to a command; with `remove_conflicts`, take it away from every other command.
-/// Returns the commands that (still) share it.
+/// Returns the commands that (still) clash with it.
 pub fn add_shortcut(
     settings: &mut Settings,
     id: &str,
@@ -443,7 +611,7 @@ pub fn add_shortcut(
         return Ok(others);
     }
     for other in others {
-        let rest: Vec<String> = shortcuts(settings, other).into_iter().filter(|s| *s != sc).collect();
+        let rest: Vec<String> = shortcuts(settings, other).into_iter().filter(|s| !clashes(s, &sc)).collect();
         set_shortcuts(settings, other, &rest)?;
     }
     Ok(Vec::new())
@@ -465,31 +633,36 @@ pub fn reset(settings: &mut Settings, id: Option<&str>) {
     let keymap = active(settings);
     match id {
         Some(id) => {
-            if let Some(o) = settings.keymap_overrides.get_mut(keymap) {
+            if let Some(o) = settings.keymap_overrides.get_mut(&keymap) {
                 let id = registry().canonical(id);
                 o.remove(id);
                 for old in registry().aliases_of(id) {
                     o.remove(old);
                 }
                 if o.is_empty() {
-                    settings.keymap_overrides.remove(keymap);
+                    settings.keymap_overrides.remove(&keymap);
                 }
             }
         }
         None => {
-            settings.keymap_overrides.remove(keymap);
+            settings.keymap_overrides.remove(&keymap);
         }
     }
 }
 
 /// Validate a whole overrides map (from `settings.set keymap_overrides` or a settings file):
-/// keymap names and shortcuts are canonicalised, unknown commands are errors.
+/// keymap names (built-in, or one of `users`) and shortcuts are canonicalised, unknown commands
+/// are errors.
 pub fn validate_overrides(
     map: &BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    users: &[UserKeymap],
 ) -> Result<BTreeMap<String, BTreeMap<String, Vec<String>>>, String> {
     let mut out = BTreeMap::new();
     for (keymap, cmds) in map {
-        let name = canonical_name(keymap).ok_or_else(|| format!("unknown keymap `{keymap}`"))?;
+        let name = match users.iter().find(|u| u.name == keymap.trim()) {
+            Some(u) => u.name.clone(),
+            None => canonical_name(keymap).ok_or_else(|| format!("unknown keymap `{keymap}`"))?.to_string(),
+        };
         let mut checked = BTreeMap::new();
         for (id, list) in cmds {
             if !registry().contains(id) {
@@ -498,7 +671,7 @@ pub fn validate_overrides(
             let list = list.iter().map(|s| normalize(s)).collect::<Result<Vec<_>, _>>()?;
             checked.insert(registry().canonical(id).to_string(), dedup(list.into_iter()));
         }
-        out.insert(name.to_string(), checked);
+        out.insert(name, checked);
     }
     Ok(out)
 }
@@ -620,7 +793,7 @@ mod tests {
         assert_eq!(shortcuts(&s, "edit.bookmarks.showLineBookmarks"), vec!["Cmd+F3"]);
         let mut map = BTreeMap::new();
         map.insert(MACOS.to_string(), BTreeMap::from([("edit.paste".to_string(), vec!["Cmd+V".to_string()])]));
-        let v = validate_overrides(&map).unwrap();
+        let v = validate_overrides(&map, &[]).unwrap();
         assert!(v[MACOS].contains_key("edit.paste.paste"));
     }
 
@@ -677,10 +850,10 @@ mod tests {
     fn overrides_validation() {
         let mut m = BTreeMap::new();
         m.insert("mac".to_string(), BTreeMap::from([("help.findAction".to_string(), vec!["cmd+k".to_string()])]));
-        let v = validate_overrides(&m).unwrap();
+        let v = validate_overrides(&m, &[]).unwrap();
         assert_eq!(v.get(MACOS).and_then(|o| o.get("help.findAction")), Some(&vec!["Cmd+K".to_string()]));
-        m.insert("emacs".into(), BTreeMap::new());
-        assert!(validate_overrides(&m).is_err());
+        m.insert("nope".into(), BTreeMap::new());
+        assert!(validate_overrides(&m, &[]).is_err());
     }
 
     #[test]
@@ -688,5 +861,95 @@ mod tests {
         assert_eq!(active(&Settings::default()), platform_default());
         assert_eq!(active(&with("bogus")), platform_default());
         assert_eq!(active(&with("Windows/Linux")), WINDOWS_LINUX);
+    }
+
+    #[test]
+    fn chords_normalize_and_clash_with_their_prefix() {
+        assert_eq!(normalize("cmd+k  cmd+c").unwrap(), "Cmd+K Cmd+C");
+        assert_eq!(normalize("Ctrl+X u").unwrap(), "Ctrl+X U");
+        assert!(normalize("Cmd+K Cmd+C Cmd+D").is_err());
+        assert!(normalize("Cmd+K Nope+C").is_err());
+        assert!(is_chord("Cmd+K Cmd+C") && !is_chord(DOUBLE_SHIFT) && !is_chord("Cmd+K"));
+        assert_eq!(strokes("Cmd+K Cmd+C"), vec!["Cmd+K", "Cmd+C"]);
+        assert!(clashes("Cmd+K", "Cmd+K Cmd+C") && clashes("Cmd+K Cmd+C", "Cmd+K"));
+        assert!(!clashes("Cmd+K Cmd+C", "Cmd+K Cmd+U") && !clashes("Cmd+C", "Cmd+K Cmd+C"));
+        assert_eq!(translate("Cmd+K Cmd+C").as_deref(), Some("Ctrl+K Ctrl+C"));
+        let mut s = with(MACOS);
+        add_shortcut(&mut s, "help.findAction", "Cmd+K Cmd+F", false).unwrap();
+        assert!(bindings(&s).iter().any(|b| b.shortcut == "Cmd+K Cmd+F" && b.id == "help.findAction"));
+        // A plain Cmd+K elsewhere is reported as a clash.
+        assert!(conflicts(&s, "Cmd+K", "navigate.lineColumn").contains(&"help.findAction"));
+    }
+
+    #[test]
+    fn derived_keymap_tables_name_registered_commands() {
+        for (name, parent, entries) in keymap_tables::DERIVED {
+            assert!(canonical_name(name) == Some(*name) && canonical_name(parent) == Some(*parent));
+            let mut seen = HashSet::new();
+            for (id, scs) in *entries {
+                assert!(registry().contains(id), "{name}: unknown command {id}");
+                assert!(seen.insert(*id), "{name}: duplicate {id}");
+                for sc in *scs {
+                    assert!(normalize(sc).is_ok(), "{name}: {id} `{sc}`");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vscode_and_emacs_keymaps() {
+        let mac = with("vscode (macos)");
+        assert_eq!(shortcuts(&mac, "help.findAction"), vec!["Shift+Cmd+P", "F1"]);
+        assert_eq!(shortcuts(&mac, "navigate.file"), vec!["Cmd+P"]);
+        assert!(shortcuts(&mac, "code.commentWithLineComment").contains(&"Cmd+K Cmd+C".to_string()));
+        // Cmd+D is VS Code's add-next-occurrence, so the RustRover Duplicate Line binding goes.
+        assert!(!shortcuts(&mac, "edit.duplicateSelection").contains(&"Cmd+D".to_string()));
+        // Commands the table does not list keep the parent's shortcuts.
+        assert_eq!(shortcuts(&mac, "edit.copy"), shortcuts(&with(MACOS), "edit.copy"));
+        assert_eq!(base(&mac, VSCODE_MAC), MACOS);
+        let pc = with("vscode");
+        assert_eq!(shortcuts(&pc, "help.findAction"), vec!["Ctrl+Shift+P", "F1"]);
+        assert_eq!(base(&pc, VSCODE), WINDOWS_LINUX);
+        let emacs = with("emacs");
+        assert_eq!(shortcuts(&emacs, "file.saveAll"), vec!["Ctrl+X Ctrl+S", "Ctrl+X S"]);
+        assert_eq!(shortcuts(&emacs, "editor.right"), vec!["Ctrl+F", "Right"]);
+        // Ctrl+X is a prefix in Emacs: Windows/Linux Cut (Ctrl+X) is dropped; Ctrl+W cuts.
+        assert_eq!(shortcuts(&emacs, "edit.cut"), vec!["Ctrl+W"]);
+        assert!(!shortcuts(&emacs, "edit.find.find").contains(&"Ctrl+F".to_string()));
+        for keymap in NAMES {
+            let s = with(keymap);
+            let b = bindings(&s);
+            for sc in ["Cmd+P", "Ctrl+P", "Ctrl+S", "Ctrl+X Ctrl+S"] {
+                let n = b.iter().filter(|k| k.shortcut == sc && k.context == Context::Global).count();
+                assert!(n <= 1, "{keymap}: {sc} bound {n} times");
+            }
+        }
+    }
+
+    #[test]
+    fn user_keymaps_chain_and_validate_override_names() {
+        let mut s = with("Mine");
+        s.user_keymaps.push(UserKeymap { name: "Mine".into(), parent: EMACS.into() });
+        assert_eq!(active(&s), "Mine");
+        assert_eq!(chain(&s, "Mine"), vec!["Mine", EMACS, WINDOWS_LINUX]);
+        assert_eq!(base(&s, "Mine"), WINDOWS_LINUX);
+        assert_eq!(shortcuts(&s, "edit.cut"), vec!["Ctrl+W"], "inherits Emacs");
+        set_shortcuts(&mut s, "edit.cut", &["Ctrl+Shift+X".into()]).unwrap();
+        assert!(s.keymap_overrides.contains_key("Mine"));
+        assert_eq!(inherited(&s, "edit.cut"), vec!["Ctrl+W"]);
+        let users = s.user_keymaps.clone();
+        let mut m = BTreeMap::new();
+        m.insert("Mine".to_string(), BTreeMap::from([("help.findAction".to_string(), vec!["F1".to_string()])]));
+        assert!(validate_overrides(&m, &users).is_ok());
+        assert!(validate_overrides(&m, &[]).is_err());
+        // A cycle written by hand never loops.
+        s.user_keymaps = vec![
+            UserKeymap { name: "A".into(), parent: "B".into() },
+            UserKeymap { name: "B".into(), parent: "A".into() },
+        ];
+        s.keymap = "A".into();
+        assert!(chain(&s, "A").len() <= MAX_DEPTH + 1);
+        let _ = shortcuts(&s, "help.findAction");
+        let _ = bindings(&s);
     }
 }

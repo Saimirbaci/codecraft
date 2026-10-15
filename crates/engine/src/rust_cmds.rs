@@ -183,6 +183,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
                 let on = p.get("enabled").and_then(Value::as_bool).unwrap_or(!d.online);
                 d.online = on;
                 d.auto = on;
+                // Remembered as Settings › Languages & Frameworks › Rust › Crates.io lookups.
+                s.ws.settings.crates_io_lookups = on;
                 if let Some(u) = opt_str(p, "indexUrl") {
                     d.index_url = u.to_string();
                 }

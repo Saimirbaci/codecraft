@@ -175,8 +175,11 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     egui::Panel::bottom("status-bar").exact_size(height).frame(bar_frame(st)).show(ui, |ui| {
         ui.horizontal_centered(|ui| {
             let muted = st.theme.text_muted;
-            // Left: the status message (Status Text widget), else the navigation path.
-            if shown("statusText") && !s.status.is_empty() {
+            // Left: a pending two-stroke shortcut, the status message (Status Text widget), else
+            // the navigation path.
+            if let Some(chord) = crate::settings_ui::pending_chord_text(st) {
+                ui.label(RichText::new(chord).color(st.theme.accent).size(12.0));
+            } else if shown("statusText") && !s.status.is_empty() {
                 let left: String = s.status.lines().next().unwrap_or_default().chars().take(160).collect();
                 ui.label(RichText::new(left).color(muted).size(12.0));
             } else if chrome.navigation_in_status_bar {
@@ -194,9 +197,9 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 crate::database_data_ui::status_widget(ui, s, st);
                 crate::ed_ui::status_widget(ui, s, st);
                 let info = s.ws.active().map(|(e, d)| {
-                    let unit = d.doc.detect_indent_unit();
-                    let indent =
-                        if unit == "\t" { "Tab".to_string() } else { format!("{} spaces", s.ws.settings.tab_size) };
+                    let opts = codecraft_engine::settings::code_style::indent(&s.ws.settings, d.language);
+                    let unit = codecraft_engine::settings::code_style::indent_unit(&d.doc, opts);
+                    let indent = if unit == "\t" { "Tab".to_string() } else { format!("{} spaces", unit.len()) };
                     let pos = d.doc.offset_to_position(e.selections.primary().head);
                     let sel_len = e.selections.primary().end() - e.selections.primary().start();
                     let caret = if sel_len > 0 {

@@ -23,6 +23,9 @@ log.workspace = true
 # feedback overlay: composite annotations onto the screenshot and encode PNGs
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
 ab_glyph = "0.2"
+# Settings › Editor › Font: check a font file with the parser egui's renderer uses (already in the
+# tree through epaint) before handing it over, since the renderer aborts on unparsable fonts
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -421,7 +421,7 @@ fn shrink_selection(s: &mut Session, _: &Value) -> CmdResult {
 }
 
 fn convert_indents(s: &mut Session, to_spaces: bool) -> CmdResult {
-    let tab = s.ws.settings.tab_size.max(1);
+    let tab = s.active_tab_width();
     s.edit_active(EditGroup::Standalone, |d, sel, _| {
         let mut changes = Vec::new();
         for line in 0..d.len_lines() {

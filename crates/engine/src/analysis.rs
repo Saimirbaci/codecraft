@@ -199,6 +199,8 @@ fn configure_level(s: &mut Session, p: &Value) -> CmdResult {
                 }
                 s.ws.analysis_levels.insert(path.clone(), level);
             }
+            // Kept per project (`.codecraft/analysis.json`, M13 track ST).
+            crate::settings::analysis_levels::persist(s);
             s.analysis.level_popup = None;
             s.status = format!("Highlighting level: {}", level.label());
             Ok(json!({ "level": level }))

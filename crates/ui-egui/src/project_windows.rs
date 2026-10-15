@@ -94,6 +94,8 @@ impl ProjectWindows {
         session.run_store.generate.auto = main.run_store.generate.auto;
         session.rust.deps.online = main.rust.deps.online;
         session.rust.deps.auto = main.rust.deps.auto;
+        session.prefs_services.network_lookups = main.prefs_services.network_lookups;
+        session.prefs_services.fonts.dirs_override = main.prefs_services.fonts.dirs_override.clone();
         // Save and restore the window's project session like the main window does.
         session.session_store.autosave = main.session_store.autosave;
         session.session_store.restore_on_open = main.session_store.restore_on_open;

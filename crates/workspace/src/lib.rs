@@ -240,6 +240,74 @@ pub struct Settings {
     pub python_reformat_on_save: bool,
     /// Optimize imports (Ruff's isort rules, or isort) of Python files when they are saved.
     pub python_optimize_imports_on_save: bool,
+    // ---- M13 track ST: settings and keymaps
+    /// Settings › Editor › Font: the editor font family (a system font); empty = the built-in
+    /// choice (a coding font when installed, else the platform's monospace font).
+    pub editor_font_family: String,
+    /// Settings › Editor › Code Style › <language>: tab and indent per language id (`rust`,
+    /// `python`, …); a missing language uses `tab_size`.
+    pub indent_by_language: BTreeMap<String, LanguageIndent>,
+    /// Settings › Keymap: the user's keymaps, each a copy of a parent keymap whose shortcuts it
+    /// inherits (its own changes are in `keymap_overrides` under its name).
+    pub user_keymaps: Vec<UserKeymap>,
+    /// Settings › Editor › TODO: the patterns the TODO tool window looks for in comments.
+    pub todo_patterns: Vec<TodoPattern>,
+    /// Settings › Editor › TODO: named filters, each showing only some patterns' items.
+    pub todo_filters: Vec<TodoFilter>,
+    /// Languages & Frameworks › Rust: ask crates.io for crate names and versions in Cargo.toml.
+    pub crates_io_lookups: bool,
+}
+
+/// Tab and indent of one language (Settings › Editor › Code Style).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageIndent {
+    /// Columns a tab character takes.
+    pub tab_size: usize,
+    /// Columns one indent level takes (spaces, unless `use_tab`).
+    pub indent_size: usize,
+    /// Indent with tab characters.
+    pub use_tab: bool,
+}
+
+impl Default for LanguageIndent {
+    fn default() -> Self {
+        Self { tab_size: 4, indent_size: 4, use_tab: false }
+    }
+}
+
+/// A user keymap (Settings › Keymap › Duplicate): a name and the keymap it inherits from.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UserKeymap {
+    pub name: String,
+    /// A built-in keymap or another user keymap.
+    pub parent: String,
+}
+
+/// A TODO pattern: a regular expression matched in comments.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TodoPattern {
+    pub pattern: String,
+    pub case_sensitive: bool,
+}
+
+/// A TODO filter: which patterns' items the TODO tool window shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TodoFilter {
+    pub name: String,
+    /// Pattern texts (as in [`TodoPattern::pattern`]).
+    pub patterns: Vec<String>,
+}
+
+/// RustRover's default TODO patterns.
+pub fn default_todo_patterns() -> Vec<TodoPattern> {
+    vec![
+        TodoPattern { pattern: r"\btodo\b.*".into(), case_sensitive: false },
+        TodoPattern { pattern: r"\bfixme\b.*".into(), case_sensitive: false },
+    ]
 }
 
 /// Where View › Appearance › Navigation Bar shows the path of the active file.
@@ -357,6 +425,12 @@ impl Default for Settings {
             python_formatter: "auto".into(),
             python_reformat_on_save: false,
             python_optimize_imports_on_save: false,
+            editor_font_family: String::new(),
+            indent_by_language: BTreeMap::new(),
+            user_keymaps: Vec::new(),
+            todo_patterns: default_todo_patterns(),
+            todo_filters: Vec::new(),
+            crates_io_lookups: true,
         }
     }
 }

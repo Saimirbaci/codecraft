@@ -23,7 +23,7 @@ thread_local! {
 
 /// Make `settings`' keymap (and the user's overrides) the one menus and labels show.
 pub fn set_active(settings: &Settings) {
-    let text_labels = keymaps::active(settings) == keymaps::WINDOWS_LINUX;
+    let text_labels = keymaps::base(settings, &keymaps::active(settings)) == keymaps::WINDOWS_LINUX;
     let table = keymaps::table(settings);
     ACTIVE.with(|a| *a.borrow_mut() = Active { text_labels, table: Some(table) });
 }
@@ -201,8 +201,12 @@ fn f_key(n: u8) -> Option<Key> {
     })
 }
 
-/// macOS menu glyphs (`⇧⌘F`); with the Windows/Linux keymap active, text (`Ctrl+Shift+F`).
+/// macOS menu glyphs (`⇧⌘F`); with a Ctrl-based keymap active, text (`Ctrl+Shift+F`). A
+/// two-stroke chord shows both strokes (`⌘K, ⌘C`).
 pub fn display(s: &str) -> String {
+    if keymaps::is_chord(s) {
+        return keymaps::strokes(s).iter().map(|k| display(k)).collect::<Vec<_>>().join(", ");
+    }
     if ACTIVE.with(|a| a.borrow().text_labels) {
         return if s == keymaps::DOUBLE_SHIFT {
             "Double Shift".into()
@@ -271,6 +275,49 @@ pub fn bindings_for(settings: &Settings) -> Vec<Binding> {
         .collect()
 }
 
+/// A two-stroke binding (`Cmd+K Cmd+C`): after `first`, the next key press is matched
+/// against `second`.
+#[derive(Clone, Debug)]
+pub struct ChordBinding {
+    pub first: Shortcut,
+    pub second: Shortcut,
+    pub id: &'static str,
+    pub context: Context,
+}
+
+/// All chord bindings of `settings`' keymap, in match order.
+pub fn chords_for(settings: &Settings) -> Vec<ChordBinding> {
+    keymaps::bindings(settings)
+        .into_iter()
+        .filter(|b| keymaps::is_chord(&b.shortcut))
+        .filter_map(|b| {
+            let strokes = keymaps::strokes(&b.shortcut);
+            let first = Shortcut::parse(strokes.first()?)?;
+            let second = Shortcut::parse(strokes.get(1)?)?;
+            Some(ChordBinding { first, second, id: b.id, context: b.context })
+        })
+        .collect()
+}
+
+/// The text of a single keystroke (for the pending-chord indicator).
+pub fn stroke_text(sc: &Shortcut) -> String {
+    let mut text = String::new();
+    for (on, part) in [(sc.ctrl, "Ctrl+"), (sc.alt, "Alt+"), (sc.shift, "Shift+"), (sc.cmd, "Cmd+")] {
+        if on {
+            text.push_str(part);
+        }
+    }
+    let key = match sc.key {
+        Key::ArrowUp => "Up".to_string(),
+        Key::ArrowDown => "Down".into(),
+        Key::ArrowLeft => "Left".into(),
+        Key::ArrowRight => "Right".into(),
+        other => other.symbol_or_name().to_string(),
+    };
+    text.push_str(&key);
+    display(&keymaps::normalize(&text).unwrap_or(text))
+}
+
 /// The shortcut text shown next to a command in menus (active keymap).
 pub fn shortcut_label(id: &str) -> Option<String> {
     active_shortcuts(id).first().map(|s| display(s))
@@ -319,6 +366,24 @@ mod tests {
         let ctrl_alt = Modifiers { ctrl: true, alt: true, ..Default::default() };
         assert_eq!(from_event(Key::Slash, &ctrl_alt).as_deref(), Some("Ctrl+Alt+/"));
         assert_eq!(from_event(Key::F5, &Modifiers::NONE).as_deref(), Some("F5"));
+        ACTIVE.with(|a| *a.borrow_mut() = Active::default());
+    }
+
+    #[test]
+    fn chords_parse_and_display() {
+        let mut mac = Settings { keymap: "macOS".into(), ..Default::default() };
+        codecraft_engine::keymaps::set_shortcuts(&mut mac, "help.findAction", &["Cmd+K Cmd+F".into()]).unwrap();
+        set_active(&mac);
+        assert_eq!(shortcut_label("help.findAction").as_deref(), Some("⌘K, ⌘F"));
+        let chords = chords_for(&mac);
+        let c = chords.iter().find(|c| c.id == "help.findAction").unwrap();
+        assert_eq!(c.first, Shortcut::parse("Cmd+K").unwrap());
+        assert_eq!(c.second, Shortcut::parse("Cmd+F").unwrap());
+        assert!(!bindings_for(&mac).iter().any(|b| b.id == "help.findAction"), "chords are not single bindings");
+        assert_eq!(stroke_text(&Shortcut::parse("Cmd+K").unwrap()), "⌘K");
+        let emacs = Settings { keymap: "Emacs".into(), ..Default::default() };
+        set_active(&emacs);
+        assert_eq!(shortcut_label("file.saveAll").as_deref(), Some("Ctrl+X, Ctrl+S"), "Emacs is Ctrl-based");
         ACTIVE.with(|a| *a.borrow_mut() = Active::default());
     }
 

@@ -120,7 +120,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "keymap.select",
             "Select Keymap",
             None,
-            "{name: string} — `macOS` or `Windows/Linux` (empty = the platform default)",
+            "{name: string} — `macOS`, `Windows/Linux`, `VS Code (macOS)`, `VS Code`, `Emacs` or a user keymap (empty = the platform default)",
             Context::Global,
             always,
             |s, p| {
@@ -405,11 +405,11 @@ pub(crate) fn check_on_save(s: &mut Session) {
 
 // ---------------------------------------------------------------- helpers
 
-fn dialog(s: &Session) -> Option<&SettingsDialog> {
+pub(crate) fn dialog(s: &Session) -> Option<&SettingsDialog> {
     if matches!(s.popup, Some(Popup::Settings)) { s.prefs.dialog.as_ref() } else { None }
 }
 
-fn dialog_mut(s: &mut Session) -> Option<&mut SettingsDialog> {
+pub(crate) fn dialog_mut(s: &mut Session) -> Option<&mut SettingsDialog> {
     if matches!(s.popup, Some(Popup::Settings)) { s.prefs.dialog.as_mut() } else { None }
 }
 
@@ -423,7 +423,7 @@ fn has_quick_switch(s: &Session) -> Result<(), String> {
 
 /// Run `f` on the dialog's draft (Settings open) or the live settings; nothing changes when it
 /// fails.
-fn edit<T>(s: &mut Session, f: impl FnOnce(&mut Settings) -> Result<T, String>) -> Result<T, CommandError> {
+pub(crate) fn edit<T>(s: &mut Session, f: impl FnOnce(&mut Settings) -> Result<T, String>) -> Result<T, CommandError> {
     if let Some(d) = dialog_mut(s) {
         let mut next = d.draft.clone();
         let out = f(&mut next).map_err(CommandError::BadParams)?;
@@ -447,6 +447,17 @@ fn after_change(s: &mut Session, old: &Settings) {
     {
         s.start_lsp(&root);
     }
+    // Languages & Frameworks › Rust › Crates.io lookups (only where the host allows the network).
+    if old.crates_io_lookups != s.ws.settings.crates_io_lookups {
+        apply_crates_io_lookups(s);
+    }
+}
+
+/// Make crates.io lookups follow the setting, when the host allows network lookups at all.
+pub(crate) fn apply_crates_io_lookups(s: &mut Session) {
+    let on = s.ws.settings.crates_io_lookups && s.prefs_services.network_lookups;
+    s.rust.deps.online = on;
+    s.rust.deps.auto = on;
 }
 
 fn open_dialog(s: &mut Session, p: &Value) -> CmdResult {
@@ -468,6 +479,13 @@ fn apply(s: &mut Session) {
     let old = std::mem::replace(&mut s.ws.settings, draft);
     after_change(s, &old);
     s.status = "Settings applied".into();
+    // Code Style formatter options go to the project's files.
+    if let Err(e) = crate::prefs_cmds::write_code_style(s) {
+        s.status = e.clone();
+        if let Some(d) = dialog_mut(s) {
+            d.error = Some(e);
+        }
+    }
 }
 
 fn close_dialog(s: &mut Session) {
@@ -537,13 +555,21 @@ fn keymap_list(s: &mut Session, p: &Value) -> CmdResult {
                     "label": c.label,
                     "menu": menu,
                     "shortcuts": shortcuts,
-                    "defaults": keymaps::defaults(keymap, c.id),
+                    "defaults": keymaps::inherited(st, c.id),
                     "overridden": keymaps::is_overridden(st, c.id),
                 })
             })
         })
         .collect();
-    Ok(json!({ "keymap": keymap, "keymaps": keymaps::NAMES, "actions": actions }))
+    let user: Vec<Value> = st.user_keymaps.iter().map(|u| json!({ "name": u.name, "parent": u.parent })).collect();
+    Ok(json!({
+        "keymap": keymap,
+        "keymaps": keymaps::all_names(st),
+        "builtin": keymaps::NAMES,
+        "user": user,
+        "parent": keymaps::parent_of(st, &keymap),
+        "actions": actions,
+    }))
 }
 
 /// The user scheme `name` (default: the current scheme); built-in schemes are read-only.
@@ -700,7 +726,9 @@ mod tests {
         ] {
             assert!(matches!(s.execute("keymap.addShortcut", &bad), Err(CommandError::BadParams(_))), "{bad}");
         }
-        assert!(s.execute("keymap.select", &json!({ "name": "emacs" })).is_err());
+        assert!(s.execute("keymap.select", &json!({ "name": "teco" })).is_err());
+        s.execute("keymap.select", &json!({ "name": "emacs" })).unwrap();
+        assert_eq!(s.ws.settings.keymap, keymaps::EMACS);
     }
 
     #[test]

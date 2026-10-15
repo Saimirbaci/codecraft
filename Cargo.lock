@@ -1057,6 +1057,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "skrifa",
  "tempfile",
  "tiny-skia",
 ]

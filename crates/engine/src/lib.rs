@@ -103,6 +103,7 @@ pub mod services;
 pub mod session_store;
 pub mod settings;
 mod settings_cmds;
+pub mod prefs_cmds;
 pub mod snippet;
 pub mod paste;
 mod split_cmds;
@@ -260,6 +261,8 @@ pub struct Session {
     pub inspections: inspections::InspectionsState,
     /// Settings dialog draft and Quick Switch Scheme (M8).
     pub prefs: settings::PrefsState,
+    /// Font listing and loading, the Code Style preview, per-project analysis levels (M13 ST).
+    pub prefs_services: settings::PrefsServices,
     /// User run configurations and the Edit Configurations dialog (M8).
     pub run_store: run_config_store::RunConfigStore,
     /// Menu sweep state: preview tabs, Compare With, processes, encodings (M10 track F).
@@ -372,6 +375,7 @@ impl Session {
             scratch: scratch::ScratchState::default(),
             inspections: inspections::InspectionsState::default(),
             prefs: settings::PrefsState::default(),
+            prefs_services: settings::PrefsServices::default(),
             run_store: run_config_store::RunConfigStore::default(),
             misc: misc::MiscState::default(),
             session_store: session_store::SessionStore::default(),
@@ -488,6 +492,8 @@ impl Session {
         self.cpp.isolated = true;
         // Never the real GitHub CLI (it acts on the user's account): tests point it at a fake.
         self.vcs.gh_program = dir.join("gh-isolated");
+        // Font scans look only in `dir/fonts`, never at the user's fonts.
+        self.prefs_services.fonts.dirs_override = Some(vec![dir.join("fonts")]);
     }
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
@@ -509,6 +515,7 @@ impl Session {
         changed |= refactor::pump(self);
         changed |= bookmarks::pump(self);
         changed |= todo::pump(self);
+        changed |= settings::pump(self);
         changed |= local_history::pump(self);
         changed |= inspections::pump(self);
         changed |= inspections::fixes::pump(self);
@@ -614,10 +621,10 @@ impl Session {
     pub(crate) fn ops_config(&self, doc: DocId) -> OpsConfig {
         let mut cfg = OpsConfig { tab_width: self.ws.settings.tab_size, ..OpsConfig::default() };
         if let Some(d) = self.ws.doc(doc) {
-            cfg.indent_unit = d.doc.detect_indent_unit();
-            if cfg.indent_unit != "\t" {
-                cfg.indent_unit = " ".repeat(self.ws.settings.tab_size.clamp(1, 16));
-            }
+            // Settings › Editor › Code Style per language; the file's own indentation wins.
+            let indent = settings::code_style::indent(&self.ws.settings, d.language);
+            cfg.tab_width = indent.tab_size;
+            cfg.indent_unit = settings::code_style::indent_unit(&d.doc, indent);
             cfg.line_comment = d.language.line_comment().map(str::to_string);
             cfg.block_comment = d.language.block_comment().map(|(a, b)| (a.to_string(), b.to_string()));
         }
