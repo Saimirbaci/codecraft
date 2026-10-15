@@ -299,6 +299,11 @@ fn connected(ds: &DataSource) -> bool {
     matches!(ds.status, ConnStatus::Connected(_))
 }
 
+/// Metadata is usable: connected, or shown from the metadata cache (offline, track DX).
+fn usable(ds: &DataSource) -> bool {
+    connected(ds) || ds.tree.stale && ds.tree.info.is_some()
+}
+
 const ROUTINES: &str = "routines";
 const INFO: &str = "info";
 
@@ -402,10 +407,10 @@ pub(crate) fn load_all(db: &mut DbState) {
 
 // ---------------------------------------------------------------- Go to Database Object
 
-/// Every object of the connected data sources that is loaded.
+/// Every object of the connected data sources that is loaded (and of cached ones, offline).
 pub fn objects(db: &DbState) -> Vec<DbObject> {
     let mut out = Vec::new();
-    for ds in db.sources.iter().filter(|d| connected(d)) {
+    for ds in db.sources.iter().filter(|d| usable(d)) {
         let source = ds.config.id.clone();
         let source_name = ds.config.name.clone();
         for (schema, node) in &ds.tree.schemas {
@@ -546,7 +551,10 @@ enum Found {
 /// Find a table or view: in `schema`, else the default schema, else any loaded schema.
 fn find_table(db: &mut DbState, source: &str, default: Option<&str>, schema: Option<&str>, name: &str) -> Found {
     let Some(ds) = db.source(source) else { return Found::Missing(format!("no data source `{source}`")) };
+    // Cached metadata answers offline (track DX).
+    let offline = !connected(ds) && usable(ds);
     match ds.status {
+        _ if offline => {}
         ConnStatus::Failed(ref e) => return Found::Missing(format!("cannot connect: {e}")),
         ConnStatus::Disconnected => {
             let _ = db.meta(source, MetaReq::Info);
@@ -699,7 +707,8 @@ pub(crate) fn context(s: &Session, offset: Option<usize>) -> Option<SqlCtx> {
 /// Whether the active editor is an SQL file or its caret is in SQL inside a Rust string.
 pub(crate) fn in_sql(s: &Session) -> bool {
     match s.ws.active() {
-        Some((_, d)) if d.language == Language::Sql => true,
+        // Redis consoles hold Redis commands, not SQL (track DX).
+        Some((_, d)) if d.language == Language::Sql => !s.db.is_redis_path(d.path.as_deref()),
         Some((_, d)) if d.language == Language::Rust => crate::sql_lang::in_injection(s),
         _ => false,
     }
@@ -1176,8 +1185,96 @@ pub(crate) fn select_in_tree(s: &mut Session, source: &str, schema: Option<&str>
 
 // ---------------------------------------------------------------- DDL tabs
 
+fn ddl_base() -> PathBuf {
+    std::env::temp_dir().join("codecraft-ddl")
+}
+
 fn ddl_dir() -> PathBuf {
-    std::env::temp_dir().join("codecraft-ddl").join(std::process::id().to_string())
+    ddl_base().join(std::process::id().to_string())
+}
+
+/// Delete a DDL file and the folders it leaves empty (up to the process folder).
+fn remove_ddl_file(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let mut dir = path.parent();
+    for _ in 0..3 {
+        let Some(d) = dir else { break };
+        // Fails (and stops) at the first folder that still holds something.
+        if std::fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
+}
+
+/// DDL tabs whose files are no longer open in any editor: delete the files (track DX).
+pub(crate) fn clean_closed_ddl(s: &mut Session) {
+    if s.db.nav.ddl_files.is_empty() {
+        return;
+    }
+    let closed: Vec<PathBuf> = s.db.nav.ddl_files.keys().filter(|p| s.ws.doc_by_path(p).is_none()).cloned().collect();
+    for p in closed {
+        s.db.nav.ddl_files.remove(&p);
+        remove_ddl_file(&p);
+    }
+}
+
+/// The session ends: delete its DDL files (other windows of the process keep theirs).
+pub(crate) fn remove_own_ddl(db: &mut DbState) {
+    for (p, _) in std::mem::take(&mut db.nav.ddl_files) {
+        remove_ddl_file(&p);
+    }
+}
+
+/// Delete the DDL folders of CodeCraft processes that are gone (left by a crash or a kill),
+/// once per process, in the background.
+pub(crate) fn sweep_ddl_dirs_once() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("db-ddl-sweep".into()).spawn(|| {
+        let n = sweep_ddl_dirs(&ddl_base(), std::process::id(), process_alive);
+        if n > 0 {
+            log::info!("removed {n} DDL folder(s) of earlier sessions");
+        }
+    });
+}
+
+/// Whether a process runs (unix: `kill -0`; elsewhere unknown, so assumed running).
+fn process_alive(pid: u32) -> bool {
+    if cfg!(unix) {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(true)
+    } else {
+        true
+    }
+}
+
+/// Remove `base/<pid>` folders of processes other than `own` that `alive` says are gone (where
+/// liveness cannot be checked, those untouched for a week). Returns how many were removed.
+pub(crate) fn sweep_ddl_dirs(base: &Path, own: u32, alive: impl Fn(u32) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(base) else { return 0 };
+    let week = std::time::Duration::from_secs(7 * 24 * 3600);
+    let mut removed = 0;
+    for e in entries.flatten().take(10_000) {
+        let path = e.path();
+        let Some(pid) = path.file_name().and_then(|n| n.to_str()).and_then(|n| n.parse::<u32>().ok()) else { continue };
+        if pid == own || !path.is_dir() {
+            continue;
+        }
+        let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age > week);
+        let gone = !alive(pid) || !cfg!(unix) && old;
+        if gone && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 fn slug(s: &str) -> String {
@@ -1436,5 +1533,29 @@ mod tests {
         assert_eq!(n.introspected("t", &["a".into()]), ["a"]);
         n.explorer_filter = "usr".into();
         assert!(n.filter_matches("users") && !n.filter_matches("orders"));
+    }
+
+    #[test]
+    fn ddl_folders_of_gone_processes_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        for pid in ["10", "20", "30"] {
+            std::fs::create_dir_all(base.join(pid).join("src").join("main")).unwrap();
+            std::fs::write(base.join(pid).join("src").join("main").join("t.sql"), "x").unwrap();
+        }
+        std::fs::create_dir_all(base.join("not-a-pid")).unwrap();
+        std::fs::write(base.join("40"), "a file, not a folder").unwrap();
+        // 10 is this process, 20 still runs, 30 is gone.
+        let removed = sweep_ddl_dirs(base, 10, |pid| pid == 20);
+        assert_eq!(removed, 1);
+        assert!(base.join("10").is_dir() && base.join("20").is_dir() && !base.join("30").exists());
+        assert!(base.join("not-a-pid").is_dir() && base.join("40").is_file());
+        assert_eq!(sweep_ddl_dirs(&base.join("missing"), 1, |_| false), 0);
+        // A removed file takes its empty folders with it, never a folder that still holds files.
+        let f = base.join("20").join("src").join("main").join("t.sql");
+        std::fs::write(base.join("20").join("src").join("keep.sql"), "y").unwrap();
+        remove_ddl_file(&f);
+        assert!(!f.exists() && !base.join("20").join("src").join("main").exists());
+        assert!(base.join("20").join("src").join("keep.sql").is_file());
     }
 }

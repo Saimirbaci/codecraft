@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use serde::{Deserialize, Serialize};
 
-use crate::sql::quote_ident;
 use crate::{Canceller, Column, Connection, DbError, DbKind, DbResult, Page, ResultSink};
 
 /// Transaction isolation levels (DataGrip's Tx selector).
@@ -240,37 +239,25 @@ pub fn end(conn: &mut dyn Connection, commit: bool) -> DbResult<TxEnd> {
     }
 }
 
-/// A savepoint name as an identifier.
-fn savepoint_ident(kind: DbKind, name: &str) -> DbResult<String> {
-    if name.is_empty() || name.len() > 63 {
-        return Err(DbError::Config("savepoint names have 1 to 63 characters".into()));
+/// Run a savepoint statement (see [`crate::savepoint::statement`]).
+fn savepoint_op(conn: &mut dyn Connection, op: crate::savepoint::SavepointOp, name: &str) -> DbResult<()> {
+    match crate::savepoint::statement(conn.kind(), op, name)? {
+        Some(sql) => run(conn, &sql),
+        None => Ok(()),
     }
-    Ok(quote_ident(kind, name))
 }
 
 pub fn savepoint(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
-    let id = savepoint_ident(conn.kind(), name)?;
-    if conn.kind() == DbKind::SqlServer {
-        return run(conn, &format!("SAVE TRANSACTION {id}"));
-    }
-    run(conn, &format!("SAVEPOINT {id}"))
+    savepoint_op(conn, crate::savepoint::SavepointOp::Set, name)
 }
 
 pub fn rollback_to(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
-    let id = savepoint_ident(conn.kind(), name)?;
-    if conn.kind() == DbKind::SqlServer {
-        return run(conn, &format!("ROLLBACK TRANSACTION {id}"));
-    }
-    run(conn, &format!("ROLLBACK TO SAVEPOINT {id}"))
+    savepoint_op(conn, crate::savepoint::SavepointOp::RollbackTo, name)
 }
 
 /// SQL Server has no RELEASE: a savepoint lasts until the transaction ends.
 pub fn release(conn: &mut dyn Connection, name: &str) -> DbResult<()> {
-    let id = savepoint_ident(conn.kind(), name)?;
-    if conn.kind() == DbKind::SqlServer {
-        return Ok(());
-    }
-    run(conn, &format!("RELEASE SAVEPOINT {id}"))
+    savepoint_op(conn, crate::savepoint::SavepointOp::Release, name)
 }
 
 // ---------------------------------------------------------------- statement timeout
@@ -389,6 +376,10 @@ impl ResultSink for TimedSink<'_> {
             self.disarmed = true;
         }
         self.inner.page(page)
+    }
+
+    fn next_result(&mut self) -> bool {
+        self.inner.next_result()
     }
 }
 

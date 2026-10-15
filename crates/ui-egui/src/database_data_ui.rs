@@ -4,6 +4,10 @@
 //! or quitting), and the Data Tools window (Compare Data, Dump, Restore, Export to File,
 //! Full-text Search, with their jobs). OWNED BY the database track. Every action is a `db.*`
 //! command; form fields edit the engine's state in place.
+//!
+//! Track DX: the savepoint menu next to Commit/Rollback (set, roll back to, release; the
+//! indicator lists them) and schema/table pickers from the Database tree in the Data Tools
+//! forms.
 
 use std::time::Duration;
 
@@ -97,6 +101,48 @@ pub fn console_tx(
     {
         cmd = Some(("db.tx.rollback", json!({ "connection": worker })));
     }
+    // Savepoints (track DX): set one, roll back to or release one of the open transaction.
+    let sps: Vec<String> = tx.map(|c| c.savepoints.clone()).unwrap_or_default();
+    let sp_label = if sps.is_empty() { "Savepoint".to_string() } else { format!("Savepoints ({})", sps.len()) };
+    ui.add_enabled_ui(open || manual, |ui| {
+        ui.menu_button(RichText::new(sp_label).size(12.0).color(theme.text), |ui| {
+            let name_id = egui::Id::new(("db-savepoint-name", worker));
+            let mut name: String = ui.data_mut(|d| d.get_temp::<String>(name_id).unwrap_or_default());
+            ui.horizontal(|ui| {
+                ui.add(TextEdit::singleline(&mut name).hint_text("name (optional)").desired_width(120.0));
+                if ui.button("Set Savepoint").clicked() {
+                    let mut p = json!({ "connection": worker });
+                    if !name.trim().is_empty() {
+                        p["name"] = json!(name.trim());
+                    }
+                    cmd = Some(("db.tx.savepoint", p));
+                    name.clear();
+                    ui.close();
+                }
+            });
+            ui.data_mut(|d| d.insert_temp(name_id, name));
+            if sps.is_empty() {
+                ui.label(RichText::new("No savepoints in this transaction").color(theme.text_muted));
+            }
+            for sp in sps.iter().rev() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(sp).color(theme.text));
+                    if ui.small_button("Rollback to").on_hover_text("Undo what ran after it").clicked() {
+                        cmd = Some(("db.tx.rollbackToSavepoint", json!({ "connection": worker, "name": sp })));
+                        ui.close();
+                    }
+                    if kind != DbKind::SqlServer
+                        && ui.small_button("Release").on_hover_text("Forget it (keeps the changes)").clicked()
+                    {
+                        cmd = Some(("db.tx.releaseSavepoint", json!({ "connection": worker, "name": sp })));
+                        ui.close();
+                    }
+                });
+            }
+        })
+        .response
+        .on_hover_text("Savepoints of the open transaction");
+    });
     if let Some(c) = tx {
         if c.open && c.failed {
             ui.label(RichText::new("✖ Tx failed: roll back").size(12.0).color(theme.error)).on_hover_text(
@@ -105,8 +151,9 @@ pub fn console_tx(
         } else if c.open {
             let dur = c.duration().map(mmss).unwrap_or_default();
             let n = c.statements;
+            let sp = if c.savepoints.is_empty() { String::new() } else { format!(" · ⛳ {}", c.savepoints.join(" › ")) };
             ui.label(
-                RichText::new(format!("● pending transaction · {n} stmt{} · {dur}", if n == 1 { "" } else { "s" }))
+                RichText::new(format!("● pending transaction · {n} stmt{} · {dur}{sp}", if n == 1 { "" } else { "s" }))
                     .size(12.0)
                     .color(theme.warning),
             )
@@ -322,6 +369,95 @@ pub fn tree_items(
     out
 }
 
+/// Schema and table pickers from the Database tree (track DX). Opening a picker asks for the
+/// level it lists (`db.dataTools.objects`), so they fill while the user looks.
+fn object_pickers(
+    ui: &mut egui::Ui,
+    s: &Session,
+    salt: &str,
+    source: &str,
+    schema: &mut String,
+    table: Option<&mut String>,
+    cmds: &mut Cmds,
+) {
+    let ds = s.db.source(source);
+    let schemas: Vec<String> = ds.map(|d| d.tree.schemas.keys().cloned().collect()).unwrap_or_default();
+    let shown = if schema.is_empty() { "<default schema>".to_string() } else { schema.clone() };
+    let r = egui::ComboBox::from_id_salt((salt, "schema")).selected_text(shown).width(120.0).show_ui(ui, |ui| {
+        ui.selectable_value(schema, String::new(), "<default schema>");
+        if schemas.is_empty() {
+            ui.label("Loading…");
+        }
+        for sc in &schemas {
+            ui.selectable_value(schema, sc.clone(), sc);
+        }
+    });
+    if r.response.clicked() && !source.is_empty() {
+        cmds.push(("db.dataTools.objects", json!({ "dataSource": source })));
+    }
+    let Some(table) = table else { return };
+    let effective = if schema.is_empty() { s.db.default_schema(source).unwrap_or_default() } else { schema.clone() };
+    let tables: Option<Vec<String>> = ds
+        .and_then(|d| d.tree.schemas.get(&effective))
+        .and_then(|n| n.tables.as_ref())
+        .map(|ts| ts.iter().map(|t| t.info.name.clone()).collect());
+    let shown = if table.is_empty() { "<table>".to_string() } else { table.clone() };
+    let r = egui::ComboBox::from_id_salt((salt, "table")).selected_text(shown).width(150.0).show_ui(ui, |ui| {
+        ui.selectable_value(table, String::new(), "<none: use a query>");
+        match &tables {
+            Some(ts) => {
+                for t in ts {
+                    ui.selectable_value(table, t.clone(), t);
+                }
+            }
+            None => {
+                ui.label("Loading…");
+            }
+        }
+    });
+    if r.response.clicked() && !source.is_empty() {
+        cmds.push(("db.dataTools.objects", json!({ "dataSource": source, "schema": effective })));
+    }
+}
+
+/// The Dump form's tables: every table of the chosen schema with a checkbox (none: all).
+fn dump_tables(ui: &mut egui::Ui, s: &Session, source: &str, schema: &str, picked: &mut Vec<String>, cmds: &mut Cmds) {
+    let effective = if schema.is_empty() { s.db.default_schema(source).unwrap_or_default() } else { schema.to_string() };
+    let tables: Option<Vec<String>> = s
+        .db
+        .source(source)
+        .and_then(|d| d.tree.schemas.get(&effective))
+        .and_then(|n| n.tables.as_ref())
+        .map(|ts| ts.iter().map(|t| t.info.name.clone()).collect());
+    let label = if picked.is_empty() { "All tables".to_string() } else { format!("{} table(s)", picked.len()) };
+    let r = ui.menu_button(label, |ui| {
+        ScrollArea::vertical().max_height(260.0).show(ui, |ui| match &tables {
+            Some(ts) => {
+                if ui.button("All tables").clicked() {
+                    picked.clear();
+                }
+                for t in ts {
+                    let full = format!("{effective}.{t}");
+                    let mut on = picked.contains(&full);
+                    if ui.checkbox(&mut on, t).changed() {
+                        if on {
+                            picked.push(full);
+                        } else {
+                            picked.retain(|x| *x != full);
+                        }
+                    }
+                }
+            }
+            None => {
+                ui.label("Loading…");
+            }
+        });
+    });
+    if r.response.clicked() && !source.is_empty() {
+        cmds.push(("db.dataTools.objects", json!({ "dataSource": source, "schema": effective })));
+    }
+}
+
 fn source_combo(ui: &mut egui::Ui, s: &Session, id: &str, value: &mut String) {
     let label = s.db.source(value).map(|d| d.config.name.clone()).unwrap_or_else(|| "<data source>".into());
     egui::ComboBox::from_id_salt(id).selected_text(label).width(180.0).show_ui(ui, |ui| {
@@ -394,8 +530,8 @@ fn form(ui: &mut egui::Ui, s: &mut Session, theme: &crate::theme::Theme, cmds: &
                     label(ui, name);
                     ui.horizontal(|ui| {
                         source_combo(ui, s, salt, &mut side.data_source);
-                        ui.add(TextEdit::singleline(&mut side.schema).hint_text("schema").desired_width(90.0));
-                        ui.add(TextEdit::singleline(&mut side.table).hint_text("table").desired_width(130.0));
+                        let src = side.data_source.clone();
+                        object_pickers(ui, s, salt, &src, &mut side.schema, Some(&mut side.table), cmds);
                         ui.add(TextEdit::singleline(&mut side.sql).hint_text("or a query").desired_width(200.0));
                     });
                     ui.end_row();
@@ -417,14 +553,12 @@ fn form(ui: &mut egui::Ui, s: &mut Session, theme: &crate::theme::Theme, cmds: &
         match d.tool {
             Tool::Dump => {
                 label(ui, "Tables");
-                let mut tables = d.dump.tables.join(", ");
-                if ui
-                    .add(TextEdit::singleline(&mut tables).hint_text("all (or schema.table, …)").desired_width(300.0))
-                    .changed()
-                {
-                    d.dump.tables =
-                        tables.split(',').map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect();
-                }
+                ui.horizontal(|ui| {
+                    let src = d.left.data_source.clone();
+                    object_pickers(ui, s, "db-dump", &src, &mut d.left.schema, None, cmds);
+                    let schema = d.left.schema.clone();
+                    dump_tables(ui, s, &src, &schema, &mut d.dump.tables, cmds);
+                });
                 ui.end_row();
                 label(ui, "Content");
                 ui.horizontal(|ui| {
@@ -440,8 +574,8 @@ fn form(ui: &mut egui::Ui, s: &mut Session, theme: &crate::theme::Theme, cmds: &
             Tool::Export => {
                 label(ui, "Table or query");
                 ui.horizontal(|ui| {
-                    ui.add(TextEdit::singleline(&mut d.left.schema).hint_text("schema").desired_width(90.0));
-                    ui.add(TextEdit::singleline(&mut d.left.table).hint_text("table").desired_width(130.0));
+                    let src = d.left.data_source.clone();
+                    object_pickers(ui, s, "db-export", &src, &mut d.left.schema, Some(&mut d.left.table), cmds);
                     ui.add(TextEdit::singleline(&mut d.left.sql).hint_text("or a query").desired_width(220.0));
                 });
                 ui.end_row();
@@ -458,7 +592,8 @@ fn form(ui: &mut egui::Ui, s: &mut Session, theme: &crate::theme::Theme, cmds: &
             }
             Tool::Search => {
                 label(ui, "Schema");
-                ui.add(TextEdit::singleline(&mut d.left.schema).hint_text("default schema").desired_width(160.0));
+                let src = d.left.data_source.clone();
+                object_pickers(ui, s, "db-search", &src, &mut d.left.schema, None, cmds);
                 ui.end_row();
                 label(ui, "Text");
                 ui.horizontal(|ui| {

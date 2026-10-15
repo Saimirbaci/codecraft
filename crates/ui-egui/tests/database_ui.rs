@@ -142,7 +142,12 @@ fn table_grid_shows_pending_changes_and_submits_from_the_preview() {
         a.session.db.result(rid).is_some_and(|r| r.edits.is_empty() && !r.edits.submitting && !r.is_running())
             && a.session.db.edit_preview.is_none()
     });
-    settle(&mut h, "reloaded", |a| a.session.db.result(rid).is_some_and(|r| r.rows.len() == 2 && !r.is_running()));
+    // The old rows stay (not running) until the reload's first page arrives: wait for the new ones.
+    settle(&mut h, "reloaded", |a| {
+        a.session.db.result(rid).is_some_and(|r| {
+            r.rows.len() == 2 && !r.is_running() && r.rows[1][1] == codecraft_engine::db::Cell::Text("Odyssey".into())
+        })
+    });
     let r = h.state().session.db.result(rid).unwrap();
     assert_eq!(r.rows[1][1], codecraft_engine::db::Cell::Text("Odyssey".into()));
     h.run_steps(2);

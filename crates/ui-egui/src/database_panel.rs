@@ -198,10 +198,28 @@ fn build_rows(s: &Session, st: &UiState) -> Vec<Row> {
         }
         r.stripe = source_color(ds.config.color_name(), st);
         r.tooltip = format!("{} · {}", ds.config.kind.label(), ds.config.summary());
+        // Metadata from the cache (track DX): greyed until connected and refreshed.
+        let stale = ds.tree.stale && ds.tree.info.is_some();
+        if stale {
+            r.detail.push_str(" · cached");
+        }
         rows.push(r);
         if !expanded {
             continue;
         }
+        let first_child = rows.len();
+        if stale {
+            let when = ds.tree.cached_unix.map(cached_age).unwrap_or_default();
+            rows.push(message(1, id, &format!("Cached metadata{when}: connect or refresh to update"), t.text_muted));
+        }
+        let grey = |rows: &mut Vec<Row>| {
+            if stale {
+                for row in rows.iter_mut().skip(first_child) {
+                    row.label_color = t.text_muted;
+                    row.icon_color = t.text_disabled;
+                }
+            }
+        };
         if let ConnStatus::Failed(e) = &ds.status {
             rows.push(message(1, id, e, t.error));
             continue;
@@ -256,8 +274,25 @@ fn build_rows(s: &Session, st: &UiState) -> Vec<Row> {
         } else {
             push_schemas(s, st, ds, depth, &mut rows);
         }
+        grey(&mut rows);
     }
     rows
+}
+
+/// ` (saved 5 min ago)` for a cache time (seconds since the Unix epoch).
+fn cached_age(saved: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let age = now.saturating_sub(saved);
+    let text = if age < 60 {
+        "just now".to_string()
+    } else if age < 3600 {
+        format!("{} min ago", age / 60)
+    } else if age < 86_400 {
+        format!("{} h ago", age / 3600)
+    } else {
+        format!("{} days ago", age / 86_400)
+    };
+    format!(" (saved {text})")
 }
 
 /// A Redis data source's databases (`db0`…), with key counts once the key browser read them.
@@ -1108,10 +1143,11 @@ pub fn console_toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if small_button(ui, "■", "Cancel", running, st.theme.error, st) {
                     cmd = Some(("db.cancel", Value::Null));
                 }
+                // DuckDB explains through its CLI too (track DX).
                 let explainable = source
                     .as_ref()
                     .and_then(|id| s.db.source(id))
-                    .is_none_or(|d| !matches!(d.config.kind, DbKind::Redis | DbKind::DuckDb));
+                    .is_none_or(|d| !matches!(d.config.kind, DbKind::Redis));
                 ui.add_enabled_ui(can_run && explainable, |ui| {
                     ui.menu_button(RichText::new("Explain").size(12.5).color(st.theme.text), |ui| {
                         if ui.button("Explain Plan").clicked() {
@@ -1789,5 +1825,35 @@ fn edit_preview(ctx: &egui::Context, s: &Session, st: &UiState, cmd: &mut Vec<(&
         });
     if !open {
         cmd.push(("db.closePreview", Value::Null));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codecraft_engine::database::{ConnStatus, DataSource, SchemaNode, SchemaTree};
+    use codecraft_engine::db::{DataSourceConfig, DatabaseInfo};
+
+    /// A cached (stale) tree is listed greyed under a "Cached metadata" note (track DX).
+    #[test]
+    fn cached_trees_are_greyed() {
+        let mut s = Session::new();
+        let st = UiState::new();
+        let mut tree = SchemaTree {
+            info: Some(DatabaseInfo { schemas: vec!["main".into()], ..Default::default() }),
+            stale: true,
+            ..Default::default()
+        };
+        tree.schemas.insert("main".into(), SchemaNode::default());
+        let config = DataSourceConfig { id: "lib".into(), name: "Lib".into(), ..Default::default() };
+        s.db.sources.push(DataSource { config, status: ConnStatus::Disconnected, tree });
+        s.db.expanded.insert(node_key("lib", None, None));
+        let rows = build_rows(&s, &st);
+        assert!(rows[0].detail.contains("cached"), "{}", rows[0].detail);
+        assert!(rows[1].label.starts_with("Cached metadata"), "{}", rows[1].label);
+        let schema = rows.iter().find(|r| r.label == "main").expect("the schema row");
+        assert_eq!(schema.label_color, st.theme.text_muted);
+        assert_eq!(schema.icon_color, st.theme.text_disabled);
+        assert!(cached_age(0).starts_with(" (saved "));
     }
 }

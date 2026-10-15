@@ -6,7 +6,8 @@
 //! Cancel sets a flag the running statement polls every 50 ms; the statement then sends the TDS
 //! attention signal (`cancel_query`) and drains the acknowledgement, keeping the connection
 //! usable. Plain INSERT/UPDATE/DELETE/MERGE run through `sp_executesql` so the grid can report
-//! rows affected; everything else runs as a batch, and the first result set is shown.
+//! rows affected; everything else runs as a batch, and every result set of the batch is shown
+//! (each in its own result tab: [`BatchResults`]).
 //!
 //! Options: `encrypt` (`off` = login only, `on` (default), `strict` (TDS 8.0), `disable`),
 //! `trust_server_certificate` (`true` for self-signed certificates), `sslrootcert`,
@@ -469,6 +470,99 @@ async fn run(
     }
 }
 
+/// The result sets of a batch, handed to the sink one after another: the first like any
+/// statement's rows; each later one only when the sink asks for it ([`ResultSink::next_result`]),
+/// else its rows are read and dropped.
+pub(crate) struct BatchResults<'a> {
+    page_size: usize,
+    started: Instant,
+    /// The sink while no result set is being paged.
+    slot: Option<&'a mut dyn ResultSink>,
+    pager: Option<Pager<'a>>,
+    columns: Vec<Column>,
+    /// Summaries of the finished result sets.
+    done: Vec<ExecSummary>,
+    /// The sink declined a later result set: the rest of the batch is drained.
+    ignore_rest: bool,
+}
+
+impl<'a> BatchResults<'a> {
+    pub(crate) fn new(sink: &'a mut dyn ResultSink, page_size: usize, started: Instant) -> Self {
+        Self {
+            page_size,
+            started,
+            slot: Some(sink),
+            pager: None,
+            columns: Vec::new(),
+            done: Vec::new(),
+            ignore_rest: false,
+        }
+    }
+
+    /// A result set starts.
+    pub(crate) fn metadata(&mut self, cols: Vec<Column>) {
+        if self.ignore_rest {
+            return;
+        }
+        let sink = match self.pager.take() {
+            Some(p) => {
+                let (summary, sink) = p.finish_keep(std::mem::take(&mut self.columns), None);
+                self.done.push(summary);
+                if !sink.next_result() {
+                    self.ignore_rest = true;
+                    self.slot = Some(sink);
+                    return;
+                }
+                sink
+            }
+            None => match self.slot.take() {
+                Some(s) => s,
+                None => return,
+            },
+        };
+        sink.columns(&cols);
+        self.pager = Some(Pager::new(sink, self.page_size, self.started));
+        self.columns = cols;
+    }
+
+    /// A row of the current result set; false when the sink wants no more rows.
+    pub(crate) fn row(&mut self, cells: Vec<Cell>) -> bool {
+        if self.ignore_rest {
+            return true;
+        }
+        match self.pager.as_mut() {
+            Some(p) => p.push(cells),
+            None => true,
+        }
+    }
+
+    /// The batch ended (or stopped). Returns the summary of all result sets (the last one's
+    /// columns, every fetched row counted) and whether the sink stopped early.
+    pub(crate) fn finish(mut self) -> (ExecSummary, bool) {
+        let stopped = self.pager.as_ref().is_some_and(Pager::stopped);
+        match self.pager.take() {
+            Some(p) => {
+                let cols = std::mem::take(&mut self.columns);
+                self.done.push(p.finish(cols, None));
+            }
+            None if self.done.is_empty() => {
+                if let Some(s) = self.slot.take() {
+                    s.columns(&[]);
+                    self.done.push(Pager::new(s, self.page_size, self.started).finish(Vec::new(), Some(0)));
+                }
+            }
+            None => {}
+        }
+        let fetched = self.done.iter().map(|d| d.rows_fetched).sum();
+        let complete = self.done.iter().all(|d| d.complete);
+        let mut last = self.done.pop().unwrap_or_default();
+        last.rows_fetched = fetched;
+        last.complete = complete && !stopped;
+        last.elapsed_ms = crate::elapsed_ms(self.started);
+        (last, stopped)
+    }
+}
+
 async fn stream_batch(
     client: &mut Tds,
     sql: &str,
@@ -482,10 +576,7 @@ async fn stream_batch(
         Some(Err(e)) => return Streamed::Failed(e),
         None => return Streamed::Cancelled,
     };
-    let mut columns: Option<Vec<Column>> = None;
-    let mut pager: Option<Pager<'_>> = None;
-    let mut slot = Some(sink);
-    let mut stopped = false;
+    let mut batch = BatchResults::new(sink, page_size, started);
     loop {
         let item = match race(stream.try_next(), flag).await {
             Some(Ok(Some(i))) => i,
@@ -494,43 +585,23 @@ async fn stream_batch(
             None => return Streamed::Cancelled,
         };
         match item {
-            QueryItem::Metadata(m) if columns.is_none() => {
+            QueryItem::Metadata(m) => {
                 let cols: Vec<Column> = m
                     .columns()
                     .iter()
                     .map(|c| Column { name: c.name().to_string(), type_name: type_name(c.column_type()) })
                     .collect();
-                if let Some(s) = slot.take() {
-                    s.columns(&cols);
-                    pager = Some(Pager::new(s, page_size, started));
-                }
-                columns = Some(cols);
+                batch.metadata(cols);
             }
-            // Later result sets of the batch run but are not shown.
-            QueryItem::Metadata(_) => {}
-            QueryItem::Row(row) if row.result_index() == 0 => {
+            QueryItem::Row(row) => {
                 let cells = row.cells().map(|(_, d)| cell(d)).collect();
-                if let Some(p) = pager.as_mut()
-                    && !p.push(cells)
-                {
-                    stopped = true;
+                if !batch.row(cells) {
                     break;
                 }
             }
-            QueryItem::Row(_) => {}
         }
     }
-    let columns = columns.unwrap_or_default();
-    let pager = match (pager, slot.take()) {
-        (Some(p), _) => p,
-        (None, Some(s)) => {
-            s.columns(&[]);
-            Pager::new(s, page_size, started)
-        }
-        (None, None) => return Streamed::Failed(tiberius::error::Error::Protocol("result sink lost".into())),
-    };
-    let affected = columns.is_empty().then_some(0);
-    let summary = pager.finish(columns, affected);
+    let (summary, stopped) = batch.finish();
     if stopped { Streamed::Stopped(summary) } else { Streamed::Done(summary) }
 }
 
@@ -802,6 +873,86 @@ mod tests {
         assert!(plain_dml("update t set a = 1"));
         assert!(!plain_dml("UPDATE t SET a = 1 OUTPUT inserted.a"));
         assert!(!plain_dml("SELECT 1"));
+    }
+
+    struct Parts {
+        parts: Vec<(Vec<Column>, Vec<Vec<Cell>>)>,
+        take_more: bool,
+        stop_after: Option<usize>,
+        rows: usize,
+    }
+
+    impl ResultSink for Parts {
+        fn columns(&mut self, columns: &[Column]) {
+            self.parts.push((columns.to_vec(), Vec::new()));
+        }
+        fn page(&mut self, page: crate::Page) -> bool {
+            self.rows += page.rows.len();
+            if let Some(p) = self.parts.last_mut() {
+                p.1.extend(page.rows);
+            }
+            self.stop_after.is_none_or(|n| self.rows < n)
+        }
+        fn next_result(&mut self) -> bool {
+            self.take_more
+        }
+    }
+
+    fn col(name: &str) -> Column {
+        Column { name: name.into(), type_name: "int".into() }
+    }
+
+    #[test]
+    fn every_result_set_of_a_batch_reaches_the_sink() {
+        let mut sink = Parts { parts: Vec::new(), take_more: true, stop_after: None, rows: 0 };
+        let mut b = BatchResults::new(&mut sink, 2, Instant::now());
+        b.metadata(vec![col("a")]);
+        for i in 0..3 {
+            assert!(b.row(vec![Cell::Int(i)]));
+        }
+        b.metadata(vec![col("b"), col("c")]);
+        assert!(b.row(vec![Cell::Int(9), Cell::Int(8)]));
+        b.metadata(vec![col("empty")]);
+        let (sum, stopped) = b.finish();
+        assert!(!stopped && sum.complete);
+        assert_eq!(sum.rows_fetched, 4);
+        assert_eq!(sum.columns, vec![col("empty")]);
+        assert_eq!(sink.parts.len(), 3);
+        assert_eq!(sink.parts[0].1.len(), 3);
+        assert_eq!(sink.parts[1].0.len(), 2);
+        assert!(sink.parts[2].1.is_empty());
+
+        // A sink that keeps one result: later result sets are drained, not shown.
+        let mut one = Parts { parts: Vec::new(), take_more: false, stop_after: None, rows: 0 };
+        let mut b = BatchResults::new(&mut one, 10, Instant::now());
+        b.metadata(vec![col("a")]);
+        assert!(b.row(vec![Cell::Int(1)]));
+        b.metadata(vec![col("b")]);
+        assert!(b.row(vec![Cell::Int(2)]));
+        let (sum, _) = b.finish();
+        assert_eq!(one.parts.len(), 1);
+        assert_eq!(sum.rows_fetched, 1);
+
+        // No result set at all (DDL, SET …).
+        let mut none = Parts { parts: Vec::new(), take_more: true, stop_after: None, rows: 0 };
+        let (sum, stopped) = BatchResults::new(&mut none, 10, Instant::now()).finish();
+        assert!(!stopped && sum.columns.is_empty() && sum.rows_affected == Some(0));
+        assert_eq!(none.parts.len(), 1);
+
+        // The sink stops in the first result set: the batch stops there.
+        let mut stop = Parts { parts: Vec::new(), take_more: true, stop_after: Some(2), rows: 0 };
+        let mut b = BatchResults::new(&mut stop, 2, Instant::now());
+        b.metadata(vec![col("a")]);
+        let mut pushed = 0;
+        for i in 0..10 {
+            if !b.row(vec![Cell::Int(i)]) {
+                break;
+            }
+            pushed += 1;
+        }
+        assert!(pushed < 10);
+        let (sum, stopped) = b.finish();
+        assert!(stopped && !sum.complete);
     }
 
     #[test]

@@ -2,6 +2,10 @@
 //! connection, with an error mode (stop on error, continue, or ask), one result tab per
 //! statement that returns rows, and an execution log (per statement: line, time, rows, error).
 //!
+//! Run from Caret and Run Selection (track DX) run part of the file the same way: the
+//! statements from the one at the caret to the end, or those of the selection, with lines
+//! numbered as in the file.
+//!
 //! A run is sent to the worker in segments: the whole rest of the script at once; in "ask" mode
 //! a failure stops the segment and the user decides whether the next segment starts after the
 //! failed statement. Statement outcomes arrive through [`on_statement`]; [`on_run_done`] closes
@@ -109,6 +113,9 @@ pub struct ScriptRun {
     pub source: String,
     pub worker: String,
     pub mode: ScriptMode,
+    /// What part of the file ran (`from line 12`, `selection`); `None`: the whole file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub statements: Vec<ScriptStmt>,
     pub state: ScriptPhase,
     /// Wall time of the whole run once it ended.
@@ -159,6 +166,9 @@ impl ScriptRun {
     }
 }
 
+/// Part of a file waiting for confirmation: its text, first line, scope label and parameter values.
+pub(crate) type ScriptPart = (String, usize, String, Option<BTreeMap<String, String>>);
+
 /// The production guard's question for a script.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +178,10 @@ pub struct ScriptConfirm {
     pub source_name: String,
     pub mode: ScriptMode,
     pub writes: Vec<String>,
+    /// Part of the file (the text, its first line and the scope label): confirming runs the
+    /// same part, not the whole file.
+    #[serde(skip)]
+    pub(crate) part: Option<ScriptPart>,
 }
 
 /// Script runs of the session.
@@ -226,7 +240,12 @@ pub fn split(sql: &str, dialect: Dialect) -> Vec<(String, usize)> {
 /// What [`start`] needs.
 pub(crate) struct ScriptStart {
     pub path: PathBuf,
+    /// The script (the whole file, or the part that runs).
     pub text: String,
+    /// The file line `text` starts on (zero-based).
+    pub first_line: usize,
+    /// `from line N`, `selection`; `None` for the whole file.
+    pub scope: Option<String>,
     pub source: String,
     pub worker: String,
     pub mode: ScriptMode,
@@ -236,13 +255,17 @@ pub(crate) struct ScriptStart {
 
 /// Start running a script; returns its id (or `Ok(None)` when it waits for confirmation).
 pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, String> {
-    let ScriptStart { path, text, source, worker, mode, confirmed, values } = req;
+    let ScriptStart { path, text, first_line, scope, source, worker, mode, confirmed, values } = req;
     if text.chars().count() > MAX_SCRIPT_CHARS {
         return Err(format!("the script is larger than {MAX_SCRIPT_CHARS} characters"));
     }
     let cfg = s.db.source(&source).map(|d| d.config.clone()).ok_or_else(|| format!("no data source `{source}`"))?;
-    let dialect = cfg.kind.dialect();
+    // The file's (or folder's) dialect when one is set (track DX).
+    let dialect = s.db.dialect_for(Some(&path), Some(&source));
     let mut stmts = split(&text, dialect);
+    for (_, line) in &mut stmts {
+        *line = line.saturating_add(first_line);
+    }
     if stmts.is_empty() {
         return Err("nothing to execute".into());
     }
@@ -271,7 +294,8 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
         return Err(format!("{} is read-only; this statement modifies data: {first}", cfg.name));
     }
     if !writes.is_empty() && cfg.confirm_writes && !confirmed {
-        s.db.scripts.confirm = Some(ScriptConfirm { path, source, source_name: cfg.name.clone(), mode, writes });
+        let part = scope.map(|sc| (text.clone(), first_line, sc, values.clone()));
+        s.db.scripts.confirm = Some(ScriptConfirm { path, source, source_name: cfg.name.clone(), mode, writes, part });
         s.status = format!("Confirm data modification on {}", cfg.name);
         return Ok(None);
     }
@@ -291,6 +315,10 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
     s.db.scripts.next += 1;
     let id = s.db.scripts.next;
     let title = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "script".into());
+    let title = match &scope {
+        Some(sc) => format!("{title} ({sc})"),
+        None => title,
+    };
     s.db.scripts.runs.push(ScriptRun {
         id,
         path,
@@ -298,6 +326,7 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
         source: source.clone(),
         worker,
         mode,
+        scope,
         statements: stmts
             .into_iter()
             .map(|(text, line)| ScriptStmt { text, line, status: StmtStatus::Pending })
@@ -435,6 +464,24 @@ pub(crate) fn decide(s: &mut Session, id: u64, go_on: bool, all: bool) -> Result
     start_segment(s, id, at + 1)
 }
 
+/// The script from the statement at `caret` (or the next one) to the end, and the line it
+/// starts on; `None` when no statement starts at or after the caret.
+pub fn from_caret(text: &str, dialect: Dialect, caret: usize) -> Option<(String, usize)> {
+    let stmts = split_statements(text, dialect);
+    let start = stmts
+        .iter()
+        .find(|st| st.start <= caret && caret <= st.end_with_delimiter)
+        .or_else(|| stmts.iter().find(|st| st.start >= caret))?
+        .start;
+    let rest: String = text.chars().skip(start).collect();
+    (!rest.trim().is_empty()).then(|| (rest, line_of(text, start)))
+}
+
+/// The zero-based line of a char offset.
+pub fn line_of(text: &str, offset: usize) -> usize {
+    text.chars().take(offset).filter(|c| *c == '\n').count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -455,6 +502,22 @@ mod tests {
         let v = split(&big, Dialect::Sqlite);
         assert_eq!(v.len(), 20_000);
         assert_eq!(v.last().map(|x| x.1), Some(19_999));
+    }
+
+    #[test]
+    fn part_of_a_file() {
+        let text = "select 1;\nselect 2;\n\nselect 3; select 4";
+        let (from, line) = from_caret(text, Dialect::Sqlite, 12).unwrap();
+        assert_eq!(line, 1);
+        assert_eq!(split(&from, Dialect::Sqlite).len(), 3);
+        // Between statements: the next one.
+        let (from, line) = from_caret(text, Dialect::Sqlite, 20).unwrap();
+        assert_eq!((line, split(&from, Dialect::Sqlite).len()), (3, 2));
+        // After the last statement: nothing.
+        assert!(from_caret("select 1;  ", Dialect::Sqlite, 11).is_none());
+        assert!(from_caret("", Dialect::Sqlite, 0).is_none());
+        assert_eq!(line_of("a\nb\nc", 4), 2);
+        assert_eq!(line_of("a", 99), 0);
     }
 
     #[test]

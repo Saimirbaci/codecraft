@@ -7,7 +7,9 @@
 //!   `ANALYZE FORMAT=JSON` (`r_rows`, `r_total_time_ms`).
 //! - SQL Server: the estimated plan from `SET SHOWPLAN_XML ON` (the `RelOp` tree).
 //! - ClickHouse: `EXPLAIN indexes = 1`, an indented text tree.
-//! - DuckDB and Redis: not here (DuckDB's `EXPLAIN` runs in the console as text).
+//! - DuckDB: `EXPLAIN` / `EXPLAIN ANALYZE` through the CLI print a box-drawing tree
+//!   ([`parse_duckdb_boxes`]).
+//! - Redis: no plans.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -103,7 +105,8 @@ pub fn explain_statement(kind: DbKind, sql: &str, analyze: bool) -> (String, boo
         // Runs between SET SHOWPLAN_XML ON and OFF (see [`explain`]).
         (DbKind::SqlServer, _) => (sql.to_string(), false),
         (DbKind::ClickHouse, _) => (format!("EXPLAIN indexes = 1 {sql}"), false),
-        (DbKind::DuckDb, _) | (DbKind::Redis, _) => (format!("EXPLAIN {sql}"), false),
+        (DbKind::DuckDb, false) | (DbKind::Redis, _) => (format!("EXPLAIN {sql}"), false),
+        (DbKind::DuckDb, true) => (format!("EXPLAIN ANALYZE {sql}"), true),
     }
 }
 
@@ -120,7 +123,7 @@ fn explain_mssql(conn: &mut dyn Connection, sql: &str) -> DbResult<Plan> {
 /// Explain `sql` on `conn` (with `analyze`, where supported, the statement runs).
 pub fn explain(conn: &mut dyn Connection, sql: &str, analyze: bool) -> DbResult<Plan> {
     let kind = conn.kind();
-    if matches!(kind, DbKind::DuckDb | DbKind::Redis) {
+    if kind == DbKind::Redis {
         return Err(DbError::Unsupported(format!(
             "Explain Plan is not available for {}; run EXPLAIN in the console",
             kind.label()
@@ -161,10 +164,129 @@ fn explain_rows(kind: DbKind, rows: &[Vec<Cell>], analyzed: bool) -> DbResult<Pl
             parse_indented(&text)
         }
         DbKind::SqlServer => parse_showplan_xml(&first_text(rows)?)?,
-        DbKind::DuckDb | DbKind::Redis => {
+        DbKind::DuckDb => {
+            // Rows `(explain_key, explain_value)`: the plan is the value's box drawing.
+            let text = rows.iter().filter_map(|r| r.last().map(Cell::to_plain)).collect::<Vec<_>>().join("\n");
+            if text.trim().is_empty() {
+                return Err(DbError::Query("the database returned no plan".into()));
+            }
+            parse_duckdb_boxes(&text, analyzed)
+        }
+        DbKind::Redis => {
             return Err(DbError::Unsupported("Explain Plan is not available for this data source".into()));
         }
     })
+}
+
+/// One box of a DuckDB plan drawing: its position and text lines.
+struct DuckBox {
+    /// Line of the top border.
+    top: usize,
+    /// Column (in chars) of the left border.
+    left: usize,
+    lines: Vec<String>,
+}
+
+/// DuckDB's `EXPLAIN` output: operators drawn as boxes (`┌─┐ │ │ └─┘`), a child below its parent
+/// and a second child to the right of the first. Boxes of one level start on the same line; a
+/// box's children are the boxes of the next level from its column up to the next box of its own
+/// level. The first text line of a box is the operator; the others become its detail (`~N Rows`
+/// and, analyzed, `N Rows` / `(0.01s)` fill the row and time fields).
+pub fn parse_duckdb_boxes(text: &str, analyzed: bool) -> Plan {
+    let grid: Vec<Vec<char>> = text.lines().map(|l| l.chars().collect()).collect();
+    let at = |r: usize, c: usize| grid.get(r).and_then(|l| l.get(c)).copied();
+    let mut boxes: Vec<DuckBox> = Vec::new();
+    for (r, line) in grid.iter().enumerate() {
+        for (c, ch) in line.iter().enumerate() {
+            if *ch != '┌' {
+                continue;
+            }
+            // The right border: the first `┐` after the corner on this line.
+            let Some(right) = line.iter().skip(c + 1).position(|x| *x == '┐').map(|k| c + 1 + k) else { continue };
+            let mut lines = Vec::new();
+            let mut row = r + 1;
+            while row < grid.len() && lines.len() < 200 {
+                match at(row, c) {
+                    Some('└') => break,
+                    Some('│' | '├' | '┤') => {
+                        let inner: String = grid
+                            .get(row)
+                            .and_then(|l| l.get(c + 1..right.min(l.len())))
+                            .unwrap_or(&[])
+                            .iter()
+                            .collect();
+                        let t = inner.trim();
+                        // Separator rows are dashes only.
+                        if !t.is_empty() && !t.chars().all(|x| matches!(x, '─' | '-' | ' ')) {
+                            lines.push(t.to_string());
+                        }
+                    }
+                    _ => break,
+                }
+                row += 1;
+            }
+            if !lines.is_empty() {
+                boxes.push(DuckBox { top: r, left: c, lines });
+            }
+        }
+    }
+    // Levels: boxes sharing a top line, left to right.
+    let mut tops: Vec<usize> = boxes.iter().map(|b| b.top).collect();
+    tops.sort_unstable();
+    tops.dedup();
+    let level_of = |b: &DuckBox| tops.iter().position(|t| *t == b.top).unwrap_or(0);
+    fn node_of(b: &DuckBox, analyzed: bool) -> PlanNode {
+        let mut it = b.lines.iter();
+        let mut n = PlanNode::new(it.next().map(String::as_str).unwrap_or("?"));
+        for l in it {
+            let t = l.trim();
+            let num = |s: &str| s.trim().replace(',', "").parse::<f64>().ok();
+            if let Some(rows) = t.strip_prefix('~').and_then(|x| x.strip_suffix(" Rows").or(x.strip_suffix(" rows"))) {
+                n.rows = num(rows);
+            } else if let Some(rows) = t.strip_suffix(" Rows").or(t.strip_suffix(" rows")).filter(|_| analyzed) {
+                n.actual_rows = num(rows);
+            } else if let Some(secs) = t.strip_prefix('(').and_then(|x| x.strip_suffix("s)")).filter(|_| analyzed) {
+                n.actual_time_ms = num(secs).map(|s| s * 1000.0);
+            } else if let Some(table) = t.strip_prefix("Table: ") {
+                n.relation = Some(table.trim().to_string());
+                n.add_detail("", t);
+            } else {
+                n.add_detail("", t);
+            }
+        }
+        n
+    }
+    fn build(i: usize, boxes: &[DuckBox], levels: &[usize], depth: usize, analyzed: bool) -> PlanNode {
+        let Some(b) = boxes.get(i) else { return PlanNode::new("?") };
+        let mut node = node_of(b, analyzed);
+        let Some(level) = levels.get(i).copied() else { return node };
+        if depth >= MAX_DEPTH {
+            return node;
+        }
+        // The next box of the same level bounds the children on the right.
+        let right = boxes
+            .iter()
+            .zip(levels)
+            .filter(|(o, l)| **l == level && o.left > b.left)
+            .map(|(o, _)| o.left)
+            .min()
+            .unwrap_or(usize::MAX);
+        let mut kids: Vec<usize> = (0..boxes.len())
+            .filter(|&k| levels.get(k) == Some(&(level + 1)))
+            .filter(|&k| boxes.get(k).is_some_and(|o| o.left >= b.left && o.left < right))
+            .collect();
+        kids.sort_by_key(|&k| boxes.get(k).map(|o| o.left));
+        for k in kids {
+            node.children.push(build(k, boxes, levels, depth + 1, analyzed));
+        }
+        node
+    }
+    let levels: Vec<usize> = boxes.iter().map(level_of).collect();
+    let mut roots: Vec<usize> = (0..boxes.len()).filter(|&k| levels.get(k) == Some(&0)).collect();
+    roots.sort_by_key(|&k| boxes.get(k).map(|o| o.left));
+    let roots: Vec<PlanNode> = roots.into_iter().map(|k| build(k, &boxes, &levels, 0, analyzed)).collect();
+    let note = roots.is_empty().then(|| "the plan could not be read; see the raw output".to_string());
+    Plan { roots, raw: text.to_string(), note, ..Plan::default() }
 }
 
 /// An indented text plan (ClickHouse `EXPLAIN`): each level two more spaces.
@@ -767,6 +889,58 @@ mod tests {
         let _ = parse_indented("");
         let _ = parse_indented(&" x\n".repeat(5));
         let _ = parse_indented(&(0..500).map(|i| format!("{}n", " ".repeat(i))).collect::<Vec<_>>().join("\n"));
+    }
+
+    #[test]
+    fn duckdb_box_plans() {
+        let text = "\
+┌───────────────────────────┐
+│         PROJECTION        │
+│    ────────────────────   │
+│             a             │
+│                           │
+│          ~3 Rows          │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│         HASH_JOIN         │
+│    ────────────────────   │
+│      Join Type: INNER     ├──────────────┐
+│        Conditions:        │              │
+│           a = b           │              │
+└─────────────┬─────────────┘              │
+┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+│         SEQ_SCAN          ││         SEQ_SCAN          │
+│    ────────────────────   ││    ────────────────────   │
+│          Table: t         ││          Table: u         │
+│                           ││                           │
+│          ~10 Rows         ││          ~20 Rows         │
+└───────────────────────────┘└───────────────────────────┘
+";
+        let plan = parse_duckdb_boxes(text, false);
+        assert_eq!(plan.roots.len(), 1, "{plan:?}");
+        let root = &plan.roots[0];
+        assert_eq!(root.operation, "PROJECTION");
+        assert_eq!(root.rows, Some(3.0));
+        assert_eq!(root.children.len(), 1);
+        let join = &root.children[0];
+        assert_eq!(join.operation, "HASH_JOIN");
+        assert!(join.detail.contains("Join Type: INNER"), "{}", join.detail);
+        assert_eq!(join.children.len(), 2);
+        assert_eq!(join.children[0].relation.as_deref(), Some("t"));
+        assert_eq!(join.children[1].relation.as_deref(), Some("u"));
+        assert_eq!(join.children[1].rows, Some(20.0));
+        let analyzed = "┌─────────────┐\n│ SEQ_SCAN    │\n│ 7 Rows      │\n│ (0.25s)     │\n└─────────────┘\n";
+        let a = parse_duckdb_boxes(analyzed, true);
+        assert_eq!(a.roots[0].actual_rows, Some(7.0));
+        assert_eq!(a.roots[0].actual_time_ms, Some(250.0));
+        assert!(parse_duckdb_boxes("not a plan", false).note.is_some());
+        for junk in ["┌", "┌┐", "┌──┐\n│", "┌─┐\n│x│", "└┘┌", "┌─┐\n├─┤\n"]
+        {
+            let _ = parse_duckdb_boxes(junk, true);
+        }
+        assert_eq!(explain_statement(DbKind::DuckDb, "select 1", true), ("EXPLAIN ANALYZE select 1".into(), true));
+        let rows = vec![vec![Cell::Text("physical_plan".into()), Cell::Text(text.into())]];
+        assert_eq!(explain_rows(DbKind::DuckDb, &rows, false).unwrap().roots.len(), 1);
     }
 
     #[test]

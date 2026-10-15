@@ -542,6 +542,89 @@ const READ_COMMANDS: &[&str] = &[
 /// Whether a Redis command line may change data (anything not known to only read counts).
 /// `CONFIG SET`, `CLIENT KILL`, `MEMORY PURGE` and the like are writes even though their
 /// first word is listed as reading.
+/// Common write commands (with [`READ_COMMANDS`], what a Redis console completes).
+const WRITE_COMMANDS: &[&str] = &[
+    "APPEND",
+    "COPY",
+    "DECR",
+    "DECRBY",
+    "DEL",
+    "EXPIRE",
+    "EXPIREAT",
+    "FLUSHALL",
+    "FLUSHDB",
+    "GETDEL",
+    "GETEX",
+    "GETSET",
+    "HDEL",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HMSET",
+    "HSET",
+    "HSETNX",
+    "INCR",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "JSON.SET",
+    "JSON.DEL",
+    "LINSERT",
+    "LMOVE",
+    "LPOP",
+    "LPUSH",
+    "LPUSHX",
+    "LREM",
+    "LSET",
+    "LTRIM",
+    "MOVE",
+    "MSET",
+    "MSETNX",
+    "PERSIST",
+    "PEXPIRE",
+    "PEXPIREAT",
+    "PSETEX",
+    "PUBLISH",
+    "RENAME",
+    "RENAMENX",
+    "RESTORE",
+    "RPOP",
+    "RPOPLPUSH",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SDIFFSTORE",
+    "SET",
+    "SETBIT",
+    "SETEX",
+    "SETNX",
+    "SETRANGE",
+    "SINTERSTORE",
+    "SMOVE",
+    "SPOP",
+    "SREM",
+    "SUNIONSTORE",
+    "SWAPDB",
+    "UNLINK",
+    "XACK",
+    "XADD",
+    "XDEL",
+    "XTRIM",
+    "ZADD",
+    "ZINCRBY",
+    "ZPOPMAX",
+    "ZPOPMIN",
+    "ZREM",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYSCORE",
+];
+
+/// Redis command names a console completes, sorted and without duplicates.
+pub fn command_names() -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = READ_COMMANDS.iter().chain(WRITE_COMMANDS).copied().collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 pub fn is_write_command(line: &str) -> bool {
     let Ok(args) = split_args(line.trim()) else { return true };
     let Some(first) = args.first() else { return false };

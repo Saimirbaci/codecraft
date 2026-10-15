@@ -1,4 +1,8 @@
 //! SQLite through rusqlite (bundled SQLite).
+//!
+//! Attached databases (track DX): every `attach.<alias>` option of the data source names a
+//! database file that each connection attaches as schema `<alias>` (`ATTACH DATABASE`), so the
+//! tree, completion and consoles all see it; [`attachments`] lists them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -56,6 +60,14 @@ impl SqliteConn {
         // Opening is lazy; touch the schema so a non-database file fails here, not on first use.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
             .map_err(|e| DbError::Connect(format!("{}: {e}", path.display())))?;
+        for (alias, file) in attachments(cfg)? {
+            if !file.is_file() {
+                return Err(DbError::Connect(format!("attached database `{alias}`: no file {}", file.display())));
+            }
+            let target = if cfg.read_only { read_only_uri(&file) } else { file.display().to_string() };
+            conn.execute(&format!("ATTACH DATABASE ?1 AS {}", quote_ident(DbKind::Sqlite, &alias)), [&target])
+                .map_err(|e| DbError::Connect(format!("cannot attach `{alias}` ({}): {e}", file.display())))?;
+        }
         Ok(Self { conn })
     }
 
@@ -76,6 +88,54 @@ impl SqliteConn {
         }
         Ok(out)
     }
+}
+
+/// The `attach.<alias>` options: (alias, file), sorted by alias. Relative files are as given
+/// (the engine resolves them against the project).
+pub fn attachments(cfg: &DataSourceConfig) -> DbResult<Vec<(String, std::path::PathBuf)>> {
+    let mut out = Vec::new();
+    for (k, v) in &cfg.options {
+        let Some(alias) = k.strip_prefix("attach.") else { continue };
+        let alias = alias.trim();
+        check_alias(alias)?;
+        let file = v.trim();
+        if file.is_empty() {
+            return Err(DbError::Config(format!("attached database `{alias}` needs a file")));
+        }
+        out.push((alias.to_string(), std::path::PathBuf::from(file)));
+    }
+    Ok(out)
+}
+
+/// A schema name for an attached database: not `main`/`temp`, 1–64 plain characters.
+pub fn check_alias(alias: &str) -> DbResult<()> {
+    let ok = !alias.is_empty()
+        && alias.chars().count() <= 64
+        && alias.chars().all(|c| c.is_alphanumeric() || c == '_')
+        && !alias.eq_ignore_ascii_case("main")
+        && !alias.eq_ignore_ascii_case("temp");
+    if ok {
+        Ok(())
+    } else {
+        Err(DbError::Config(format!(
+            "`{alias}` cannot name an attached database (letters, digits and _; not main or temp)"
+        )))
+    }
+}
+
+/// `file:<path>?mode=ro` with the URI's special characters escaped.
+fn read_only_uri(path: &std::path::Path) -> String {
+    let mut uri = String::from("file:");
+    for c in path.display().to_string().chars() {
+        match c {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3f"),
+            '#' => uri.push_str("%23"),
+            c => uri.push(c),
+        }
+    }
+    uri.push_str("?mode=ro");
+    uri
 }
 
 fn col(row: &[Option<String>], i: usize) -> String {

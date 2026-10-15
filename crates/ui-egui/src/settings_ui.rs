@@ -271,6 +271,7 @@ fn page(
         settings::PAGE_COLOR_SCHEME => color_scheme_page(ui, st, draft, query, cmds),
         settings::PAGE_LIVE_TEMPLATES => templates_page(ui, s, st),
         settings::PAGE_TOOLS => tools_page(ui, s, st, cmds),
+        settings::PAGE_SQL => crate::database_settings_ui::page(ui, s, st, cmds),
         settings::PAGE_FONT => {
             setting_grid(ui, st, page, draft, query, cmds);
             ui.add_space(6.0);

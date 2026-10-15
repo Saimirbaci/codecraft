@@ -17,6 +17,8 @@ echo "$@" > "$dir/args"
 input=$(cat)
 printf '%s' "$input" > "$dir/last_input"
 case "$input" in
+  *"EXPLAIN ANALYZE"*) printf '%s\n' '{"explain_key":"analyzed_plan","explain_value":"┌──────────┐\n│ SEQ_SCAN │\n│ 3 Rows   │\n│ (0.50s)  │\n└──────────┘"}' ;;
+  *"EXPLAIN"*) printf '%s\n' '{"explain_key":"physical_plan","explain_value":"┌──────────┐\n│ SEQ_SCAN │\n│ Table: t │\n│ ~3 Rows  │\n└──────────┘"}' ;;
   *"SELECT 1 AS ok"*) echo '{"ok":1}' ;;
   *"DESCRIBE SELECT * FROM items"*)
     echo '{"column_name":"id","column_type":"INTEGER","null":"YES","key":null}'
@@ -70,6 +72,23 @@ fn cfg(cli: &Path, db: &Path) -> DataSourceConfig {
     };
     c.options.insert("duckdb_path".into(), cli.display().to_string());
     c
+}
+
+#[test]
+fn explain_plan_through_the_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = fake_cli(dir.path());
+    let mut conn = connect(&cfg(&cli, &dir.path().join("x.db")), None).unwrap();
+    let plan = codecraft_db::explain::explain(conn.as_mut(), "select * from t", false).unwrap();
+    assert_eq!(plan.roots.len(), 1, "{plan:?}");
+    assert_eq!(plan.roots[0].operation, "SEQ_SCAN");
+    assert_eq!(plan.roots[0].relation.as_deref(), Some("t"));
+    assert_eq!(plan.roots[0].rows, Some(3.0));
+    assert!(std::fs::read_to_string(dir.path().join("last_input")).unwrap().contains("EXPLAIN select * from t"));
+    let plan = codecraft_db::explain::explain(conn.as_mut(), "select * from t", true).unwrap();
+    assert!(plan.analyzed);
+    assert_eq!(plan.roots[0].actual_rows, Some(3.0));
+    assert_eq!(plan.roots[0].actual_time_ms, Some(500.0));
 }
 
 #[test]
@@ -134,7 +153,8 @@ fn fake_cli_protocol() {
     assert_eq!(conn.row_count("main", "items").unwrap(), 1234);
     assert_eq!(conn.transaction_status(), codecraft_db::tx::TxStatus::Idle);
     assert!(codecraft_db::tx::begin(conn.as_mut(), None).is_err(), "no transactions across processes");
-    assert!(codecraft_db::explain::explain(conn.as_mut(), "SELECT 1", false).is_err());
+    // Explain Plan works through the CLI (track DX; see `explain_plan_through_the_cli`).
+    assert!(codecraft_db::explain::explain(conn.as_mut(), "SELECT 1", false).is_ok());
 
     // Read-only data sources pass -readonly and need the file.
     let mut ro = cfg(&cli, &db);
