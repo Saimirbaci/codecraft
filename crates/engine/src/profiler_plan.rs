@@ -72,6 +72,9 @@ pub struct Plan {
     /// tracemalloc: milliseconds between memory samples (`None`:
     /// [`DEFAULT_TRACEMALLOC_INTERVAL_MS`], 0: one snapshot at the end only).
     pub sample_interval_ms: Option<u64>,
+    /// Where it runs: the configuration's target (M16 track RT: profiling on SSH hosts and in
+    /// Docker containers; a command's `target` param wins).
+    pub run_target: crate::run_targets::RunTarget,
 }
 
 /// Milliseconds between tracemalloc memory samples by default.
@@ -132,13 +135,12 @@ pub fn resolve_program(program: &str) -> String {
 
 /// The plan for a run configuration (`python`: the project's interpreter, for `pytest`).
 pub fn plan_config(config: &RunConfig, python: Option<&Path>) -> Result<Plan, String> {
-    if !config.target.is_local() {
-        return Err("profiling runs only on this machine (the configuration has a remote target)".into());
-    }
-    match &config.command {
+    let mut plan = match &config.command {
         Some(cmd) => plan_process(&config.name, cmd, python),
         None => plan_cargo(&config.name, &config.invocation),
-    }
+    }?;
+    plan.run_target = config.target.clone();
+    Ok(plan)
 }
 
 /// The plan for a command line (`["cargo", "test", "name"]`, `["pytest", "-k", "x"]`,
@@ -214,6 +216,7 @@ fn plan_cargo(name: &str, inv: &CargoInvocation) -> Result<Plan, String> {
         env: inv.env.clone(),
         debug_build: !inv.release,
         sample_interval_ms: None,
+        run_target: Default::default(),
     })
 }
 
@@ -229,6 +232,7 @@ fn plan_process(name: &str, cmd: &ProcessCommand, python: Option<&Path>) -> Resu
         env: cmd.env.clone(),
         debug_build: false,
         sample_interval_ms: None,
+        run_target: Default::default(),
     };
     if matches!(base.as_str(), "sh" | "bash" | "zsh") && cmd.args.first().is_some_and(|a| a == "-c") {
         let script = cmd.args.get(1).ok_or("`sh -c` without a script")?;

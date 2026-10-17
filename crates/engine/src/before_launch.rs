@@ -70,6 +70,9 @@ pub struct PendingLaunch {
     pub current: Option<(Step, RunTabId)>,
     /// Finished steps (labels).
     pub done: Vec<String>,
+    /// The command's `target` param: the configuration starts there at the end (M16 RT); the
+    /// tasks themselves run here, as for a configuration's own target.
+    pub target: Option<crate::run_targets::RunTarget>,
 }
 
 #[derive(Debug, Default)]
@@ -147,8 +150,17 @@ pub(crate) fn begin(s: &mut Session, name: &str, mode: LaunchMode) -> Result<Opt
     let labels: Vec<String> = steps.iter().map(Step::label).collect();
     s.launch.last_error = None;
     s.launch.pending =
-        Some(PendingLaunch { config: name.to_string(), mode, steps: steps.into(), current: None, done: Vec::new() });
+        Some(PendingLaunch {
+            config: name.to_string(),
+            mode,
+            steps: steps.into(),
+            current: None,
+            done: Vec::new(),
+            target: s.targets.scoped.clone(),
+        });
+    let scoped = s.targets.scoped.take();
     advance(s);
+    s.targets.scoped = scoped;
     if let Some(e) = s.launch.last_error.clone().filter(|_| s.launch.pending.is_none()) {
         return Err(CommandError::Failed(e));
     }
@@ -202,9 +214,13 @@ fn finish(s: &mut Session) {
         return;
     };
     let params = json!({ "config": index, "beforeLaunch": false });
-    let started = match p.mode {
+    let start = |s: &mut Session| match p.mode {
         LaunchMode::Run => crate::run_cmds::run_selected(s, &params),
         LaunchMode::Debug => crate::debug_cmds::debug_config(s, &params),
+    };
+    let started = match p.target.clone() {
+        Some(t) => crate::target_exec::with_target(s, t, start),
+        None => start(s),
     };
     if let Err(e) = started {
         let message = format!("'{}' could not start after its before-launch tasks: {e}", p.config);

@@ -37,6 +37,9 @@ pub enum Convert {
     /// A samply / Firefox Profiler JSON whose native frames may have only addresses: looked up
     /// in samply's presymbolication sidecar, then with `atos` (macOS) or `addr2line`.
     Samply { atos: Option<PathBuf>, addr2line: Option<PathBuf> },
+    /// A snapshot recorded on an SSH host or in a container (M16 track RT): converted with
+    /// `inner`, then the target's paths under `from` are mapped to `to` (the project here).
+    Remap { inner: Box<Convert>, from: String, to: String },
 }
 
 /// A converted snapshot: a file to parse, or a profile parsed already (with symbolication).
@@ -112,6 +115,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 pub fn convert(c: &Convert, input: &Path) -> Result<Converted, String> {
     match c {
         Convert::None => Ok(Converted::File(input.to_path_buf())),
+        Convert::Remap { inner, .. } => convert(inner, input),
         Convert::PerfScript { perf } => {
             let out = with_suffix(input, ".txt");
             run(perf, &["script".into(), "-i".into(), input.display().to_string()], None, Some(&out))?;

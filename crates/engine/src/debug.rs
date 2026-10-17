@@ -34,6 +34,8 @@ pub(crate) mod agent;
 mod children;
 mod cpp_values;
 pub mod exceptions;
+// M16 track RT: sessions on SSH hosts and in Docker containers.
+pub(crate) mod on_target;
 mod python_values;
 mod rust_values;
 #[cfg(test)]
@@ -458,6 +460,11 @@ pub enum DebugTarget {
     /// Stopping detaches.
     #[serde(rename_all = "camelCase")]
     AttachWait { name: String, process: String },
+    /// `debug` run on an SSH host or in a Docker image/container/Compose service (M16 track RT):
+    /// built there when it builds, its debug server (debugpy, lldb-server/gdbserver) started
+    /// there and its port forwarded; the local adapter attaches with the paths mapped.
+    #[serde(rename_all = "camelCase")]
+    OnTarget { name: String, target: crate::run_targets::RunTarget, debug: Box<DebugTarget> },
 }
 
 fn yes() -> bool {
@@ -477,7 +484,8 @@ impl DebugTarget {
             | Self::CoreDump { name, .. }
             | Self::Remote { name, .. }
             | Self::PythonRemote { name, .. }
-            | Self::AttachWait { name, .. } => name,
+            | Self::AttachWait { name, .. }
+            | Self::OnTarget { name, .. } => name,
         }
     }
 }
@@ -1286,6 +1294,8 @@ struct Runtime {
     panic_breakpoints: Vec<i64>,
     /// The session whose adapter started this one (a debugpy subprocess's parent).
     child_of: Option<u64>,
+    /// A session on an SSH host or in a container: its debug server and port forward (M16 RT).
+    on_target: Option<Box<on_target::OnTarget>>,
 }
 
 impl Runtime {
@@ -1316,25 +1326,29 @@ impl Runtime {
             children: children::Children::default(),
             panic_breakpoints: Vec::new(),
             child_of: None,
+            on_target: None,
         }
     }
 
     /// A Rust program under an LLDB adapter (values get Rust's formatting clean-up).
     fn is_rust(&self) -> bool {
         matches!(self.plan.run, RunSpec::Native { rust: true, .. } | RunSpec::Attach { process: ProcessKind::Rust, .. })
+            || self.on_target.as_ref().is_some_and(|o| o.is_rust())
     }
 
     /// Attached to a process we did not start (or a core dump, or a remote program whose pid
     /// means nothing here): stopping detaches and never kills it.
     fn attached(&self) -> bool {
-        matches!(
-            self.plan.run,
-            RunSpec::Attach { .. }
-                | RunSpec::Core { .. }
-                | RunSpec::Remote { .. }
-                | RunSpec::AttachWait { .. }
-                | RunSpec::PythonRemote { .. }
-        )
+        // A session on a target started its program there: stopping ends it (M16 RT).
+        self.on_target.is_none()
+            && matches!(
+                self.plan.run,
+                RunSpec::Attach { .. }
+                    | RunSpec::Core { .. }
+                    | RunSpec::Remote { .. }
+                    | RunSpec::AttachWait { .. }
+                    | RunSpec::PythonRemote { .. }
+            )
     }
 
     /// End the session with `disconnect`: detach from an attached process, else terminate.
@@ -1369,11 +1383,22 @@ impl Runtime {
 
     /// The path the adapter knows a file by (symlinks resolved, as in debug info).
     fn to_adapter(&self, path: &Path) -> PathBuf {
+        // A native session on a target: the program was built there, with its paths (M16 RT).
+        if let Some(map) = self.on_target.as_ref().and_then(|o| o.native_map())
+            && let Some(remote) = on_target::to_target(map, path)
+        {
+            return remote;
+        }
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     }
 
     /// A path from the adapter, mapped back into the project as the user opened it.
     fn map_from_adapter(&self, path: &Path) -> PathBuf {
+        if let Some(map) = self.on_target.as_ref().and_then(|o| o.native_map())
+            && let Some(local) = on_target::from_target(map, path)
+        {
+            return local;
+        }
         if let (Some(root), Some(canonical)) = (&self.project_root, &self.canonical_root)
             && root != canonical
             && let Ok(rest) = path.strip_prefix(canonical)
@@ -1602,6 +1627,9 @@ fn plan_for(target: &DebugTarget) -> Result<LaunchPlan, String> {
             cwd: cwd.clone().or_else(|| program.parent().map(Path::to_path_buf)),
             env: Vec::new(),
         }),
+        DebugTarget::OnTarget { name, target, .. } => {
+            Err(format!("{name} runs on {}: start it with the session (debug.start)", target.label()))
+        }
     }
 }
 
@@ -1857,7 +1885,8 @@ fn prepare(
         }
         RunSpec::Remote { address, program } => {
             let adapter = dap::discover::find_native().map_err(|e| e.to_string())?;
-            let init = rust_init_commands(adapter.kind);
+            // The configuration's init commands too (a session on a target maps its sources).
+            let init = extra_init(rust_init_commands(adapter.kind), adapter.kind);
             let args = dap::launch::native_remote(adapter.kind, &plan.name, program.as_deref(), address, &init);
             (adapter, args)
         }
@@ -1954,6 +1983,14 @@ pub(crate) fn start(s: &mut Session, target: DebugTarget) -> Result<(), CommandE
 pub(crate) fn compile_and_reload(s: &mut Session) -> Result<String, CommandError> {
     let target =
         s.debug.last_target.clone().ok_or_else(|| CommandError::Disabled("there is no debug session".into()))?;
+    // On a target: rebuild there and restart (M16 RT).
+    if let DebugTarget::OnTarget { name, target: t, .. } = &target {
+        let message = format!("{name}: rebuilding on {} and restarting (breakpoints kept)", t.label());
+        let options = s.debug.last_options.clone();
+        start_with(s, target.clone(), options)?;
+        s.status = message.clone();
+        return Ok(message);
+    }
     let plan = plan_for(&target).map_err(CommandError::Failed)?;
     if matches!(
         plan.run,
@@ -1990,7 +2027,16 @@ pub(crate) fn start_with(
     target: DebugTarget,
     options: crate::run_config_store::DebuggerOptions,
 ) -> Result<(), CommandError> {
-    let plan = plan_for(&target).map_err(CommandError::Failed)?;
+    // A command's `target` param runs what it starts there (M16 RT).
+    let target = on_target::wrap(s, &crate::run_targets::RunTarget::Local, target);
+    // On an SSH host or in a container (M16 RT): the target side plans the session.
+    let (plan, remote) = match &target {
+        DebugTarget::OnTarget { name, target: t, debug } => {
+            let (plan, on) = on_target::plan(s, name, t, debug).map_err(CommandError::Failed)?;
+            (plan, Some(Box::new(on)))
+        }
+        other => (plan_for(other).map_err(CommandError::Failed)?, None),
+    };
     // Debugging a configuration that is being debugged restarts it (RustRover's single
     // instance); other sessions keep running next to the new one.
     let same: Vec<u64> = s
@@ -2047,10 +2093,13 @@ pub(crate) fn start_with(
     let phase = match &plan.build {
         Some(build) => {
             s.debug.tab = DebugTab::Console;
-            let line = std::iter::once(build.program.display().to_string())
-                .chain(build.args.iter().map(|a| codecraft_cargo::shell_quote(a)))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let line = match &remote {
+                Some(on) => on_target::describe(on),
+                None => std::iter::once(build.program.display().to_string())
+                    .chain(build.args.iter().map(|a| codecraft_cargo::shell_quote(a)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
             s.debug.info(line);
             let (handle, events) =
                 codecraft_cargo::spawn_process(&build.program, &build.args, &build.cwd, &build.env, build.cargo)
@@ -2065,6 +2114,12 @@ pub(crate) fn start_with(
     };
     let mut rt = Runtime::new(plan, phase, root);
     rt.options = options;
+    if let Some(on) = remote {
+        s.status = format!("Debugging {} on {}", target.name(), on.label());
+        rt.on_target = Some(on);
+        s.debug.rt = Some(rt);
+        return Ok(());
+    }
     s.debug.rt = Some(rt);
     s.status = format!("Debugging {}", target.name());
     Ok(())
@@ -2467,6 +2522,12 @@ fn back_to_parent(s: &mut Session, before: Option<(u64, bool)>) -> bool {
 
 /// Drain the selected session's events.
 fn pump_selected(s: &mut Session) -> bool {
+    // A session on a target: its debug server's output (M16 RT).
+    let launcher = on_target::pump(s);
+    pump_phase(s) || launcher
+}
+
+fn pump_phase(s: &mut Session) -> bool {
     let Some(rt) = s.debug.rt.as_mut() else { return false };
     match &mut rt.phase {
         Phase::Build { events, .. } => {
@@ -2523,6 +2584,15 @@ fn fail(s: &mut Session, message: &str) {
 }
 
 fn on_build_event(s: &mut Session, event: RunEvent) {
+    // A session on a target: its preflight, remote build and launcher (M16 RT).
+    if s.debug.rt.as_ref().is_some_and(|rt| rt.on_target.is_some()) {
+        on_target::on_build_event(s, event);
+        return;
+    }
+    on_local_build_event(s, event);
+}
+
+fn on_local_build_event(s: &mut Session, event: RunEvent) {
     match event {
         RunEvent::Started { .. } | RunEvent::Test(_) => {}
         RunEvent::Stdout(line) => s.debug.push_console(DebugConsoleKind::Info, line),

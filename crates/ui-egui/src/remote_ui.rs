@@ -267,6 +267,13 @@ pub(crate) fn ssh_target_fields(ui: &mut egui::Ui, t: &mut SshTarget) {
         ui.label("");
         ui.checkbox(&mut t.sync, "Upload the project before running (rsync)");
         ui.end_row();
+        ui.label("Python interpreter:");
+        ui.add(
+            TextEdit::singleline(&mut t.python)
+                .hint_text("(python3; Settings › Python › Remote interpreters)")
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
     });
 }
 

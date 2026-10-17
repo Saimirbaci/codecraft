@@ -283,6 +283,7 @@ fn targets_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     }
                 });
             });
+            add_target_form(ui, &theme, &mut cmds);
         });
     ui.data_mut(|d| d.insert_temp(selected_id, selected));
     if !open {
@@ -291,4 +292,57 @@ fn targets_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     for (id, p) in cmds {
         run_command(s, st, id, &p);
     }
+}
+
+/// Manage Targets › Add (M16 track RT): a named SSH or Docker target and its Python interpreter
+/// (`run.manageTargets.add`). The draft is view state.
+fn add_target_form(ui: &mut egui::Ui, theme: &crate::theme::Theme, cmds: &mut Vec<(&'static str, Value)>) {
+    const KINDS: [(&str, &str, &str); 4] = [
+        ("ssh", "SSH server", "a ~/.ssh/config host or a Deployment server"),
+        ("docker", "Docker image", "python:3.12"),
+        ("container", "Docker container", "a running container's name"),
+        ("compose", "Compose service", "web"),
+    ];
+    let id = Id::new("manage-targets-add");
+    let (mut name, mut kind, mut value, mut python): (String, usize, String, String) =
+        ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    ui.separator();
+    ui.label(RichText::new("Add a target").strong());
+    egui::Grid::new("manage-targets-add-grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+        ui.label("Name:");
+        ui.add(TextEdit::singleline(&mut name).hint_text("build box").desired_width(260.0));
+        ui.end_row();
+        ui.label("Kind:");
+        let current = KINDS.get(kind).map_or("SSH server", |k| k.1);
+        egui::ComboBox::from_id_salt("manage-targets-add-kind").selected_text(current).show_ui(ui, |ui| {
+            for (i, k) in KINDS.iter().enumerate() {
+                ui.selectable_value(&mut kind, i, k.1);
+            }
+        });
+        ui.end_row();
+        ui.label("Server / image / container / service:");
+        let hint = KINDS.get(kind).map_or("", |k| k.2);
+        ui.add(TextEdit::singleline(&mut value).hint_text(hint).desired_width(260.0));
+        ui.end_row();
+        ui.label("Python interpreter there:");
+        ui.add(TextEdit::singleline(&mut python).hint_text("(python3)").desired_width(260.0));
+        ui.end_row();
+    });
+    ui.label(
+        RichText::new("Run, Debug, Test and Profile of a configuration using it run there (debugpy, gdbserver/lldb-server, cProfile, perf).")
+            .color(theme.text_muted)
+            .small(),
+    );
+    let ready = !name.trim().is_empty() && !value.trim().is_empty();
+    if ui.add_enabled(ready, egui::Button::new("Add Target")).clicked() {
+        let prefix = KINDS.get(kind).map_or("ssh", |k| k.0);
+        cmds.push((
+            "run.manageTargets.add",
+            json!({ "name": name.trim(), "target": format!("{prefix}:{}", value.trim()), "python": python.trim() }),
+        ));
+        name.clear();
+        value.clear();
+        python.clear();
+    }
+    ui.data_mut(|d| d.insert_temp(id, (name, kind, value, python)));
 }

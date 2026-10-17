@@ -410,7 +410,7 @@ fn ssh_run_target_syncs_then_runs_in_the_mapped_folder() {
     // Without a mapping or a remote folder the target explains what to do.
     let other = crate::ssh_target::SshTarget { server: "web2".into(), ..Default::default() };
     assert!(crate::ssh_target::wrap(&mut s, &other, cmd.clone()).is_err());
-    let explicit = crate::ssh_target::SshTarget { server: "web2".into(), remote_dir: "/srv/x".into(), sync: false };
+    let explicit = crate::ssh_target::SshTarget { server: "web2".into(), remote_dir: "/srv/x".into(), sync: false, ..Default::default() };
     let w = crate::ssh_target::wrap(&mut s, &explicit, cmd).unwrap();
     assert!(w.args.last().unwrap().contains("cd /srv/x/scripts"), "{:?}", w.args);
     assert!(w.args.contains(&"--".to_string()));

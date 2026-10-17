@@ -125,6 +125,11 @@ pub fn target_rows(s: &mut Session) -> Vec<TargetRow> {
             used_by: Vec::new(),
         });
     }
+    // Saved, named targets (M16 track RT: run.manageTargets.add).
+    for (name, target) in crate::target_cmds::saved_rows(s) {
+        let kind = if matches!(target, RunTarget::Ssh(_)) { "ssh" } else { "docker" };
+        rows.push(TargetRow { kind: kind.into(), name, detail: target.label(), target, used_by: Vec::new() });
+    }
     // Targets the configurations use (Docker images and containers, SSH servers not listed).
     let configs: Vec<(String, RunTarget)> = s.run_configs.iter().map(|c| (c.name.clone(), c.target.clone())).collect();
     for (config, target) in configs {
@@ -133,11 +138,23 @@ pub fn target_rows(s: &mut Session) -> Vec<TargetRow> {
             RunTarget::Ssh(t) => ("ssh", t.server.clone(), t.remote_dir.clone()),
             RunTarget::Docker(t) => (
                 "docker",
-                if t.container.is_empty() { t.image.clone() } else { t.container.clone() },
-                if t.container.is_empty() { "image".into() } else { "container".into() },
+                if !t.service.is_empty() {
+                    t.service.clone()
+                } else if t.container.is_empty() {
+                    t.image.clone()
+                } else {
+                    t.container.clone()
+                },
+                if !t.service.is_empty() {
+                    "Compose service".into()
+                } else if t.container.is_empty() {
+                    "image".into()
+                } else {
+                    "container".into()
+                },
             ),
         };
-        match rows.iter_mut().find(|r| r.kind == kind && r.name == name) {
+        match rows.iter_mut().find(|r| (r.kind != "local" && r.target == target) || (r.kind == kind && r.name == name)) {
             Some(r) => r.used_by.push(config),
             None => rows.push(TargetRow { kind: kind.into(), name, detail, target, used_by: vec![config] }),
         }
@@ -149,7 +166,8 @@ fn assign(s: &mut Session, p: &Value) -> CmdResult {
     let index = req_usize(p, "config")?;
     let target: RunTarget = match p.get("target") {
         None | Some(Value::Null) => RunTarget::Local,
-        Some(v) => serde_json::from_value(v.clone()).map_err(|e| CommandError::BadParams(format!("bad `target`: {e}")))?,
+        // A name (a saved target, an SSH server, docker:<image>, …; M16 track RT) or an object.
+        Some(v) => crate::target_exec::resolve_ref(s, &v.clone())?,
     };
     let c = s
         .run_store

@@ -93,6 +93,12 @@ pub(crate) fn page(ui: &mut Ui, s: &mut Session, st: &mut UiState, draft: &Setti
         });
     }
 
+    // ------------------------------------------------------------ remote interpreters (M16 RT)
+    if s.project_root().is_some() {
+        heading(ui, "Remote Interpreters (SSH / Docker)");
+        crate::remote_python_ui::section(ui, s, &theme, cmds);
+    }
+
     // ------------------------------------------------------------ language server
     heading(ui, "Language Server");
     ui.horizontal(|ui| {

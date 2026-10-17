@@ -292,7 +292,8 @@ A log message makes a logpoint (logs, doesn't stop). **`debug_breakpoint_remove`
 `path`+`line` or `all: true`; **`debug_breakpoints`** lists them.
 
 **`debug_start`** (debug) — one of `config` (name or index), `file` (+ `line` for a Rust test or
-`main`), `program` (+ `args`), `pid` (+ `kind`: native, rust, python).
+`main`), `program` (+ `args`), `pid` (+ `kind`: native, rust, python); `target` debugs on an SSH
+host or in a Docker container (see [Remote targets](#remote-targets-ssh-hosts-and-docker-containers)).
 ```json
 { "config": "Run app" } → { "state": "building", "session": "Run app", "started": true, "breakpoints": 1, "next": "call debug_wait_for_stop" }
 ```
@@ -413,6 +414,41 @@ the first sample; xctrace and samply snapshots) to look at one thread or one pha
 (stderr lines start with `[stderr]`; page with `offset`).
 
 **`run_stop`** (run) — `{ "tab": 8 }` → `{ "tab": 8, "stopped": true }`
+
+### Remote targets (SSH hosts and Docker containers)
+
+`debug_start`, `profile_start`, `test_run` and `run_start` take **`target`** (M16 track RT): run
+there instead of the configuration's own target (Edit Configurations › Run on, or
+`run.manageTargets.assign`). A target is a name — `local`, a saved target (Run › Manage
+Targets…, `run.manageTargets.add {name, target, python?}`, stored in `.codecraft/targets.json`),
+an SSH server (`~/.ssh/config` or Tools › Deployment), `ssh:<server>`, `docker:<image>`,
+`container:<name>`, `compose:<service>` (or `compose:<file>:<service>`) — or an object
+(`{ "kind": "ssh", "server": "web", "remoteDir": "/srv/app", "python": "/srv/app/.venv/bin/python" }`,
+`{ "kind": "docker", "image": "python:3.12", "mount": "/workspace" }`, `"container"`,
+`"service"` + `"compose_file"`). `run.manageTargets.resolve {target}` says what a name means.
+```json
+{ "config": "Run app", "target": "build box" }      (debug_start) → { "state": "starting", "session": "Run app", "started": true, … }
+{ "path": "tests/test_calc.py", "target": "ssh:web" } (test_run)    → { "commandLine": "python3 -m pytest …/tests/test_calc.py (on SSH: web)", "counts": {…}, "failures": [{ "file": "/work/app/tests/test_calc.py", … }] }
+{ "command": "python3 work.py", "target": "docker:python:3.12" } (profile_start) → { "job": 4, "tool": "cProfile", "state": "recording", … }
+```
+How it works: an SSH target syncs the project to its deployment folder (rsync, the deployment
+exclusions) and runs there; a Docker image or Compose service runs with the project mounted
+(`-v <project>:<mount>`), a container through `docker exec` (the project mounted at `mount`).
+**Debugging** starts the debug server on the target — Python: `python -m debugpy --listen …
+--wait-for-client` with the target's interpreter; Rust (Cargo built there), C and C++ (the
+configuration's build step run there, else the program uploaded): `lldb-server gdbserver`,
+`gdbserver` or `debugserver`, whichever the target has — forwards its port (`ssh -N -L`, a
+published `-p 127.0.0.1:P:P` port, or a `docker exec` socket relay for running containers) and
+attaches with the paths mapped (debugpy `pathMappings`, LLDB `target.source-map`; the native
+program is copied back for its symbols). Stop summaries, breakpoints, test failures and profile
+hotspots show **local paths**. **Profiling** runs cProfile or tracemalloc (CodeCraft's helper is
+copied there) or py-spy for Python, samply or perf for native code, on the target, and brings
+the snapshot back to `.codecraft/remote-run/`. A missing tool fails with what to install *there*
+(`debugpy is not installed for python3 on SSH: web. Install it there: python3 -m pip install
+debugpy`); CodeCraft never installs anything on a target. Remote interpreters:
+`python.remoteInterpreters.detect {target}` (python3 and virtualenvs there), `…packages {target,
+python}`, `python.remoteInterpreters {target?}` (results), `…use {config, python, target?}` (the
+interpreter a configuration uses there).
 
 ### Databases
 

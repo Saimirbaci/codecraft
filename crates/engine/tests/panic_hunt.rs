@@ -107,6 +107,11 @@ fn skip(id: &str, params: &Value) -> bool {
     if id.starts_with("python.packages.") {
         return true;
     }
+    // Remote interpreters run `ssh`/`docker` on a target (M16 RT; remote_targets tests drive
+    // them with fakes).
+    if matches!(id, "python.remoteInterpreters.detect" | "python.remoteInterpreters.packages") && !params.is_null() {
+        return true;
+    }
     // Analysis jobs start every installed analyzer (clang, clangd, rust-analyzer…) and installs
     // run uv (analysis_ca tests drive them with fakes; M14 CA).
     if matches!(id, "analysis.run" | "analysis.installTool") && !params.is_null() {

@@ -73,6 +73,8 @@ pub(crate) fn start_debugging(s: &mut Session, seq: i64, arguments: &Value) {
     let connect = args.configuration.get("connect");
     let host = connect.and_then(|c| c.get("host")).and_then(Value::as_str).unwrap_or("127.0.0.1").to_owned();
     let port = connect.and_then(|c| c.get("port")).and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok());
+    // On a target, the adapter's port there is forwarded to another port here (M16 RT).
+    let port = port.map(|p| rt.on_target.as_ref().map_or(p, |o| o.local_port(p)));
     let pending = rt.children.connecting.len();
     let Some(client) = rt.client() else { return };
     let refusal = match (rt.kind, port) {

@@ -10,6 +10,7 @@
 //! - [`rsync`]: `--itemize-changes` output.
 //! - [`listing`]: `ls -lAn` output.
 //! - [`deploy`]: per-project deployment mappings (`.codecraft/deployment.json`).
+//! - [`target_script`]: scripts run on a run target to debug, test and profile there (M16 RT).
 #![deny(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -26,6 +27,7 @@ pub mod quote;
 pub mod rsync;
 pub mod server;
 pub mod ssh_config;
+pub mod target_script;
 
 pub use command::{Direction, RsyncSpec, SshOptions, TunnelAuth};
 pub use deploy::{DeploymentConfig, PathMapping, ServerDeployment};

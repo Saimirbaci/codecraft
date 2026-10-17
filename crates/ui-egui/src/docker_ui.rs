@@ -587,5 +587,22 @@ pub(crate) fn target_fields(ui: &mut egui::Ui, t: &mut DockerTarget) {
                 .desired_width(f32::INFINITY),
         );
         ui.end_row();
+        ui.label("Or Compose service:");
+        ui.add(
+            TextEdit::singleline(&mut t.service)
+                .hint_text("(docker compose run --rm <service>)")
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
+        ui.label("Compose file:");
+        ui.add(TextEdit::singleline(&mut t.compose_file).hint_text("compose.yaml").desired_width(f32::INFINITY));
+        ui.end_row();
+        ui.label("Python interpreter:");
+        ui.add(
+            TextEdit::singleline(&mut t.python)
+                .hint_text("(python3; Settings › Python › Remote interpreters)")
+                .desired_width(f32::INFINITY),
+        );
+        ui.end_row();
     });
 }

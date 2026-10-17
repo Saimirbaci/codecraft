@@ -23,7 +23,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.debug",
             "Debug",
             None,
-            "{config?: int} — debug the selected (or given) run configuration",
+            "{config?: int, target?: string|object} — debug the selected (or given) run configuration; on an SSH or \
+             Docker target the debug server (debugpy, lldb-server/gdbserver) starts there, its port is forwarded and \
+             the paths are mapped; `target` (a saved target or SSH server name, ssh:<server>, docker:<image>, \
+             container:<name>, compose:<service>, local, or an object) debugs it there instead",
             Context::Global,
             has_project,
             debug_config,
@@ -51,7 +54,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "debug.atCaret",
             "Debug Context Configuration",
             Some("Ctrl+Shift+D"),
-            "{path?: string, line?: int} — debug what is at the caret: a Rust test or main, a pytest test or Python \
+            "{path?: string, line?: int, target?} — debug what is at the caret (on `target` when given): a Rust test or main, a pytest test or Python \
              file, a GoogleTest/Catch2/doctest/Boost.Test test or C/C++ main (its CMake target built first), a \
              jest/vitest test (js-debug), a Zig or JavaScript file",
             Context::Editor,
@@ -724,6 +727,9 @@ pub(crate) fn debug_config(s: &mut Session, p: &Value) -> CmdResult {
         }
         },
     };
+    // A configuration with an SSH or Docker target is debugged there (M16 track RT).
+    let configured = s.run_configs.get(s.selected_run_config).map(|c| c.target.clone()).unwrap_or_default();
+    let target = debug::on_target::wrap(s, &configured, target);
     let name = target.name().to_owned();
     let options = selected
         .as_deref()
