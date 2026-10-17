@@ -122,6 +122,41 @@ pub fn write_png(path: &Path, size: u32) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A Windows `.ico` holding PNG images (Vista and later read PNG entries) at `sizes` (each 1..=256).
+pub fn encode_ico(sizes: &[u32]) -> Result<Vec<u8>, String> {
+    let images: Vec<(u32, Vec<u8>)> =
+        sizes.iter().map(|&s| encode_png(s, &render(s)).map(|png| (s, png))).collect::<Result<_, _>>()?;
+    let count = u16::try_from(images.len()).map_err(|_| "too many icon sizes".to_string())?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0, 0, 1, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    let mut offset = 6 + 16 * u32::from(count);
+    for (size, png) in &images {
+        if !(1..=256).contains(size) {
+            return Err(format!("icon size {size} is outside 1..=256"));
+        }
+        // 0 means 256 in the directory entry.
+        let dim = u8::try_from(*size).unwrap_or(0);
+        let len = u32::try_from(png.len()).map_err(|_| "icon image too large".to_string())?;
+        out.extend_from_slice(&[dim, dim, 0, 0]);
+        out.extend_from_slice(&1u16.to_le_bytes()); // colour planes
+        out.extend_from_slice(&32u16.to_le_bytes()); // bits per pixel
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset = offset.checked_add(len).ok_or_else(|| "icon too large".to_string())?;
+    }
+    for (_, png) in images {
+        out.extend_from_slice(&png);
+    }
+    Ok(out)
+}
+
+/// Write the Windows icon (16 to 256 pixels).
+pub fn write_ico(path: &Path) -> Result<(), String> {
+    let bytes = encode_ico(&[16, 32, 48, 64, 128, 256])?;
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// The files of a macOS `.iconset` directory: (file name, pixel size).
 pub const ICONSET: &[(&str, u32)] = &[
     ("icon_16x16.png", 16),

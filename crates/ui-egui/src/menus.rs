@@ -3,6 +3,7 @@
 
 use egui::{Button, Color32, RichText};
 
+use codecraft_engine::about::DISPLAY_NAME;
 use codecraft_engine::appearance;
 use codecraft_engine::catalog::CATALOG;
 use codecraft_engine::{CatalogItem, Scope, Session, registry};
@@ -68,8 +69,8 @@ fn children<'a>(path: &'a [&'a str]) -> impl Iterator<Item = &'static CatalogIte
 
 pub(crate) fn label_for(item: &CatalogItem) -> String {
     match item.id {
-        "app.aboutRustRover" => "About CodeCraft".into(),
-        "app.quitRustRover" => "Quit CodeCraft".into(),
+        "app.aboutRustRover" => format!("About {DISPLAY_NAME}"),
+        "app.quitRustRover" => format!("Quit {DISPLAY_NAME}"),
         "run.run" | "run.debug" | "run.runWithCoverage" | "run.profile" | "run.runWithValgrindMemcheck" => {
             item.label.replace("'Run'", "")
         }
@@ -179,7 +180,7 @@ pub fn menu_bar_contents(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         }
     }
     for top in tops {
-        let title = if top == "RustRover" { "CodeCraft" } else { top };
+        let title = if top == "RustRover" { DISPLAY_NAME } else { top };
         ui.menu_button(title, |ui| {
             ui.set_min_width(260.0);
             menu_items(ui, s, st, &[top]);

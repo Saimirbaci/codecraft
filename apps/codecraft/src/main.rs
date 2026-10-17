@@ -1,11 +1,16 @@
-//! CodeCraft desktop app.
+//! Code Craft desktop app.
 //!
 //! `codecraft [--no-restore] [PATH]`: open PATH (a file or directory), else the last project(s)
 //! with their editors. `--no-restore` starts without reopening any project or editor.
+//! `codecraft --version` prints the version and build.
 //! `codecraft --mcp-bridge --port N [--lock-dir D] [--job J]`: an MCP stdio bridge to the
 //! running IDE's server (what built-in agent jobs launch; see docs/agents.md); `--ide` instead of
 //! `--port` finds the IDE (a job's environment, else the window whose project holds the working
 //! directory).
+
+// Release builds on Windows open no console window next to the app. Pipes a parent hands over
+// (the MCP bridge's stdio) still work.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -19,6 +24,11 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(codecraft_engine::agent_mcp::BRIDGE_FLAG) {
         std::process::exit(codecraft_engine::agent_mcp::bridge_main(&args));
+    }
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V")) {
+        let info = codecraft_engine::about::BuildInfo::current();
+        println!("{} {}", info.name, info.version_line());
+        return Ok(());
     }
     codecraft_ui_egui::launch(parse(std::env::args_os().skip(1)))
 }

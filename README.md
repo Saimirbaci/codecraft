@@ -1,4 +1,4 @@
-<h1 align="center">CodeCraft</h1>
+<h1 align="center">Code Craft</h1>
 
 <p align="center">
   <b>A native Rust IDE, written in Rust: a clean-room reimplementation of the RustRover workflow.</b><br>
@@ -8,7 +8,7 @@
 
 <p align="center">
   <img alt="100% Rust" src="https://img.shields.io/badge/100%25-Rust-b7410e?style=flat-square&logo=rust">
-  <img alt="License: MIT OR Apache-2.0" src="https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-3a3a3a?style=flat-square">
+  <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-3a3a3a?style=flat-square">
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-d69e2e?style=flat-square">
 </p>
 
@@ -67,6 +67,12 @@ cargo run -p codecraft-ui-egui --example snapshot -- path/to/project out.png vie
 - **Clean-room:** RustRover's behaviour and look are observed from the running app (Accessibility
   menu walk, bundle metadata); no JetBrains code or assets are used. See `docs/clean-room.md`.
 
+## Download
+
+Installers for macOS (Apple silicon), Windows and Linux (`.deb` and tarball) are attached to each
+[GitHub release](https://github.com/Saimirbaci/codecraft/releases), with install notes and
+checksums. Maintainers cut a release with Actions › New version (see `docs/release.md`).
+
 ## Documentation
 
 `AGENTS.md` (start here) · `docs/architecture.md` · `docs/development.md` ·
@@ -74,5 +80,5 @@ cargo run -p codecraft-ui-egui --example snapshot -- path/to/project out.png vie
 
 ## License
 
-MIT OR Apache-2.0. RustRover is a trademark of JetBrains s.r.o.; CodeCraft is not affiliated
+[MIT](LICENSE). RustRover is a trademark of JetBrains s.r.o.; CodeCraft is not affiliated
 with or endorsed by JetBrains.

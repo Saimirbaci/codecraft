@@ -12,6 +12,7 @@
     clippy::unreachable
 )]
 
+pub mod about;
 mod agent_cmds;
 // M14 track AX: the agent control plane (MCP tools over the engine, access policy).
 pub mod agent_access;

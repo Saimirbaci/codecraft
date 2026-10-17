@@ -79,6 +79,7 @@ use std::time::{Duration, Instant};
 use egui::{Event, Key, Modifiers, Pos2, Rect};
 use serde_json::{Value, json};
 
+use codecraft_engine::about::DISPLAY_NAME;
 use codecraft_engine::{Context, Effect, Popup, Session};
 use codecraft_workspace::{DocId, EditorId, NotificationLevel};
 
@@ -588,7 +589,7 @@ impl App {
             (Some(p), Some(f)) => format!("{p} – {f}"),
             (Some(p), None) => p,
             (None, Some(f)) => f,
-            (None, None) => "CodeCraft".into(),
+            (None, None) => DISPLAY_NAME.into(),
         }
     }
 
@@ -834,7 +835,7 @@ pub fn launch(launch: Launch) -> eframe::Result {
     let persisted = PersistedState::load();
     let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
     let mut viewport =
-        egui::ViewportBuilder::default().with_title("CodeCraft").with_inner_size(size).with_min_inner_size([640.0, 400.0]);
+        egui::ViewportBuilder::default().with_title(DISPLAY_NAME).with_inner_size(size).with_min_inner_size([640.0, 400.0]);
     if let Some(pos) = persisted.saved_window_pos() {
         viewport = viewport.with_position(pos);
     }

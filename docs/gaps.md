@@ -1635,3 +1635,16 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     mode) are not repeated on resume; restored output is plain text (no colours); other shells
     (nu, xonsh, sh) get no per-tab history; the shell's directory is read every 5 s, so a `cd`
     just before quitting is caught by the final save only.
+68. Releases and versions (2026-10-17): the display name is **Code Craft** (window title, app
+    menu, About, Info.plist, desktop entry, installer); MIT only (`LICENSE`); Help › About shows
+    the version, build commit and date, platform, license and links, with Copy Version Info;
+    `codecraft --version` / `codecraft-cli --version`. `cargo xtask version` prints or bumps the
+    workspace version (Cargo.toml and the workspace's Cargo.lock entries); Actions › New version
+    bumps, commits, tags and calls the Release workflow, which now also builds a `.deb` (on
+    Ubuntu 22.04) and an Inno Setup installer, writes SHA256SUMS, and can be run by hand to build
+    packages without releasing. Remaining: neither workflow has run on GitHub yet; macOS is Apple
+    silicon only (no Intel or universal build); Linux and Windows are x64 only; Windows binaries
+    aren't Authenticode-signed (SmartScreen warns) and `codecraft.exe` has no embedded icon; no
+    AppImage/Flatpak, Homebrew cask or winget manifest; no in-app update check; file names keep
+    `CodeCraft` (`CodeCraft.app`, `CodeCraft-<version>.dmg`); feedback on "CodeCraft itself"
+    needs `CODECRAFT_SOURCE_DIR` in packaged builds (the build folder isn't on users' machines).

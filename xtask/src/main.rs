@@ -1,18 +1,23 @@
-//! Workspace automation: `cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-windows>`.
+//! Workspace automation: `cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-deb|
+//! package-windows|package-windows-installer|version>`.
 //!
 //! - `layers`  checks crate layering (a crate may only depend on lower layers; no UI deps below L3).
 //! - `catalog` regenerates `crates/engine/src/catalog.rs` from the observed RustRover menus.
 //! - `parity`  regenerates `docs/parity-checklist.md` from the catalog and the engine's commands.
-//! - `bundle`, `dmg`, `package-linux`, `package-windows` build and package the app (see
+//! - `bundle`, `dmg`, `package-linux`, `package-deb`, `package-windows`, `package-windows-installer`
+//!   build and package the app (see
 //!   `package.rs` and docs/development.md); options `--release`, `--layout-only`, `--dry-run`,
 //!   and for the macOS tasks `--sign <identity>` (default ad hoc) and `--keychain <path>`.
 //! - `notarize` submits the signed dmg (or `--app`) with `xcrun notarytool` and a keychain profile,
 //!   staples and assesses it (`sign.rs`, docs/release.md); `--profile <name>`, `--dmg <path>`,
 //!   `--app <path>`, `--keychain <path>`, `--dry-run`.
+//! - `version [patch|minor|major|<x.y.z>] [--dry-run]` prints or bumps the workspace version
+//!   (`version.rs`, docs/release.md).
 
 mod icon;
 mod package;
 mod sign;
+mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -39,7 +44,11 @@ fn main() -> ExitCode {
         "notarize" => sign::NotarizeOptions::parse(&rest).and_then(|o| package::notarize(&root, &o)),
         "package-linux" => opts().and_then(|o| package::package_linux(&root, &o)).map(drop),
         "package-windows" => opts().and_then(|o| package::package_windows(&root, &o)).map(drop),
-        _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-windows> \
+        "package-windows-installer" => opts().and_then(|o| package::package_windows_installer(&root, &o)).map(drop),
+        "package-deb" => opts().and_then(|o| package::package_deb(&root, &o)).map(drop),
+        "version" => version::run(&root, &rest),
+        _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-deb|package-windows|\
+                  package-windows-installer|version> \
                   [--release] [--dry-run] [--sign <identity>] [--profile <notarytool profile>]"
             .to_string()),
     };

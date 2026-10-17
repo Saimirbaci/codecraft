@@ -48,6 +48,11 @@ fn main() -> ExitCode {
         return exit_code(agent_mcp::bridge_main(&args));
     }
     let result = match args.first().map(String::as_str) {
+        Some("--version" | "-V" | "version") => {
+            let info = codecraft_engine::about::BuildInfo::current();
+            println!("codecraft-cli {}", info.version_line());
+            Ok(ExitCode::SUCCESS)
+        }
         Some("mcp") => agent::mcp(args.get(1..).unwrap_or_default()),
         Some("debug") => agent::debug(args.get(1..).unwrap_or_default()),
         Some("analyze") => agent::analyze(args.get(1..).unwrap_or_default()),
@@ -58,7 +63,7 @@ fn main() -> ExitCode {
         Some("check") => check(args.get(1), args.iter().any(|a| a == "--clippy")),
         Some("run") => run(args.get(1), args.get(2), args.get(3)),
         Some("configs") => configs(args.get(1), args.get(2..).unwrap_or_default()),
-        _ => Err("usage: codecraft-cli <commands [--json] | catalog --json | check <project> [--clippy] | run <project> <command-id> [json-params] | configs <project> <list|add|update|copy|delete|run> [flags] | mcp <project> [--allow caps] | debug <project> <config> --break file:line | analyze <project> | profile <project> <config> | test <project> [filter]>".into()),
+        _ => Err("usage: codecraft-cli <--version | commands [--json] | catalog --json | check <project> [--clippy] | run <project> <command-id> [json-params] | configs <project> <list|add|update|copy|delete|run> [flags] | mcp <project> [--allow caps] | debug <project> <config> --break file:line | analyze <project> | profile <project> <config> | test <project> [filter]>".into()),
     };
     match result {
         Ok(code) => code,

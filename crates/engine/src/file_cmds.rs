@@ -80,11 +80,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             always,
             new_project,
         ),
-        simple("app.aboutRustRover", "About CodeCraft", always, |s, _| {
+        simple("app.aboutRustRover", "About Code Craft", always, |s, _| {
             s.popup = Some(Popup::About);
             ok()
         }),
-        simple("app.quitRustRover", "Quit CodeCraft", always, |s, _| {
+        simple("app.quitRustRover", "Quit Code Craft", always, |s, _| {
             let _ = s.save_all();
             s.effects.push(Effect::Quit);
             ok()

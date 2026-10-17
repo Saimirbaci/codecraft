@@ -1,0 +1,105 @@
+# New version: Actions › New version › Run workflow. Bumps the workspace version
+# (`cargo xtask version <bump>`: Cargo.toml and the workspace's Cargo.lock entries), commits
+# "Release vX.Y.Z" on main, tags it, pushes both, then runs the Release workflow for that tag
+# (macOS dmg, Linux .deb and tarball, Windows installer and zip, checksums, GitHub release).
+# See docs/release.md › Versions.
+#
+# Pushes made with the workflow's own token don't start other workflows, so the Release workflow
+# is called directly below (the tag push itself doesn't trigger a second run). If main is
+# protected against direct pushes, allow GitHub Actions to bypass the rule or release by
+# pushing a tag by hand (docs/release.md).
+
+name: New version
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "patch, minor, major, or an exact version (0.3.0, 0.3.0-beta.1)"
+        required: true
+        default: patch
+        type: string
+      publish:
+        description: "Publish the release right away (off: a draft to review and publish by hand)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: new-version
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  bump:
+    name: bump, commit and tag
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Bump the version
+        id: bump
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          case "$BUMP" in
+            patch|minor|major) ;;
+            v[0-9]*|[0-9]*) ;;
+            *) echo "::error::bump must be patch, minor, major or a version, got '$BUMP'"; exit 1 ;;
+          esac
+          old=$(cargo xtask version)
+          new=$(cargo xtask version "$BUMP")
+          tag="v$new"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::tag $tag already exists"
+            exit 1
+          fi
+          echo "$old → $new"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Cargo.lock is consistent
+        # Fails if the bump left the lock file out of date (nothing is updated: --locked).
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Commit, tag and push
+        env:
+          TAG: ${{ steps.bump.outputs.tag }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Release $TAG"
+          git tag -a "$TAG" -m "Code Craft $VERSION"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$TAG"
+
+  release:
+    name: release
+    needs: bump
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+      draft: ${{ !inputs.publish }}
+    secrets: inherit

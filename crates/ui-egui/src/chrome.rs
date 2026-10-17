@@ -6,6 +6,7 @@ use egui::{
 };
 use serde_json::{Value, json};
 
+use codecraft_engine::about::DISPLAY_NAME;
 use codecraft_engine::appearance::{self, NavPathItem, widget_visible};
 use codecraft_engine::{LspStatus, Session};
 use codecraft_workspace::{EditorId, GroupId, Severity, SplitAxis, SplitNode};
@@ -362,7 +363,7 @@ pub fn welcome(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, persisted: 
     egui::CentralPanel::default().frame(Frame::new().fill(st.theme.editor_bg)).show(ui, |ui| {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.18);
-            ui.label(RichText::new("CodeCraft").size(34.0).strong());
+            ui.label(RichText::new(DISPLAY_NAME).size(34.0).strong());
             ui.label(RichText::new("A native Rust IDE").size(14.0).color(st.theme.text_muted));
             ui.add_space(24.0);
             ui.horizontal(|ui| {

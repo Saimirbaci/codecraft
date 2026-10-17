@@ -1,6 +1,12 @@
-# Release: on a `v*` tag, build the macOS dmg (Developer ID-signed and notarized when the secrets
-# exist, ad hoc otherwise), the Linux tarball and the Windows zip, and attach them to a DRAFT
-# GitHub release. Nothing is published automatically. See docs/release.md.
+# Release: build the macOS dmg (Developer ID-signed and notarized when the secrets exist, ad hoc
+# otherwise), the Linux tarball and .deb, and the Windows installer and zip, then attach them with
+# SHA256SUMS to a GitHub release (a draft unless asked otherwise). See docs/release.md.
+#
+# Started by:
+#   - a pushed `v*` tag (draft release);
+#   - the "New version" workflow (new-version.yml), which bumps the version, tags and calls this;
+#   - Actions › Release › Run workflow: with a tag, release it; without one, only build the
+#     packages (downloadable from the run's Artifacts) for testing.
 #
 # Secrets (all optional; names only, values live in the repository settings):
 #   MACOS_CERTIFICATE_P12        base64 of the Developer ID Application certificate + key (.p12)
@@ -14,6 +20,26 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v0.2.0). Empty: build the packages only, no release."
+        required: false
+        type: string
+      draft:
+        description: "Create the release as a draft to review before publishing"
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      draft:
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -25,19 +51,53 @@ env:
 
 jobs:
   version:
-    name: tag matches the workspace version
+    name: version and build metadata
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      ref: ${{ steps.meta.outputs.ref }}
+      version: ${{ steps.meta.outputs.version }}
+      date: ${{ steps.meta.outputs.date }}
     steps:
-      - uses: actions/checkout@v4.2.2
-      - name: Compare
+      - name: Which tag
+        id: tag
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
         run: |
-          tag="${GITHUB_REF_NAME#v}"
+          if [ -n "$TAG_INPUT" ]; then
+            tag="$TAG_INPUT"
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag=""
+          fi
+          case "$tag" in
+            ""|v[0-9]*) ;;
+            *) echo "::error::tags look like v1.2.3, got $tag"; exit 1 ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=${tag:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ steps.tag.outputs.ref }}
+      - name: Compare the tag with the workspace version
+        id: meta
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          REF: ${{ steps.tag.outputs.ref }}
+        run: |
           version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml)
-          echo "tag $tag, workspace version $version"
-          if [ "$tag" != "$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match version = \"$version\" in Cargo.toml"
+          echo "tag ${TAG:-none}, workspace version $version"
+          if [ -n "$TAG" ] && [ "${TAG#v}" != "$version" ]; then
+            echo "::error::tag $TAG does not match version = \"$version\" in Cargo.toml"
             exit 1
           fi
+          {
+            echo "tag=$TAG"
+            echo "ref=$(git rev-parse HEAD)"
+            echo "version=$version"
+            echo "date=$(date -u +%F)"
+          } >> "$GITHUB_OUTPUT"
 
   macos:
     name: macOS dmg
@@ -45,6 +105,8 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 150
     env:
+      CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
+      CODECRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
       HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
       HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
     outputs:
@@ -52,6 +114,8 @@ jobs:
       notarized: ${{ steps.status.outputs.notarized }}
     steps:
       - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ needs.version.outputs.ref }}
 
       - name: Install Rust
         run: |
@@ -135,12 +199,19 @@ jobs:
           if-no-files-found: error
 
   linux:
-    name: Linux tarball
+    name: Linux tarball and .deb
     needs: version
-    runs-on: ubuntu-latest
+    # The oldest supported Ubuntu LTS runner: the binary needs the glibc it was built against or
+    # newer (2.35 here: Ubuntu 22.04+, Debian 12+, Fedora 36+).
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
+      CODECRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
       - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ needs.version.outputs.ref }}
       - name: Install Rust and build dependencies
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
@@ -148,36 +219,56 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
       - name: Package
-        run: cargo xtask package-linux --release
+        run: |
+          cargo xtask package-linux --release
+          cargo xtask package-deb --release
+          dpkg-deb --info target/package/codecraft_*.deb
       - uses: actions/upload-artifact@v4.6.2
         with:
-          name: linux-tarball
-          path: target/package/codecraft-*.tar.gz
+          name: linux-packages
+          path: |
+            target/package/codecraft-*.tar.gz
+            target/package/codecraft_*.deb
           if-no-files-found: error
 
   windows:
-    name: Windows zip
+    name: Windows installer and zip
     needs: version
     runs-on: windows-latest
     timeout-minutes: 90
+    env:
+      CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
+      CODECRAFT_BUILD_DATE: ${{ needs.version.outputs.date }}
     steps:
       - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ needs.version.outputs.ref }}
       - name: Install Rust
         shell: bash
         run: |
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
+      - name: Install Inno Setup (when the runner lacks it)
+        shell: pwsh
+        run: |
+          $known = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe")
+          if (-not ($known | Where-Object { Test-Path $_ }) -and -not (Get-Command iscc -ErrorAction SilentlyContinue)) {
+            choco install innosetup --no-progress -y
+          }
       - name: Package
-        run: cargo xtask package-windows --release
+        run: cargo xtask package-windows-installer --release
       - uses: actions/upload-artifact@v4.6.2
         with:
-          name: windows-zip
-          path: target/package/codecraft-*.zip
+          name: windows-packages
+          path: |
+            target/package/codecraft-*-setup.exe
+            target/package/codecraft-*.zip
           if-no-files-found: error
 
   release:
-    name: draft GitHub release
-    needs: [macos, linux, windows]
+    name: GitHub release
+    needs: [version, macos, linux, windows]
+    if: needs.version.outputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -186,20 +277,44 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      - name: Create the draft release
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create the release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          DRAFT_INPUT: ${{ inputs.draft }}
           SIGNED: ${{ needs.macos.outputs.signed }}
           NOTARIZED: ${{ needs.macos.outputs.notarized }}
         run: |
           if [ "$NOTARIZED" = true ]; then
-            mac="The macOS dmg (Apple silicon) is Developer ID-signed, notarized and stapled."
+            mac="Developer ID-signed and notarized: open the dmg and drag Code Craft to Applications."
           elif [ "$SIGNED" = true ]; then
-            mac="The macOS dmg (Apple silicon) is Developer ID-signed but NOT notarized."
+            mac="Developer ID-signed but not notarized: the first time, right-click the app › Open."
           else
-            mac="The macOS dmg (Apple silicon) is ad-hoc signed only: Gatekeeper will refuse it on other Macs."
+            mac="Not signed by a developer certificate: after copying the app to Applications, run \`xattr -dr com.apple.quarantine /Applications/CodeCraft.app\` once, or right-click › Open."
           fi
-          ls -l dist
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
-            --title "CodeCraft $GITHUB_REF_NAME" --notes "$mac" --generate-notes
+          debver=$(printf '%s' "$VERSION" | tr '-' '~')
+          cat > notes.md <<EOF
+          ## Downloads
+
+          | Platform | File | How to install |
+          |---|---|---|
+          | macOS (Apple silicon) | \`CodeCraft-$VERSION.dmg\` | $mac |
+          | Windows 10/11 (x64) | \`codecraft-$VERSION-windows-x64-setup.exe\` | Run the installer (no administrator rights needed). Windows SmartScreen may ask you to confirm: More info › Run anyway. A portable \`.zip\` is attached too. |
+          | Ubuntu 22.04+ / Debian 12+ (x64) | \`codecraft_${debver}_amd64.deb\` | \`sudo apt install ./codecraft_${debver}_amd64.deb\` |
+          | Other Linux (x64) | \`codecraft-$VERSION-linux-x64.tar.gz\` | Unpack and \`cp -r bin share ~/.local/\` |
+
+          Check a download with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`.
+
+          EOF
+          flags=()
+          if [ "$DRAFT_INPUT" != false ]; then flags+=(--draft); fi
+          case "$VERSION" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag "${flags[@]}" \
+            --title "Code Craft $TAG" --notes-file notes.md --generate-notes

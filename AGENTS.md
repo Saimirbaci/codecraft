@@ -3,8 +3,10 @@
 CodeCraft is an open-source, native Rust IDE written in **Rust only**: a clean-room
 reimplementation of the behaviour and workflow of JetBrains RustRover. **No Tauri, Electron,
 webview or JVM.** The desktop app is native egui/eframe. Language intelligence comes from
-rust-analyzer over LSP; build/run/test from Cargo. The product name is written **CodeCraft** in
-user-facing text; machine names are lowercase (`codecraft-*` crates, `codecraft` binary).
+rust-analyzer over LSP; build/run/test from Cargo. The app's display name is **Code Craft**
+(window title, app menu, About, installers: `codecraft_engine::about::DISPLAY_NAME`); prose and
+docs still say CodeCraft; machine names are lowercase (`codecraft-*` crates, `codecraft` binary).
+MIT licensed.
 
 The goal is RustRover parity: the same menus, shortcuts (macOS keymap first), tool windows and
 behaviour, with a smaller, faster native app where every action is drivable by agents.

@@ -1,7 +1,8 @@
 # Signed builds, notarization and releases
 
-How to build a CodeCraft that other people can open: a Developer ID-signed, notarized and stapled
-`.dmg` for macOS, a tarball for Linux and a zip for Windows, locally or from CI.
+How to build a Code Craft that other people can open: a Developer ID-signed, notarized and stapled
+`.dmg` for macOS, a `.deb` and a tarball for Linux, and an installer and a zip for Windows, locally
+or from CI, and how to cut a new version.
 
 Credentials never live in the repository. Locally, the signing identity is in your login keychain
 and notarization uses a `notarytool` keychain profile you create once. In CI they come from GitHub
@@ -164,10 +165,15 @@ Apple rejects. Submissions and logs are also listed by
   Formatting it is a separate, all-at-once change; once it is made, add
   `cargo fmt --all -- --check` as the first step of the `test` job.
 
-### `.github/workflows/release.yml` (tags `v*`)
+### `.github/workflows/release.yml` (tags `v*`, New version, or by hand)
+
+Started by a pushed `v*` tag, by the New version workflow (below), or from Actions › Release ›
+Run workflow (with a tag: release it; without: only build the packages, which the run keeps
+as downloadable Artifacts, for testing a build before releasing it).
 
 1. **version**: the tag must equal the workspace version (`v0.1.0` ↔ `version = "0.1.0"` in
-   `Cargo.toml`).
+   `Cargo.toml`). Every build job checks out that tag and compiles in the commit and the date
+   (`CODECRAFT_BUILD_COMMIT`, `CODECRAFT_BUILD_DATE`), which Help › About and `--version` show.
 2. **macOS**: if the signing secrets exist, the p12 is imported into a temporary keychain made
    for the job (random password, auto-lock), the identity is read from it, and
    `cargo xtask dmg --release --sign <identity> --keychain <temp>` runs. If the notarization
@@ -175,12 +181,22 @@ Apple rejects. Submissions and logs are also listed by
    in that same temporary keychain and `cargo xtask notarize --profile codecraft-ci --keychain <temp>`
    submits, staples and assesses the dmg. Without secrets the dmg is ad-hoc signed (usable for
    testing, not for distribution). The temporary keychain and the p12 file are deleted in an
-   `always()` step.
-3. **Linux**: `cargo xtask package-linux --release` → `codecraft-<version>-linux-x64.tar.gz`.
-4. **Windows**: `cargo xtask package-windows --release` → `codecraft-<version>-windows-x64.zip`.
-5. **release**: downloads the three artifacts and creates a **draft** GitHub release for the tag
-   with them attached (`gh release create --draft`). Nothing is published until someone reviews
-   the draft and presses Publish.
+   `always()` step. Apple silicon only (`macos-latest` is arm64).
+3. **Linux** (Ubuntu 22.04, so the binary runs on glibc 2.35 and newer):
+   `cargo xtask package-linux --release` → `codecraft-<version>-linux-x64.tar.gz`, and
+   `cargo xtask package-deb --release` → `codecraft_<version>_amd64.deb` (`dpkg-deb`; installs
+   `/usr/bin/codecraft`, `/usr/bin/codecraft-cli`, the desktop entry and icons; a pre-release
+   `0.3.0-beta.1` becomes Debian version `0.3.0~beta.1`).
+4. **Windows**: `cargo xtask package-windows-installer --release` → the zip
+   `codecraft-<version>-windows-x64.zip` and the Inno Setup installer
+   `codecraft-<version>-windows-x64-setup.exe` (per-user install without administrator rights,
+   Start menu entry, optional desktop shortcut, uninstaller; upgrades in place thanks to a fixed
+   AppId). Inno Setup is installed with Chocolatey when the runner lacks it. Neither is
+   Authenticode-signed yet, so SmartScreen asks for confirmation.
+5. **release** (only with a tag): downloads the artifacts, writes `SHA256SUMS.txt`, and creates
+   the GitHub release with install notes per platform plus the generated change list. It is a
+   **draft** unless the run asked to publish; a version with a `-` (`0.3.0-beta.1`) is marked
+   as a pre-release.
 
 Secrets the release workflow reads (repository › Settings › Secrets and variables › Actions). All
 are optional; missing ones only disable signing or notarization:
@@ -195,13 +211,41 @@ are optional; missing ones only disable signing or notarization:
 
 Actions are pinned to exact release tags (`actions/checkout@v4.2.2`, …). Pinning to commit SHAs is
 stricter; convert them with a tool such as Dependabot (`package-ecosystem: github-actions`) or
-`pinact` when the repository is on GitHub. No third-party actions are used: Rust comes from the
-runner's `rustup`, the release from the runner's `gh`.
+`pinact`. No third-party actions are used: Rust comes from the runner's `rustup`, the release from
+the runner's `gh`.
+
+### `.github/workflows/new-version.yml` (by hand)
+
+Actions › New version › Run workflow, on `main`:
+
+- **bump**: `patch` (0.1.0 → 0.1.1), `minor` (→ 0.2.0), `major` (→ 1.0.0), or an exact version
+  (`0.3.0`, `0.3.0-beta.1`; `patch` on a pre-release releases it: 0.3.0-beta.1 → 0.3.0).
+- **publish**: off (default) creates a draft release to check and publish by hand; on publishes
+  it right away.
+
+It runs `cargo xtask version <bump>`, checks that `Cargo.lock` is consistent
+(`cargo metadata --locked`), commits `Release vX.Y.Z` to main as `github-actions[bot]`, tags it,
+pushes both in one atomic push, and calls the Release workflow for the tag. If main is protected
+against direct pushes, add GitHub Actions to the rule's bypass list, or cut releases by hand.
+
+## Versions
+
+The version lives once, under `[workspace.package]` in `Cargo.toml`; every crate inherits it.
+It follows semantic versioning: patch for fixes, minor for features, major for breaking changes
+to saved settings, the command ids agents use, or the CLI.
+
+```sh
+cargo xtask version                 # print it: 0.1.0
+cargo xtask version minor --dry-run # what a bump would do
+cargo xtask version minor           # Cargo.toml + the workspace's entries in Cargo.lock → 0.2.0
+```
 
 ### Cutting a release
 
-1. Bump `version` under `[workspace.package]` in `Cargo.toml`, run the gates, commit.
-2. `git tag v0.2.0 && git push origin v0.2.0`.
+Either run the New version workflow (above), or by hand:
+
+1. `cargo xtask version minor`, run the gates, commit (`Release v0.2.0`).
+2. `git tag v0.2.0 && git push origin main v0.2.0`.
 3. Wait for the Release workflow; open the draft release, check the artifacts (the macOS job log
    shows `notarization accepted` and `source=Notarized Developer ID` when the secrets are set),
    edit the notes, publish.

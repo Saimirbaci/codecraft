@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use egui::{Event, Key, Modifiers};
 use serde_json::{Value, json};
 
+use codecraft_engine::about::DISPLAY_NAME;
 use codecraft_engine::catalog::CATALOG;
 use codecraft_engine::{CatalogItem, Session, registry};
 
@@ -151,7 +152,7 @@ pub(crate) fn model() -> Vec<Node> {
     }
     tops.into_iter()
         .map(|top| Node::Submenu {
-            title: if top == "RustRover" { "CodeCraft".into() } else { top.to_string() },
+            title: if top == "RustRover" { DISPLAY_NAME.into() } else { top.to_string() },
             children: entries(&[top]),
         })
         .collect()
@@ -794,12 +795,12 @@ mod tests {
                 _ => "?",
             })
             .collect();
-        assert_eq!(titles.first(), Some(&"CodeCraft"));
+        assert_eq!(titles.first(), Some(&"Code Craft"));
         for t in ["File", "Edit", "View", "Navigate", "Code", "Refactor", "Build", "Run", "Window", "Help"] {
             assert!(titles.contains(&t), "missing top menu {t}: {titles:?}");
         }
         // App menu: About, Settings with its shortcut, macOS roles, Quit; no Check for Updates.
-        let app = submenu(&m, "CodeCraft");
+        let app = submenu(&m, "Code Craft");
         let ids: Vec<&str> = app
             .iter()
             .filter_map(|n| match n {
@@ -819,7 +820,7 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(about.label, "About CodeCraft");
+        assert_eq!(about.label, "About Code Craft");
         let settings = find_item(app, "app.settings").unwrap();
         assert_eq!(settings.accelerator.as_deref(), Some("super+Comma"));
         // Window menu has the system's Minimize/Zoom.

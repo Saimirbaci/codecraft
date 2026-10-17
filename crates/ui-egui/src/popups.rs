@@ -7,6 +7,7 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align2, Color32, FontId, Frame, Key, Margin, Modifiers, RichText, ScrollArea, Sense, TextEdit, vec2};
 use serde_json::{Value, json};
 
+use codecraft_engine::about;
 use codecraft_engine::popup::NewItemKind;
 use codecraft_engine::{Popup, Session, registry};
 
@@ -850,19 +851,38 @@ fn find_in_files(ctx: &egui::Context, s: &mut Session, st: &mut UiState, width: 
 
 fn about(ctx: &egui::Context, s: &mut Session, st: &UiState) {
     let mut open = true;
-    crate::windows::resizable(egui::Window::new("About CodeCraft"), st, "about")
+    let info = about::BuildInfo::current();
+    crate::windows::resizable(egui::Window::new(format!("About {}", about::DISPLAY_NAME)), st, "about")
         .id(egui::Id::new("about-window"))
         .open(&mut open)
         .collapsible(false)
         .show(ctx, |ui| {
-            ui.label(RichText::new("CodeCraft").size(22.0).strong());
-            ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            ui.label(RichText::new(about::DISPLAY_NAME).size(22.0).strong());
+            ui.label(format!("Version {}", info.version_line()));
+            ui.label(RichText::new(info.platform()).color(st.theme.text_muted));
             ui.add_space(6.0);
-            ui.label("A native Rust IDE written in Rust: a clean-room reimplementation of RustRover's workflow.");
+            ui.label("A native IDE written in Rust for Rust, Python, C/C++, SQL and more, built for people and coding agents alike.");
+            ui.label("Debugging, code analysis, profiling and databases in one fast native app.");
+            ui.add_space(6.0);
             ui.label(
-                RichText::new("Language intelligence by rust-analyzer. Licensed MIT OR Apache-2.0.")
+                RichText::new(format!("{}. Released under the {} License.", about::COPYRIGHT, about::LICENSE))
                     .color(st.theme.text_muted),
             );
+            ui.label(
+                RichText::new(
+                    "Language intelligence by rust-analyzer and other language servers. Not affiliated with or \
+                     endorsed by JetBrains.",
+                )
+                .color(st.theme.text_muted),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.hyperlink_to("Source code", about::REPOSITORY);
+                ui.hyperlink_to("Releases", format!("{}/releases", about::REPOSITORY));
+                if ui.button("Copy Version Info").on_hover_text("For bug reports").clicked() {
+                    ui.ctx().copy_text(info.report());
+                }
+            });
         });
     if !open {
         s.popup = None;
