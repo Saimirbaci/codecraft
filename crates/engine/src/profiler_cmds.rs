@@ -20,7 +20,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "run.profile",
             "Profile 'Run'",
             None,
-            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number, interval?: number} — run the \
+            "{config?: int|name, kind?: cpu|memory, tool?: string, seconds?: number, interval?: number, target?} — run the \
              selected (or given) run configuration under a profiler in a Run tab (Cargo targets and CMake chains are \
              built first, then only the program is recorded; CPU: xctrace on macOS, samply, perf on Linux, cProfile \
              or py-spy for Python; memory: leaks on macOS, heaptrack on Linux, tracemalloc or memray for Python; \

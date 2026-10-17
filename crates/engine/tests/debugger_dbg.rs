@@ -3,6 +3,7 @@
 //! tools are missing.
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -672,8 +673,12 @@ fn python_remote_attach_to_a_debug_server() {
         .arg(remote_dir.join("server.py"))
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .unwrap();
+    // debugpy and the adapter it starts must not outlive a failed assertion (they once ran for a
+    // day and a half): kill their process group however the test ends.
+    let _reap = KillGroupOnDrop(server.id());
     let mut s = open_project(&local_dir);
     let local_file = local_dir.join("server.py");
     bp(&mut s, json!({ "path": local_file, "line": line_of(SERVER, "@remote") }));
@@ -699,6 +704,19 @@ fn python_remote_attach_to_a_debug_server() {
 
 trait WaitOrKill {
     fn wait_timeout_or_kill(&mut self, timeout: Duration) -> bool;
+}
+
+/// Kills a process group when dropped (also while a failed assertion unwinds).
+struct KillGroupOnDrop(u32);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", &format!("-{}", self.0)])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 }
 
 impl WaitOrKill for std::process::Child {

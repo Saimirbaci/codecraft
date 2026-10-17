@@ -1599,7 +1599,7 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
                 );
             }
             if let Some(o) = p.as_object_mut() {
-                for key in ["kind", "tool", "seconds", "interval"] {
+                for key in ["kind", "tool", "seconds", "interval", "target"] {
                     if let Some(v) = args.get(key).filter(|v| !v.is_null()) {
                         o.insert(key.into(), v.clone());
                     }
@@ -1641,7 +1641,7 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
                 Ok(i) => i,
                 Err(e) => return done_err(e),
             };
-            match s.execute("run.run", &json!({ "config": i })) {
+            match s.execute("run.run", &with_target(args, json!({ "config": i }))) {
                 Ok(mut v) => {
                     if let Some(o) = v.as_object_mut() {
                         o.insert("next".into(), json!("read the output with run_output (waitMs waits for the end)"));
@@ -1909,10 +1909,19 @@ fn debug_settled(s: &Session) -> bool {
     }
 }
 
+/// `p` with the tool's `target` (M16 track RT: run there instead of the configuration's own
+/// target).
+fn with_target(args: &Value, mut p: Value) -> Value {
+    if let (Some(t), Some(o)) = (args.get("target").filter(|t| !t.is_null()), p.as_object_mut()) {
+        o.insert("target".into(), t.clone());
+    }
+    p
+}
+
 fn debug_start(s: &mut Session, args: &Value) -> Step {
     let started = if let Some(c) = args.get("config") {
         match config_index(s, c) {
-            Ok(i) => s.execute("run.debug", &json!({ "config": i })),
+            Ok(i) => s.execute("run.debug", &with_target(args, json!({ "config": i }))),
             Err(e) => return done_err(e),
         }
     } else if args.get("pid").is_some() {
@@ -1930,7 +1939,7 @@ fn debug_start(s: &mut Session, args: &Value) -> Step {
         if let (Some(a), Some(o)) = (args.get("args"), p.as_object_mut()) {
             o.insert("args".into(), a.clone());
         }
-        s.execute("debug.executable", &p)
+        s.execute("debug.executable", &with_target(args, p))
     } else if args.get("file").is_some() {
         let path = match path_param(s, args, "file") {
             Ok(p) => p,
@@ -1946,9 +1955,9 @@ fn debug_start(s: &mut Session, args: &Value) -> Step {
             Ok(None) => {}
             Err(e) => return cmd_err(e),
         }
-        s.execute("debug.atCaret", &p)
+        s.execute("debug.atCaret", &with_target(args, p))
     } else {
-        s.execute("run.debug", &json!({}))
+        s.execute("run.debug", &with_target(args, json!({})))
     };
     if let Err(e) = started {
         return cmd_err(e);
@@ -2189,18 +2198,18 @@ fn debug_evaluate(s: &mut Session, args: &Value) -> Step {
 
 fn test_run(s: &mut Session, args: &Value) -> Step {
     let started = if let Some(name) = args.get("name").and_then(Value::as_str) {
-        s.execute("test.runFiltered", &json!({ "name": name }))
+        s.execute("test.runFiltered", &with_target(args, json!({ "name": name })))
     } else if args.get("path").is_some() {
         let (path, line) = match zero_based_location(s, args) {
             Ok(x) => x,
             Err(step) => return step,
         };
         match line {
-            Some(l) => s.execute("run.contextConfiguration", &json!({ "path": path, "line": l })),
-            None => s.execute("run.testsInFile", &json!({ "path": path })),
+            Some(l) => s.execute("run.contextConfiguration", &with_target(args, json!({ "path": path, "line": l }))),
+            None => s.execute("run.testsInFile", &with_target(args, json!({ "path": path }))),
         }
     } else {
-        s.execute("test.runFiltered", &json!({ "name": "" }))
+        s.execute("test.runFiltered", &with_target(args, json!({ "name": "" })))
     };
     let v = match started {
         Ok(v) => v,

@@ -199,6 +199,9 @@ pub struct TestRun {
     /// Loaded from history or a file (no process).
     #[serde(default)]
     pub imported: bool,
+    /// The SSH host or Docker container the tests ran on (M16 track RT); reruns go there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<crate::run_targets::RunTarget>,
     #[serde(skip)]
     pub view: TreeView,
     #[serde(skip)]
@@ -231,6 +234,7 @@ impl TestRun {
             duration_ms: None,
             finished: false,
             imported: false,
+            target: None,
             view: TreeView::default(),
             junit: None,
             parser: parse::Parser::default(),
@@ -1220,6 +1224,21 @@ fn navigate_to(s: &mut Session, tab: RunTabId, si: usize, ti: usize) -> Result<(
 
 /// Start a configuration again (a new Run tab).
 pub(crate) fn start_origin(s: &mut Session, origin: TestOrigin, title: &str) -> Result<RunTabId, CommandError> {
+    start_origin_on(s, origin, title, None)
+}
+
+/// [`start_origin`] on a run target (`None`: where the command's `target` param says, else here).
+pub(crate) fn start_origin_on(
+    s: &mut Session,
+    origin: TestOrigin,
+    title: &str,
+    target: Option<crate::run_targets::RunTarget>,
+) -> Result<RunTabId, CommandError> {
+    if let Some(t) = target.filter(|t| !t.is_local())
+        && crate::target_exec::override_target(s).is_none()
+    {
+        return crate::target_exec::with_target(s, t, |s| start_origin_on(s, origin, title, None));
+    }
     match origin {
         TestOrigin::Cargo(inv) => crate::runs::start(s, inv, title, false),
         TestOrigin::Process(cmd) => crate::runs::start_process(s, &cmd, title),
@@ -1231,7 +1250,15 @@ pub(crate) fn rerun_tab(s: &mut Session, tab: RunTabId) -> Option<Result<RunTabI
     let run = s.testing.run(tab)?;
     let origin = run.origin.clone()?;
     let title = run.title.clone();
-    Some(start_origin(s, origin, &title))
+    let target = run.target.clone();
+    Some(start_origin_on(s, origin, &title, target))
+}
+
+/// Remember the target a test run in `tab` runs on (M16 track RT).
+pub(crate) fn set_run_target(s: &mut Session, tab: RunTabId, target: &crate::run_targets::RunTarget) {
+    if let Some(run) = s.testing.run_mut(tab) {
+        run.target = Some(target.clone()).filter(|t| !t.is_local());
+    }
 }
 
 /// The failed tests of a run, as (suite, test).

@@ -401,7 +401,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     container file browser; no registry browsing or push; Dev Containers ignore features, mounts,
     customizations and hooks other than `postCreateCommand`, and Compose-based ones need the
     `devcontainer` CLI; Dockerfile run configurations take one command field; no Dockerfile
-    completion or inspections.
+    completion or inspections. M16 track RT (item 62) closed the run-target part: Docker images,
+    running containers and Compose services (`docker compose run`) now debug (debugpy,
+    gdbserver/lldb-server), test and profile, not only run, with the mount mapped back.
 32. SSH and remote (track S): SSH servers from `~/.ssh/config` plus `$CODECRAFT_HOME/ssh.json`
     (keys/agent only), Start SSH Session, all of Tools › Deployment (upload, download, sync with
     preview, compare with deployed, automatic upload), File Transfer and Remote Host tool
@@ -414,6 +416,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     multi-select; `Match` blocks in `~/.ssh/config` aren't evaluated; BatchMode means no password
     or passphrase prompts (accept host keys once via Start SSH Session); Remote Development opens
     the mirror in the current window, with no remote language server or file watching; no WSL.
+    M16 track RT (item 62): SSH targets now debug (debugpy / gdb-remote over `ssh -L`), test
+    (reports copied back) and profile (snapshots copied back) with the deployment mapping, and
+    the target's Python interpreter is chosen per configuration (the server field is still text
+    in Edit Configurations; Manage Targets saves named targets).
 33. Python (track Y): interpreter detection (venv, uv, poetry, conda, pyenv, system), a status-bar
     interpreter switcher and Create Virtualenv driving runs, debugpy, pytest and the language
     server; the Python Packages tool window; an "Install package" quick-fix; the Python Console
@@ -422,7 +428,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     the test tree; console interrupt is Unix-only and children of console code survive Stop; no
     console completion or debug-console switching; the Variables view doesn't expand objects;
     package search filters installed packages only (no PyPI search); no pipenv, hatch, Windows
-    registry, remote, WSL or Docker interpreters; the install quick-fix needs a running Python
+    registry or WSL interpreters (~~remote or Docker~~: M16 RT, item 62); the install quick-fix needs a running Python
     language server; mypy/pyright findings offer suppression only; Create setup.py has no dialog.
 34. Profiler (track P): Run › Profile (samply, `perf` on Linux, py-spy for Python), Attach
     Profiler to Process…, Open Profiler Snapshot (samply/Firefox, Gecko, speedscope, collapsed
@@ -434,7 +440,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Remaining: samply's `--save-only` snapshots are symbolicated by CodeCraft since M15 (item
     59: `atos`/`addr2line`, samply's presymbolication file) but not from separate symbol
     servers or `.dSYM`/`debuglink` files the tools don't find; snapshots are parsed whole into
-    memory; no profiling on Docker/SSH targets; no Chrome trace
+    memory; ~~no profiling on Docker/SSH targets~~ (M16 RT, item 62); no Chrome trace
     format; py-spy needs root on macOS; speedscope files with mixed units keep only the first
     unit's profiles (memray's: the bytes, not the allocation counts).
 35. SQL in Rust strings (track Q): SQL detected in sqlx/diesel/rusqlite/postgres calls and after
@@ -582,7 +588,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     in Debug/Release; Valgrind is Linux-only Memcheck without suppressions; no Conan/vcpkg
     dependency tree or updates, no vcpkg classic mode; Reset Frame via `thread return` doesn't
     undo side effects; Attach to an Unstarted Process has no run configuration or recent names;
-    Manage Targets can't add or edit targets and has no WSL.
+    ~~Manage Targets can't add or edit targets~~ (M16 RT: named targets, item 62) and has no WSL.
 46. More data sources (track DD): Microsoft SQL Server (tiberius; SQL auth, TLS, GO batches,
     `sys.*` introspection, `@@TRANCOUNT` transaction state, attention-signal cancel, estimated
     plans), ClickHouse (HTTP; streamed rows, sessions, KILL QUERY cancel, `readonly=2`, no
@@ -906,6 +912,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     completion in the console is a list of buttons (no keyboard navigation of the list); there
     is no editor context menu with Jump to Line (Run › Debugging Actions › Jump to Line acts on
     the caret line).
+    M16 track RT (item 62): Python, Rust and C/C++ configurations debug on SSH hosts and in
+    Docker containers (the debug server started there, its port forwarded, paths mapped), not
+    only by attaching to a server started by hand.
 
 54. Code analysis (track CA): Inspect Code runs the analyzers the active **inspection profile**
     turns on, per language — Rust: Clippy (when asked for, when Settings › Rust turns it on or
@@ -1007,7 +1016,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     each total (not absolute time) and match paths by function name; Cargo test targets with
     several executables (`cargo test` without `--lib`/`--test`) must be narrowed first; py-spy,
     heaptrack and perf were exercised only through fakes (py-spy needs root on macOS; heaptrack
-    and perf are Linux-only); the memray test doesn't run by default; no Docker/SSH targets.
+    and perf are Linux-only); the memray test doesn't run by default; ~~no Docker/SSH targets~~
+    (M16 RT, item 62: cProfile/tracemalloc/py-spy and samply/perf on the target, the snapshot
+    copied back with local paths).
     M15 track PP (item 59) closed: tracemalloc's periodic snapshots with the peak, per-thread
     line statistics and gutter marks, Gecko/samply sample times, the time-range selection, and
     profiling the test at the caret.
@@ -1249,7 +1260,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     a sample, so a short spike between samples is in `peak` but not in the snapshot; profiling a
     pytest test also records it in the Test Runner (the run gets the usual JUnit report); C++
     tests whose configuration falls back to `ctest -R` profile ctest rather than the test
-    binary; profiling a test on a Docker/SSH target is not offered.
+    binary; ~~profiling a test on a Docker/SSH target is not offered~~ (M16 RT: `profiler.atCaret`
+    / `profile_start {test, target}`, item 62).
 
 60. AI agents everywhere (track AI): every agent CLI gets CodeCraft's tools the way it documents,
     never by editing the user's files. Gemini Auto/Review jobs: a per-job settings file in the
@@ -1348,6 +1360,87 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     only through fakes.
 
 ## M16 (2026-10-16)
+
+62. Remote targets (track RT): a configuration's target — the local machine, an SSH server or a
+    Docker image, running container or Compose service (`docker compose [-f file] run --rm -T`,
+    new) — applies to Run, Debug, Test and Profile, as PyCharm's remote interpreters and CLion's
+    remote toolchains do (`engine/src/target_exec.rs`; the scripts that run on the target are
+    pure text in `remote/src/target_script.rs`). SSH targets sync the project to the deployment
+    mapping (or the target's remote folder) and run there; Docker targets mount the project;
+    the target's Python interpreter (`python` on the target, chosen per configuration) replaces
+    the configuration's local one. **Debugging** (`debug/on_target.rs`): a preflight on the
+    target reports the project folder's absolute path (`~/app` mappings work) and checks for the
+    tools; Python then starts `python -m debugpy --listen <port> --wait-for-client (script | -m
+    module) args` there, Rust builds there with `cargo build --message-format=json` (the
+    executable read from the artifacts) and C/C++ runs the configuration's build step there (a
+    prebuilt program is uploaded), then `lldb-server gdbserver`, `gdbserver` or `debugserver`
+    (whichever the target has) serves the program; the launcher announces when the port listens
+    (`/proc/net/tcp`, `ss`, `netstat` or `lsof`, never a probing connection: a stub serves one
+    connection), the port is forwarded (`ssh -N -L` with the same port number on both sides, a
+    published `-p 127.0.0.1:P:P` port for images and Compose services, or a local listener
+    relayed through `docker exec -i <container>` + python3/nc/socat for running containers) and
+    the local adapter attaches: debugpy with `pathMappings` (project ↔ the target's folder),
+    lldb-dap with `gdb-remote` and `target.source-map`, breakpoints sent with the target's paths
+    and frames mapped back, the remote binary (and a macOS host's `.dSYM`) copied back for
+    symbols; stopping ends the program there (terminate, not detach); debugpy subprocesses
+    connect through the same forward (port remapped for relays); pytest tests at the caret,
+    `debug.test` and agents' `debug_start` debug on the target too; Rebuild/Compile and Reload
+    restarts on the target. **Tests**: test runs on a target write their reports (pytest JUnit,
+    C++ framework reports) into the project's `.codecraft/remote-run/` (the Docker mount, or
+    copied back from the SSH host when the run ends, the run's exit status kept), the tree and
+    `test_run` show local locations and the configured command line with `(on SSH: web)`, and
+    Rerun / Rerun Failed go to the same target. **Profiling** (`profiler_target.rs`): one Run tab
+    process records on the target and copies the snapshot back to `.codecraft/remote-run/
+    profile-<time>/`: cProfile (converted there by CodeCraft's helper with the target's own
+    interpreter: pstats depend on the Python version), tracemalloc (with the peak snapshot) and
+    py-spy for Python, samply else perf (`perf script` there) for native code, Cargo targets built
+    there first; frames' and allocation sites' paths are mapped back to the project
+    (`Convert::Remap`), so reports, hotspots and gutter marks show local files; `seconds` uses
+    the target's `timeout -s INT`. **Missing tools** fail with the command to run *there*, never
+    run automatically (`debugpy is not installed for python3 on SSH: web. Install it there:
+    python3 -m pip install debugpy`; `no gdb-remote debug server on SSH: web: install gdbserver
+    (apt-get install -y gdbserver) or lldb-server …`; py-spy, samply/perf, cargo, python).
+    **Remote interpreters** (`target_python.rs`, Settings › Languages & Frameworks › Python ›
+    Remote Interpreters): detect `python3`/`python3.x` on the target's PATH and virtualenvs (the
+    project's `.venv`/`venv`/`env`, `~/.virtualenvs`, pyenv, conda, `/opt`) with versions, list an
+    interpreter's packages (importlib.metadata, no pip needed) and set the one a configuration
+    uses there; Edit Configurations has the Compose service, Compose file and interpreter fields.
+    **Manage Targets** saves named targets (`run.manageTargets.add/remove/resolve`,
+    `.codecraft/targets.json`, an Add a target form in the dialog). **Commands and agents**: `run.run`,
+    `run.debug`, `debug.atCaret`, `debug.test`, `debug.executable`, `run.contextConfiguration`,
+    `run.testsInFile`, `test.runFiltered`, `test.rerun(Failed)`, `run.profile`, `profiler.record`,
+    `profiler.atCaret` take `target` (a saved target or SSH server name, `ssh:<server>`,
+    `docker:<image>`, `container:<name>`, `compose:<service>`, `local`, or an object), scoped by
+    `Session::execute` and kept through before-launch tasks; the MCP tools `debug_start`,
+    `profile_start`, `test_run` and `run_start` have `target` (additive schema); results show
+    local paths. Tested without a real host or the Docker daemon: fake `ssh`/`rsync`/`scp`/
+    `docker`/`perf` scripts that run the remote command locally in a temp "remote home" or
+    mapped folder (`crates/engine/tests/remote_targets.rs`, 15 tests): the real debugpy on an SSH
+    host, in a running container through the relay and in an image (a pytest test at the caret,
+    published port), lldb-dap + Xcode's debugserver standing in for gdbserver on a C++ program
+    built on the host and a Rust binary built there by cargo (Rust values, `target.source-map`),
+    real pytest on the host (report copied back, rerun failed on the target), real cProfile and
+    tracemalloc on the host and cProfile in an image (paths mapped back), Rust built there and
+    profiled with a fake perf, missing debugpy / interpreter / debug server / py-spy messages, a
+    Compose service run, remote interpreter detection and packages, and agents' `debug_start
+    {target}` over the in-process MCP tools; unit tests for the scripts (run in `sh`, including
+    the listening announcement against a real socket and the relay), path mapping, target
+    references, Docker/SSH process building and profile remapping; egui_kittest
+    `ui-egui/tests/remote_targets_ui.rs` (the Remote Interpreters section and the Add a target
+    form). Remaining: no real SSH host or Docker daemon was used — real `ssh -L`, Docker port
+    publishing and `docker exec` relays, Linux `gdbserver`/`lldb-server` (their argument shapes
+    are unit-tested), perf, samply and py-spy on a target ran only through fakes; an SSH forward
+    uses the same port number there (a port busy on the host fails the start with the server's
+    error); without `/proc/net/tcp`, `ss`, `netstat` or `lsof` on the target the launcher assumes
+    the server listens after 1.5 s; the debuggee's stdin is not connected on a target; stopping a
+    plain SSH *run* still doesn't stop the remote process (debug sessions end theirs through the
+    debugger); files a Docker image target writes must be inside the mount; the source and
+    profile mappings cover the project root only (a target's site-packages or system headers
+    keep their remote paths); native memory profiling, xctrace, leaks, heaptrack and memray run
+    only locally; samply snapshots from a target are symbolicated with local tools only when the
+    binaries' paths exist here; a remote profile's Stop also ends the copy back (no snapshot);
+    interpreter detection doesn't follow `.python-version` or Poetry/uv project settings on the
+    target; no WSL targets and no language server on the target.
 
 63. Live analysis while typing (track LT): the analyzers re-run on the unsaved buffer shortly
     after the last edit, like PyCharm's on-the-fly inspections (`engine/src/analysis/live.rs`).

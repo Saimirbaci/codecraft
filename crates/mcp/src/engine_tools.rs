@@ -68,6 +68,14 @@ fn line(what: &str) -> Value {
     json!({ "type": "integer", "minimum": 1, "description": format!("{what} (1-based)") })
 }
 
+/// The `target` of run, debug, test and profile tools (M16 track RT).
+fn run_target() -> Value {
+    json!({
+        "description": "Where to run instead of the configuration's own target: `local`, a saved target or SSH server             name (Run › Manage Targets), `ssh:<server>`, `docker:<image>`, `container:<name>`, `compose:<service>`, or             {kind: ssh|docker, …}. Results show local paths (mapped back from the target)",
+        "anyOf": [{ "type": "string" }, { "type": "object" }],
+    })
+}
+
 fn timeout(default_ms: u64) -> Value {
     json!({ "type": "integer", "minimum": 0, "maximum": 600_000,
             "description": format!("How long to wait, in milliseconds (default {default_ms})") })
@@ -260,6 +268,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "args": { "type": "array", "items": { "type": "string" }, "description": "Program arguments (with `program`)" },
                 "pid": { "type": "integer", "minimum": 1, "description": "Attach to this process" },
                 "kind": { "type": "string", "enum": ["native", "rust", "python"], "description": "With `pid`: the debugger to attach with" },
+                "target": run_target(),
             }),
             &[],
         ),
@@ -380,6 +389,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                     "required": ["path", "line"],
                 },
                 "interval": { "type": "number", "minimum": 0, "description": "Memory profiles with tracemalloc: seconds between memory samples (default 0.1; 0 = only the snapshot at the end). The report then has the memory over time and the top allocations at the peak" },
+                "target": run_target(),
             }),
             &[],
         ),
@@ -417,6 +427,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
                 "line": line("With `path`: the test at this line"),
                 "name": { "type": "string", "description": "A test name filter" },
                 "timeoutMs": timeout(600_000),
+                "target": run_target(),
             }),
             &[],
         ),
@@ -434,7 +445,7 @@ pub fn engine_tools() -> Vec<ToolDef> {
         tool(
             RUN_START,
             "Run a configuration (its before-launch tasks first). Returns {tab}; read the output with run_output",
-            json!({ "config": config_ref() }),
+            json!({ "config": config_ref(), "target": run_target() }),
             &["config"],
         ),
         tool(

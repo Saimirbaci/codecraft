@@ -49,6 +49,10 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 /// The helper script run by Python interpreters (cProfile conversion, tracemalloc).
 const HELPER: &str = include_str!("profiler_helper.py");
 
+// M16 track RT: profiling on SSH hosts and in Docker containers.
+#[path = "profiler_target.rs"]
+mod on_target;
+
 /// A profiler CodeCraft can drive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -188,6 +192,8 @@ pub struct Recording {
     pub deadline: Option<Instant>,
     /// What turns the output into a snapshot.
     pub convert: Convert,
+    /// A recording on an SSH host or in a container: the files it may hand back (M16 RT).
+    pub remote: Option<on_target::RemoteSnapshot>,
 }
 
 /// Where a job is.
@@ -1078,13 +1084,17 @@ fn spawn_load(s: &mut Session, path: PathBuf, convert: Convert, purpose: Purpose
     let job_path = path.clone();
     let spawned = std::thread::Builder::new().name("profiler-load".into()).spawn(move || {
         let result = (|| {
-            let (file, profile) = match crate::profiler_convert::convert(&convert, &job_path)? {
+            let (file, mut profile) = match crate::profiler_convert::convert(&convert, &job_path)? {
                 Converted::File(file) => {
                     let p = codecraft_profile::load(&file).map_err(|e| e.to_string())?;
                     (file, p)
                 }
                 Converted::Parsed(file, p) => (file, *p),
             };
+            // A snapshot recorded on a target: its paths as local ones (M16 RT).
+            if let Convert::Remap { from, to, .. } = &convert {
+                crate::target_exec::remap_profile(&mut profile, from, to);
+            }
             let analysis = Analysis::new(&profile, None);
             let baseline = (purpose == Purpose::Baseline).then(|| {
                 let mut methods: HashMap<FunctionKey, (u64, u64)> = HashMap::new();
@@ -1239,6 +1249,11 @@ pub(crate) fn project_python(s: &Session) -> Option<PathBuf> {
 
 /// Start a profiling job: build first when the plan says so, then record.
 pub(crate) fn record(s: &mut Session, req: RecordRequest) -> Result<u64, CommandError> {
+    // On an SSH host or in a container: the configuration's target, or the command's `target`.
+    let target = crate::target_exec::effective(s, &req.plan.run_target);
+    if !target.is_local() {
+        return on_target::record(s, req, target);
+    }
     let RecordRequest { mut plan, kind, tool, seconds, interval } = req;
     if interval.is_some() {
         plan.sample_interval_ms = interval.map(crate::profiler_plan::seconds_to_ms);
@@ -1401,6 +1416,7 @@ fn start_recording(
         job,
         deadline,
         convert,
+        remote: None,
     });
     if let Some(j) = s.profiler.job_mut(job) {
         j.state = JobState::Recording;
@@ -1480,6 +1496,7 @@ pub(crate) fn attach_job(
         job,
         deadline,
         convert,
+        remote: None,
     });
     if let Some(j) = s.profiler.job_mut(job) {
         j.tab = Some(tab);
@@ -1777,7 +1794,14 @@ fn written_output(rec: &Recording) -> Option<PathBuf> {
 }
 
 /// A recording's process ended: open its snapshot, or say why there is none.
-fn finished(s: &mut Session, rec: Recording) {
+fn finished(s: &mut Session, mut rec: Recording) {
+    // A recording on a target: pick the file it handed back and map its paths (M16 RT).
+    if let Some(remote) = rec.remote.take() {
+        match on_target::finish(s, rec, remote) {
+            Some(r) => rec = r,
+            None => return,
+        }
+    }
     if let Some(output) = written_output(&rec) {
         if let Some(t) = s.ws.run_mut(rec.tab) {
             t.push(ConsoleKind::System, format!("Profiler snapshot: {}", output.display()));

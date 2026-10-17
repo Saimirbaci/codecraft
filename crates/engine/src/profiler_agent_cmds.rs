@@ -26,13 +26,15 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             None,
             "{config?: int|name, command?: string|[string], cwd?: string, test?: {path, line (1-based)}, pid?: int, \
              python?: bool, kind?: cpu|memory, tool?: xctrace|samply|perf|py-spy|cProfile|tracemalloc|memray|leaks|\
-             heaptrack, seconds?: number, interval?: number} — profile a run configuration (default: the selected \
+             heaptrack, seconds?: number, interval?: number, target?: string|object} — profile a run configuration (default: the selected \
              one), a command line (`cargo test name`, `pytest -k x`, `./build/app --fast`, `python app.py`), the test \
              at a source line (`test`: what the gutter ▶ runs there — `cargo test --lib name -- --exact`, pytest \
              `file::test`, a GoogleTest/Catch2/doctest/Boost.Test filter) or a running process (`pid`). Cargo \
              targets and CMake chains are built first; `seconds` stops the recording early; `interval` = seconds \
              between tracemalloc memory samples (default 0.1; 0 = only the snapshot at the end). → {job, state, \
-             tool, tab}; poll profiler.job, then profiler.report {snapshot: job}",
+             tool, tab}; poll profiler.job, then profiler.report {snapshot: job}. On an SSH/Docker target (the \
+             configuration's, or `target`): cProfile/tracemalloc/py-spy for Python, samply/perf for native code run \
+             there and the snapshot comes back with local paths",
             Context::Global,
             always,
             record,

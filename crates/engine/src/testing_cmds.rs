@@ -342,8 +342,9 @@ fn rerun_failed(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::Disabled("the tests are still running".into()));
     }
     let title = run.title.clone();
+    let target = run.target.clone();
     let origin = testing::rerun_failed_origin(run).map_err(CommandError::Failed)?;
-    let new = testing::start_origin(s, origin, &title)?;
+    let new = testing::start_origin_on(s, origin, &title, target)?;
     Ok(json!({ "tab": new.0 }))
 }
 

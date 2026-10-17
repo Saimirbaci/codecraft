@@ -142,6 +142,10 @@ pub mod ssr;
 pub mod ssr_cmds;
 pub mod user_store;
 pub mod ssh_target;
+// M16 track RT: run, debug, test and profile on SSH hosts and Docker containers.
+pub mod target_exec;
+mod target_cmds;
+pub mod target_python;
 pub mod ssh_tunnel;
 pub mod structure;
 pub mod templates;
@@ -345,6 +349,8 @@ pub struct Session {
     pub cpp: cpp::CppState,
     /// A Run/Debug waiting for its configuration's before-launch tasks (M13 track RC).
     pub launch: before_launch::LaunchState,
+    /// Run targets: the `target` param of a command and remote interpreters (M16 track RT).
+    pub targets: target_exec::TargetsState,
     /// The Zig tool window's build steps (M13 track RC).
     pub zig: zig_tool::ZigState,
     /// The TypeScript tool window: tsc errors and tsconfig files (M13 track RC).
@@ -441,6 +447,7 @@ impl Session {
             inline: inline_completion::InlineState::default(),
             cpp: cpp::CppState::default(),
             launch: before_launch::LaunchState::default(),
+            targets: target_exec::TargetsState::default(),
             zig: zig_tool::ZigState::default(),
             typescript: typescript_tool::TsState::default(),
             modify: modify_code::ModifyState::default(),
@@ -459,6 +466,14 @@ impl Session {
 
     /// Run a command by id. Never panics: a panic inside a command is caught and reported.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
+        // Run, debug, test and profile commands run on the target their `target` param names (M16 RT).
+        if let Some(target) = target_exec::scope(self, id, params)? {
+            return target_exec::with_target(self, target, |s| s.execute_scoped(id, params));
+        }
+        self.execute_scoped(id, params)
+    }
+
+    fn execute_scoped(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
         // Debug commands act on the session their `session` param names (M15 track DM).
         if let Some(session) = debug::session_scope(self, id, params)? {
             return debug::with_session(self, session, |s| s.execute_here(id, params));
@@ -589,6 +604,7 @@ impl Session {
         changed |= jupyter::pump(self);
         changed |= python_format::pump(self);
         changed |= profiler::pump(self);
+        changed |= target_python::pump(self);
         changed |= sql_lang::pump(self);
         changed |= run_config_gen::pump(self);
         changed |= rust_tools::pump(self);
@@ -628,6 +644,7 @@ impl Session {
             || self.jupyter.busy()
             || self.py_format.busy()
             || self.profiler.busy()
+            || self.targets.python.busy()
             || self.sql_lang.busy()
             || self.rust.busy()
             || self.ssr.busy()

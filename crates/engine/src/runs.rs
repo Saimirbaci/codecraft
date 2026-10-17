@@ -184,7 +184,21 @@ pub fn derive_configs(meta: &CargoMetadata) -> Vec<RunConfig> {
 /// Start a cargo invocation in a new Run (or Build) tab. Saves all files first, like RustRover.
 pub(crate) fn start(s: &mut Session, inv: CargoInvocation, title: &str, build: bool) -> Result<RunTabId, CommandError> {
     let _ = s.save_all();
+    // A command's `target` param runs it on an SSH host or in a container (M16 track RT).
+    if let Some(target) = crate::target_exec::override_target(s) {
+        let mut cmd = cargo_command(&inv);
+        cmd.build = build;
+        return start_on_target(s, &cmd, title, &target);
+    }
     start_chain(s, inv, None, title, build)
+}
+
+/// A Cargo invocation as a plain `cargo …` process (human-readable output, for targets).
+fn cargo_command(inv: &CargoInvocation) -> ProcessCommand {
+    let mut c = ProcessCommand::new("cargo", &[], inv.cwd.clone());
+    c.args = CargoInvocation { json_messages: false, ..inv.clone() }.args();
+    c.env = inv.env.clone();
+    c
 }
 
 pub(crate) fn start_chain(
@@ -208,20 +222,19 @@ pub(crate) fn start_chain(
 
 /// Start any run configuration (saves all files first).
 pub(crate) fn start_config(s: &mut Session, config: &RunConfig) -> Result<RunTabId, CommandError> {
-    if !config.target.is_local() {
+    let target = crate::target_exec::effective(s, &config.target);
+    if !target.is_local() {
         // On another machine or in a container: run the plain command line through the target.
         let cmd = match &config.command {
             Some(c) => c.clone(),
-            None => {
-                let inv = config.invocation.clone();
-                let mut c = ProcessCommand::new("cargo", &[], inv.cwd.clone());
-                c.args = CargoInvocation { json_messages: false, ..inv.clone() }.args();
-                c.env = inv.env;
-                c
-            }
+            None => cargo_command(&config.invocation),
         };
-        let wrapped = crate::run_targets::wrap(s, &config.target, cmd)?;
-        return start_process(s, &wrapped, &config.name);
+        return start_on_target(s, &cmd, &config.name, &target);
+    }
+    // `target: local` overrides a configuration's own target.
+    if !config.target.is_local() {
+        let local = RunConfig { target: Default::default(), ..config.clone() };
+        return start_config(s, &local);
     }
     match &config.command {
         Some(cmd) => start_process(s, cmd, &config.name),
@@ -231,17 +244,98 @@ pub(crate) fn start_config(s: &mut Session, config: &RunConfig) -> Result<RunTab
 
 /// Start a plain process in a Run (or Build) tab. Saves all files first.
 pub(crate) fn start_process(s: &mut Session, cmd: &ProcessCommand, title: &str) -> Result<RunTabId, CommandError> {
+    // A command's `target` param runs it on an SSH host or in a container (M16 track RT).
+    if let Some(target) = crate::target_exec::override_target(s) {
+        return start_on_target(s, cmd, title, &target);
+    }
+    start_process_here(s, cmd, title)
+}
+
+/// [`start_process`] on this machine, whatever the command's `target` param says (for wrapped
+/// commands that already run on a target).
+pub(crate) fn start_process_here(s: &mut Session, cmd: &ProcessCommand, title: &str) -> Result<RunTabId, CommandError> {
     let _ = s.save_all();
     // Test processes may get extra arguments (pytest: `-v` and a JUnit report).
     let (configured, (cmd, junit)) = (cmd, crate::testing::instrument_process(cmd));
+    spawn_tracked(s, &cmd, configured, junit, title, None)
+}
+
+/// Spawn `cmd` in a new tab, tracking test results as for `configured`.
+fn spawn_tracked(
+    s: &mut Session,
+    cmd: &ProcessCommand,
+    configured: &ProcessCommand,
+    junit: Option<PathBuf>,
+    title: &str,
+    display: Option<String>,
+) -> Result<RunTabId, CommandError> {
     let program = cmd.resolved_program();
     let (handle, events) = codecraft_cargo::spawn_process(&program, &cmd.args, &cmd.cwd, &cmd.env, false)
         .map_err(|e| CommandError::Failed(e.to_string()))?;
-    let tab = s.ws.add_run(title, cmd.command_line(), cmd.build);
+    let tab = s.ws.add_run(title, display.unwrap_or_else(|| cmd.command_line()), cmd.build);
     crate::testing::track_process(s, tab, configured, junit, title);
     s.ws.layout.show(if cmd.build { ToolWindowId::Build } else { ToolWindowId::Run });
     s.runs.procs.push(Proc { tab, handle, events, root: cmd.cwd.clone(), then: None });
     s.status = format!("{title}: running");
+    Ok(tab)
+}
+
+/// A test report path as one inside the project's [`crate::target_exec::RUN_DIR`] (so the
+/// target writes it where CodeCraft can read it: in the Docker mount, or downloaded from the
+/// SSH host).
+fn relocate_report(root: &Path, mut cmd: ProcessCommand, report: Option<PathBuf>) -> (ProcessCommand, Option<PathBuf>) {
+    let Some(old) = report else { return (cmd, None) };
+    if old.starts_with(root) {
+        return (cmd, Some(old));
+    }
+    let name = old.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "report.xml".into());
+    let new = root.join(crate::target_exec::RUN_DIR).join(name);
+    let (from, to) = (old.display().to_string(), new.display().to_string());
+    for a in &mut cmd.args {
+        if a.contains(&from) {
+            *a = a.replace(&from, &to);
+        }
+    }
+    (cmd, Some(new))
+}
+
+/// Run `cmd` (local paths) on `target` in a Run tab: the target's wrapper (`ssh`/`docker`), with
+/// test reports written into the project and copied back from an SSH host (M16 track RT).
+pub(crate) fn start_on_target(
+    s: &mut Session,
+    cmd: &ProcessCommand,
+    title: &str,
+    target: &crate::run_targets::RunTarget,
+) -> Result<RunTabId, CommandError> {
+    use crate::run_targets::RunTarget;
+    let _ = s.save_all();
+    let root = s.project_root().ok_or_else(|| CommandError::Failed("no project is open".into()))?;
+    let (instrumented, report) = crate::testing::instrument_process(cmd);
+    let (instrumented, report) = relocate_report(&root, instrumented, report);
+    if let Some(r) = &report {
+        if let Some(dir) = r.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::remove_file(r);
+    }
+    let wrapped = match target {
+        RunTarget::Local => instrumented.clone(),
+        RunTarget::Ssh(t) => {
+            let downloads: Vec<(String, PathBuf)> = report
+                .iter()
+                .filter_map(|r| Some((codecraft_remote::deploy::rel_path(&root, r)?, r.clone())))
+                .collect();
+            crate::ssh_target::wrap_with(s, t, instrumented, &downloads)?
+        }
+        RunTarget::Docker(_) => crate::run_targets::wrap(s, target, instrumented)?,
+    };
+    // The Run window and test results show the command as configured, and where it runs.
+    let display = format!("{} (on {})", cmd.command_line(), target.label());
+    let tab = spawn_tracked(s, &wrapped, cmd, report, title, Some(display))?;
+    crate::testing::set_run_target(s, tab, target);
+    if let Some(t) = s.ws.run_mut(tab) {
+        t.push(codecraft_workspace::ConsoleKind::System, format!("Running on {}", target.label()));
+    }
     Ok(tab)
 }
 
