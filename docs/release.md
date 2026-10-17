@@ -228,7 +228,7 @@ The CI twin of `./release.sh` (below). Actions › New version › Run workflow,
   hand; on publishes it right away.
 
 It runs `cargo xtask version <bump>`, checks that `Cargo.lock` is consistent
-(`cargo metadata --locked`), commits `Release vX.Y.Z` to main as `github-actions[bot]`, tags it,
+(`cargo tree --locked`), commits `Release vX.Y.Z` to main as `github-actions[bot]`, tags it,
 and pushes both in one atomic push. If main is protected against direct pushes, add GitHub
 Actions to the rule's bypass list, or use `./release.sh`.
 
@@ -257,7 +257,7 @@ cargo xtask version minor           # Cargo.toml + the workspace's entries in Ca
 
    It checks that you are on `main` with a clean tree, not behind `origin/main`, and that the tag
    is new; shows the plan and asks for confirmation (`--yes` skips it); runs
-   `cargo xtask version <level>` and `cargo metadata --locked --offline` (the bump is undone if
+   `cargo xtask version <level>` and `cargo tree --locked --offline` (the bump is undone if
    that fails); commits `Release vX.Y.Z`; creates the annotated tag; and pushes `main` and the tag
    in one atomic push. Nothing is built: pushing the tag starts no workflow. (Or use the New
    version workflow, above.)

@@ -20,7 +20,9 @@ set -euo pipefail
 
 # Overridable for the script's own tests only.
 XTASK=${CODECRAFT_RELEASE_XTASK:-cargo xtask}
-LOCK_CHECK=${CODECRAFT_RELEASE_LOCK_CHECK:-cargo metadata --locked --offline --format-version 1}
+# Fails if the bump left Cargo.lock stale; needs no downloads (cargo metadata would fetch the
+# crates of every platform).
+LOCK_CHECK=${CODECRAFT_RELEASE_LOCK_CHECK:-cargo tree --locked --offline --workspace --depth 0}
 REMOTE=${CODECRAFT_RELEASE_REMOTE:-origin}
 BRANCH=main
 
@@ -63,7 +65,8 @@ if [ -n "$(git status --porcelain)" ]; then
     fi
 fi
 if $push || ! $dry_run; then
-    git fetch --quiet "$REMOTE" "$BRANCH" --tags || die "cannot fetch $REMOTE"
+    # One connection: the remote's tags come along, so the tag check below covers them too.
+    git fetch --quiet --tags "$REMOTE" "$BRANCH" || die "cannot fetch $REMOTE"
     behind=$(git rev-list --count "HEAD..$REMOTE/$BRANCH")
     [ "$behind" = 0 ] || die "$BRANCH is $behind commit(s) behind $REMOTE/$BRANCH; pull first"
 fi
@@ -73,9 +76,6 @@ next=$($XTASK version "$level" --dry-run | tail -n 1)
 tag="v$next"
 if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     die "tag $tag already exists"
-fi
-if $push && git ls-remote --exit-code --tags "$REMOTE" "refs/tags/$tag" >/dev/null 2>&1; then
-    die "tag $tag already exists on $REMOTE"
 fi
 
 echo "Version: $current → $next"

@@ -82,7 +82,7 @@ jobs:
 
       - name: Cargo.lock is consistent
         # Fails if the bump left the lock file out of date (nothing is updated: --locked).
-        run: cargo metadata --locked --format-version 1 > /dev/null
+        run: cargo tree --locked --workspace --depth 0 > /dev/null
 
       - name: Commit, tag and push
         env:

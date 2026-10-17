@@ -202,3 +202,19 @@ fn refusals_change_nothing() {
     unchanged(&r);
     assert!(!origin_has_tag(&r, "v0.2.0"));
 }
+
+/// The script's default lock check must work offline on this workspace without downloading the
+/// crates of other platforms (`cargo metadata --offline` failed on `wasi` this way).
+#[test]
+fn default_lock_check_works_offline() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let script = std::fs::read_to_string(root.join("release.sh")).unwrap();
+    let line = script.lines().find(|l| l.starts_with("LOCK_CHECK=")).unwrap();
+    let cmd = line.split_once(":-").unwrap().1.trim_end_matches('}');
+    let words: Vec<&str> = cmd.split_whitespace().collect();
+    assert_eq!(words.first(), Some(&"cargo"), "{cmd}");
+    assert!(words.contains(&"--locked") && words.contains(&"--offline"), "{cmd}");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let out = Command::new(cargo).args(&words[1..]).current_dir(root).output().unwrap();
+    assert!(out.status.success(), "{cmd}: {}", String::from_utf8_lossy(&out.stderr));
+}
