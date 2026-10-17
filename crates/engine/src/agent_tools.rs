@@ -291,6 +291,12 @@ enum Wait {
     RunDone {
         args: Value,
     },
+    /// A command that answered `pending: true` to answer again without it (M16 LT:
+    /// `analysis.fileFindings {waitMs}` waits for the current revision's results).
+    Pending {
+        id: String,
+        params: Value,
+    },
     Db {
         source: String,
         before: Vec<u64>,
@@ -1143,6 +1149,15 @@ fn on_timeout(s: &mut Session, name: &str, wait: &Wait) -> ToolResult {
                 Err(e) => ToolResult::error(e.to_string()),
             }
         }
+        Wait::Pending { id, params } => match s.execute(id, params) {
+            Ok(mut v) => {
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("timedOut".into(), json!(true));
+                }
+                json_result(&json!({ "id": id, "result": v }))
+            }
+            Err(e) => ToolResult::error(e.to_string()),
+        },
         Wait::ProjectLoad { .. } => ToolResult::error(format!(
             "{name}: the project is still loading (scanning files, reading Cargo metadata); try again in a moment"
         )),
@@ -1353,6 +1368,11 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 Err(e) => cmd_err(e),
             })
         }
+        Wait::Pending { id, params } => match s.execute(id, params) {
+            Ok(v) if v.get("pending").and_then(Value::as_bool) == Some(true) => None,
+            Ok(v) => Some(done_json(json!({ "id": id, "result": v }))),
+            Err(e) => Some(cmd_err(e)),
+        },
         Wait::RunDone { args } => {
             let tab = args.get("tab").and_then(Value::as_u64).map(codecraft_workspace::RunTabId);
             let running = match tab {
@@ -1458,7 +1478,18 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
         t::EXECUTE => {
             let id = args.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
             let params = args.get("params").cloned().unwrap_or(Value::Null);
+            // `waitMs` on a command that reports `pending` (analysis.fileFindings, M16 LT): wait
+            // here, polling with the IDE's pumps, instead of blocking the command.
+            let wait_ms = params.get("waitMs").and_then(Value::as_u64).filter(|ms| *ms > 0 && id == "analysis.fileFindings");
             match s.execute(&id, &params) {
+                Ok(v) if wait_ms.is_some() && v.get("pending").and_then(Value::as_bool) == Some(true) => {
+                    let mut params = params.clone();
+                    if let Some(o) = params.as_object_mut() {
+                        o.remove("waitMs");
+                    }
+                    let ms = wait_ms.unwrap_or(0).min(600_000);
+                    Step::Wait(Wait::Pending { id, params }, Duration::from_millis(ms))
+                }
                 Ok(v) => done_json(json!({ "id": id, "result": v })),
                 // A command that needs the project's settings (run configurations, data
                 // sources) while the project is still loading: run it again once it has (M15 AI:

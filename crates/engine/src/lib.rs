@@ -639,6 +639,9 @@ impl Session {
             || self.zig.busy()
             || self.typescript.busy()
             || self.modify.busy()
+            // Analysis while typing waits for its delay, then runs (M16 LT).
+            || self.analysis.editor.live.busy()
+            || self.analysis.editor.on_save.busy()
     }
 
     /// Whether processes or jobs (not the language server) are still running.

@@ -210,12 +210,46 @@ pub fn settings_page(ui: &mut Ui, s: &mut Session, st: &mut UiState, cmds: &mut 
             cmds.push(("settings.set", json!({ "key": "analysis_on_save", "value": on })));
         }
     }
+    analyze_while_typing(ui, s, &theme, cmds);
     if ui
         .checkbox(&mut commit_check, "Analyze code before commit")
         .on_hover_text("The Commit tool window inspects the files being committed with this profile first")
         .changed()
     {
         cmds.push(("vcs.commit.analyzeCode", json!({ "enabled": commit_check })));
+    }
+}
+
+/// Analyze while typing (M16 LT): per language, and the delay after the last edit. Settings of
+/// the Settings dialog (applied with OK / Apply); Power Save mode pauses them.
+fn analyze_while_typing(ui: &mut Ui, s: &Session, theme: &Theme, cmds: &mut Cmds) {
+    let Some(draft) = s.prefs.dialog.as_ref().map(|d| &d.draft) else { return };
+    let rows = [
+        ("analysis_while_typing_python", "Python files", draft.analysis_while_typing_python, "Ruff on the unsaved buffer; the language server's findings are live either way"),
+        ("analysis_while_typing_cpp", "C/C++ files", draft.analysis_while_typing_cpp, "clang-tidy on a copy of the buffer with the file's compile command (when installed); clangd is live either way"),
+        ("analysis_while_typing_sql", "SQL files and consoles", draft.analysis_while_typing_sql, "The SQL inspections in .sql files and database consoles"),
+    ];
+    let mut delay = draft.analysis_while_typing_delay_ms;
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Analyze while typing:")
+            .on_hover_text("Re-run the analyzers on the unsaved buffer shortly after the last edit (Rust: rust-analyzer's diagnostics are live; Clippy runs on save)");
+        for (key, label, on, hint) in rows {
+            let mut v = on;
+            if ui.checkbox(&mut v, label).on_hover_text(hint).changed() {
+                cmds.push(("settings.set", json!({ "key": key, "value": v })));
+            }
+        }
+        ui.label("Delay:");
+        if ui
+            .add(egui::DragValue::new(&mut delay).range(100..=10_000).speed(10.0).suffix(" ms"))
+            .on_hover_text("Wait this long after the last edit (an edit during a run cancels it)")
+            .changed()
+        {
+            cmds.push(("settings.set", json!({ "key": "analysis_while_typing_delay_ms", "value": delay })));
+        }
+    });
+    if s.power_save() {
+        ui.label(RichText::new("Power Save mode is on: analysis while typing is paused").color(theme.text_muted).small());
     }
 }
 

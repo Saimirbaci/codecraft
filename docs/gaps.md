@@ -1096,11 +1096,14 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     (`crates/engine/tests/analysis_editor.rs`, 9), and egui_kittest UI tests: Cmd+S runs ruff,
     the underline appears, Alt+Enter on it applies ruff's fix; the Python and Inspections pages
     (`crates/ui-egui/tests/analysis_editor_ui.rs`, 2; `testing_ui.rs` checks the relative
-    location). Remaining: findings move with edits but are not recomputed while typing (only on
-    save; PyCharm's on-the-fly inspections re-run as you type); Python on save runs Ruff only
+    location). Remaining: ~~findings move with edits but are not recomputed while typing (only on
+    save; PyCharm's on-the-fly inspections re-run as you type)~~ (M16 LT, item 63: Ruff and
+    clang-tidy re-run on the unsaved buffer, SQL inspections as you type); Python on save runs Ruff only
     (mypy/pyright findings come from the language server or Inspect Code); Rust on save without
     rust-analyzer builds the whole workspace with Clippy; clangd on save starts a clangd per run
-    (no index kept); clang-tidy on save reported nothing for a compile error here (clangd did);
+    (no index kept); ~~clang-tidy on save reported nothing for a compile error here (clangd did)~~
+    (M16 LT: clang-tidy 22 defaults to `clang-diagnostic-*` and then refuses to run, "no checks
+    enabled"; without profile checks or a `.clang-tidy` it now gets `clang-diagnostic-*,clang-analyzer-*`);
     a closed file's findings keep the positions of the text last seen, so a file changed on disk
     while closed shows them where they were until it is analyzed again; the duplicate check
     against language-server diagnostics compares the line and the code or first message line
@@ -1332,10 +1335,85 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Console's Variables panel taking the width at 900 px; Connect an External Agent doing nothing
     from Find Action; the Memory view's rows not lining up with its header (and absolute paths);
     `isolate_home` not isolating Docker. Remaining: evcxr, samply, py-spy, js-debug and
-    basedpyright aren't installed here (the REPL was painted with a stand-in); analysis on open is
-    Python only; a C++ test profiled at the caret shows the test report flag on its build step's
+    basedpyright aren't installed here (the REPL was painted with a stand-in); ~~analysis on open is
+    Python only~~ (M16 LT, item 63: every language); a C++ test profiled at the caret shows the test report flag on its build step's
     command line; `.codecraft/.gitignore` itself is a new file to commit; Low polish listed in
     `docs/qa-m15.md` (log graph gaps, the range marker over its axis label, tight session-tab
     close buttons, "1 threads", a short program's two-sample memory chart, Cmd+F1 without the
     analyzer's name, `/var` vs `/private/var` in snapshot paths); Docker, remote hosts and GitHub
     only through fakes.
+
+## M16 (2026-10-16)
+
+63. Live analysis while typing (track LT): the analyzers re-run on the unsaved buffer shortly
+    after the last edit, like PyCharm's on-the-fly inspections (`engine/src/analysis/live.rs`).
+    Each pump compares the open documents' revisions with the last ones seen (a map lookup per
+    open document; nothing is copied or re-lexed per keystroke); an edit re-arms the file's timer
+    (Settings › Editor › Inspections › Analyze while typing › Delay, 500 ms, 100–10000) and
+    cancels the run in flight for an older revision (its process is killed); when the timer
+    fires a cheap snapshot of the document (the rope is shared) goes to a worker thread, which
+    makes the text there, runs the analyzers and sends the findings back tagged with the
+    revision they were computed for. A result for an older revision than the document's is
+    mapped forward through the change log (findings whose text was edited are dropped) and never
+    replaces findings computed for a newer revision (per analyzer and file, also against the
+    analysis on save: `editor::take`, `FileFindings::revisions`); a reopened document starts
+    afresh. **Python**: `ruff check --stdin-filename <path> -` with the inspection profile's rules
+    (basedpyright/pyright findings stay live through the language server). **C/C++**: clang-tidy
+    (only when installed) on a temporary copy of the buffer, compiled with the file's real
+    command from `compile_commands.json` (the source argument rewritten to the copy, the file's
+    own directory first on the include path, `-p` a one-entry database next to the copy; without
+    an entry the defaults with the project's include directories), the real file's `.clang-tidy`
+    passed with `--config-file`; findings and fixes are moved back to the real path and the copy
+    removed. clangd's diagnostics are live for open documents through the language server (as
+    before; now tested as you type). **SQL**: the SQL inspections of `.sql` files and database
+    consoles (`sql_lang.rs`) wait the same delay and follow the same switch (off: an edited file
+    is checked when it opens and after a save); a file without a connected data source is now
+    checked on a worker thread (a 10k-line file took ~60 ms on the UI thread here; the pump that
+    starts it now ~50 µs), with checks against a connected schema still on the UI thread.
+    **Rust**: nothing new per keystroke (rust-analyzer's diagnostics are live, Clippy stays on
+    save). **Analysis on open for every language** (QA M15 #8 was Python only): an open buffer is
+    analyzed at once by the analysis while typing; the analysis on save also runs on open for what
+    it covers there (clangd without its language server, Clippy when it runs on save, Ruff and
+    clang-tidy when typing analysis is off). The analysis on save leaves out what the live
+    analysis already keeps current for an open buffer (Ruff, clang-tidy), and Inspect Code's
+    findings of those analyzers for an open document are not drawn twice. Settings: Analyze while
+    typing per language (`analysis_while_typing_python`, `_cpp`, `_sql`, on by default) and the
+    delay on Settings › Editor › Inspections; Power Save mode pauses it (runs in flight are
+    cancelled; what was typed meanwhile is analyzed when it ends). Agents:
+    `analysis.fileFindings` reports the open document's `revision`, `modified`, `pending` (a run
+    due or in flight, live or on save), findings with `source: "live"` and the `revision` the run
+    analyzed, and `live: {language, enabled, powerSave, analyzers, computedFor, pending, running,
+    delayMs, last}`; `waitMs` through `codecraft_execute` waits without blocking the IDE
+    (`agent_tools::Wait::Pending`, re-running the command each pump) and answers `timedOut: true`
+    with the state so far when it runs out; `analysis.analyzeFile` also re-runs the live
+    analyzers now. clang-tidy 22 fix: with no checks from the profile or a `.clang-tidy` it ran
+    with only `clang-diagnostic-*` and refused ("no checks enabled"), so Inspect Code and the
+    analysis on save got nothing from it (item 57); it now gets `clang-diagnostic-*,clang-analyzer-*`.
+    Measured (this machine, test profile): 200 keystrokes in ~150 ms start one Ruff run; a pump
+    after a keystroke on a 10k-line Python file costs ~10–25 µs with or without the live
+    analysis; ~5–10 µs per keystroke on a 10k-line SQL file. Tests: unit tests (languages,
+    compile-command rewriting, stdin processes with cancellation and 4 MB inputs, an older result
+    never replacing newer findings, mapping forward and dropping touched findings, hostile and
+    closed states), `crates/engine/tests/analysis_live.rs` (13: the real ruff typing, mapping and
+    clearing, Alt+Enter's fix; 200 quick keystrokes → at most two runs and the last run read the
+    final buffer; cancellation killing the run; a result for an older revision mapped forward;
+    Power Save and the setting; `codecraft_execute analysis.fileFindings {waitMs}` and its
+    timeout; per-keystroke cost on 10k-line Python and SQL files; a fake clang-tidy checking the
+    copied buffer and the rewritten compile command; the real clang-tidy finding a typed compile
+    error through the copied command; the real clangd reporting an unsaved edit over LSP; SQL as
+    you type and with the setting off; Clippy on open for Rust with a stand-in cargo) and
+    egui_kittest `crates/ui-egui/tests/analysis_live_ui.rs` (2: typing underlines an unused
+    import without saving and undo clears it; the Inspections page's switches, the delay and the
+    Power Save note). The M15 tests about the analysis on save turn the Python/C++ switches off
+    (`analysis_editor.rs`), and `qa_m15.rs` expects `source: "live"` on open.
+    Remaining: no basedpyright/pyright here, so Python's language-server findings while typing
+    are untested (unchanged M15 path); Ruff runs per file (no project-wide re-check of files
+    importing the edited one); clang-tidy re-runs the whole translation unit after each pause
+    (seconds on heavy C++; cancelled by the next edit) and analyzes `.c/.cpp/.m` files, not
+    headers (clangd covers those); SQL checks against a connected data source's schema still run
+    on the UI thread, once per pause; with Analyze while typing off, an edited SQL file keeps its
+    last problems at their old positions until it is saved; a Rust syntax pass while typing
+    without rust-analyzer (the plan's "light syntax pass") was left out; at most two live runs
+    run at once (others wait their turn) and buffers over 4 M chars are analyzed on save only;
+    `waitMs` waits only through `codecraft_execute` (a direct `analysis.fileFindings` answers at
+    once with a note).

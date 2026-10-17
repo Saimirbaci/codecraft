@@ -270,6 +270,17 @@ pub struct Settings {
     /// `typeCheckingMode`): empty = the project's configuration, else `off`, `basic`,
     /// `standard`, `strict` (basedpyright also `recommended`, `all`).
     pub python_type_checking: String,
+    // ---- M16 track LT: analysis while typing
+    /// Settings › Editor › Inspections › Analyze while typing › Python: Ruff re-runs on the
+    /// unsaved buffer (through stdin) shortly after the last edit.
+    pub analysis_while_typing_python: bool,
+    /// … › C/C++: clang-tidy re-runs on a temporary copy of the buffer with the file's compile
+    /// command (clangd's diagnostics are live through the language server either way).
+    pub analysis_while_typing_cpp: bool,
+    /// … › SQL: CodeCraft's SQL inspections re-run in `.sql` files and database consoles.
+    pub analysis_while_typing_sql: bool,
+    /// … › Delay: how long after the last edit the analyzers start (ms).
+    pub analysis_while_typing_delay_ms: u64,
 }
 
 /// Tab and indent of one language (Settings › Editor › Code Style).
@@ -449,6 +460,10 @@ impl Default for Settings {
             analysis_on_save: true,
             python_language_server: "auto".into(),
             python_type_checking: String::new(),
+            analysis_while_typing_python: true,
+            analysis_while_typing_cpp: true,
+            analysis_while_typing_sql: true,
+            analysis_while_typing_delay_ms: 500,
         }
     }
 }

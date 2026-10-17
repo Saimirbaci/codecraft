@@ -118,7 +118,8 @@ fn python_lint_is_underlined_on_open_and_save_and_fixed_with_alt_enter() {
         eprintln!("fileFindings after open: {v:#}");
     }
     assert_eq!(v["findings"][0]["line"], 1, "{v}");
-    assert_eq!(v["findings"][0]["source"], "onSave", "{v}");
+    // Since M16 (track LT) the analysis while typing analyzes the buffer when it opens.
+    assert_eq!(v["findings"][0]["source"], "live", "{v}");
 
     // A second problem typed in and saved.
     let len = s.ws.active().unwrap().1.doc.len_chars();
@@ -190,6 +191,9 @@ fn analysis_on_open_is_python_only_and_follows_the_setting() {
     pump_until(&mut s, "idle", 10, |s| !s.analysis.editor.on_save.busy());
     assert_eq!(runs(), 1);
     s.ws.settings.analysis_on_save = false;
+    // Since M16 (track LT) the analysis while typing analyzes a buffer when it opens too: both
+    // settings off, nothing runs.
+    s.ws.settings.analysis_while_typing_python = false;
     s.execute("file.open", &json!({ "path": root.join("b.py") })).unwrap();
     for _ in 0..30 {
         s.pump();

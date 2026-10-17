@@ -39,8 +39,13 @@ pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) 
         Tool::Eslint => vec!["--format".into(), "json".into(), "--no-error-on-unmatched-pattern".into()],
         Tool::ClangTidy => {
             let mut a = Vec::new();
-            if let Some(checks) = spec.profile.clang_tidy_checks() {
-                a.push(format!("--checks={checks}"));
+            match spec.profile.clang_tidy_checks() {
+                Some(checks) => a.push(format!("--checks={checks}")),
+                // clang-tidy 22 defaults to `clang-diagnostic-*` only and then refuses to run
+                // ("no checks enabled"): ask for its classic default unless the project
+                // configures checks (M16 LT).
+                None if !has_tidy_config(&spec.root) => a.push(format!("--checks={DEFAULT_TIDY_CHECKS}")),
+                None => {}
             }
             // Its fixes, read back by `parse` (M14 CA).
             a.push(format!("--export-fixes={}", tidy_fixes_file(spec).display()));
@@ -80,6 +85,14 @@ pub(crate) fn args(tool: Tool, spec: &JobSpec, paths: &[String], exts: &[&str]) 
     }
     a.extend(paths.iter().cloned());
     a
+}
+
+/// clang-tidy's checks when neither the inspection profile nor a `.clang-tidy` names any.
+pub(crate) const DEFAULT_TIDY_CHECKS: &str = "clang-diagnostic-*,clang-analyzer-*";
+
+/// Whether a `.clang-tidy` applies to files in `dir` (in it or a parent directory).
+pub(crate) fn has_tidy_config(dir: &Path) -> bool {
+    dir.ancestors().take(64).any(|d| d.join(".clang-tidy").is_file())
 }
 
 /// Where clang-tidy exports its fixes for a run (removed once read).
