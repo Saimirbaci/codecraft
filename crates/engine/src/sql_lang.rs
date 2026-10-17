@@ -125,12 +125,31 @@ pub struct SqlLangState {
     published: HashSet<PathBuf>,
     /// A visible document is waiting to settle.
     waiting: bool,
+    /// SQL files checked on a worker thread (no connected data source: the check needs only the
+    /// text; M16 LT), by document.
+    jobs: HashMap<DocId, SqlJob>,
+}
+
+/// A check of a `.sql` document's text on a worker thread.
+#[derive(Debug)]
+struct SqlJob {
+    revision: u64,
+    fingerprint: u64,
+    /// The text the problems' offsets refer to.
+    snapshot: Document,
+    rx: crossbeam_channel::Receiver<Vec<crate::database::sql_nav::inspect::SqlProblem>>,
 }
 
 impl SqlLangState {
     /// Whether background work is in flight (a document waiting to be checked).
     pub fn busy(&self) -> bool {
         self.waiting
+    }
+
+    /// The document revision its SQL problems were last computed for (M16 LT: agents'
+    /// `analysis.fileFindings` › `live.computedFor`).
+    pub fn checked_revision(&self, doc: DocId) -> Option<u64> {
+        self.checked.get(&doc).map(|(r, _)| *r)
     }
 
     /// The SQL fragments of a Rust document at `revision` (after [`refresh`]).
@@ -179,7 +198,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     load_settings(s, false);
     refresh_env(s, false);
     s.sql_lang.waiting = false;
-    let mut changed = false;
+    let mut changed = finish_jobs(s);
     let docs = s.visible_decoration_docs();
     for doc in docs {
         refresh(s, doc);
@@ -191,6 +210,46 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         st.docs.retain(|d, _| open.contains(d));
         st.seen.retain(|d, _| open.contains(d));
         st.checked.retain(|d, _| open.contains(d));
+        st.jobs.retain(|d, _| open.contains(d));
+    }
+    changed
+}
+
+/// Publish the checks finished on worker threads; a result for an older revision than the
+/// document's is dropped (the newer text is checked once it settles).
+fn finish_jobs(s: &mut Session) -> bool {
+    let mut changed = false;
+    let ids: Vec<DocId> = s.sql_lang.jobs.keys().copied().collect();
+    for id in ids {
+        let result = match s.sql_lang.jobs.get(&id).map(|j| j.rx.try_recv()) {
+            Some(Ok(found)) => Some(found),
+            Some(Err(crossbeam_channel::TryRecvError::Empty)) => {
+                s.sql_lang.waiting = true;
+                continue;
+            }
+            Some(Err(crossbeam_channel::TryRecvError::Disconnected)) | None => None,
+        };
+        let Some(job) = s.sql_lang.jobs.remove(&id) else { continue };
+        let Some(found) = result else { continue };
+        let Some((rev, path)) = s.ws.doc(id).and_then(|d| d.path.clone().map(|p| (d.doc.revision(), p))) else { continue };
+        if rev != job.revision {
+            continue;
+        }
+        let d = &job.snapshot;
+        let problems = found
+            .into_iter()
+            .map(|p| Problem {
+                path: path.clone(),
+                start: d.offset_to_position(p.start.min(d.len_chars())),
+                end: d.offset_to_position(p.end.max(p.start).min(d.len_chars())),
+                severity: p.severity,
+                message: p.message,
+                code: Some(p.code.to_string()),
+                source: ProblemSource::Inspection,
+            })
+            .collect();
+        s.sql_lang.checked.insert(id, (job.revision, job.fingerprint));
+        changed |= publish(s, path, problems);
     }
     changed
 }
@@ -548,6 +607,16 @@ fn diagnose(s: &mut Session, doc: DocId, force: bool) -> bool {
         s.sql_lang.checked.insert(doc, (revision, 0));
         return false;
     }
+    // Analyze while typing (Settings › Editor › Inspections, M16 LT): off, or in Power Save
+    // mode, an edited SQL file is checked when it opens and after a save only.
+    if !force
+        && language == Language::Sql
+        && !crate::analysis::live::enabled(s, crate::analysis::live::LiveLang::Sql)
+        && s.sql_lang.checked.contains_key(&doc)
+        && s.ws.doc(doc).is_some_and(|d| d.doc.is_modified())
+    {
+        return false;
+    }
     if !force {
         let now = Instant::now();
         let first = match s.sql_lang.seen.get(&doc) {
@@ -557,7 +626,10 @@ fn diagnose(s: &mut Session, doc: DocId, force: bool) -> bool {
                 now
             }
         };
-        if now.duration_since(first) < SETTLE {
+        // SQL files and consoles wait the analysis-while-typing delay; SQL in Rust strings the
+        // short settle it always had.
+        let settle = if language == Language::Sql { crate::analysis::live::delay(s) } else { SETTLE };
+        if now.duration_since(first) < settle {
             if s.sql_lang.checked.get(&doc).is_none_or(|(r, _)| *r != revision) {
                 s.sql_lang.waiting = true;
             }
@@ -567,6 +639,27 @@ fn diagnose(s: &mut Session, doc: DocId, force: bool) -> bool {
     let fp = fingerprint(source.as_deref(), source.as_deref().and_then(|id| s.db.source(id)));
     if !force && s.sql_lang.checked.get(&doc) == Some(&(revision, fp)) {
         return false;
+    }
+    // A `.sql` file without a connected data source needs only its text: checked on a worker
+    // thread, never on the UI thread (M16 LT; a 10k-line file took ~60 ms here).
+    let schema_less = source.as_deref().and_then(|id| s.db.source(id)).is_none_or(|d| !connected(d));
+    if !force && language == Language::Sql && schema_less {
+        if s.sql_lang.jobs.get(&doc).is_some_and(|j| j.revision == revision && j.fingerprint == fp) {
+            s.sql_lang.waiting = true;
+            return false;
+        }
+        if let Some(snapshot) = s.ws.doc(doc).filter(|d| d.doc.len_chars() <= MAX_SCAN_CHARS).map(|d| d.doc.snapshot()) {
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let text = snapshot.clone();
+            let spawned = std::thread::Builder::new().name("codecraft-sql-check".into()).spawn(move || {
+                let _ = tx.send(crate::database::sql_nav::inspect::check(&text.text(), None));
+            });
+            if spawned.is_ok() {
+                s.sql_lang.jobs.insert(doc, SqlJob { revision, fingerprint: fp, snapshot, rx });
+                s.sql_lang.waiting = true;
+                return false;
+            }
+        }
     }
     let (problems, wanted) = problems_of(s, doc, source.as_deref());
     s.sql_lang.checked.insert(doc, (revision, fp));

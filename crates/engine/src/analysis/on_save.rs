@@ -187,17 +187,18 @@ pub(crate) fn after_save(s: &mut Session, saved: &[PathBuf]) {
     }
 }
 
-/// A file was opened in an editor: a Python file without findings yet is analyzed right away
-/// (Ruff takes milliseconds), so its problems are underlined without an edit and a save, as
-/// PyCharm's inspections are when a file opens (QA M15: Cmd+S on an unmodified file saves
-/// nothing, so there was no way to see them short of an edit or Inspect Code). Rust and C/C++
-/// wait for a save: Clippy builds the workspace, and their language servers report as they go.
+/// A file was opened in an editor: a file without findings yet is analyzed right away, so its
+/// problems are underlined without an edit and a save, as PyCharm's inspections are when a file
+/// opens (QA M15: Cmd+S on an unmodified file saves nothing, so there was no way to see them
+/// short of an edit or Inspect Code). Every language with analyzers on save (M16 LT: QA M15 had
+/// Python only): Ruff for Python, clang-tidy and clangd (without its language server) for
+/// C/C++, Clippy for Rust when it runs on save. What the analysis while typing covers for the
+/// open buffer (Ruff, clang-tidy) runs there instead (`live.rs` analyzes files when they open).
 pub(crate) fn after_open(s: &mut Session, path: &Path) {
     if !s.ws.settings.analysis_on_save || s.power_save() {
         return;
     }
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !inspections::PY_EXTS.contains(&ext) || !s.analysis.editor.of(path).is_empty() {
+    if !analyzable(path) || !s.analysis.editor.of(path).is_empty() {
         return;
     }
     let Some(root) = s.project_root() else { return };
@@ -246,7 +247,9 @@ fn start(s: &mut Session) -> bool {
     let mut tools: BTreeSet<Tool> = BTreeSet::new();
     let mut files: BTreeMap<PathBuf, Option<(u64, Document)>> = BTreeMap::new();
     for (path, at) in batch {
-        let t = wanted_tools(s, &profile, &path);
+        let mut t = wanted_tools(s, &profile, &path);
+        // The analysis while typing analyzes the open buffer with these (M16 LT).
+        t.retain(|tool| !super::live::covers(s, &path, *tool));
         if t.is_empty() || !path.is_file() {
             continue;
         }
@@ -289,7 +292,7 @@ fn start(s: &mut Session) -> bool {
 /// Whether the run would find the analyzer: like Inspect Code, the linters (Ruff, Clippy,
 /// clang-tidy) come from overrides or `PATH`; the M14 analyzers (clangd) from overrides only in
 /// isolated sessions.
-fn available(spec: &inspections::JobSpec, tool: Tool) -> bool {
+pub(crate) fn available(spec: &inspections::JobSpec, tool: Tool) -> bool {
     if spec.programs.contains_key(&tool) {
         return true;
     }
@@ -334,6 +337,7 @@ pub(crate) fn shutdown(s: &mut Session) {
     st.queue.clear();
     st.cancel_running();
     st.queue.clear();
+    super::live::shutdown(s);
 }
 
 // ---------------------------------------------------------------- commands
@@ -367,6 +371,9 @@ fn analyze_file(s: &mut Session, p: &Value) -> CmdResult {
     {
         s.save_all()?;
     }
+    // The open buffer's live analyzers run now too (M16 LT); the analysis on save leaves them
+    // out for open documents.
+    let live = super::live::run_now(s, &path);
     queue(s, &path);
     let st = &mut s.analysis.editor.on_save;
     st.due = Some(Instant::now());
@@ -376,7 +383,8 @@ fn analyze_file(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({
         "queued": path,
         "analyzers": tools.iter().map(|t| t.id()).collect::<Vec<_>>(),
-        "next": "read the findings with analysis.fileFindings {path} once onSave.pending and onSave.running are false",
+        "live": live.iter().map(|t| t.id()).collect::<Vec<_>>(),
+        "next": "read the findings with analysis.fileFindings {path} once `pending` is false (codecraft_execute with waitMs waits for it)",
     }))
 }
 

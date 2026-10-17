@@ -73,6 +73,10 @@ fn session(p: &Project) -> Session {
     s.lsp_enabled = false;
     s.isolate_home(&p.home);
     s.analysis.editor.on_save.debounce = Duration::ZERO;
+    // These tests are about the analysis on save; analysis while typing has its own
+    // (`analysis_live.rs`, M16 LT).
+    s.ws.settings.analysis_while_typing_python = false;
+    s.ws.settings.analysis_while_typing_cpp = false;
     s.execute("file.open", &json!({ "path": p.root })).unwrap();
     pump_until(&mut s, "project scan", 60, |s| s.ws.project.as_ref().is_some_and(|p| p.tree.len() > 1) && !s.jobs_running());
     s
@@ -359,8 +363,12 @@ fn clangd_on_save_for_cpp() {
     assert!(last.tools.iter().any(|t| t.starts_with("clangd:")), "{last:?}");
     let v = s.execute("analysis.fileFindings", &json!({ "path": main })).unwrap();
     let found = v["findings"].as_array().unwrap();
+    // clang-tidy (when installed) reports the same compile error since M16 (it ran with no
+    // checks before, see `DEFAULT_TIDY_CHECKS`); one report is kept.
     assert!(
-        found.iter().any(|f| f["analyzer"] == "clangd" && f["line"] == 2 && f["message"].as_str().unwrap_or("").contains("undefined_name")),
+        found.iter().any(|f| (f["analyzer"] == "clangd" || f["analyzer"] == "clang_tidy")
+            && f["line"] == 2
+            && f["message"].as_str().unwrap_or("").contains("undefined_name")),
         "{v}"
     );
     s.shutdown();

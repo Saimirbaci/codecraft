@@ -50,6 +50,9 @@ pub enum Origin {
     Inspection { job: u64, id: usize },
     /// The analysis on save (`run` counts the runs of the session).
     OnSave { run: u64 },
+    /// The analysis while typing (M16 LT): `revision` is the document revision the run
+    /// analyzed (the findings were mapped forward from it when the document had moved on).
+    Live { run: u64, revision: u64 },
 }
 
 /// One finding in a file.
@@ -73,6 +76,9 @@ pub struct FileFindings {
     /// Analyzers re-run on save since the last Inspect Code (their Inspect Code findings for the
     /// file are superseded).
     pub saved_tools: BTreeSet<Tool>,
+    /// The open document's revision each analyzer's findings were computed for (M16 LT): a
+    /// result for an older revision never replaces them. Cleared when the file closes.
+    pub revisions: BTreeMap<Tool, u64>,
 }
 
 /// The store (in [`super::AnalysisState`]).
@@ -93,6 +99,8 @@ pub struct EditorFindings {
     others: HashMap<PathBuf, u64>,
     /// Analysis on save.
     pub on_save: on_save::OnSaveState,
+    /// Analysis while typing (M16 LT).
+    pub live: super::live::LiveState,
 }
 
 impl EditorFindings {
@@ -155,8 +163,10 @@ fn map_finding(f: &mut Finding, path: &Path, base: &Document, now: &Document, se
 /// Bring a file's findings to the open document's current text. Returns whether they moved.
 fn sync_file(path: &Path, ff: &mut FileFindings, doc: Option<&Document>) -> bool {
     let Some(doc) = doc else {
-        // Closed: positions stay those of the last text seen (saved, or on disk).
+        // Closed: positions stay those of the last text seen (saved, or on disk); a reopened
+        // document counts its revisions afresh.
         ff.base = None;
+        ff.revisions.clear();
         return false;
     };
     let rev = doc.revision();
@@ -274,6 +284,16 @@ fn sync_results(s: &mut Session, snaps: Option<BTreeMap<PathBuf, (u64, Document)
     }
     for (path, mut found) in by_file {
         let at = snaps.as_ref().and_then(|m| m.get(&path));
+        // Analyzers the analysis while typing keeps current for the open document (M16 LT):
+        // their findings are already shown, as new as Inspect Code's or newer.
+        let live: BTreeSet<Tool> = s
+            .analysis
+            .editor
+            .files
+            .get(&path)
+            .map(|ff| ff.revisions.keys().copied().filter(|t| super::live::covers(s, &path, *t)).collect())
+            .unwrap_or_default();
+        found.retain(|f| !live.contains(&f.tool));
         // Bring the file's existing findings to the current text, then map the new ones there.
         let doc = doc_in(&s.ws, &path);
         let store = &mut s.analysis.editor;
@@ -284,7 +304,7 @@ fn sync_results(s: &mut Session, snaps: Option<BTreeMap<PathBuf, (u64, Document)
         if ff.base.is_none() {
             ff.base = doc.map(|d| (d.revision(), d.snapshot()));
         }
-        ff.saved_tools.clear();
+        ff.saved_tools.retain(|t| live.contains(t));
         for f in found {
             if ff.list.len() >= MAX_PER_FILE {
                 break;
@@ -299,8 +319,15 @@ fn sync_results(s: &mut Session, snaps: Option<BTreeMap<PathBuf, (u64, Document)
     }
     // Files of the scope without problems now are clean.
     for path in s.analysis.editor.files.keys().filter(|p| in_scope(p)).cloned().collect::<Vec<_>>() {
+        let live: BTreeSet<Tool> = s
+            .analysis
+            .editor
+            .files
+            .get(&path)
+            .map(|ff| ff.revisions.keys().copied().filter(|t| super::live::covers(s, &path, *t)).collect())
+            .unwrap_or_default();
         if let Some(ff) = s.analysis.editor.files.get_mut(&path) {
-            ff.saved_tools.clear();
+            ff.saved_tools.retain(|t| live.contains(t));
         }
     }
 }
@@ -331,30 +358,76 @@ pub(crate) fn take_saved(
     s: &mut Session,
     path: &Path,
     tools: &BTreeSet<Tool>,
-    mut found: Vec<Finding>,
+    found: Vec<Finding>,
     at: Option<&(u64, Document)>,
     run: u64,
 ) {
+    take(s, path, tools, found, at, Origin::OnSave { run });
+}
+
+/// A run of the analysis while typing finished (M16 LT): its findings of `tools` replace the
+/// old ones unless those were computed for a newer revision; `at` is the document's text the
+/// run analyzed. Returns whether anything was taken in.
+pub(crate) fn take_live(
+    s: &mut Session,
+    path: &Path,
+    tools: &BTreeSet<Tool>,
+    found: Vec<Finding>,
+    at: &(u64, Document),
+    run: u64,
+) -> bool {
+    take(s, path, tools, found, Some(at), Origin::Live { run, revision: at.0 })
+}
+
+/// Replace the findings of `tools` in `path` with `found` (positions in `at`'s text, mapped to
+/// the current text). Analyzers whose findings were computed for a newer revision than `at`
+/// keep them: an older result is never taken in. Returns whether any analyzer's were replaced.
+fn take(
+    s: &mut Session,
+    path: &Path,
+    tools: &BTreeSet<Tool>,
+    mut found: Vec<Finding>,
+    at: Option<&(u64, Document)>,
+    origin: Origin,
+) -> bool {
     let doc = doc_in(&s.ws, path);
     let store = &mut s.analysis.editor;
     let ff = store.files.entry(path.to_path_buf()).or_default();
     sync_file(path, ff, doc);
+    // Only results at least as new as each analyzer's current findings (open documents).
+    let rev = at.filter(|_| doc.is_some()).map(|(r, _)| *r);
+    let tools: BTreeSet<Tool> = tools
+        .iter()
+        .copied()
+        .filter(|t| rev.is_none_or(|r| ff.revisions.get(t).is_none_or(|have| *have <= r)))
+        .collect();
+    if tools.is_empty() {
+        return false;
+    }
+    found.retain(|f| tools.contains(&f.tool));
     map_new(path, &mut found, at, doc);
     if ff.base.is_none() {
         ff.base = doc.map(|d| (d.revision(), d.snapshot()));
     }
     ff.list.retain(|e| !tools.contains(&e.finding.tool));
     ff.saved_tools.extend(tools.iter().copied());
+    for t in &tools {
+        match rev {
+            Some(r) => ff.revisions.insert(*t, r),
+            None => ff.revisions.remove(t),
+        };
+    }
     for f in found {
         if ff.list.len() >= MAX_PER_FILE {
             break;
         }
         store.next_key = store.next_key.saturating_add(1);
         let key = store.next_key;
-        ff.list.push(EditorFinding { key, finding: f, origin: Origin::OnSave { run }, shown: false });
+        ff.list.push(EditorFinding { key, finding: f, origin, shown: false });
     }
     sort(&mut ff.list);
     store.dirty.insert(path.to_path_buf());
+    true
 }
 
 // ---------------------------------------------------------------- publishing
@@ -427,6 +500,7 @@ fn publish(s: &mut Session, path: &Path) {
 /// whether anything changed.
 pub(crate) fn pump(s: &mut Session) -> bool {
     let mut changed = on_save::pump(s);
+    changed |= super::live::pump(s);
     sync_results(s, None);
     // Open documents edited since the last pump.
     let ws = &s.ws;
@@ -472,7 +546,8 @@ pub fn superseded(s: &Session, f: &Finding) -> bool {
     s.analysis.editor.files.get(&f.path).is_some_and(|ff| ff.saved_tools.contains(&f.tool))
 }
 
-/// Findings of the analysis on save (Inspect Code's are in `Session::inspections.results`).
+/// Findings of the analysis on save and while typing (Inspect Code's are in
+/// `Session::inspections.results`).
 pub fn saved_findings<'a>(s: &'a Session, under: Option<&'a Path>) -> impl Iterator<Item = &'a EditorFinding> + 'a {
     s.analysis
         .editor
@@ -480,7 +555,7 @@ pub fn saved_findings<'a>(s: &'a Session, under: Option<&'a Path>) -> impl Itera
         .iter()
         .filter(move |(p, _)| under.is_none_or(|u| p.starts_with(u)))
         .flat_map(|(_, ff)| ff.list.iter())
-        .filter(|e| matches!(e.origin, Origin::OnSave { .. }))
+        .filter(|e| matches!(e.origin, Origin::OnSave { .. } | Origin::Live { .. }))
 }
 
 /// The shown findings at a position of a file (the caret, the pointer).
@@ -716,6 +791,11 @@ pub fn finding_json(e: &EditorFinding) -> Value {
                 o.insert("source".into(), json!("onSave"));
                 o.insert("run".into(), json!(run));
             }
+            Origin::Live { run, revision } => {
+                o.insert("source".into(), json!("live"));
+                o.insert("run".into(), json!(run));
+                o.insert("revision".into(), json!(revision));
+            }
         }
         if let Some(url) = crate::inspections::finding_url(f) {
             o.insert("url".into(), json!(url));
@@ -726,6 +806,7 @@ pub fn finding_json(e: &EditorFinding) -> Value {
 
 fn file_findings(s: &mut Session, p: &Value) -> CmdResult {
     pump(s);
+    let wait_ms = opt_usize(p, "waitMs")?.map(|ms| ms.min(600_000));
     let path = match crate::params::opt_path(p, "path") {
         Some(p) => {
             let p = if p.is_absolute() { p } else { s.project_root().map(|r| r.join(&p)).unwrap_or(p) };
@@ -759,15 +840,28 @@ fn file_findings(s: &mut Session, p: &Value) -> CmdResult {
         .collect();
     let pending = s.analysis.editor.on_save.pending(&path);
     let running = s.analysis.editor.on_save.running_for(&path);
-    let next = if findings.is_empty() && !pending && !running {
+    // The analysis while typing (M16 LT): the revision its findings were computed for.
+    let live = super::live::status_json(s, &path);
+    let live_pending = live["pending"].as_bool().unwrap_or(false) || live["running"].as_bool().unwrap_or(false);
+    let doc = doc_of(s, &path);
+    let revision = doc.map(Document::revision);
+    let modified = doc.is_some_and(Document::is_modified);
+    let any_pending = pending || running || live_pending;
+    let next = if any_pending {
+        "An analysis of this file is outstanding: call again (codecraft_execute with waitMs waits for the current revision's results)"
+    } else if findings.is_empty() && live["enabled"].as_bool() != Some(true) {
         "Save the file (or call analysis.analyzeFile) to analyze it; fix with analysis.editorFix {key, fix}"
     } else {
         "Fix with analysis.editorFix {key, fix}; suppress with analysis.editorSuppress {key}"
     };
-    Ok(json!({
+    let mut out = json!({
         "path": path,
+        "revision": revision,
+        "modified": modified,
+        "pending": any_pending,
         "findings": findings,
         "otherProblems": others,
+        "live": live,
         "onSave": {
             "enabled": s.ws.settings.analysis_on_save,
             "pending": pending,
@@ -775,7 +869,17 @@ fn file_findings(s: &mut Session, p: &Value) -> CmdResult {
             "last": s.analysis.editor.on_save.last_for(&path),
         },
         "next": next,
-    }))
+    });
+    if let (Some(o), Some(ms)) = (out.as_object_mut(), wait_ms) {
+        o.insert("waitMs".into(), json!(ms));
+        if any_pending {
+            o.insert(
+                "note".into(),
+                json!("this command answers at once (the IDE never blocks); codecraft_execute over MCP waits up to waitMs for pending: false"),
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// The Python language server: the setting, what runs or would run, the managed basedpyright.
@@ -820,7 +924,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "analysis.fileFindings",
             "File Analysis Findings",
             None,
-            "{path?: string (default: the active file)} → {path, findings: [{key, analyzer, rule, severity, line, column, endLine, endColumn, message, fixes: [{fix, title, safe}], suppressible, source: inspection|onSave, shown}], otherProblems: [language server / build problems], onSave: {enabled, pending, running, last}} — the findings shown in the editor for one file (absolute path, 1-based lines), current with unsaved edits",
+            "{path?: string (default: the active file), waitMs?: int (through codecraft_execute: wait up to this long, max 600000, for the current revision's results)} → {path, revision (the open document's, null when closed), modified, pending (an analysis is due or running), findings: [{key, analyzer, rule, severity, line, column, endLine, endColumn, message, fixes: [{fix, title, safe}], suppressible, source: inspection|onSave|live, revision? (live: the revision analyzed), shown}], otherProblems: [language server / build / SQL inspection problems], live: {language, enabled, analyzers, computedFor (the revision of the newest live results), pending, running, delayMs, last}, onSave: {enabled, pending, running, last}} — the findings shown in the editor for one file (absolute path, 1-based lines), current with unsaved edits (analysis while typing)",
             Context::Global,
             always,
             file_findings,

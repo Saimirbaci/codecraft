@@ -22,6 +22,7 @@ pub mod export;
 pub mod glob;
 pub mod install;
 pub mod jobs;
+pub mod live;
 pub mod on_save;
 pub mod profiles;
 pub mod rust_analyzer;

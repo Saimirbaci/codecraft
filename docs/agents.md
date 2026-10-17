@@ -202,7 +202,8 @@ needs for it (`blocked` = agents may not run it).
 `db.execute` with `sql`, on whether the SQL writes). Queries are reads: `vcs.status`,
 `vcs.changelists`, `vcs.shelves`, `vcs.worktrees`, `analysis.fileFindings`, `debug.sessions`,
 `profiler.report`/`memory`/`lineHits`/`compare`/`job`; `analysis.analyzeFile` runs an analyzer
-(`run`). Right after the server starts, repository commands (`vcs.*`, `git.*`) and `inspect
+(`run`). `analysis.fileFindings` with `waitMs` waits here for its `pending` to clear (see
+Findings while typing). Right after the server starts, repository commands (`vcs.*`, `git.*`) and `inspect
 {scope: "uncommitted"}` wait until the Git repository has been read.
 ```json
 { "id": "cargo.check" }                       → { "id": "cargo.check", "result": { "tab": 3 } }
@@ -261,6 +262,35 @@ check` unless `tools` asks for `clippy` (or Settings › Rust turns Clippy on).
 ```
 Then `codecraft_execute` `analysis.fix {id}` (or `{rule}` for all of a kind), `analysis.suppress
 {id}` (`# noqa: F401`, `#[allow(…)]`, `// NOLINT(…)`), `analysis.export {format: "sarif", path}`.
+
+**Findings while typing** — the editor re-analyzes unsaved buffers shortly after the last edit
+(Ruff on the buffer for Python, clang-tidy on a copy of the buffer for C/C++, the SQL inspections
+in `.sql` files and consoles; language servers report live on their own) and when a file opens.
+`codecraft_execute analysis.fileFindings {path}` reads one file's state: the open document's
+`revision`, `modified`, the findings shown (`source: "live"` with the `revision` the run
+analyzed, `onSave` or `inspection`), and `pending: true` while a run is due or in flight.
+`live.computedFor` is the revision of the newest live results: equal to `revision` when they
+describe the current text (older results are mapped forward through the edits, never shown over
+newer ones). Pass `waitMs` to wait (the IDE keeps working) until nothing is pending; a wait
+that runs out answers with `timedOut: true` and the state so far. After an edit (a person's in
+the editor, or `file_edit` on an open file), this gives the analyzers' verdict on the new text.
+```json
+codecraft_execute { "id": "analysis.fileFindings", "params": { "path": "tools/gen.py", "waitMs": 10000 } }
+→ { "id": "analysis.fileFindings", "result": { "path": "/work/app/tools/gen.py", "revision": 7, "modified": true,
+    "pending": false, "findings": [{ "key": 12, "analyzer": "ruff", "rule": "F401", "severity": "warning",
+      "line": 1, "column": 8, "endLine": 1, "endColumn": 10, "message": "`os` imported but unused",
+      "fixes": [{ "fix": 0, "title": "Remove unused import: `os`", "safe": true }], "suppressible": true,
+      "source": "live", "run": 4, "revision": 7, "shown": true }],
+    "otherProblems": [], "live": { "language": "python", "enabled": true, "analyzers": ["ruff"],
+      "computedFor": 7, "pending": false, "running": false, "delayMs": 500,
+      "last": { "run": 4, "revision": 7, "tools": ["ruff: 1 problem"], "millis": 31, "cancelled": false, "mapped": false } },
+    "onSave": { "enabled": true, "pending": false, "running": false, "last": null } } }
+```
+Fix with `analysis.editorFix {key, fix}`, suppress with `analysis.editorSuppress {key}`.
+`analysis.analyzeFile {path}` (run) analyzes now. Settings: `analysis_while_typing_python`,
+`analysis_while_typing_cpp`, `analysis_while_typing_sql`, `analysis_while_typing_delay_ms`
+(100–10000); Power Save mode (`file.powerSaveMode`) pauses it (`live.enabled: false`,
+`live.powerSave: true`).
 
 **`definition`**, **`references`**, **`hover`** — a position is `path` + `line` + either `column` or
 `symbol` (an identifier on that line).
