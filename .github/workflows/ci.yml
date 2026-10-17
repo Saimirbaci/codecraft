@@ -1,0 +1,107 @@
+# CI: clippy, tests, layering and the parity checklist on macOS and Linux; a build check on Windows.
+# See docs/release.md › CI.
+#
+# rustfmt is not checked yet: the tree is not rustfmt-clean (`cargo fmt --all -- --check` reports
+# differences in about a thousand places). Once it has been formatted in one change, add
+# `cargo fmt --all -- --check` as the first step of the `test` job.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # The toolchain every job installs (the workspace needs Rust 1.95+, edition 2024).
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      - name: Install Linux build and test dependencies
+        if: runner.os == 'Linux'
+        # OpenSSL headers (TLS for the SQL Server and ClickHouse drivers), Wayland/xkbcommon
+        # headers (winit), and Mesa's Vulkan driver so egui snapshot tests have a software GPU.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libwayland-dev libxkbcommon-dev libvulkan1 mesa-vulkan-drivers
+
+      - uses: actions/cache@v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        # Tests that need tools the runner lacks (rust-analyzer, lldb-dap, debugpy, Docker,
+        # database servers, …) skip themselves.
+        run: cargo test --workspace
+
+      - name: Layering
+        run: cargo xtask layers
+
+      - name: Parity checklist is current
+        run: |
+          cargo xtask parity
+          git diff --exit-code -- docs/parity-checklist.md
+
+  windows:
+    name: check (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version
+
+      - uses: actions/cache@v4.2.3
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Build check
+        run: cargo check --workspace

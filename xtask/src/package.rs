@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::icon;
+use crate::sign::{self, Cmd, Runner, Signer};
 
 pub const BUNDLE_ID: &str = "dev.codecraft.CodeCraft";
 pub const APP_NAME: &str = "CodeCraft";
@@ -13,6 +14,10 @@ pub const APP_NAME: &str = "CodeCraft";
 pub const EXECUTABLE: &str = "codecraft";
 /// Oldest macOS the bundle declares (eframe/wgpu need Metal 2; Apple silicon starts at 11).
 pub const MIN_MACOS: &str = "11.0";
+
+/// Why programs run from CodeCraft may control other apps (the Apple Events consent prompt).
+pub const APPLE_EVENTS_USAGE: &str =
+    "Programs you run from CodeCraft's terminal or run configurations may control other apps.";
 
 /// Workspace version (xtask inherits it).
 pub fn version() -> &'static str {
@@ -25,16 +30,38 @@ pub struct Options {
     pub release: bool,
     /// Lay out the package without building or signing (CI dry runs, tests).
     pub layout_only: bool,
+    /// Print the build, signing and packaging commands without running them or writing files.
+    pub dry_run: bool,
+    /// `--sign <identity>`: the codesign identity (`-` ad hoc, the default; else e.g.
+    /// `Developer ID Application: Name (TEAMID)`). Falls back to `$CODECRAFT_SIGN_IDENTITY`.
+    pub sign: Option<String>,
+    /// `--keychain <path>`: where codesign finds the identity (CI's temporary keychain).
+    pub keychain: Option<PathBuf>,
 }
 
 impl Options {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut o = Self::default();
-        for a in args {
-            match a.as_str() {
+        let mut it = args.iter();
+        while let Some(a) = it.next() {
+            let (flag, inline) = match a.split_once('=') {
+                Some((f, v)) if f.starts_with("--") => (f, Some(v.to_string())),
+                _ => (a.as_str(), None),
+            };
+            let mut value = |name: &str| -> Result<String, String> {
+                inline.clone().or_else(|| it.next().cloned()).ok_or_else(|| format!("{name} needs a value"))
+            };
+            match flag {
                 "--release" => o.release = true,
                 "--layout-only" => o.layout_only = true,
-                other => return Err(format!("unknown option {other} (expected --release, --layout-only)")),
+                "--dry-run" => o.dry_run = true,
+                "--sign" => o.sign = Some(value("--sign")?),
+                "--keychain" => o.keychain = Some(PathBuf::from(value("--keychain")?)),
+                other => {
+                    return Err(format!(
+                        "unknown option {other} (expected --release, --layout-only, --dry-run, --sign <identity>, --keychain <path>)"
+                    ));
+                }
             }
         }
         Ok(o)
@@ -42,6 +69,14 @@ impl Options {
 
     fn profile(&self) -> &'static str {
         if self.release { "release" } else { "debug" }
+    }
+
+    fn runner(&self) -> Runner {
+        Runner { dry_run: self.dry_run }
+    }
+
+    pub fn signer(&self) -> Signer {
+        Signer::resolve(self.sign.as_deref(), self.keychain.as_deref())
     }
 }
 
@@ -59,17 +94,26 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     if status.success() { Ok(()) } else { Err(format!("{shown} failed: {status}")) }
 }
 
-fn cargo_build(root: &Path, opts: &Options, packages: &[&str]) -> Result<(), String> {
+/// `cargo build -p … [--release]` (the `cargo` running xtask).
+pub fn cargo_build_cmd(opts: &Options, packages: &[&str]) -> Cmd {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut cmd = Command::new(cargo);
-    cmd.current_dir(root).arg("build");
+    let mut cmd = Cmd::new(&cargo).arg("build");
     for p in packages {
-        cmd.args(["-p", p]);
+        cmd = cmd.args(["-p", p]);
     }
     if opts.release {
-        cmd.arg("--release");
+        cmd = cmd.arg("--release");
     }
-    run(&mut cmd)
+    cmd
+}
+
+fn cargo_build(root: &Path, opts: &Options, packages: &[&str]) -> Result<(), String> {
+    let cmd = cargo_build_cmd(opts, packages);
+    if opts.dry_run {
+        return opts.runner().run(&cmd);
+    }
+    println!("$ {cmd}");
+    run(cmd.command().current_dir(root))
 }
 
 fn create_dir(dir: &Path) -> Result<(), String> {
@@ -128,6 +172,9 @@ pub fn info_plist(version: &str) -> String {
         ("CFBundleVersion", &v),
         ("LSApplicationCategoryType", "public.app-category.developer-tools"),
         ("LSMinimumSystemVersion", MIN_MACOS),
+        // Shown when a program run from CodeCraft (Terminal, run configurations) sends Apple Events;
+        // pairs with the apple-events entitlement (apps/codecraft/macos/CodeCraft.entitlements).
+        ("NSAppleEventsUsageDescription", APPLE_EVENTS_USAGE),
         ("NSHumanReadableCopyright", "MIT OR Apache-2.0"),
     ];
     let mut out = String::from(
@@ -201,33 +248,43 @@ pub fn write_app_bundle(bundle_dir: &Path, binary: Option<&Path>, icns: Option<&
     Ok(layout)
 }
 
-/// Sign the bundle: `CODECRAFT_SIGN_IDENTITY` if set, else ad hoc (`-`); then verify.
-pub fn codesign(app: &Path) -> Result<(), String> {
-    let identity = std::env::var("CODECRAFT_SIGN_IDENTITY").ok().filter(|s| !s.trim().is_empty());
-    let identity = identity.as_deref().unwrap_or("-");
-    let mut sign = Command::new("codesign");
-    sign.args(["--force", "--deep", "--sign", identity]);
-    if identity != "-" {
-        // Real identities get the hardened runtime and a timestamp (needed for notarization).
-        sign.args(["--options", "runtime", "--timestamp"]);
+/// Sign the bundle inside-out with the hardened runtime and the entitlements, then verify it.
+pub fn sign_bundle(root: &Path, opts: &Options, layout: &AppLayout) -> Result<(), String> {
+    let signer = opts.signer();
+    if signer.is_ad_hoc() {
+        eprintln!("signing ad hoc (runs on this Mac only; pass --sign <identity> to distribute)");
     }
-    run(sign.arg(app))?;
-    run(Command::new("codesign").args(["--verify", "--deep", "--strict"]).arg(app))
+    let entitlements = root.join(sign::ENTITLEMENTS);
+    for (key, why) in sign::ENTITLEMENT_KEYS {
+        eprintln!("entitlement {key}: {why}");
+    }
+    sign::sign_app(&opts.runner(), &signer, &layout.app, &layout.executable, &entitlements)
 }
 
 /// `cargo xtask bundle`: build, lay out, sign. Returns the bundle path.
 pub fn bundle(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     let target = target_dir(root);
     let binary = target.join(opts.profile()).join(EXECUTABLE);
+    let bundle_dir = target.join("bundle");
+    if opts.dry_run {
+        let layout = AppLayout::new(&bundle_dir);
+        if !opts.layout_only {
+            cargo_build(root, opts, &["codecraft"])?;
+        }
+        println!("# lay out {}", layout.app.display());
+        if !opts.layout_only {
+            sign_bundle(root, opts, &layout)?;
+        }
+        return Ok(layout.app);
+    }
     if !opts.layout_only {
         cargo_build(root, opts, &["codecraft"])?;
     }
-    let bundle_dir = target.join("bundle");
     let bin = (!opts.layout_only).then_some(binary.as_path());
     let layout = write_app_bundle(&bundle_dir, bin, None)?;
     if !opts.layout_only {
         if cfg!(target_os = "macos") {
-            codesign(&layout.app)?;
+            sign_bundle(root, opts, &layout)?;
         } else {
             eprintln!("not on macOS: the bundle is not signed");
         }
@@ -236,28 +293,62 @@ pub fn bundle(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     Ok(layout.app)
 }
 
-/// `cargo xtask dmg`: the bundle plus an `/Applications` link in a compressed disk image.
+/// The disk image `dmg` writes: `<target>/bundle/CodeCraft-<version>.dmg`.
+pub fn dmg_path(root: &Path) -> PathBuf {
+    target_dir(root).join("bundle").join(format!("{APP_NAME}-{}.dmg", version()))
+}
+
+/// `hdiutil create`: the staging folder as a compressed (UDZO) image.
+pub fn hdiutil_create(staging: &Path, image: &Path) -> Cmd {
+    Cmd::new("hdiutil")
+        .args(["create", "-volname", APP_NAME, "-fs", "HFS+", "-format", "UDZO", "-ov", "-srcfolder"])
+        .arg(staging)
+        .arg(image)
+}
+
+/// `cargo xtask dmg`: the signed bundle plus an `/Applications` link in a compressed disk image,
+/// itself signed with the same identity and verified.
 pub fn dmg(root: &Path, opts: &Options) -> Result<PathBuf, String> {
-    if !cfg!(target_os = "macos") {
+    if !cfg!(target_os = "macos") && !opts.dry_run {
         return Err("dmg needs macOS (hdiutil)".into());
+    }
+    if opts.layout_only {
+        return Err("dmg needs a built, signed bundle (drop --layout-only)".into());
     }
     let app = bundle(root, opts)?;
     let bundle_dir = target_dir(root).join("bundle");
     let staging = bundle_dir.join("dmg-staging");
-    remove_dir(&staging)?;
-    create_dir(&staging)?;
-    run(Command::new("ditto").arg(&app).arg(staging.join(format!("{APP_NAME}.app"))))?;
-    #[cfg(unix)]
-    std::os::unix::fs::symlink("/Applications", staging.join("Applications"))
-        .map_err(|e| format!("Applications link: {e}"))?;
-    let image = bundle_dir.join(format!("{APP_NAME}-{}.dmg", version()));
-    run(Command::new("hdiutil")
-        .args(["create", "-volname", APP_NAME, "-fs", "HFS+", "-format", "UDZO", "-ov", "-srcfolder"])
-        .arg(&staging)
-        .arg(&image))?;
-    remove_dir(&staging)?;
+    let image = dmg_path(root);
+    let runner = opts.runner();
+    let ditto = Cmd::new("ditto").arg(&app).arg(staging.join(format!("{APP_NAME}.app")));
+    if opts.dry_run {
+        runner.run(&ditto)?;
+        println!("# ln -s /Applications {}", staging.join("Applications").display());
+        runner.run(&hdiutil_create(&staging, &image))?;
+    } else {
+        remove_dir(&staging)?;
+        create_dir(&staging)?;
+        runner.run(&ditto)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/Applications", staging.join("Applications"))
+            .map_err(|e| format!("Applications link: {e}"))?;
+        runner.run(&hdiutil_create(&staging, &image))?;
+        remove_dir(&staging)?;
+    }
+    sign::sign_dmg(&runner, &opts.signer(), &image)?;
     println!("{}", image.display());
     Ok(image)
+}
+
+/// `cargo xtask notarize`: submit the dmg (or `--app`) with the user's notarytool keychain profile,
+/// wait, staple and check with Gatekeeper. Never handles credentials itself.
+pub fn notarize(root: &Path, opts: &sign::NotarizeOptions) -> Result<(), String> {
+    if !cfg!(target_os = "macos") && !opts.dry_run {
+        return Err("notarize needs macOS (xcrun notarytool, stapler, spctl)".into());
+    }
+    let notary = opts.notary()?;
+    let target = opts.target(dmg_path(root));
+    sign::notarize(&Runner { dry_run: opts.dry_run }, &notary, &target)
 }
 
 // ---------------------------------------------------------------- Linux
@@ -343,14 +434,22 @@ pub fn package_linux(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     } else {
         eprintln!("layout only (binaries are built on Linux)");
     }
+    let tarball = out.join(format!("{name}.tar.gz"));
+    let tar = Cmd::new("tar").arg("-czf").arg(&tarball).arg("-C").arg(&out).arg(&name);
+    if opts.dry_run {
+        println!("# lay out {}", dir.display());
+        if build {
+            opts.runner().run(&tar)?;
+        }
+        return Ok(if build { tarball } else { dir });
+    }
     let bins = target.join(opts.profile());
     write_linux_layout(&dir, root, build.then_some(bins.as_path()))?;
     if !build {
         println!("{}", dir.display());
         return Ok(dir);
     }
-    let tarball = out.join(format!("{name}.tar.gz"));
-    run(Command::new("tar").arg("-czf").arg(&tarball).arg("-C").arg(&out).arg(&name))?;
+    opts.runner().run(&tar)?;
     println!("{}", tarball.display());
     Ok(tarball)
 }
@@ -385,14 +484,22 @@ pub fn package_windows(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     } else {
         eprintln!("layout only (binaries are built on Windows)");
     }
+    let zip = out.join(format!("{name}.zip"));
+    let tar = Cmd::new("tar").arg("-a").arg("-c").arg("-f").arg(&zip).arg("-C").arg(&out).arg(&name);
+    if opts.dry_run {
+        println!("# lay out {}", dir.display());
+        if build {
+            opts.runner().run(&tar)?;
+        }
+        return Ok(if build { zip } else { dir });
+    }
     let bins = target.join(opts.profile());
     write_windows_layout(&dir, root, build.then_some(bins.as_path()))?;
     if !build {
         println!("{}", dir.display());
         return Ok(dir);
     }
-    let zip = out.join(format!("{name}.zip"));
-    run(Command::new("tar").arg("-a").arg("-c").arg("-f").arg(&zip).arg("-C").arg(&out).arg(&name))?;
+    opts.runner().run(&tar)?;
     println!("{}", zip.display());
     Ok(zip)
 }
@@ -434,8 +541,60 @@ mod tests {
     #[test]
     fn options_parse() {
         let o = Options::parse(&["--release".into()]).unwrap();
-        assert!(o.release && !o.layout_only);
+        assert!(o.release && !o.layout_only && !o.dry_run);
+        assert!(o.sign.is_none() && o.keychain.is_none());
         assert!(Options::parse(&["--bogus".into()]).is_err());
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let o = Options::parse(&args(&[
+            "--sign",
+            "Developer ID Application: Jane (ABC)",
+            "--keychain=/tmp/k.keychain-db",
+            "--dry-run",
+        ]))
+        .unwrap();
+        assert_eq!(o.sign.as_deref(), Some("Developer ID Application: Jane (ABC)"));
+        assert_eq!(o.keychain, Some(PathBuf::from("/tmp/k.keychain-db")));
+        assert!(o.dry_run);
+        assert_eq!(o.signer().identity, "Developer ID Application: Jane (ABC)");
+        assert_eq!(Options::parse(&args(&["--sign", "-"])).unwrap().signer().identity, "-");
+        assert_eq!(Options::parse(&args(&["--sign=-"])).unwrap().sign.as_deref(), Some("-"));
+        assert!(Options::parse(&args(&["--sign"])).is_err());
+        assert!(Options::parse(&args(&["--keychain"])).is_err());
+    }
+
+    #[test]
+    fn build_and_dmg_commands() {
+        let o = Options { release: true, ..Default::default() };
+        let c = cargo_build_cmd(&o, &["codecraft", "codecraft-cli"]);
+        assert_eq!(c.args, ["build", "-p", "codecraft", "-p", "codecraft-cli", "--release"]);
+        let h = hdiutil_create(Path::new("/b/dmg-staging"), Path::new("/b/CodeCraft-1.0.dmg"));
+        assert_eq!(
+            h.to_string(),
+            "hdiutil create -volname CodeCraft -fs HFS+ -format UDZO -ov -srcfolder /b/dmg-staging /b/CodeCraft-1.0.dmg"
+        );
+        let root = Path::new("/w");
+        assert!(dmg_path(root).ends_with(format!("bundle/CodeCraft-{}.dmg", version())));
+    }
+
+    #[test]
+    fn dry_runs_write_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = Options { dry_run: true, sign: Some("Developer ID Application: X (Y)".into()), ..Default::default() };
+        let app = bundle(dir.path(), &opts).unwrap();
+        assert!(app.ends_with("bundle/CodeCraft.app"));
+        let image = dmg(dir.path(), &opts).unwrap();
+        assert!(image.ends_with(format!("bundle/CodeCraft-{}.dmg", version())));
+        package_linux(dir.path(), &opts).unwrap();
+        package_windows(dir.path(), &opts).unwrap();
+        // Nothing under the (default) target dir of this fake root.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        let n = sign::NotarizeOptions { profile: Some("p".into()), dry_run: true, ..Default::default() };
+        notarize(dir.path(), &n).unwrap();
+        // Without a profile notarize says how to make one.
+        let e = notarize(dir.path(), &sign::NotarizeOptions { dry_run: true, ..Default::default() });
+        if std::env::var_os(sign::PROFILE_ENV).is_none() {
+            assert!(e.unwrap_err().contains("store-credentials"));
+        }
     }
 
     #[test]

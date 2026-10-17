@@ -40,24 +40,30 @@ after UI changes.
 ## Packaging
 
 ```sh
-cargo xtask bundle [--release]           # target/bundle/CodeCraft.app, signed
-cargo xtask dmg [--release]              # target/bundle/CodeCraft-<version>.dmg (macOS, hdiutil)
+cargo xtask bundle [--release] [--sign <identity>]   # target/bundle/CodeCraft.app, signed
+cargo xtask dmg [--release] [--sign <identity>]      # target/bundle/CodeCraft-<version>.dmg (macOS, hdiutil), signed
+cargo xtask notarize --profile <notarytool profile>  # submit the dmg, wait, staple, spctl
 cargo xtask package-linux [--release]    # target/package/codecraft-<version>-linux-<arch>.tar.gz
 cargo xtask package-windows [--release]  # target/package/codecraft-<version>-windows-<arch>.zip
 ```
 
-`--layout-only` writes the package layout without building or signing. Outputs go under the Cargo
-target directory (`CARGO_TARGET_DIR` when set).
+`--layout-only` writes the package layout without building or signing; `--dry-run` prints every
+command (build, codesign, hdiutil, notarytool, …) without running anything. Outputs go under the
+Cargo target directory (`CARGO_TARGET_DIR` when set). Developer ID signing, notarization, the
+entitlements and the CI/release workflows are described in [release.md](release.md).
 
 - **macOS bundle.** `Contents/MacOS/codecraft`, `Contents/Info.plist` (bundle id
   `dev.codecraft.CodeCraft`, version from the workspace, `LSMinimumSystemVersion` 11.0,
   `NSHighResolutionCapable`), `Contents/Resources/CodeCraft.icns` and `PkgInfo`. The icon is our
   own, drawn by `xtask/src/icon.rs` at every icon-set size and converted with `iconutil`. The
-  bundle is signed ad hoc (`codesign --force --deep -s -`) and verified; set
-  `CODECRAFT_SIGN_IDENTITY` to sign with a Developer ID (adds the hardened runtime and a
-  timestamp; notarize separately with `xcrun notarytool`). No document types are declared yet: the
-  app takes its project from the command line or File › Open, not from Finder's open events.
-- **dmg.** The signed bundle plus an `/Applications` link, compressed (UDZO).
+  bundle is signed inside-out with the hardened runtime and
+  `apps/codecraft/macos/CodeCraft.entitlements`, ad hoc by default (`--timestamp=none`), or with
+  `--sign <identity>` / `CODECRAFT_SIGN_IDENTITY` (a Developer ID, with a secure timestamp), then
+  verified (`codesign --verify --deep --strict`, runtime flag checked). No document types are
+  declared yet: the app takes its project from the command line or File › Open, not from Finder's
+  open events.
+- **dmg.** The signed bundle plus an `/Applications` link, compressed (UDZO), the image itself
+  signed with the same identity and verified.
 - **Linux.** On Linux: `bin/codecraft`, `bin/codecraft-cli`,
   `share/applications/dev.codecraft.CodeCraft.desktop`, `share/icons/hicolor/<size>/apps/*.png`,
   README and licenses, as a tarball (install with `cp -r bin share ~/.local/`). Elsewhere the task

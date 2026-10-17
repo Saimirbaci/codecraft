@@ -1,13 +1,18 @@
-//! Workspace automation: `cargo xtask <layers|catalog|parity|bundle|dmg|package-linux|package-windows>`.
+//! Workspace automation: `cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-windows>`.
 //!
 //! - `layers`  checks crate layering (a crate may only depend on lower layers; no UI deps below L3).
 //! - `catalog` regenerates `crates/engine/src/catalog.rs` from the observed RustRover menus.
 //! - `parity`  regenerates `docs/parity-checklist.md` from the catalog and the engine's commands.
 //! - `bundle`, `dmg`, `package-linux`, `package-windows` build and package the app (see
-//!   `package.rs` and docs/development.md); options `--release`, `--layout-only`.
+//!   `package.rs` and docs/development.md); options `--release`, `--layout-only`, `--dry-run`,
+//!   and for the macOS tasks `--sign <identity>` (default ad hoc) and `--keychain <path>`.
+//! - `notarize` submits the signed dmg (or `--app`) with `xcrun notarytool` and a keychain profile,
+//!   staples and assesses it (`sign.rs`, docs/release.md); `--profile <name>`, `--dmg <path>`,
+//!   `--app <path>`, `--keychain <path>`, `--dry-run`.
 
 mod icon;
 mod package;
+mod sign;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -31,9 +36,11 @@ fn main() -> ExitCode {
         "parity" => parity(&root),
         "bundle" => opts().and_then(|o| package::bundle(&root, &o)).map(drop),
         "dmg" => opts().and_then(|o| package::dmg(&root, &o)).map(drop),
+        "notarize" => sign::NotarizeOptions::parse(&rest).and_then(|o| package::notarize(&root, &o)),
         "package-linux" => opts().and_then(|o| package::package_linux(&root, &o)).map(drop),
         "package-windows" => opts().and_then(|o| package::package_windows(&root, &o)).map(drop),
-        _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|package-linux|package-windows> [--release]"
+        _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-windows> \
+                  [--release] [--dry-run] [--sign <identity>] [--profile <notarytool profile>]"
             .to_string()),
     };
     match result {

@@ -804,6 +804,8 @@ fn waiter_loop(_pid: u32, shared: Arc<Shared>) {
     shared.wake();
 }
 
+// Only the Unix waiter reports signals (dead code elsewhere).
+#[cfg(unix)]
 fn signal_name(sig: i32) -> String {
     match sig {
         1 => "SIGHUP".into(),

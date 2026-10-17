@@ -1,0 +1,205 @@
+# Release: on a `v*` tag, build the macOS dmg (Developer ID-signed and notarized when the secrets
+# exist, ad hoc otherwise), the Linux tarball and the Windows zip, and attach them to a DRAFT
+# GitHub release. Nothing is published automatically. See docs/release.md.
+#
+# Secrets (all optional; names only, values live in the repository settings):
+#   MACOS_CERTIFICATE_P12        base64 of the Developer ID Application certificate + key (.p12)
+#   MACOS_CERTIFICATE_PASSWORD   the .p12 export password
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_SPECIFIC_PASSWORD   notarization credentials
+# They are imported into a temporary keychain that exists only for the macOS job and is deleted
+# at its end, whatever happened.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_TOOLCHAIN: stable
+
+jobs:
+  version:
+    name: tag matches the workspace version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Compare
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p;}' Cargo.toml)
+          echo "tag $tag, workspace version $version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match version = \"$version\" in Cargo.toml"
+            exit 1
+          fi
+
+  macos:
+    name: macOS dmg
+    needs: version
+    runs-on: macos-latest
+    timeout-minutes: 150
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_SPECIFIC_PASSWORD != '' }}
+    outputs:
+      signed: ${{ steps.status.outputs.signed }}
+      notarized: ${{ steps.status.outputs.notarized }}
+    steps:
+      - uses: actions/checkout@v4.2.2
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Import the signing certificate into a temporary keychain
+        if: env.HAS_SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          umask 077
+          keychain="$RUNNER_TEMP/codecraft-signing.keychain-db"
+          cert="$RUNNER_TEMP/codecraft-signing.p12"
+          keychain_password="$(openssl rand -base64 32)"
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$MACOS_CERTIFICATE_P12" | base64 --decode > "$cert"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -f pkcs12 -T /usr/bin/codesign
+          rm -f "$cert"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+          # codesign also needs the keychain in the search list to build the certificate chain.
+          existing=()
+          while IFS= read -r k; do existing+=("$k"); done < <(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          identity=$(security find-identity -v -p codesigning "$keychain" | awk -F'"' '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$identity" ]; then
+            echo "::error::the certificate holds no Developer ID Application identity"
+            exit 1
+          fi
+          echo "CODECRAFT_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "CODECRAFT_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+
+      - name: Store the notarization credentials in the temporary keychain
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials codecraft-ci \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --keychain "$CODECRAFT_KEYCHAIN"
+
+      - name: Build, sign and package the dmg
+        # The identity comes from CODECRAFT_SIGN_IDENTITY (set above); without it, ad hoc.
+        run: |
+          args=(--release)
+          if [ -n "${CODECRAFT_KEYCHAIN:-}" ]; then args+=(--keychain "$CODECRAFT_KEYCHAIN"); fi
+          cargo xtask dmg "${args[@]}"
+
+      - name: Notarize, staple and assess
+        if: env.HAS_SIGNING == 'true' && env.HAS_NOTARY == 'true'
+        run: cargo xtask notarize --profile codecraft-ci --keychain "$CODECRAFT_KEYCHAIN"
+
+      - name: Signing status
+        id: status
+        run: |
+          echo "signed=${HAS_SIGNING}" >> "$GITHUB_OUTPUT"
+          if [ "$HAS_SIGNING" = true ] && [ "$HAS_NOTARY" = true ]; then
+            echo "notarized=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "notarized=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete the temporary keychain
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/codecraft-signing.p12"
+          if [ -n "${CODECRAFT_KEYCHAIN:-}" ] && [ -e "$CODECRAFT_KEYCHAIN" ]; then
+            security delete-keychain "$CODECRAFT_KEYCHAIN"
+          fi
+
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: macos-dmg
+          path: target/bundle/CodeCraft-*.dmg
+          if-no-files-found: error
+
+  linux:
+    name: Linux tarball
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install Rust and build dependencies
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+      - name: Package
+        run: cargo xtask package-linux --release
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: linux-tarball
+          path: target/package/codecraft-*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows zip
+    needs: version
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Package
+        run: cargo xtask package-windows --release
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: windows-zip
+          path: target/package/codecraft-*.zip
+          if-no-files-found: error
+
+  release:
+    name: draft GitHub release
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SIGNED: ${{ needs.macos.outputs.signed }}
+          NOTARIZED: ${{ needs.macos.outputs.notarized }}
+        run: |
+          if [ "$NOTARIZED" = true ]; then
+            mac="The macOS dmg (Apple silicon) is Developer ID-signed, notarized and stapled."
+          elif [ "$SIGNED" = true ]; then
+            mac="The macOS dmg (Apple silicon) is Developer ID-signed but NOT notarized."
+          else
+            mac="The macOS dmg (Apple silicon) is ad-hoc signed only: Gatekeeper will refuse it on other Macs."
+          fi
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+            --title "CodeCraft $GITHUB_REF_NAME" --notes "$mac" --generate-notes
