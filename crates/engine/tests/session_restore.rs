@@ -412,7 +412,11 @@ fn terminals_come_back_with_their_names_and_directories() {
     s.shutdown();
     let saved: Value =
         serde_json::from_str(&std::fs::read_to_string(a.join(".codecraft/workspace.json")).unwrap()).unwrap();
-    assert_eq!(saved["terminals"], json!([{ "cwd": a }, { "name": "API server", "cwd": a.join("src") }]), "{saved}");
+    let terms = saved["terminals"].as_array().unwrap();
+    assert_eq!(terms.len(), 2, "{saved}");
+    assert_eq!((&terms[0]["name"], &terms[0]["cwd"]), (&Value::Null, &json!(a)));
+    assert_eq!((&terms[1]["name"], &terms[1]["cwd"]), (&json!("API server"), &json!(a.join("src"))));
+    assert!(terms.iter().all(|t| t["key"].is_string()), "{saved}");
     assert_eq!(saved["terminal_active"], 1);
 
     // Restart: the shells start again, named, in their directories, the same tab selected.

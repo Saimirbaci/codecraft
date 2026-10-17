@@ -54,15 +54,51 @@ pub struct SessionSnapshot {
 /// At most this many terminal tabs are restored.
 pub const MAX_TERMINALS: usize = 32;
 
-/// One Terminal shell tab: a new shell is started in `cwd` when the project opens again.
+/// One Terminal tab: a shell (or Claude Code) is started again in `cwd` when the project opens.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TerminalSnapshot {
+    /// The tab's stable key: its own command history and saved output are kept under it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// The name the user gave the tab (`None`: the automatic "Local", "Local (2)", …).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     /// The shell's working directory when the snapshot was taken.
     pub cwd: PathBuf,
+    #[serde(skip_serializing_if = "TerminalKind::is_shell")]
+    pub kind: TerminalKind,
+    /// The Claude Code session running in the tab (in its shell, or as the tab's program):
+    /// restoring resumes exactly this one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeSnapshot>,
+}
+
+/// What a terminal tab runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalKind {
+    /// The login shell.
+    #[default]
+    Shell,
+    /// Claude Code itself (Open Claude Code in Terminal).
+    ClaudeCode,
+}
+
+impl TerminalKind {
+    pub fn is_shell(&self) -> bool {
+        *self == Self::Shell
+    }
+}
+
+/// A Claude Code session in a terminal tab.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClaudeSnapshot {
+    pub session: String,
+    /// Its transcript file: when it is gone, the session cannot be resumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<PathBuf>,
 }
 
 impl Default for SessionSnapshot {

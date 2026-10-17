@@ -5,8 +5,10 @@
 //! connects to CodeCraft. Output is parsed on background threads; [`pump`] takes a fresh
 //! [`Screen`] snapshot for each tab whose output changed.
 //!
-//! Shell tabs are part of the project's saved session ([`snapshot`]/[`restore`]): their names and
-//! working directories come back, each with a fresh shell, when the project opens again. The
+//! Shell and Claude Code tabs are part of the project's saved session ([`snapshot`]/[`restore`]):
+//! their names, working directories, own command histories and earlier output come back, each
+//! with a fresh shell, when the project opens again, and a Claude Code session that ran in a tab
+//! is resumed there ([`crate::terminal_shell`]). The
 //! directory follows `cd` through OSC 7 reports and, for shells that don't send them, a
 //! background look at the shell process every [`CWD_POLL`].
 
@@ -18,8 +20,9 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use codecraft_term::{ExitInfo, Palette, Screen, SharedPalette, SharedWaker, TermConfig, TermEvent, Terminal};
-use codecraft_workspace::{MAX_TERMINALS, TerminalSnapshot, ToolWindowId};
+use codecraft_workspace::{ClaudeSnapshot, MAX_TERMINALS, TerminalKind, TerminalSnapshot, ToolWindowId};
 
+use crate::terminal_shell as shell_int;
 use crate::{CommandError, Effect, Session};
 
 /// Open tabs are capped so a runaway script or agent cannot fork shells without bound.
@@ -65,6 +68,13 @@ pub struct TerminalTab {
     pub cwd: PathBuf,
     /// The command line it runs (`None` for the login shell).
     pub command: Option<String>,
+    /// Stable across restarts: the tab's own command history and saved output are kept under it.
+    pub key: String,
+    /// The tab runs Claude Code itself (Open Claude Code in Terminal).
+    pub claude: bool,
+    /// The Claude Code session the tab was started with (`--session-id`/`--resume`), until the
+    /// session hook reports the current one.
+    pub claude_session: Option<String>,
     pub status: TabStatus,
     /// The latest snapshot of the visible grid (refreshed by `pump`).
     pub screen: Screen,
@@ -132,6 +142,13 @@ pub struct TerminalState {
     /// A working-directory lookup running in the background, and when the last one started.
     cwd_poll: Option<Receiver<Vec<(u32, PathBuf)>>>,
     cwd_polled: Option<Instant>,
+    /// Where tab histories, saved output and Claude Code session records go (default:
+    /// `terminals/` in the config directory, in sessions with background services only).
+    pub data_dir: Option<PathBuf>,
+    /// Extra environment for every tab (tests point `HOME` at a temporary directory).
+    pub env: Vec<(String, String)>,
+    /// The shell integration directory written this session.
+    pub(crate) installed: Option<PathBuf>,
 }
 
 impl Default for TerminalState {
@@ -151,6 +168,9 @@ impl Default for TerminalState {
             closing: Vec::new(),
             cwd_poll: None,
             cwd_polled: None,
+            data_dir: None,
+            env: Vec::new(),
+            installed: None,
         }
     }
 }
@@ -229,6 +249,12 @@ pub(crate) struct NewTab {
     pub background: bool,
     /// Extra environment (e.g. an enriched `PATH`).
     pub env: Vec<(String, String)>,
+    /// The tab's key (a restored tab's); default: a new one.
+    pub key: Option<String>,
+    /// `command` is Claude Code, started with this session.
+    pub claude: Option<String>,
+    /// Text shown above the program's output (a restored tab's earlier output).
+    pub preface: Option<String>,
 }
 
 fn default_cwd(s: &Session) -> PathBuf {
@@ -257,9 +283,7 @@ pub fn open_command(
             command: Some(program.to_string()),
             args: Some(args.to_vec()),
             title: Some(title.to_string()),
-            renamed: false,
-            background: false,
-            env: Vec::new(),
+            ..NewTab::default()
         },
     )
 }
@@ -274,8 +298,28 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         return Err(CommandError::Failed(format!("not a directory: {}", cwd.display())));
     }
     let shell = shell(s);
+    let key = new.key.clone().filter(|k| shell_int::valid_id(k)).unwrap_or_else(shell_int::new_key);
+    let integration = if new.command.is_none() || new.claude.is_some() { shell_int::install(s) } else { None };
+    let mut extra_env = Vec::new();
+    let mut shell_program = None;
+    if let Some(integration) = &integration {
+        if new.command.is_none() {
+            let resolved = codecraft_term::default_shell(shell.as_deref());
+            let launch = shell_int::shell_launch(s, integration, &resolved, &key);
+            shell_program = launch.program;
+            extra_env = launch.env;
+        } else {
+            extra_env = shell_int::common_env(s, integration, &key);
+            // Claude Code is the tab's program: the hook records "the program" (no pid), and a
+            // `claude` run inside it is not tracked.
+            extra_env.push((shell_int::ENV_CLAUDE_PID.into(), "0".into()));
+        }
+    }
     let (program, args) = match (&new.command, &new.args) {
-        (None, _) => (None, Vec::new()),
+        (None, _) => match shell_program {
+            Some((program, args)) => (Some(program), args),
+            None => (None, Vec::new()),
+        },
         (Some(program), Some(args)) => (Some(program.clone()), args.clone()),
         // A command line runs in the user's login shell, so their PATH and aliases apply.
         (Some(line), None) => {
@@ -285,6 +329,22 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
     };
     let mut env = s.ide.env_for_child();
     env.extend(new.env.iter().cloned());
+    env.extend(s.terminal.env.iter().cloned());
+    if let Some(integration) = &integration {
+        // The `claude` shim first on PATH (the integration's rc files put it first again after
+        // the user's own startup files).
+        let path = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        let bin = integration.bin().to_string_lossy().into_owned();
+        env.retain(|(k, _)| k != "PATH");
+        env.push(("PATH".into(), if path.is_empty() { bin } else { format!("{bin}:{path}") }));
+    }
+    env.extend(extra_env.into_iter().filter(|(k, _)| k != "PATH"));
     let cfg = TermConfig {
         program,
         args,
@@ -295,6 +355,7 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         cols: 80,
         rows: 24,
         scrollback: s.terminal.scrollback,
+        preface: new.preface.clone(),
     };
     let term = Terminal::spawn(cfg, s.terminal.waker.clone(), s.terminal.palette.clone())
         .map_err(|e| CommandError::Failed(e.to_string()))?;
@@ -311,6 +372,9 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         osc_title: None,
         cwd,
         command: new.command.clone(),
+        key,
+        claude: new.claude.is_some(),
+        claude_session: new.claude.clone().filter(|c| !c.is_empty()),
         status: TabStatus::Running,
         screen,
         bell: false,
@@ -362,6 +426,9 @@ fn unique_name(s: &Session, title: Option<&str>, command: Option<&str>) -> Strin
 /// Close a tab (killing its processes in the background). Closing the last tab hides the tool
 /// window, like RustRover.
 pub(crate) fn close(s: &mut Session, index: usize) -> bool {
+    if let Some(key) = s.terminal.tabs.get(index).map(|t| t.key.clone()) {
+        forget_files(s, &key);
+    }
     let closed = s.terminal.close_index(index);
     if closed && s.terminal.tabs.is_empty() {
         s.ws.layout.hide(ToolWindowId::Terminal);
@@ -455,26 +522,84 @@ pub(crate) fn refresh_cwds(s: &mut Session) {
     apply_cwds(&mut s.terminal, &found);
 }
 
-/// The live shell tabs for the session snapshot, and which of them is selected. Tabs running a
-/// program (`ssh`, `docker exec`, `claude`, a command) are not kept: they would run again.
+/// The live shell and Claude Code tabs for the session snapshot, and which of them is selected.
+/// Tabs running another program (`ssh`, `docker exec`, a command) are not kept: they would run
+/// again.
 pub fn snapshot(s: &Session) -> (Vec<TerminalSnapshot>, Option<usize>) {
     let mut out = Vec::new();
     let mut active = None;
     for (i, tab) in s.terminal.tabs.iter().enumerate() {
-        if tab.command.is_some() || !tab.alive() {
+        if (tab.command.is_some() && !tab.claude) || !tab.alive() {
             continue;
         }
         if i == s.terminal.active {
             active = Some(out.len());
         }
-        out.push(TerminalSnapshot { name: tab.renamed.then(|| tab.name.clone()), cwd: tab.cwd.clone() });
+        out.push(TerminalSnapshot {
+            key: Some(tab.key.clone()),
+            name: tab.renamed.then(|| tab.name.clone()),
+            cwd: tab.cwd.clone(),
+            kind: if tab.claude { TerminalKind::ClaudeCode } else { TerminalKind::Shell },
+            claude: claude_session(s, tab),
+        });
     }
     (out, active)
 }
 
-/// Start a shell for each saved tab, with its name, in its directory (the project root when
-/// the directory is gone). Nothing happens when terminals are already open. Returns how many
-/// tabs were opened.
+/// The Claude Code session running in `tab`: the one its hook reported (for a shell tab, only
+/// while that claude process still runs in the tab), else the one a Claude Code tab started with.
+fn claude_session(s: &Session, tab: &TerminalTab) -> Option<ClaudeSnapshot> {
+    let state = shell_int::claude_state_file(s, &tab.key).and_then(|p| shell_int::read_claude_state(&p));
+    if tab.claude {
+        return match state {
+            Some(st) if st.pid.is_none() => Some(ClaudeSnapshot { session: st.session, transcript: st.transcript }),
+            _ => tab.claude_session.clone().map(|session| ClaudeSnapshot { session, transcript: None }),
+        };
+    }
+    let st = state?;
+    let (shell, pid) = (tab.term.pid()?, st.pid?);
+    codecraft_term::runs_under(shell, pid).then_some(ClaudeSnapshot { session: st.session, transcript: st.transcript })
+}
+
+/// A saved session that can be resumed: a plain id whose transcript (when known) still exists.
+fn resumable(claude: Option<&ClaudeSnapshot>) -> Option<String> {
+    let c = claude?;
+    (shell_int::valid_id(&c.session) && c.transcript.as_ref().is_none_or(|t| t.is_file())).then(|| c.session.clone())
+}
+
+/// Before the final save: keep each shell tab's output (the end of its scrollback) for the next
+/// start, and drop the files of tabs that are gone. Tabs running Claude Code keep none: the
+/// resumed session shows its conversation itself.
+pub(crate) fn save_tab_files(s: &mut Session) {
+    let (saved, _) = snapshot(s);
+    for tab in &s.terminal.tabs {
+        let Some(path) = shell_int::output_file(s, &tab.key) else { continue };
+        let keep = !tab.claude
+            && tab.command.is_none()
+            && saved.iter().any(|t| t.key.as_deref() == Some(tab.key.as_str()) && t.claude.is_none());
+        let text = if keep { shell_int::output_tail(&tab.term.text(true)) } else { String::new() };
+        if text.is_empty() {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if let Some(dir) = path.parent()
+            && let Err(e) = std::fs::create_dir_all(dir)
+        {
+            log::warn!("cannot create {}: {e}", dir.display());
+            continue;
+        }
+        if let Err(e) = codecraft_fs::write_text_file_atomic(&path, &text) {
+            log::warn!("cannot save the output of terminal tab {}: {e}", tab.name);
+        }
+    }
+    let keys: Vec<String> = s.terminal.tabs.iter().map(|t| t.key.clone()).collect();
+    shell_int::prune(s, &keys);
+}
+
+/// Start a shell (or Claude Code) for each saved tab, with its name, in its directory (the
+/// project root when the directory is gone), with its own history and earlier output; a Claude
+/// Code session that ran in it is resumed (`claude --resume <id>`). Nothing happens when
+/// terminals are already open. Returns how many tabs were opened.
 pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Option<usize>) -> usize {
     if !s.terminal.tabs.is_empty() {
         return 0;
@@ -485,8 +610,32 @@ pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Optio
         let name = tab.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(100).collect());
         let renamed = name.is_some();
         let cwd = Some(tab.cwd.clone()).filter(|d| d.is_absolute() && d.is_dir());
-        let new = NewTab { cwd, title: name, renamed, background: true, ..NewTab::default() };
-        match open(s, new) {
+        let key = tab.key.clone().filter(|k| shell_int::valid_id(k));
+        let resume = resumable(tab.claude.as_ref());
+        let base = NewTab { cwd, title: name, renamed, background: true, key, ..NewTab::default() };
+        let result = match tab.kind {
+            TerminalKind::ClaudeCode => {
+                crate::terminal_cmds::claude_tab(s, resume.as_deref(), base).and_then(|new| open(s, new))
+            }
+            TerminalKind::Shell => {
+                let preface = match (&resume, base.key.as_deref().and_then(|k| shell_int::output_file(s, k))) {
+                    (None, Some(path)) => {
+                        std::fs::read_to_string(path).ok().and_then(|t| shell_int::output_preface(&t))
+                    }
+                    _ => None,
+                };
+                let opened = open(s, NewTab { preface, ..base });
+                if let (Ok(id), Some(session)) = (&opened, &resume)
+                    && let Some(t) = s.terminal.tabs.iter().find(|t| t.id == *id)
+                {
+                    // Typed into the shell (it reads it once ready), so the tab is back at its
+                    // prompt when Claude Code exits.
+                    t.term.send_text(&format!("claude --resume {session}\r"));
+                }
+                opened
+            }
+        };
+        match result {
             Ok(_) => {
                 if active == Some(i) {
                     select = Some(opened);
@@ -498,6 +647,16 @@ pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Optio
     }
     s.terminal.active = select.unwrap_or(0);
     opened
+}
+
+/// A tab the user closed: its history, saved output and session record go too.
+fn forget_files(s: &Session, key: &str) {
+    for path in [shell_int::history_file(s, key), shell_int::output_file(s, key), shell_int::claude_state_file(s, key)]
+        .into_iter()
+        .flatten()
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// The project is closing: its terminals go with it (the session saved them first).

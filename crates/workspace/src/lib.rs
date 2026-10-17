@@ -35,8 +35,8 @@ pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
 pub use run::{ConsoleKind, ConsoleLine, RunStatus, RunTab, RunTabId, TestRecord};
 pub use session_state::{
-    GroupSnapshot, MAX_GROUPS, MAX_TABS, MAX_TERMINALS, RestoreSummary, SNAPSHOT_VERSION, SelectionSnapshot,
-    SessionSnapshot, TabSnapshot, TerminalSnapshot,
+    ClaudeSnapshot, GroupSnapshot, MAX_GROUPS, MAX_TABS, MAX_TERMINALS, RestoreSummary, SNAPSHOT_VERSION, SelectionSnapshot,
+    SessionSnapshot, TabSnapshot, TerminalKind, TerminalSnapshot,
 };
 pub use splits::{EditorGroup, GroupId, MIN_RATIO, SplitAxis, SplitNode, Stretch};
 

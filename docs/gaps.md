@@ -1619,3 +1619,19 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `ssh` or `docker` itself) is outside CodeCraft's tools and governed by that agent's own
     permission prompts and mode; when a call names no target or configuration (`debug_start {file}`), a project with any
     remote configuration asks (pass `target: "local"` to stay local).
+
+67. Terminal sessions (2026-10-17): tabs can be renamed in place (double-click, right-click ›
+    Rename Session…), and a given name wins over program titles. The project's saved session
+    keeps its shell and Claude Code tabs (name, directory, selected tab); on reopen each gets a
+    fresh shell with its **own command history** (zsh via a `ZDOTDIR` wrapper, bash via
+    `--rcfile`, fish via `fish_history`; the user's history loads first, the tab's on top) and
+    its **earlier output** above the new prompt. A `claude` shim first on the tab's `PATH` and
+    CodeCraft's own Claude Code tabs pass `--settings` with a `SessionStart` hook that records
+    the session id; a tab whose Claude Code was running when CodeCraft closed runs
+    `claude --resume <id>` on restore (a fresh session when the transcript is gone). Files live
+    in `<config>/terminals/<project>/`, never in the project. Remaining: verified with a fake
+    `claude` only, never against the real CLI (that `--settings` hooks merge with the user's
+    own and need no review prompt); flags the user started `claude` with (`--model`, permission
+    mode) are not repeated on resume; restored output is plain text (no colours); other shells
+    (nu, xonsh, sh) get no per-tab history; the shell's directory is read every 5 s, so a `cd`
+    just before quitting is caught by the final save only.

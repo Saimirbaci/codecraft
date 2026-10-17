@@ -245,7 +245,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "terminal.openClaude",
             "Open Claude Code in Terminal",
             None,
-            "{cwd?: path} — a terminal tab running `claude` in the project root; it connects to CodeCraft's IDE server",
+            "{cwd?: path, resume?: string} — a terminal tab running `claude` in the project root (resuming session `resume`); it connects to CodeCraft's IDE server, and the tab's session is resumed when the project opens again → {tab, program, ideServer, session}",
             Context::Global,
             always,
             open_claude,
@@ -352,8 +352,7 @@ fn new_tab(s: &mut Session, p: &Value) -> CmdResult {
             args,
             title: opt_str(p, "title").map(str::to_string),
             renamed: true,
-            background: false,
-            env: Vec::new(),
+            ..NewTab::default()
         },
     )?;
     Ok(json!({ "tab": id }))
@@ -433,19 +432,59 @@ fn claude_program(s: &Session) -> Result<PathBuf, CommandError> {
 }
 
 fn open_claude(s: &mut Session, p: &Value) -> CmdResult {
+    let resume = opt_str(p, "resume").map(str::trim).filter(|r| !r.is_empty()).map(str::to_string);
+    if let Some(r) = &resume
+        && !crate::terminal_shell::valid_id(r)
+    {
+        return Err(CommandError::BadParams(format!("`resume` is not a session id: {r}")));
+    }
+    let new = claude_tab(s, resume.as_deref(), NewTab { cwd: opt_path(p, "cwd"), ..NewTab::default() })?;
+    let program = new.command.clone();
+    let session = new.claude.clone();
+    let id = terminal::open(s, new)?;
+    Ok(json!({ "tab": id, "program": program, "ideServer": s.ide.port(), "session": session }))
+}
+
+/// A Claude Code tab: `claude` with CodeCraft's session hook, resuming `resume` or starting a
+/// new session with a known id (so the tab can be restored even before the hook reports).
+pub(crate) fn claude_tab(s: &mut Session, resume: Option<&str>, base: NewTab) -> Result<NewTab, CommandError> {
     let program = claude_program(s)?;
     let path = codecraft_agent::backend::enriched_path().to_string_lossy().into_owned();
-    let id = terminal::open(
-        s,
-        NewTab {
-            cwd: opt_path(p, "cwd"),
-            command: Some(program.display().to_string()),
-            args: Some(Vec::new()),
-            title: Some("Claude Code".into()),
-            renamed: false,
-            background: false,
-            env: vec![("PATH".into(), path)],
+    let mut args = Vec::new();
+    let session = match crate::terminal_shell::install(s) {
+        Some(integration) => {
+            args.push("--settings".to_string());
+            args.push(integration.claude_settings().to_string_lossy().into_owned());
+            match resume {
+                Some(id) => {
+                    args.extend(["--resume".to_string(), id.to_string()]);
+                    id.to_string()
+                }
+                None => {
+                    let id = crate::terminal_shell::new_key();
+                    args.extend(["--session-id".to_string(), id.clone()]);
+                    id
+                }
+            }
+        }
+        // No place to record sessions (tests, the CLI): a plain `claude` (or the one asked for).
+        None => match resume {
+            Some(id) => {
+                args.extend(["--resume".to_string(), id.to_string()]);
+                id.to_string()
+            }
+            None => String::new(),
         },
-    )?;
-    Ok(json!({ "tab": id, "program": program, "ideServer": s.ide.port() }))
+    };
+    let title = base.title.clone().or_else(|| Some("Claude Code".into()));
+    let mut env = base.env.clone();
+    env.push(("PATH".into(), path));
+    Ok(NewTab {
+        command: Some(program.display().to_string()),
+        args: Some(args),
+        title,
+        env,
+        claude: Some(session),
+        ..base
+    })
 }

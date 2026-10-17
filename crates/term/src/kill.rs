@@ -51,6 +51,13 @@ pub(crate) fn descendants(root: i32) -> Vec<(i32, i32)> {
     out
 }
 
+/// Whether `pid` is running and is `root` or one of its descendants (a pid read from a file may
+/// have been reused by an unrelated process).
+pub fn runs_under(root: u32, pid: u32) -> bool {
+    let (Ok(root), Ok(pid)) = (i32::try_from(root), i32::try_from(pid)) else { return false };
+    alive(pid) && descendants(root).iter().any(|(p, _)| *p == pid)
+}
+
 fn alive(pid: i32) -> bool {
     Pid::from_raw(pid).is_some_and(|p| test_kill_process(p).is_ok())
 }

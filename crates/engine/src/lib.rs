@@ -152,6 +152,7 @@ pub mod templates;
 pub mod templates_django;
 pub mod todo;
 pub mod terminal;
+pub mod terminal_shell;
 mod terminal_cmds;
 pub mod testing;
 mod testing_cmds;
@@ -537,6 +538,7 @@ impl Session {
         self.agents.sessions.dir_override = Some(dir.join(agent_sessions::DIR_NAME));
         self.scratch.dir_override = Some(dir.join("scratches"));
         self.hot_exit.fallback_dir = Some(dir.join("unsaved"));
+        self.terminal.data_dir = Some(dir.join("terminals"));
         // Review worktrees too, unless a test chose a directory.
         if self.agents.settings.worktrees_dir.is_none() {
             self.agents.settings.worktrees_dir = Some(dir.join("worktrees"));

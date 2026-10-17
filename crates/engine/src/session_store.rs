@@ -56,14 +56,17 @@ impl SessionStore {
             Some(d) => d.clone(),
             None => config_dir()?.join("workspaces"),
         };
-        let name: String = root
-            .file_name()
-            .map(|n| {
-                n.to_string_lossy().chars().filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_')).take(40).collect()
-            })
-            .unwrap_or_default();
-        Some(dir.join(format!("{name}-{:016x}.json", fnv1a(root.to_string_lossy().as_bytes()))))
+        Some(dir.join(format!("{}.json", project_key(root))))
     }
+}
+
+/// A stable file name for a project path: `<dir name>-<hash of the path>`.
+pub(crate) fn project_key(root: &Path) -> String {
+    let name: String = root
+        .file_name()
+        .map(|n| n.to_string_lossy().chars().filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_')).take(40).collect())
+        .unwrap_or_default();
+    format!("{name}-{:016x}", fnv1a(root.to_string_lossy().as_bytes()))
 }
 
 /// The app's configuration directory: `$CODECRAFT_CONFIG_DIR`, else `~/Library/Application
@@ -149,6 +152,7 @@ fn to_json(snap: &SessionSnapshot) -> Result<String, String> {
 pub fn save_now(s: &mut Session) -> Result<Option<PathBuf>, String> {
     let Some(root) = project_root(s) else { return Ok(None) };
     crate::terminal::refresh_cwds(s);
+    crate::terminal::save_tab_files(s);
     let json = to_json(&snapshot(s))?;
     let path = write_snapshot(&s.session_store, &root, &json)?;
     s.session_store.last_saved = Some((root, json));

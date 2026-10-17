@@ -48,6 +48,14 @@ use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
 pub use cwd::process_cwds;
+#[cfg(unix)]
+pub use kill::runs_under;
+
+/// Whether `pid` runs under `root` (never on platforms without process trees here).
+#[cfg(not(unix))]
+pub fn runs_under(_root: u32, _pid: u32) -> bool {
+    false
+}
 pub use input::{Key, Mods, MouseAction, MouseButton, encode_key, encode_mouse, parse_key};
 pub use links::{Link, LinkTarget, find_links};
 pub use screen::{Cell, CellFlags, Color, CursorShape, Modes, Screen, ScreenCursor, ScreenSelection, xterm_rgb};
@@ -114,6 +122,9 @@ pub struct TermConfig {
     pub rows: u16,
     /// Scrollback lines.
     pub scrollback: usize,
+    /// Text shown before the program's output (a restored tab's earlier output), parsed like
+    /// output.
+    pub preface: Option<String>,
 }
 
 /// How the child process ended.
@@ -386,7 +397,12 @@ impl Terminal {
         };
         let size = GridSize { cols: usize::from(cols), rows: usize::from(rows) };
         let term = Term::new(options, &size, Listener(shared.clone()));
-        let emu = Arc::new(Mutex::new(Emu { term, parser: ansi::Processor::new() }));
+        let mut emu = Emu { term, parser: ansi::Processor::new() };
+        if let Some(text) = cfg.preface.as_deref().filter(|t| !t.is_empty()) {
+            let Emu { term, parser } = &mut emu;
+            parser.advance(term, text.as_bytes());
+        }
+        let emu = Arc::new(Mutex::new(emu));
 
         let mut terminal = Self {
             emu: emu.clone(),
