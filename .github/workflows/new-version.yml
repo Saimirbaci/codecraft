@@ -1,13 +1,11 @@
-# New version: Actions › New version › Run workflow. Bumps the workspace version
-# (`cargo xtask version <bump>`: Cargo.toml and the workspace's Cargo.lock entries), commits
-# "Release vX.Y.Z" on main, tags it, pushes both, then runs the Release workflow for that tag
-# (macOS dmg, Linux .deb and tarball, Windows installer and zip, checksums, GitHub release).
-# See docs/release.md › Versions.
+# New version: Actions › New version › Run workflow. The CI twin of ./release.sh: bumps the
+# workspace version (`cargo xtask version <bump>`: Cargo.toml and the workspace's Cargo.lock
+# entries), commits "Release vX.Y.Z" on main, tags it and pushes both. The release (packages and
+# GitHub release) starts only if "start the release" is ticked; otherwise run Actions › Release
+# for the tag when ready. See docs/release.md › Versions.
 #
-# Pushes made with the workflow's own token don't start other workflows, so the Release workflow
-# is called directly below (the tag push itself doesn't trigger a second run). If main is
-# protected against direct pushes, allow GitHub Actions to bypass the rule or release by
-# pushing a tag by hand (docs/release.md).
+# If main is protected against direct pushes, allow GitHub Actions to bypass the rule, or use
+# ./release.sh locally.
 
 name: New version
 
@@ -19,8 +17,13 @@ on:
         required: true
         default: patch
         type: string
+      start_release:
+        description: "Also start the release (build the packages and create the GitHub release)"
+        required: false
+        type: boolean
+        default: false
       publish:
-        description: "Publish the release right away (off: a draft to review and publish by hand)"
+        description: "With the release: publish it right away (off: a draft to review and publish by hand)"
         required: false
         type: boolean
         default: false
@@ -96,6 +99,7 @@ jobs:
   release:
     name: release
     needs: bump
+    if: inputs.start_release
     permissions:
       contents: write
     uses: ./.github/workflows/release.yml

@@ -2,11 +2,12 @@
 # otherwise), the Linux tarball and .deb, and the Windows installer and zip, then attach them with
 # SHA256SUMS to a GitHub release (a draft unless asked otherwise). See docs/release.md.
 #
-# Started by:
-#   - a pushed `v*` tag (draft release);
-#   - the "New version" workflow (new-version.yml), which bumps the version, tags and calls this;
-#   - Actions › Release › Run workflow: with a tag, release it; without one, only build the
-#     packages (downloadable from the run's Artifacts) for testing.
+# Started by hand only (pushing a tag starts nothing; tags come from ./release.sh or the
+# New version workflow):
+#   - Actions › Release › Run workflow (or `gh workflow run release.yml -f tag=v0.2.0`): with a
+#     tag, build and release it; without one, only build the packages (downloadable from the
+#     run's Artifacts) for testing;
+#   - the New version workflow, when its "start the release" box is ticked.
 #
 # Secrets (all optional; names only, values live in the repository settings):
 #   MACOS_CERTIFICATE_P12        base64 of the Developer ID Application certificate + key (.p12)
@@ -18,8 +19,6 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
@@ -64,13 +63,7 @@ jobs:
         env:
           TAG_INPUT: ${{ inputs.tag }}
         run: |
-          if [ -n "$TAG_INPUT" ]; then
-            tag="$TAG_INPUT"
-          elif [ "$GITHUB_REF_TYPE" = tag ]; then
-            tag="$GITHUB_REF_NAME"
-          else
-            tag=""
-          fi
+          tag="$TAG_INPUT"
           case "$tag" in
             ""|v[0-9]*) ;;
             *) echo "::error::tags look like v1.2.3, got $tag"; exit 1 ;;

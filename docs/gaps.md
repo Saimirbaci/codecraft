@@ -1639,10 +1639,11 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     menu, About, Info.plist, desktop entry, installer); MIT only (`LICENSE`); Help › About shows
     the version, build commit and date, platform, license and links, with Copy Version Info;
     `codecraft --version` / `codecraft-cli --version`. `cargo xtask version` prints or bumps the
-    workspace version (Cargo.toml and the workspace's Cargo.lock entries); Actions › New version
-    bumps, commits, tags and calls the Release workflow, which now also builds a `.deb` (on
-    Ubuntu 22.04) and an Inno Setup installer, writes SHA256SUMS, and can be run by hand to build
-    packages without releasing. Remaining: neither workflow has run on GitHub yet; macOS is Apple
+    workspace version (Cargo.toml and the workspace's Cargo.lock entries); `./release.sh
+    patch|minor|major` (or Actions › New version) bumps, commits, tags and pushes; releases are
+    started by hand (a tag push starts nothing): the Release workflow now also builds a `.deb`
+    (on Ubuntu 22.04) and an Inno Setup installer, writes SHA256SUMS, and without a tag only
+    builds the packages. Remaining: neither workflow has run on GitHub yet; macOS is Apple
     silicon only (no Intel or universal build); Linux and Windows are x64 only; Windows binaries
     aren't Authenticode-signed (SmartScreen warns) and `codecraft.exe` has no embedded icon; no
     AppImage/Flatpak, Homebrew cask or winget manifest; no in-app update check; file names keep

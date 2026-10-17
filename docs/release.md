@@ -165,11 +165,13 @@ Apple rejects. Submissions and logs are also listed by
   Formatting it is a separate, all-at-once change; once it is made, add
   `cargo fmt --all -- --check` as the first step of the `test` job.
 
-### `.github/workflows/release.yml` (tags `v*`, New version, or by hand)
+### `.github/workflows/release.yml` (by hand)
 
-Started by a pushed `v*` tag, by the New version workflow (below), or from Actions › Release ›
-Run workflow (with a tag: release it; without: only build the packages, which the run keeps
-as downloadable Artifacts, for testing a build before releasing it).
+Releases are started by hand only: **pushing a tag starts nothing**. Run it from Actions ›
+Release › Run workflow, or `gh workflow run release.yml -f tag=v0.2.0` (with a tag: build and
+release it; without: only build the packages, which the run keeps as downloadable Artifacts,
+for testing a build before releasing it), or tick "start the release" in the New version
+workflow.
 
 1. **version**: the tag must equal the workspace version (`v0.1.0` ↔ `version = "0.1.0"` in
    `Cargo.toml`). Every build job checks out that tag and compiles in the commit and the date
@@ -216,17 +218,19 @@ the runner's `gh`.
 
 ### `.github/workflows/new-version.yml` (by hand)
 
-Actions › New version › Run workflow, on `main`:
+The CI twin of `./release.sh` (below). Actions › New version › Run workflow, on `main`:
 
 - **bump**: `patch` (0.1.0 → 0.1.1), `minor` (→ 0.2.0), `major` (→ 1.0.0), or an exact version
   (`0.3.0`, `0.3.0-beta.1`; `patch` on a pre-release releases it: 0.3.0-beta.1 → 0.3.0).
-- **publish**: off (default) creates a draft release to check and publish by hand; on publishes
-  it right away.
+- **start the release**: off (default) stops after pushing the tag; on also runs the Release
+  workflow for it.
+- **publish** (with the release): off (default) creates a draft release to check and publish by
+  hand; on publishes it right away.
 
 It runs `cargo xtask version <bump>`, checks that `Cargo.lock` is consistent
 (`cargo metadata --locked`), commits `Release vX.Y.Z` to main as `github-actions[bot]`, tags it,
-pushes both in one atomic push, and calls the Release workflow for the tag. If main is protected
-against direct pushes, add GitHub Actions to the rule's bypass list, or cut releases by hand.
+and pushes both in one atomic push. If main is protected against direct pushes, add GitHub
+Actions to the rule's bypass list, or use `./release.sh`.
 
 ## Versions
 
@@ -242,13 +246,25 @@ cargo xtask version minor           # Cargo.toml + the workspace's entries in Ca
 
 ### Cutting a release
 
-Either run the New version workflow (above), or by hand:
+1. **Tag the version** with `./release.sh` from a clean, up-to-date `main`:
 
-1. `cargo xtask version minor`, run the gates, commit (`Release v0.2.0`).
-2. `git tag v0.2.0 && git push origin main v0.2.0`.
-3. Wait for the Release workflow; open the draft release, check the artifacts (the macOS job log
-   shows `notarization accepted` and `source=Notarized Developer ID` when the secrets are set),
-   edit the notes, publish.
+   ```sh
+   ./release.sh patch            # 0.1.0 → 0.1.1  (minor → 0.2.0, major → 1.0.0)
+   ./release.sh 0.3.0-beta.1     # an exact version
+   ./release.sh minor --dry-run  # show what would happen
+   ./release.sh minor --no-push  # commit and tag locally only
+   ```
+
+   It checks that you are on `main` with a clean tree, not behind `origin/main`, and that the tag
+   is new; shows the plan and asks for confirmation (`--yes` skips it); runs
+   `cargo xtask version <level>` and `cargo metadata --locked --offline` (the bump is undone if
+   that fails); commits `Release vX.Y.Z`; creates the annotated tag; and pushes `main` and the tag
+   in one atomic push. Nothing is built: pushing the tag starts no workflow. (Or use the New
+   version workflow, above.)
+2. **Release it** when ready: Actions › Release › Run workflow with the tag, or
+   `gh workflow run release.yml -f tag=vX.Y.Z` (`-f draft=false` to publish at once).
+3. Open the draft release, check the artifacts (the macOS job log shows `notarization accepted`
+   and `source=Notarized Developer ID` when the secrets are set), edit the notes, publish.
 
 ## Cross-platform checks without the toolchains
 

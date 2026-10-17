@@ -45,6 +45,7 @@ cargo xtask dmg [--release] [--sign <identity>]      # target/bundle/CodeCraft-<
 cargo xtask package-deb [--release]                 # target/package/codecraft_<version>_<arch>.deb (Linux, dpkg-deb)
 cargo xtask package-windows-installer [--release]   # zip + Inno Setup installer (Windows, ISCC)
 cargo xtask version [patch|minor|major|<x.y.z>]     # print or bump the workspace version
+./release.sh patch|minor|major [--dry-run]          # bump, commit, tag, push (no build; see docs/release.md)
 cargo xtask notarize --profile <notarytool profile>  # submit the dmg, wait, staple, spctl
 cargo xtask package-linux [--release]    # target/package/codecraft-<version>-linux-<arch>.tar.gz
 cargo xtask package-windows [--release]  # target/package/codecraft-<version>-windows-<arch>.zip

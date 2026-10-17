@@ -71,7 +71,8 @@ cargo run -p codecraft-ui-egui --example snapshot -- path/to/project out.png vie
 
 Installers for macOS (Apple silicon), Windows and Linux (`.deb` and tarball) are attached to each
 [GitHub release](https://github.com/Saimirbaci/codecraft/releases), with install notes and
-checksums. Maintainers cut a release with Actions › New version (see `docs/release.md`).
+checksums. Maintainers tag a version with `./release.sh patch|minor|major` and then start the
+build by hand with Actions › Release (see `docs/release.md`).
 
 ## Documentation
 
