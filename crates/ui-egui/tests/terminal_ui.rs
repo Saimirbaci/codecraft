@@ -112,3 +112,43 @@ fn typing_in_the_terminal_runs_commands() {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
+
+#[test]
+fn renaming_a_tab_in_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("notes.txt"), "keep me\n").unwrap();
+    let file = root.join("notes.txt");
+    let open = root.clone();
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(move |_| App::ephemeral(Some(open)));
+    h.run_steps(2);
+    h.state_mut().session.execute("file.open", &json!({ "path": file })).unwrap();
+    let tab = h.state_mut().session.execute("terminal.new", &json!({})).unwrap()["tab"].as_u64().unwrap();
+    settle(&mut h, "the shell prompt", |a| {
+        a.session.terminal.active_tab().is_some_and(|t| t.screen.text().contains('$'))
+    });
+
+    // Rename Tab… (no title) opens the name field with the name selected; typing replaces it.
+    h.state_mut().session.execute("terminal.rename", &json!({})).unwrap();
+    h.run_steps(3);
+    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::new("codecraft-terminal-rename"))), "the field has focus");
+    type_text(&mut h, "API server");
+    h.key_press(Key::Enter);
+    h.run_steps(3);
+    let t = h.state().session.terminal.active_tab().unwrap();
+    assert_eq!((t.id, t.title(), t.renamed), (tab, "API server", true));
+    assert_eq!(h.state().session.ws.active().map(|(_, d)| d.doc.text()).unwrap(), "keep me\n");
+    assert!(!t.screen.text().contains("API server"), "the name was not typed into the shell");
+    assert!(h.ctx.memory(|m| m.has_focus(egui::Id::new("codecraft-terminal-grid"))), "back to the shell");
+    snapshot(&mut h, "terminal-renamed");
+
+    // Escape cancels.
+    h.state_mut().session.execute("terminal.rename", &json!({})).unwrap();
+    h.run_steps(3);
+    type_text(&mut h, "never");
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert_eq!(h.state().session.terminal.active_tab().unwrap().title(), "API server");
+    h.state_mut().session.shutdown();
+}

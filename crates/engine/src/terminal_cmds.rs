@@ -52,20 +52,23 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "terminal.rename",
             "Rename Terminal Tab",
             None,
-            "{tab?: int, title: string}",
+            "{tab?: int, title?: string} — the tab keeps this name even when the program sets a title; \
+             a blank `title` restores the automatic name; no `title` edits the name in place (UI)",
             Context::Global,
             has_tab,
             |s, p| {
-                let title = req_str(p, "title")?.trim().chars().take(100).collect::<String>();
-                if title.is_empty() {
-                    return Err(CommandError::BadParams("`title` is empty".into()));
-                }
                 let i = tab_index(s, p)?;
-                if let Some(t) = s.terminal.tabs.get_mut(i) {
-                    t.name = title;
-                    t.osc_title = None;
+                let id = s.terminal.tabs.get(i).map(|t| t.id);
+                match p.get("title") {
+                    None | Some(Value::Null) => {
+                        s.terminal.rename_requested = id;
+                        s.ws.layout.show(codecraft_workspace::ToolWindowId::Terminal);
+                    }
+                    Some(Value::String(title)) => terminal::rename(s, i, title),
+                    Some(_) => return Err(CommandError::BadParams("`title` must be a string".into())),
                 }
-                ok()
+                let active = s.terminal.active;
+                Ok(s.terminal.tabs.get(i).map(|t| t.info(i == active)).unwrap_or(Value::Null))
             },
         ),
         spec(
@@ -348,6 +351,7 @@ fn new_tab(s: &mut Session, p: &Value) -> CmdResult {
             command,
             args,
             title: opt_str(p, "title").map(str::to_string),
+            renamed: true,
             env: Vec::new(),
         },
     )?;
@@ -437,6 +441,7 @@ fn open_claude(s: &mut Session, p: &Value) -> CmdResult {
             command: Some(program.display().to_string()),
             args: Some(Vec::new()),
             title: Some("Claude Code".into()),
+            renamed: false,
             env: vec![("PATH".into(), path)],
         },
     )?;

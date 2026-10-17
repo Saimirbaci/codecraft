@@ -111,7 +111,8 @@ fn xctrace_on_the_rust_test_at_the_caret() {
     let tab = s.profiler.jobs.iter().find(|j| j.id == job).and_then(|j| j.tab).unwrap();
     let cmd = s.ws.run(tab).unwrap().command_line.clone();
     assert!(cmd.contains("tests::hot_test --exact"), "{cmd}");
-    assert!(!cmd.contains("cargo"), "{cmd}");
+    // No `cargo` program in the line (the target dir's path may contain "cargo").
+    assert!(!cmd.split_whitespace().any(|w| w == "cargo" || w.ends_with("/cargo")), "{cmd}");
     let rep = s.execute("profiler.report", &json!({ "snapshot": job, "top": 10 })).unwrap();
     let top = names(&rep["top"]);
     assert!(top.iter().any(|n| n.contains("spin")) && top.iter().any(|n| n.contains("churn")), "{rep}");

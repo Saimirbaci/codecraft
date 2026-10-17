@@ -1,6 +1,6 @@
 //! The Terminal tool window. OWNED BY the terminal track.
 //!
-//! A tab strip (+, ×, Open Claude Code), the grid (per-cell colours and attributes, cursor
+//! A tab strip (+, ×, Open Claude Code; double-click or right-click a tab to rename it), the grid (per-cell colours and attributes, cursor
 //! shapes and blink, mouse selection, wheel scrollback, a scrollbar, Cmd+click links) and the
 //! keyboard routing used while the grid has focus ([`handle_keys`]). Terminal state lives in the
 //! engine (`Session::terminal`); this module paints snapshots and keeps view state only.
@@ -48,6 +48,15 @@ pub struct TerminalUi {
     wheel: f32,
     scrollbar_drag: bool,
     blink_start: Option<Instant>,
+    /// The tab whose name is being edited in place, and the text so far.
+    renaming: Option<(u64, String)>,
+    /// The name field should take keyboard focus (it was just opened).
+    rename_focus: bool,
+}
+
+/// The rename field's widget id.
+fn rename_id() -> Id {
+    Id::new("codecraft-terminal-rename")
 }
 
 /// The grid's widget id (keyboard focus).
@@ -104,7 +113,10 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
 
     let theme = st.theme.clone();
     let mut actions = Vec::new();
-    tab_strip(ui, s, &theme, &mut actions);
+    if let Some(id) = s.terminal.rename_requested.take() {
+        start_rename(s, &mut st.terminal, id);
+    }
+    tab_strip(ui, s, &mut st.terminal, &theme, &mut actions);
     if s.terminal.tabs.is_empty() {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -126,11 +138,62 @@ pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
 
 // ---------------------------------------------------------------- tab strip
 
-fn tab_strip(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>) {
+fn start_rename(s: &Session, view: &mut TerminalUi, id: u64) {
+    if let Some(tab) = s.terminal.tabs.iter().find(|t| t.id == id) {
+        view.renaming = Some((id, tab.title().to_string()));
+        view.rename_focus = true;
+    }
+}
+
+/// The in-place name field: Enter or clicking elsewhere renames, Escape cancels.
+fn rename_field(ui: &mut Ui, view: &mut TerminalUi, actions: &mut Vec<Action>) {
+    let Some((id, text)) = view.renaming.as_mut() else { return };
+    let id = *id;
+    let resp = ui.add(
+        egui::TextEdit::singleline(text)
+            .id(rename_id())
+            .desired_width(140.0)
+            .font(FontId::proportional(12.5))
+            .hint_text("Tab name"),
+    );
+    if view.rename_focus {
+        view.rename_focus = false;
+        resp.request_focus();
+        if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), rename_id()) {
+            let all = egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(text.chars().count()),
+            );
+            state.cursor.set_char_range(Some(all));
+            state.store(ui.ctx(), rename_id());
+        }
+        return;
+    }
+    let cancel = ui.input(|i| i.key_pressed(Key::Escape));
+    if resp.lost_focus() || cancel || !resp.has_focus() {
+        if !cancel {
+            actions.push(Action::Command("terminal.rename", json!({ "tab": id, "title": text.as_str() })));
+        }
+        view.renaming = None;
+        // Back to the shell.
+        actions.push(Action::Command("terminal.activate", json!({ "tab": id })));
+        ui.memory_mut(|m| m.request_focus(grid_id()));
+    }
+}
+
+fn tab_strip(ui: &mut Ui, s: &Session, view: &mut TerminalUi, theme: &Theme, actions: &mut Vec<Action>) {
+    if view.renaming.as_ref().is_some_and(|(id, _)| s.terminal.index_of(*id).is_none()) {
+        view.renaming = None;
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         for (i, tab) in s.terminal.tabs.iter().enumerate() {
             let selected = i == s.terminal.active;
+            if view.renaming.as_ref().is_some_and(|(id, _)| *id == tab.id) {
+                rename_field(ui, view, actions);
+                ui.add_space(4.0);
+                continue;
+            }
             let mut title: String = tab.title().chars().take(32).collect();
             if tab.title().chars().count() > 32 {
                 title.push('…');
@@ -152,9 +215,27 @@ fn tab_strip(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>)
                 Some(c) => format!("{}\n{c}", tab.cwd.display()),
                 None => tab.cwd.display().to_string(),
             };
-            if resp.on_hover_text(tip).clicked() {
+            let resp = resp.on_hover_text(format!("{tip}\nDouble-click to rename"));
+            if resp.double_clicked() {
+                start_rename(s, view, tab.id);
+            } else if resp.clicked() {
                 actions.push(Action::Command("terminal.activate", json!({ "tab": tab.id })));
             }
+            resp.context_menu(|ui| {
+                if ui.button("Rename Session…").clicked() {
+                    start_rename(s, view, tab.id);
+                    ui.close();
+                }
+                if tab.renamed && ui.button("Use Automatic Name").clicked() {
+                    actions.push(Action::Command("terminal.rename", json!({ "tab": tab.id, "title": "" })));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Close Tab").shortcut_text("⌘W")).clicked() {
+                    actions.push(Action::Command("terminal.close", json!({ "tab": tab.id })));
+                    ui.close();
+                }
+            });
             if ui
                 .add(egui::Button::new(RichText::new("×").color(theme.text_muted)).frame(false))
                 .on_hover_text("Close tab (⌘W)")
@@ -174,6 +255,12 @@ fn tab_strip(ui: &mut Ui, s: &Session, theme: &Theme, actions: &mut Vec<Action>)
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.menu_button(RichText::new("…").color(theme.text_muted), |ui| {
                 let has = !s.terminal.tabs.is_empty();
+                if ui.add_enabled(has, egui::Button::new("Rename Tab…")).clicked() {
+                    if let Some(id) = s.terminal.active_tab().map(|t| t.id) {
+                        start_rename(s, view, id);
+                    }
+                    ui.close();
+                }
                 for (label, id, hint) in [
                     ("Copy", "terminal.copy", "⌘C"),
                     ("Paste", "terminal.paste", "⌘V"),

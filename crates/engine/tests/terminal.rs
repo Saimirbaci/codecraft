@@ -204,6 +204,49 @@ fn run_in_terminal_and_commands() {
 }
 
 #[test]
+fn renamed_tabs_keep_their_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut s = session(&root);
+    let a = tab_id(&s.execute("terminal.new", &Value::Null).unwrap());
+    let title = |s: &mut Session| {
+        s.pump();
+        s.execute("terminal.list", &Value::Null).unwrap()[0]["title"].clone()
+    };
+    let set_osc = |s: &mut Session, osc: &str, marker: &str| {
+        let text = format!("printf '\\033]0;{osc}\\007'; echo {marker}-$((1+1))\r");
+        s.execute("terminal.sendText", &json!({ "tab": a, "text": text })).unwrap();
+        wait_text(s, a, &format!("{marker}-2"));
+    };
+
+    // Unnamed: the program's title shows.
+    set_osc(&mut s, "vim notes", "one");
+    assert_eq!(title(&mut s), "vim notes");
+
+    // Renamed: the name sticks when the program sets a title again.
+    let r = s.execute("terminal.rename", &json!({ "tab": a, "title": "  Deploy staging  " })).unwrap();
+    assert_eq!((r["title"].as_str(), r["renamed"].as_bool()), (Some("Deploy staging"), Some(true)));
+    set_osc(&mut s, "zsh: ~/project", "two");
+    assert_eq!(title(&mut s), "Deploy staging");
+
+    // A blank name goes back to the automatic one, and the program's title shows again.
+    let r = s.execute("terminal.rename", &json!({ "tab": a, "title": " " })).unwrap();
+    assert_eq!(r["renamed"], false);
+    assert_eq!(s.terminal.tabs[0].name, "Local");
+    assert_eq!(title(&mut s), "zsh: ~/project");
+
+    // A title given to `terminal.new` is the user's name too.
+    let b = tab_id(&s.execute("terminal.new", &json!({ "title": "Migrations" })).unwrap());
+    assert!(s.terminal.tabs[1].renamed);
+
+    // No `title`: the UI edits the name in place.
+    assert_eq!(s.terminal.rename_requested, None);
+    s.execute("terminal.rename", &json!({ "tab": b })).unwrap();
+    assert_eq!(s.terminal.rename_requested, Some(b));
+    assert!(matches!(s.execute("terminal.rename", &json!({ "title": 3 })), Err(CommandError::BadParams(_))));
+}
+
+#[test]
 fn tab_limit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut s = session(tmp.path());

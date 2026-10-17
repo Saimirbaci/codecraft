@@ -49,7 +49,10 @@ pub struct TerminalTab {
     pub id: u64,
     /// "Local", "Claude Code", the command, or a name given with `terminal.rename`.
     pub name: String,
-    /// The title the program set (OSC 0/2), shown instead of `name` while set.
+    /// The name was given by the user (`terminal.rename`, `terminal.new {title}`): it is shown
+    /// even when the program sets a title, so a renamed tab keeps its name.
+    pub renamed: bool,
+    /// The title the program set (OSC 0/2), shown instead of an automatic `name` while set.
     pub osc_title: Option<String>,
     /// The start directory, updated by OSC 7 reports.
     pub cwd: PathBuf,
@@ -65,6 +68,9 @@ pub struct TerminalTab {
 
 impl TerminalTab {
     pub fn title(&self) -> &str {
+        if self.renamed {
+            return &self.name;
+        }
         self.osc_title.as_deref().map(str::trim).filter(|t| !t.is_empty()).unwrap_or(&self.name)
     }
 
@@ -85,6 +91,7 @@ impl TerminalTab {
         json!({
             "tab": self.id,
             "title": self.title(),
+            "renamed": self.renamed,
             "cwd": self.cwd,
             "command": self.command,
             "alive": self.alive(),
@@ -108,6 +115,8 @@ pub struct TerminalState {
     pub scrollback: usize,
     /// The UI should focus the terminal (a tab was just opened).
     pub focus_requested: bool,
+    /// The UI should start editing this tab's name in place (`terminal.rename` without `title`).
+    pub rename_requested: Option<u64>,
     next_id: u64,
     waker: SharedWaker,
     palette: SharedPalette,
@@ -125,6 +134,7 @@ impl Default for TerminalState {
             claude_program: None,
             scrollback: 10_000,
             focus_requested: false,
+            rename_requested: None,
             next_id: 1,
             waker: SharedWaker::default(),
             palette: SharedPalette::default(),
@@ -201,6 +211,8 @@ pub(crate) struct NewTab {
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     pub title: Option<String>,
+    /// `title` is the user's name for the tab (kept when the program sets a title).
+    pub renamed: bool,
     /// Extra environment (e.g. an enriched `PATH`).
     pub env: Vec<(String, String)>,
 }
@@ -231,6 +243,7 @@ pub fn open_command(
             command: Some(program.to_string()),
             args: Some(args.to_vec()),
             title: Some(title.to_string()),
+            renamed: false,
             env: Vec::new(),
         },
     )
@@ -272,11 +285,14 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         .map_err(|e| CommandError::Failed(e.to_string()))?;
     let id = s.terminal.next_id;
     s.terminal.next_id += 1;
-    let name = unique_name(s, new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()), new.command.as_deref());
+    let title = new.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
+    let renamed = new.renamed && title.is_some();
+    let name = unique_name(s, title, new.command.as_deref());
     let screen = term.screen();
     s.terminal.tabs.push(TerminalTab {
         id,
         name,
+        renamed,
         osc_title: None,
         cwd,
         command: new.command.clone(),
@@ -289,6 +305,24 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
     s.terminal.focus_requested = true;
     s.ws.layout.show(ToolWindowId::Terminal);
     Ok(id)
+}
+
+/// Rename a tab; a blank `title` goes back to the automatic name (and the program's title).
+pub(crate) fn rename(s: &mut Session, index: usize, title: &str) {
+    let title: String = title.trim().chars().take(100).collect();
+    let Some(tab) = s.terminal.tabs.get_mut(index) else { return };
+    if !title.is_empty() {
+        tab.name = title;
+        tab.renamed = true;
+        return;
+    }
+    tab.name.clear();
+    tab.renamed = false;
+    let command = tab.command.clone();
+    let name = unique_name(s, None, command.as_deref());
+    if let Some(tab) = s.terminal.tabs.get_mut(index) {
+        tab.name = name;
+    }
 }
 
 /// RustRover names shell tabs "Local", "Local (2)", …; commands are named after the program.
