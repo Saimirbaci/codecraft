@@ -372,3 +372,85 @@ fn reopen_setting_is_a_documented_bool() {
     let def = codecraft_engine::settings::find("reopen_last_project").unwrap();
     assert_eq!(def.page, codecraft_engine::settings::PAGE_SYSTEM);
 }
+
+#[cfg(unix)]
+fn wait_terminal_text(s: &mut Session, tab: u64, needle: &str) {
+    let start = Instant::now();
+    loop {
+        s.pump();
+        let r = s.execute("terminal.read", &json!({ "tab": tab, "scrollback": true })).unwrap();
+        if r["text"].as_str().unwrap().contains(needle) {
+            return;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "no `{needle}` in:\n{}", r["text"]);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn terminals_come_back_with_their_names_and_directories() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().canonicalize().unwrap();
+    let a = project(&dir, "alpha");
+    let b = project(&dir, "beta");
+    let cfg = dir.join("cfg");
+    let mut s = session(&cfg, true);
+    open(&mut s, &a);
+    let tab = |v: Value| v["tab"].as_u64().unwrap();
+    tab(s.execute("terminal.new", &Value::Null).unwrap());
+    let api = tab(s.execute("terminal.new", &json!({ "title": "API server" })).unwrap());
+    // A program tab is not kept (it would run again).
+    s.execute("terminal.new", &json!({ "command": "/bin/sleep", "args": ["30"] })).unwrap();
+    // /bin/sh reports no directory (OSC 7): the shell process is asked.
+    s.execute("terminal.sendText", &json!({ "tab": api, "text": "cd src && echo moved-$((1+1))\r" })).unwrap();
+    wait_terminal_text(&mut s, api, "moved-2");
+    s.execute("terminal.activate", &json!({ "tab": api })).unwrap();
+    let state = s.execute("session.state", &Value::Null).unwrap();
+    assert_eq!(state["terminals"].as_array().unwrap().len(), 2, "{state}");
+    // Closing the window saves the session, then ends the shells.
+    s.shutdown();
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(a.join(".codecraft/workspace.json")).unwrap()).unwrap();
+    assert_eq!(saved["terminals"], json!([{ "cwd": a }, { "name": "API server", "cwd": a.join("src") }]), "{saved}");
+    assert_eq!(saved["terminal_active"], 1);
+
+    // Restart: the shells start again, named, in their directories, the same tab selected.
+    let mut t = session(&cfg, true);
+    open(&mut t, &a);
+    let tabs = &t.terminal.tabs;
+    assert_eq!(tabs.len(), 2);
+    assert_eq!((tabs[0].title(), tabs[0].renamed), ("Local", false));
+    assert_eq!((tabs[1].title(), tabs[1].renamed), ("API server", true));
+    assert_eq!(t.terminal.active, 1);
+    let api = tabs[1].id;
+    t.execute("terminal.sendText", &json!({ "tab": api, "text": "echo at-$(pwd -P)\r" })).unwrap();
+    wait_terminal_text(&mut t, api, &format!("at-{}", a.join("src").display()));
+
+    // Another project in this window: alpha's terminals close (and are saved); beta has none.
+    open(&mut t, &b);
+    assert!(t.terminal.tabs.is_empty());
+    open(&mut t, &a);
+    assert_eq!(t.terminal.tabs.len(), 2, "back again");
+    t.shutdown();
+
+    // A hostile snapshot: too many tabs, long names, relative or missing directories.
+    let mut u = session(&cfg, false);
+    open(&mut u, &b);
+    let bad = json!({ "snapshot": { "terminals": [{ "cwd": 7 }] } });
+    assert!(matches!(u.execute("session.restore", &bad), Err(CommandError::BadParams(_))));
+    let many: Vec<Value> = (0..40)
+        .map(|i| match i % 3 {
+            0 => json!({ "name": "x".repeat(500), "cwd": "relative/dir" }),
+            1 => json!({ "cwd": "/no/such/dir" }),
+            _ => json!({ "name": "  ", "cwd": b }),
+        })
+        .collect();
+    u.execute("session.restore", &json!({ "snapshot": { "terminals": many, "terminal_active": 99 } })).unwrap();
+    let tabs = &u.terminal.tabs;
+    assert_eq!(tabs.len(), codecraft_engine::terminal::MAX_TABS);
+    assert!(tabs.iter().all(|t| t.name.chars().count() <= 110 && t.cwd.is_dir()));
+    assert!(tabs.iter().any(|t| t.cwd == b) && tabs.iter().filter(|t| t.renamed).count() == 11);
+    assert_eq!(u.terminal.active, 0);
+    u.shutdown();
+}

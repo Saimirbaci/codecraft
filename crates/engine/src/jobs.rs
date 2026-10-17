@@ -80,6 +80,10 @@ impl Session {
     /// Close the project: tabs, runs, language server.
     pub fn close_project(&mut self) {
         crate::session_store::save_on_close(self);
+        // The project's terminals close with it (its saved session brings them back).
+        if self.ws.project.is_some() {
+            crate::terminal::close_all(self);
+        }
         // Hot exit keeps unsaved buffers for the next time instead of saving them.
         crate::hot_exit::quit_save(self);
         crate::runs::stop_all(self);

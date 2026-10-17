@@ -1,5 +1,5 @@
 //! Session restore (M10 track A): each project's editors (split groups, tabs, carets, scroll,
-//! folds, pinned tabs) and tool-window layout are saved as a
+//! folds, pinned tabs), tool-window layout and Terminal shell tabs (names, directories) are saved as a
 //! [`SessionSnapshot`](codecraft_workspace::SessionSnapshot) in `<project>/.codecraft/workspace.json`
 //! (or, when the project directory is not writable, under the config directory keyed by the
 //! project path) and restored when the project opens again, like RustRover's `workspace.xml`.
@@ -89,9 +89,12 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3))
 }
 
-/// The session snapshot, with each tab's column selection mode (kept by the engine).
+/// The session snapshot, with each tab's column selection mode and the terminals (kept by the
+/// engine).
 pub fn snapshot(s: &Session) -> SessionSnapshot {
-    s.ws.session_snapshot_with(|id| s.editing.column_mode.contains(&id))
+    let mut snap = s.ws.session_snapshot_with(|id| s.editing.column_mode.contains(&id));
+    (snap.terminals, snap.terminal_active) = crate::terminal::snapshot(s);
+    snap
 }
 
 fn project_root(s: &Session) -> Option<PathBuf> {
@@ -145,6 +148,7 @@ fn to_json(snap: &SessionSnapshot) -> Result<String, String> {
 /// Save the open project's session now. `Ok(None)` without a project.
 pub fn save_now(s: &mut Session) -> Result<Option<PathBuf>, String> {
     let Some(root) = project_root(s) else { return Ok(None) };
+    crate::terminal::refresh_cwds(s);
     let json = to_json(&snapshot(s))?;
     let path = write_snapshot(&s.session_store, &root, &json)?;
     s.session_store.last_saved = Some((root, json));
@@ -194,6 +198,10 @@ pub fn restore(s: &mut Session, snap: &SessionSnapshot) -> RestoreSummary {
         {
             s.lsp_did_close(path);
         }
+    }
+    let terminals = crate::terminal::restore(s, &snap.terminals, snap.terminal_active);
+    if terminals > 0 {
+        log::info!("restored {terminals} terminal tab(s)");
     }
     if summary.tabs > 0 {
         s.effects.push(Effect::FocusEditor);
@@ -300,7 +308,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "session.state",
             "Session State",
             None,
-            "→ the session snapshot: {version, project, split (tree whose leaves index `groups`), groups: [{tabs: [{path, pinned, selections: [{anchor: {line, column}, head}], primary, scroll_line, scroll_x, folded}], active}], focused, layout}",
+            "→ the session snapshot: {version, project, split (tree whose leaves index `groups`), groups: [{tabs: [{path, pinned, selections: [{anchor: {line, column}, head}], primary, scroll_line, scroll_x, folded}], active}], focused, layout, terminals: [{name?, cwd}], terminal_active?}",
             Context::Global,
             always,
             state,
@@ -318,7 +326,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "session.restore",
             "Restore Session",
             None,
-            "{snapshot?: object, path?: string} — reopen editors from a snapshot (as `session.state` returns), a snapshot file, or the project's saved session; missing files are skipped; tabs open now stay → {file, groups, tabs, skipped}",
+            "{snapshot?: object, path?: string} — reopen editors from a snapshot (as `session.state` returns), a snapshot file, or the project's saved session; missing files are skipped; tabs open now stay; its terminal shells are started when no terminal is open → {file, groups, tabs, skipped}",
             Context::Global,
             always,
             restore_cmd,

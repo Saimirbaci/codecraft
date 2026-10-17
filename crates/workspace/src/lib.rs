@@ -27,15 +27,16 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 pub use document::{
-    DocId, Editor, EditorId, InlayHint, InlayKind, InlayLabelPart, InlayLocation, OpenDocument, SemanticSpan, TextEncoding,
+    DocId, Editor, EditorId, InlayHint, InlayKind, InlayLabelPart, InlayLocation, OpenDocument, SemanticSpan,
+    TextEncoding,
 };
 pub use layout::{Layout, Side, ToolWindowId};
 pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
 pub use run::{ConsoleKind, ConsoleLine, RunStatus, RunTab, RunTabId, TestRecord};
 pub use session_state::{
-    GroupSnapshot, MAX_GROUPS, MAX_TABS, RestoreSummary, SNAPSHOT_VERSION, SelectionSnapshot, SessionSnapshot,
-    TabSnapshot,
+    GroupSnapshot, MAX_GROUPS, MAX_TABS, MAX_TERMINALS, RestoreSummary, SNAPSHOT_VERSION, SelectionSnapshot,
+    SessionSnapshot, TabSnapshot, TerminalSnapshot,
 };
 pub use splits::{EditorGroup, GroupId, MIN_RATIO, SplitAxis, SplitNode, Stretch};
 

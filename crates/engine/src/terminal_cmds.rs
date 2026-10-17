@@ -352,6 +352,7 @@ fn new_tab(s: &mut Session, p: &Value) -> CmdResult {
             args,
             title: opt_str(p, "title").map(str::to_string),
             renamed: true,
+            background: false,
             env: Vec::new(),
         },
     )?;
@@ -442,6 +443,7 @@ fn open_claude(s: &mut Session, p: &Value) -> CmdResult {
             args: Some(Vec::new()),
             title: Some("Claude Code".into()),
             renamed: false,
+            background: false,
             env: vec![("PATH".into(), path)],
         },
     )?;

@@ -1,6 +1,7 @@
 //! Session snapshot: what a project window shows, as serde data (RustRover keeps the same in
 //! `.idea/workspace.xml`): the split tree of editor groups, each group's tabs (file, pinned,
-//! carets, scroll, folds), the focused group and the tool-window layout. The engine persists it
+//! carets, scroll, folds), the focused group, the tool-window layout and the Terminal's shell
+//! tabs (name and directory; the engine starts new shells for them). The engine persists it
 //! per project and opens the files; [`Workspace::restore_session`] rebuilds the editors.
 //!
 //! A snapshot comes from disk, so it is hostile: indices, positions, sizes and the tree shape are
@@ -42,6 +43,26 @@ pub struct SessionSnapshot {
     /// Index in `groups` of the focused group.
     pub focused: usize,
     pub layout: Option<Layout>,
+    /// The Terminal's shell tabs, in order (programs such as `ssh` or `claude` are not kept).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub terminals: Vec<TerminalSnapshot>,
+    /// Index in `terminals` of the selected tab.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_active: Option<usize>,
+}
+
+/// At most this many terminal tabs are restored.
+pub const MAX_TERMINALS: usize = 32;
+
+/// One Terminal shell tab: a new shell is started in `cwd` when the project opens again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TerminalSnapshot {
+    /// The name the user gave the tab (`None`: the automatic "Local", "Local (2)", …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The shell's working directory when the snapshot was taken.
+    pub cwd: PathBuf,
 }
 
 impl Default for SessionSnapshot {
@@ -53,6 +74,8 @@ impl Default for SessionSnapshot {
             groups: Vec::new(),
             focused: 0,
             layout: None,
+            terminals: Vec::new(),
+            terminal_active: None,
         }
     }
 }
@@ -167,6 +190,8 @@ impl Workspace {
             groups: leaves.iter().map(|g| self.group_snapshot(*g, &column_mode)).collect(),
             focused: index.get(&self.focused).copied().unwrap_or(0),
             layout: Some(self.layout.clone()),
+            terminals: Vec::new(),
+            terminal_active: None,
         }
     }
 

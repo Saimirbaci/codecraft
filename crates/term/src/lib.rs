@@ -24,6 +24,7 @@
     clippy::unreachable
 )]
 
+mod cwd;
 pub mod input;
 #[cfg(unix)]
 mod kill;
@@ -46,6 +47,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
+pub use cwd::process_cwds;
 pub use input::{Key, Mods, MouseAction, MouseButton, encode_key, encode_mouse, parse_key};
 pub use links::{Link, LinkTarget, find_links};
 pub use screen::{Cell, CellFlags, Color, CursorShape, Modes, Screen, ScreenCursor, ScreenSelection, xterm_rgb};

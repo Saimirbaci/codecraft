@@ -3,7 +3,12 @@
 //! Each tab is a [`codecraft_term::Terminal`]: a login shell (or a program such as `claude`) on a
 //! PTY, started in the project root with the IDE server's environment, so `claude` run there
 //! connects to CodeCraft. Output is parsed on background threads; [`pump`] takes a fresh
-//! [`Screen`] snapshot for each tab whose output changed. Nothing is persisted across restarts.
+//! [`Screen`] snapshot for each tab whose output changed.
+//!
+//! Shell tabs are part of the project's saved session ([`snapshot`]/[`restore`]): their names and
+//! working directories come back, each with a fresh shell, when the project opens again. The
+//! directory follows `cd` through OSC 7 reports and, for shells that don't send them, a
+//! background look at the shell process every [`CWD_POLL`].
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,12 +18,14 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use codecraft_term::{ExitInfo, Palette, Screen, SharedPalette, SharedWaker, TermConfig, TermEvent, Terminal};
-use codecraft_workspace::ToolWindowId;
+use codecraft_workspace::{MAX_TERMINALS, TerminalSnapshot, ToolWindowId};
 
 use crate::{CommandError, Effect, Session};
 
 /// Open tabs are capped so a runaway script or agent cannot fork shells without bound.
 pub const MAX_TABS: usize = 32;
+/// How often the shells' working directories are read while tabs are open.
+pub const CWD_POLL: Duration = Duration::from_secs(5);
 
 /// Inherited variables a CodeCraft terminal must not pass on: another terminal's or IDE's
 /// identity (CodeCraft sets its own), and Claude Code's nesting marker (a CodeCraft terminal is
@@ -122,6 +129,9 @@ pub struct TerminalState {
     palette: SharedPalette,
     /// Tabs being terminated in the background.
     closing: Vec<Receiver<()>>,
+    /// A working-directory lookup running in the background, and when the last one started.
+    cwd_poll: Option<Receiver<Vec<(u32, PathBuf)>>>,
+    cwd_polled: Option<Instant>,
 }
 
 impl Default for TerminalState {
@@ -139,6 +149,8 @@ impl Default for TerminalState {
             waker: SharedWaker::default(),
             palette: SharedPalette::default(),
             closing: Vec::new(),
+            cwd_poll: None,
+            cwd_polled: None,
         }
     }
 }
@@ -213,6 +225,8 @@ pub(crate) struct NewTab {
     pub title: Option<String>,
     /// `title` is the user's name for the tab (kept when the program sets a title).
     pub renamed: bool,
+    /// Open without selecting the tab, showing the tool window or taking focus (session restore).
+    pub background: bool,
     /// Extra environment (e.g. an enriched `PATH`).
     pub env: Vec<(String, String)>,
 }
@@ -244,6 +258,7 @@ pub fn open_command(
             args: Some(args.to_vec()),
             title: Some(title.to_string()),
             renamed: false,
+            background: false,
             env: Vec::new(),
         },
     )
@@ -301,9 +316,11 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         bell: false,
         term,
     });
-    s.terminal.active = s.terminal.tabs.len() - 1;
-    s.terminal.focus_requested = true;
-    s.ws.layout.show(ToolWindowId::Terminal);
+    if !new.background {
+        s.terminal.active = s.terminal.tabs.len() - 1;
+        s.terminal.focus_requested = true;
+        s.ws.layout.show(ToolWindowId::Terminal);
+    }
     Ok(id)
 }
 
@@ -380,9 +397,115 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         }
     }
     s.effects.extend(effects);
+    poll_cwds(s);
     let before = s.terminal.closing.len();
     s.terminal.closing.retain(|rx| matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     changed | (before != s.terminal.closing.len())
+}
+
+/// Apply a finished working-directory lookup; start the next one every [`CWD_POLL`].
+fn poll_cwds(s: &mut Session) {
+    if let Some(rx) = &s.terminal.cwd_poll {
+        match rx.try_recv() {
+            Ok(found) => {
+                apply_cwds(&mut s.terminal, &found);
+                s.terminal.cwd_poll = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => s.terminal.cwd_poll = None,
+        }
+    }
+    if s.terminal.cwd_polled.is_some_and(|t| t.elapsed() < CWD_POLL) {
+        return;
+    }
+    let pids = shell_pids(&s.terminal);
+    if pids.is_empty() {
+        return;
+    }
+    s.terminal.cwd_polled = Some(Instant::now());
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let spawned = std::thread::Builder::new().name("term-cwd".into()).spawn(move || {
+        let _ = tx.send(codecraft_term::process_cwds(&pids));
+    });
+    match spawned {
+        Ok(_) => s.terminal.cwd_poll = Some(rx),
+        Err(e) => log::debug!("cannot start the terminal cwd lookup: {e}"),
+    }
+}
+
+/// The processes of live shell tabs (the ones a session snapshot keeps).
+fn shell_pids(state: &TerminalState) -> Vec<u32> {
+    state.tabs.iter().filter(|t| t.command.is_none() && t.alive()).filter_map(|t| t.term.pid()).collect()
+}
+
+fn apply_cwds(state: &mut TerminalState, found: &[(u32, PathBuf)]) {
+    for tab in &mut state.tabs {
+        let Some(pid) = tab.term.pid() else { continue };
+        if let Some((_, dir)) = found.iter().find(|(p, _)| *p == pid)
+            && dir.is_dir()
+        {
+            tab.cwd = dir.clone();
+        }
+    }
+}
+
+/// Read the shells' working directories now (blocking briefly; before a final save).
+pub(crate) fn refresh_cwds(s: &mut Session) {
+    let found = codecraft_term::process_cwds(&shell_pids(&s.terminal));
+    apply_cwds(&mut s.terminal, &found);
+}
+
+/// The live shell tabs for the session snapshot, and which of them is selected. Tabs running a
+/// program (`ssh`, `docker exec`, `claude`, a command) are not kept: they would run again.
+pub fn snapshot(s: &Session) -> (Vec<TerminalSnapshot>, Option<usize>) {
+    let mut out = Vec::new();
+    let mut active = None;
+    for (i, tab) in s.terminal.tabs.iter().enumerate() {
+        if tab.command.is_some() || !tab.alive() {
+            continue;
+        }
+        if i == s.terminal.active {
+            active = Some(out.len());
+        }
+        out.push(TerminalSnapshot { name: tab.renamed.then(|| tab.name.clone()), cwd: tab.cwd.clone() });
+    }
+    (out, active)
+}
+
+/// Start a shell for each saved tab, with its name, in its directory (the project root when
+/// the directory is gone). Nothing happens when terminals are already open. Returns how many
+/// tabs were opened.
+pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Option<usize>) -> usize {
+    if !s.terminal.tabs.is_empty() {
+        return 0;
+    }
+    let mut opened = 0;
+    let mut select = None;
+    for (i, tab) in saved.iter().take(MAX_TERMINALS.min(MAX_TABS)).enumerate() {
+        let name = tab.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(100).collect());
+        let renamed = name.is_some();
+        let cwd = Some(tab.cwd.clone()).filter(|d| d.is_absolute() && d.is_dir());
+        let new = NewTab { cwd, title: name, renamed, background: true, ..NewTab::default() };
+        match open(s, new) {
+            Ok(_) => {
+                if active == Some(i) {
+                    select = Some(opened);
+                }
+                opened += 1;
+            }
+            Err(e) => log::warn!("cannot restore a terminal tab: {e}"),
+        }
+    }
+    s.terminal.active = select.unwrap_or(0);
+    opened
+}
+
+/// The project is closing: its terminals go with it (the session saved them first).
+pub(crate) fn close_all(s: &mut Session) {
+    while !s.terminal.tabs.is_empty() {
+        s.terminal.close_index(0);
+    }
+    s.terminal.active = 0;
 }
 
 /// Stop background work (window closing): terminate every tab and wait (bounded) until their
