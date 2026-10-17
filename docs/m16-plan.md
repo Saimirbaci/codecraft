@@ -1,6 +1,6 @@
 # M16: remote targets, live analysis, safer SQL, shippable builds
 
-Status: in progress (2026-10-16). Goal: same as M14/M15 (CodeCraft replaces PyCharm, CLion,
+Status: done (2026-10-16; all four tracks landed; remaining depth is in `docs/gaps.md` items 62–65). Goal: same as M14/M15 (CodeCraft replaces PyCharm, CLion,
 RustRover and DataGrip; debugging, analysis and profiling first-class for people and AI agents),
 now with the four items the user chose: debugging and profiling on SSH and Docker targets,
 analysis while typing in every language, bind parameters and editable console results in the
