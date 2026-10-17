@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements for CodeCraft.app, signed with the hardened runtime by `cargo xtask bundle`.
+  Keep this minimal: every key must be listed with its reason in xtask/src/sign.rs
+  (ENTITLEMENT_KEYS) and docs/release.md; a test checks that they agree.
+
+  com.apple.security.automation.apple-events: programs started from the Terminal tool window and
+  run configurations are attributed to CodeCraft by macOS, so their Apple Events (osascript,
+  scripting another app) need this to reach the consent prompt instead of being denied.
+
+  Deliberately absent: allow-jit, allow-unsigned-executable-memory, allow-dyld-environment-variables,
+  disable-library-validation (CodeCraft is a static Rust binary linking only system frameworks),
+  cs.debugger (lldb-dap and debugserver carry their own entitlements; CodeCraft never attaches to a
+  process itself) and get-task-allow (release builds are not debuggable by other processes).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

@@ -72,8 +72,10 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
    against the connected displays (a window saved on a detached monitor relies on macOS moving
    it back); plain-key and Alt+character shortcuts (Backspace, Tab, Alt+/) are not native key
    equivalents, so the native menu shows no shortcut for them; enabled states refresh every 250 ms
-   instead of when a menu opens; no Developer ID signing or notarization in CI; the Windows zip task
-   is untested on Windows.
+   instead of when a menu opens; ~~no Developer ID signing or notarization in CI~~ (M16 track SN,
+   2026-10-16: `bundle|dmg --sign`, `notarize --profile`, CI and release workflows; item 65); the
+   Windows zip task is untested on Windows (it now runs in the release workflow, which has not
+   run yet).
 8. ~~No split editors, editor tab groups~~ (M4, 2026-10-13: Split Right/Down, Split and Move,
    Unsplit/Unsplit All, Next/Previous Splitter, Change Orientation, Maximize/Normalize, Stretch
    Editor, draggable splitters, a tab bar per group, tabs dragged between groups, several views
@@ -1339,3 +1341,50 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     close buttons, "1 threads", a short program's two-sample memory chart, Cmd+F1 without the
     analyzer's name, `/var` vs `/private/var` in snapshot paths); Docker, remote hosts and GitHub
     only through fakes.
+
+## M16 (2026-10-16)
+
+65. Signed builds and CI (track SN, `docs/release.md`): `cargo xtask bundle --sign <identity>`
+    (default ad hoc `-`, or `CODECRAFT_SIGN_IDENTITY`) signs nested code inside-out (nested
+    bundles and Mach-O files, deepest first; no `--deep` signing), then the app with the hardened
+    runtime (`--options runtime`, also for ad-hoc builds), a secure timestamp for real identities
+    (`--timestamp=none` ad hoc) and a minimal, documented entitlements file
+    (`apps/codecraft/macos/CodeCraft.entitlements`: only `automation.apple-events`, for programs
+    run from the Terminal and run configurations, with `NSAppleEventsUsageDescription` in
+    Info.plist; no JIT, unsigned memory, DYLD, library-validation, `cs.debugger` or
+    `get-task-allow`), verifies with `codesign --verify --deep --strict --verbose=2` and fails
+    unless `codesign --display` shows the runtime flag; `cargo xtask dmg --sign` signs and verifies
+    the image too; `cargo xtask notarize --profile <keychain profile> [--dmg|--app] [--keychain]`
+    runs `notarytool submit --wait --output-format json`, prints `notarytool log` when the
+    verdict is not Accepted, then `stapler staple`/`validate` and `spctl -a -vv -t install` (`-t
+    exec` for an app); credentials only through the user's notarytool keychain profile;
+    `--dry-run` on every packaging task prints the exact commands and runs/writes nothing. Unit
+    tests cover every command line (inside-out order, entitlements only on the app, no secrets in
+    notarytool arguments, JSON verdict parsing, option parsing, dry runs writing nothing), the
+    entitlements file agreeing with the documented list and `plutil -lint`, and a test that ad-hoc
+    signs a tiny bundle with a nested helper and checks verification, the runtime flag on both,
+    the embedded entitlements and that tampering is caught. `.github/workflows/ci.yml` (clippy
+    `-D warnings`, `cargo test --workspace`, `xtask layers`, `xtask parity` + `git diff
+    --exit-code` on macOS and Linux; `cargo check --workspace` on Windows; rustfmt skipped because
+    the tree is not rustfmt-clean, ~1000 diffs) and `.github/workflows/release.yml` (tag `v*` must
+    match the workspace version; macOS dmg Developer ID-signed from a p12 imported into a
+    temporary keychain and notarized with credentials stored in that keychain when the secrets
+    exist, ad hoc otherwise, keychain deleted in an `always()` step; Linux tarball; Windows zip;
+    a draft GitHub release whose notes say whether the dmg is notarized); both pass `actionlint`.
+    Cross-platform: the whole workspace (all targets) type-checks for
+    `aarch64-unknown-linux-musl` with a check-only C compiler stand-in (recipe in
+    `docs/release.md`); the non-Unix branches of 12 crates (text, syntax, fs, cargo, lsp,
+    workspace, vcs, agent, dap, profile, remote, xtask) check cleanly on `wasm32-unknown-unknown`
+    as a stand-in for Windows; `term`'s `signal_name` is now Unix-only (dead code elsewhere).
+    Locally verified: an ad-hoc `cargo xtask dmg` of the real app (hardened runtime flags
+    `adhoc,runtime`, entitlements embedded, the signed binary starts, the dmg's signature and
+    checksum valid). Remaining: nothing has been signed with a Developer ID or notarized (no
+    identity or Apple contact was allowed), so the notarytool/stapler/spctl path and the
+    release workflow's keychain steps have never run; neither workflow has run on GitHub (Linux
+    tests have never run, Windows has never compiled: no Windows target here); actions are pinned
+    to exact tags, not commit SHAs; the macOS dmg is Apple silicon only (no universal binary); no
+    `.deb`; test modules in `engine` (at least `profiler_cmds`, `profiler_agent_cmds`,
+    `docker_cmds`) use `std::os::unix` without a cfg, so `cargo test` would not compile on Windows
+    (left alone: other tracks own those files; CI's Windows job runs `cargo check` only); programs run from
+    CodeCraft can't use the camera or microphone under the hardened runtime (entitlements not
+    requested); the tree still needs a one-time `cargo fmt` before CI can check formatting.
