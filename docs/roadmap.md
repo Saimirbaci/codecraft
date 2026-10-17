@@ -21,6 +21,7 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 | M13 Daily-use depth II | Changelists, shelf, editable merge, GitHub pull requests; DataGrip follow-ups (savepoints, server timeouts, metadata cache, SQL settings); hot exit and restored windows; Code Style, fonts, editable live templates, keymap copies and chords; before-launch tasks and the last six menu items. Plan: `docs/m13-plan.md` | ✅ (2026-10-15) |
 | M14 Debug, analyze, profile for people and agents | MCP control plane over the engine (IDE and headless) with an access policy; debugging depth for Rust, C/C++ and Python verified with real adapters; Inspect Code with scopes, profiles, baselines and SARIF; CPU and memory profiling for native code and Python; a hands-on QA pass. Plan: `docs/m14-plan.md` | ✅ (2026-10-15) |
 | M15 The daily loop, polished | Analysis findings in the editor and on save, managed basedpyright, Python settings; several debug sessions at once; profiling a single test, time ranges, memory over time; MCP tools for every agent CLI, Review jobs in their worktree, cancellation; a second QA pass. Plan: `docs/m15-plan.md` | ✅ (2026-10-15) |
+| M16 Remote targets, live analysis, safer SQL, shippable builds | Run, debug, test and profile on SSH and Docker targets; analysis while typing in every language; bind parameters and editable console results; Developer ID signing, notarization and CI workflows. Plan: `docs/m16-plan.md` | in progress |
 
 ## Current focus
 
