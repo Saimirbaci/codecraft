@@ -1427,7 +1427,24 @@ fn result_view(
             st.db.value_viewer = !st.db.value_viewer;
         }
         let editable = s.db.editable(r.id);
-        if let Some(t) = &r.table {
+        // Table data, or a console query of one table whose keys it shows, can be edited.
+        let target = match (&r.table, &r.query_table) {
+            (Some(t), _) => Some((t.schema.clone(), t.table.clone())),
+            (None, Some(q)) if editable.is_ok() || !r.edits.is_empty() => Some((q.schema.clone(), q.table.clone())),
+            _ => None,
+        };
+        if target.is_none()
+            && r.table.is_none()
+            && r.plan.is_none()
+            && !r.columns.is_empty()
+            && let Err(why) = &editable
+        {
+            ui.separator();
+            let short: String = why.chars().take(70).collect();
+            let text = if short.len() < why.len() { format!("read-only: {short}…") } else { format!("read-only: {short}") };
+            ui.label(RichText::new(text).color(st.theme.text_muted)).on_hover_text(why.as_str());
+        }
+        if let Some((t_schema, t_table)) = &target {
             ui.separator();
             let can = editable.is_ok() && !r.transposed;
             let pending = !r.edits.is_empty() && !r.edits.submitting;
@@ -1461,7 +1478,7 @@ fn result_view(
             {
                 cmd.push((
                     "db.importData",
-                    json!({ "dataSource": r.source, "schema": t.schema, "table": t.table, "path": path }),
+                    json!({ "dataSource": r.source, "schema": t_schema, "table": t_table, "path": path }),
                 ));
             }
             if r.edits.submitting {

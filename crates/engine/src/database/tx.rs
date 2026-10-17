@@ -30,7 +30,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use codecraft_db::savepoint::{SavepointOp, SavepointStack, server_timeout_sql};
-use codecraft_db::tx::{Isolation, TxStatus, Watchdog, execute_timed, option_secs, session_isolation_sql};
+use codecraft_db::tx::{Isolation, TxStatus, Watchdog, execute_timed_bound, option_secs, session_isolation_sql};
 use codecraft_db::{
     Canceller, Connection, DataSourceConfig, DbError, DbKind, ExecSummary, Page, ResultSink, SecretStore,
 };
@@ -347,6 +347,7 @@ impl Link {
     pub(crate) fn execute(
         &mut self,
         sql: &str,
+        params: &[codecraft_db::Cell],
         page_size: usize,
         sink: &mut dyn ResultSink,
         retry_read: bool,
@@ -358,7 +359,7 @@ impl Link {
                 return Err(DbError::Connect("not connected".into()));
             };
             let mut counted = CountingSink { inner: &mut *sink, pages: 0 };
-            let r = execute_timed(conn.as_mut(), watchdog, sql, page_size, &mut counted);
+            let r = execute_timed_bound(conn.as_mut(), watchdog, sql, params, page_size, &mut counted);
             let pages = counted.pages;
             self.last_used = Instant::now();
             let Err(e) = r else { return r };

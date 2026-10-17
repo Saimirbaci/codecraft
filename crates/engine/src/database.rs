@@ -41,8 +41,9 @@ pub mod sql_settings;
 pub mod tx;
 pub mod schema_tools;
 
+pub use codecraft_db::bind::ParamKind;
 pub use codecraft_db::explain::{Plan, PlanNode};
-pub use edit::{CellView, EditPreview, GridEdits, KeyState, RowState};
+pub use edit::{CellView, EditPreview, GridEdits, KeyState, QueryEdit, RowState};
 pub use exec::{ConfirmPrompt, ExecAction, ParamField, ParamPrompt};
 pub use history::{HistoryEntry, HistoryPopup, HistoryStore, SavedQuery};
 pub use import::{ImportDialog, ImportState};
@@ -195,6 +196,12 @@ pub struct ResultSet {
     pub filter: ResultFilter,
     /// Rows shown as columns (record view).
     pub transposed: bool,
+    /// The bind parameters of `sql` (and of the query it re-runs), in placeholder order.
+    pub params: Vec<Cell>,
+    /// A console query of one table: where its edits go once the table's keys are known.
+    pub query_table: Option<QueryEdit>,
+    /// Why a query result is read-only (shown in the grid toolbar).
+    pub read_only_reason: Option<String>,
     /// The query without the ORDER BY added by sorting.
     #[serde(skip)]
     pub(crate) base_sql: String,
@@ -459,6 +466,8 @@ enum Req {
     Exec {
         run: u64,
         statements: Vec<String>,
+        /// Each statement's bind parameters (empty: none).
+        params: Vec<Vec<Cell>>,
         manual: bool,
         /// Run the remaining statements after one fails (script mode "continue").
         keep_going: bool,
@@ -467,6 +476,7 @@ enum Req {
     Explain {
         run: u64,
         sql: String,
+        params: Vec<Cell>,
         analyze: bool,
         manual: bool,
     },
@@ -589,6 +599,8 @@ pub(crate) struct RunSpec {
     pub owner: String,
     pub title: String,
     pub statements: Vec<String>,
+    /// Bind parameters per statement (empty: none; else one list per statement).
+    pub params: Vec<Vec<Cell>>,
     pub table: Option<TableRef>,
     pub sort: Option<SortKey>,
     /// Re-sort this tab in place.
@@ -611,6 +623,7 @@ struct RunInfo {
     owner: String,
     title: String,
     statements: Vec<String>,
+    params: Vec<Vec<Cell>>,
     /// Re-sorting reuses this result tab.
     replace: Option<u64>,
     table: Option<TableRef>,
@@ -638,6 +651,9 @@ pub struct DbState {
     pub bindings: BTreeMap<PathBuf, String>,
     /// Primary keys of tables opened for editing (by [`node_key`]).
     pub table_keys: HashMap<String, KeyState>,
+    /// The metadata behind `table_keys` (columns, unique keys): what console results of one
+    /// table are matched against.
+    pub(crate) key_details: HashMap<String, TableDetails>,
     /// The SQL preview of a result's pending changes (Submit asks to confirm it).
     pub edit_preview: Option<EditPreview>,
     /// Query history and saved queries per data source.
@@ -651,7 +667,7 @@ pub struct DbState {
     /// The Import Data dialog.
     pub import: Option<ImportDialog>,
     /// Parameter values remembered per console (worker key → name → value).
-    pub param_values: HashMap<String, BTreeMap<String, String>>,
+    pub param_values: HashMap<String, codecraft_db::bind::ParamValues>,
     root: Option<PathBuf>,
     loaded: bool,
     secrets: Arc<dyn SecretStore>,
@@ -695,6 +711,7 @@ impl Default for DbState {
             selected: None,
             bindings: BTreeMap::new(),
             table_keys: HashMap::new(),
+            key_details: HashMap::new(),
             edit_preview: None,
             history: HistoryStore::default(),
             history_popup: None,
@@ -1000,6 +1017,7 @@ impl DbState {
             owner,
             title,
             statements,
+            params,
             table,
             sort,
             replace,
@@ -1012,9 +1030,16 @@ impl DbState {
         if statements.is_empty() {
             return Err("nothing to execute".into());
         }
+        if !params.is_empty() && params.len() != statements.len() {
+            return Err(format!("{} parameter lists for {} statements", params.len(), statements.len()));
+        }
         if !self.workers.contains_key(&worker) {
             // A new connection starts in the default schema.
             self.nav.forget_worker(&worker);
+        }
+        let kind = self.source(&source).map(|d| d.config.kind).unwrap_or_default();
+        if statements.iter().any(|st| codecraft_db::query_table::switches_schema(kind, st)) {
+            self.nav.note_manual_schema(&worker);
         }
         self.ensure_worker(&worker, &source)?;
         self.close_cursors(&worker, &source);
@@ -1034,8 +1059,11 @@ impl DbState {
             }
         }
         let run = self.next();
-        for sql in &statements {
-            self.log(OutputLevel::Sql, &source, sql.clone());
+        for (i, sql) in statements.iter().enumerate() {
+            // Bound values are logged after the statement, never inside it.
+            let values = params.get(i).cloned().unwrap_or_default();
+            let line = codecraft_db::bind::Bound { sql: sql.clone(), params: values }.preview(kind);
+            self.log(OutputLevel::Sql, &source, line);
         }
         self.runs.insert(
             run,
@@ -1045,6 +1073,7 @@ impl DbState {
                 owner,
                 title,
                 statements: statements.clone(),
+                params: params.clone(),
                 replace,
                 table,
                 sort,
@@ -1056,10 +1085,14 @@ impl DbState {
             },
         );
         let req = match explain {
-            Some(analyze) => {
-                Req::Explain { run, sql: statements.into_iter().next().unwrap_or_default(), analyze, manual }
-            }
-            None => Req::Exec { run, statements, manual, keep_going },
+            Some(analyze) => Req::Explain {
+                run,
+                sql: statements.into_iter().next().unwrap_or_default(),
+                params: params.into_iter().next().unwrap_or_default(),
+                analyze,
+                manual,
+            },
+            None => Req::Exec { run, statements, params, manual, keep_going },
         };
         if let Err(e) = self.send(&worker, req) {
             self.runs.remove(&run);
@@ -1083,6 +1116,7 @@ impl DbState {
                 owner: format!("schema:{worker}"),
                 title: String::new(),
                 statements: vec![sql.clone()],
+                params: Vec::new(),
                 replace: None,
                 table: None,
                 sort: None,
@@ -1093,7 +1127,7 @@ impl DbState {
                 waiting: false,
             },
         );
-        let req = Req::Exec { run, statements: vec![sql], manual: false, keep_going: false };
+        let req = Req::Exec { run, statements: vec![sql], params: Vec::new(), manual: false, keep_going: false };
         if self.send(worker, req).is_err() {
             self.runs.remove(&run);
             self.nav.forget_worker(worker);
@@ -1196,6 +1230,7 @@ impl DbState {
         }
         let prefix = source.map(|s| node_key(s, Some(""), None));
         self.table_keys.retain(|k, _| prefix.as_ref().is_some_and(|p| !k.starts_with(p.as_str())));
+        self.key_details.retain(|k, _| prefix.as_ref().is_some_and(|p| !k.starts_with(p.as_str())));
         self.nav.forget_source(source);
         for r in self.results.iter_mut().filter(|r| source.is_none_or(|s| r.source == s)) {
             r.edits.submitting = false;
@@ -1557,17 +1592,18 @@ fn worker_main(
                 let _ = events.send(Event::TxDone { worker: key.clone(), commit, result });
                 link.refresh();
             }
-            Req::Explain { run, sql, analyze, manual } => {
+            Req::Explain { run, sql, params, analyze, manual } => {
                 let result = link.ready().and_then(|()| link.begin_if_manual(manual)).and_then(|()| {
                     let conn = link.conn()?;
-                    codecraft_db::explain::explain(conn, &sql, analyze).map_err(|e| e.to_string())
+                    let stmt = codecraft_db::bind::Bound { sql: sql.clone(), params: params.clone() };
+                    codecraft_db::explain::explain_bound(conn, &stmt, analyze).map_err(|e| e.to_string())
                 });
                 link.check_broken();
                 link.refresh();
                 let _ = events.send(Event::Plan { run, result });
                 let _ = events.send(Event::RunDone { run });
             }
-            Req::Exec { run, statements, manual, keep_going } => {
+            Req::Exec { run, statements, params, manual, keep_going } => {
                 if let Err(e) = link.ready().and_then(|()| link.begin_if_manual(manual)) {
                     let _ = events.send(Event::StmtFailed { run, stmt: 0, error: DbError::Query(e) });
                     link.refresh();
@@ -1588,7 +1624,8 @@ fn worker_main(
                     let read = !codecraft_db::is_modifying(sql, dialect)
                         && codecraft_db::transaction_effect(sql, dialect) == codecraft_db::TxEffect::None;
                     let retry = read && !link.in_tx;
-                    let r = link.execute(sql, codecraft_db::PAGE_SIZE, &mut sink, retry);
+                    let values = params.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    let r = link.execute(sql, values, codecraft_db::PAGE_SIZE, &mut sink, retry);
                     link.track(sql, r.is_ok());
                     let stop = r.is_err() && !keep_going;
                     let _ = events.send(match r {
@@ -1707,11 +1744,23 @@ fn handle(s: &mut Session, ev: Event) {
                 info.filter.clone(),
             );
             let base_sql = info.base_sql.clone().unwrap_or_else(|| sql.clone());
+            let params = info.params.get(stmt).cloned().unwrap_or_default();
             let id = match replace.filter(|r| db.result(*r).is_some()) {
                 Some(r) => r,
                 None => db.next(),
             };
             let transposed = db.result(id).is_some_and(|r| r.transposed);
+            // A console query of one table can be edited like Open Table (its keys load now).
+            let (query_table, read_only_reason) = if table.is_some() || worker.starts_with("schema:") {
+                (None, None)
+            } else if part > 0 {
+                (None, Some("only a statement's first result set can be edited".to_string()))
+            } else {
+                match db.query_edit(&source, &worker, &base_sql) {
+                    Ok(q) => (Some(q), None),
+                    Err(why) => (None, Some(why)),
+                }
+            };
             let rs = ResultSet {
                 id,
                 title,
@@ -1731,6 +1780,9 @@ fn handle(s: &mut Session, ev: Event) {
                 plan: None,
                 filter,
                 transposed,
+                params,
+                query_table,
+                read_only_reason,
                 base_sql,
                 run,
                 stmt,
@@ -1895,6 +1947,7 @@ fn on_meta(db: &mut DbState, source: &str, req: MetaReq, result: Result<MetaResu
         if db.table_keys.contains_key(&k) {
             let state = match &result {
                 Ok(MetaResult::Details(d)) => {
+                    db.key_details.insert(k.clone(), d.clone());
                     KeyState::Ready(d.columns.iter().filter(|c| c.primary_key).map(|c| c.name.clone()).collect())
                 }
                 Ok(_) => KeyState::Failed("unexpected reply".into()),
@@ -2040,6 +2093,9 @@ fn on_plan(s: &mut Session, run: u64, result: Result<Plan, String>) {
                 plan: Some(plan),
                 filter: ResultFilter::default(),
                 transposed: false,
+                params: Vec::new(),
+                query_table: None,
+                read_only_reason: Some("a plan has no rows to edit".into()),
                 base_sql: sql,
                 run,
                 stmt: 0,
@@ -2088,6 +2144,7 @@ fn on_applied(
                 owner: r.owner.clone(),
                 title: r.title.clone(),
                 statements: vec![r.sql.clone()],
+                params: if r.params.is_empty() { Vec::new() } else { vec![r.params.clone()] },
                 table: r.table.clone(),
                 sort: r.sort,
                 replace: Some(r.id),
@@ -2190,6 +2247,9 @@ mod tests {
             plan: None,
             filter: ResultFilter::default(),
             transposed: false,
+            params: Vec::new(),
+            query_table: None,
+            read_only_reason: None,
             base_sql: String::new(),
             run: 0,
             stmt: 0,
@@ -2213,6 +2273,7 @@ mod tests {
             owner: "o".into(),
             title: title.into(),
             statements: vec!["exec p".into()],
+            params: Vec::new(),
             replace: None,
             table: None,
             sort: None,

@@ -46,6 +46,24 @@ fn cell(v: ValueRef<'_>) -> Cell {
     }
 }
 
+/// A bind value: SQLite has integers, reals, text and blobs. Booleans are 0/1; unsigned values
+/// above `i64::MAX` bind as their decimal text (an INTEGER column converts what fits).
+fn bind_value(c: &Cell) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    match c {
+        Cell::Null => Value::Null,
+        Cell::Bool(b) => Value::Integer(i64::from(*b)),
+        Cell::Int(i) => Value::Integer(*i),
+        Cell::UInt(u) => match i64::try_from(*u) {
+            Ok(i) => Value::Integer(i),
+            Err(_) => Value::Text(u.to_string()),
+        },
+        Cell::Float(f) => Value::Real(*f),
+        Cell::Text(s) | Cell::Other(s) => Value::Text(s.clone()),
+        Cell::Bytes(b) => Value::Blob(b.clone()),
+    }
+}
+
 impl SqliteConn {
     pub(crate) fn open(cfg: &DataSourceConfig) -> DbResult<Self> {
         let path = cfg.path.as_ref().ok_or_else(|| DbError::Config("no database file".into()))?;
@@ -156,8 +174,28 @@ impl Connection for SqliteConn {
     }
 
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary> {
+        self.execute_bound(sql, &[], page_size, sink)
+    }
+
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
         let started = Instant::now();
         let mut stmt = self.conn.prepare(sql).map_err(err)?;
+        let expected = stmt.parameter_count();
+        if expected != params.len() {
+            return Err(DbError::Query(format!(
+                "the statement has {expected} parameter{} but {} value{} given",
+                if expected == 1 { "" } else { "s" },
+                params.len(),
+                if params.len() == 1 { " was" } else { "s were" }
+            )));
+        }
+        let values: Vec<rusqlite::types::Value> = params.iter().map(bind_value).collect();
         let columns: Vec<Column> = stmt
             .columns()
             .iter()
@@ -167,7 +205,7 @@ impl Connection for SqliteConn {
         let n = columns.len();
         let mut pager = Pager::new(sink, page_size, started);
         {
-            let mut rows = stmt.query([]).map_err(err)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(values.iter())).map_err(err)?;
             while let Some(row) = rows.next().map_err(err)? {
                 let cells = (0..n).map(|i| row.get_ref(i).map(cell).unwrap_or(Cell::Null)).collect();
                 if !pager.push(cells) {

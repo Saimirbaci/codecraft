@@ -1206,6 +1206,7 @@ impl DbState {
         }
         let prefix = node_key(source, Some(""), None);
         self.table_keys.retain(|k, _| !k.starts_with(&prefix));
+        self.key_details.retain(|k, _| !k.starts_with(&prefix));
         for r in reqs {
             let _ = self.meta(source, r);
         }

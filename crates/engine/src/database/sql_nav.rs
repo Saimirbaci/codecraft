@@ -160,6 +160,9 @@ pub struct NavState {
     pub(crate) pending: Option<PendingNav>,
     /// The schema each console connection was switched to.
     worker_schema: HashMap<String, String>,
+    /// Connections whose schema a typed statement may have changed (`USE x`, `SET search_path`):
+    /// unqualified table names in their queries cannot be resolved for editing.
+    manual_schema: BTreeSet<String>,
     /// DDL tabs: file → (data source, schema).
     ddl_files: HashMap<PathBuf, (String, String)>,
     /// A Find Usages search in flight: results and the title.
@@ -223,6 +226,21 @@ impl NavState {
     /// A connection was (re)opened: it starts in the default schema.
     pub(crate) fn forget_worker(&mut self, worker: &str) {
         self.worker_schema.remove(worker);
+        self.manual_schema.remove(worker);
+    }
+
+    /// The schema the IDE switched `worker` to, if it did.
+    pub(crate) fn worker_schema(&self, worker: &str) -> Option<&str> {
+        self.worker_schema.get(worker).map(String::as_str)
+    }
+
+    /// A statement typed on `worker` may have changed its current schema.
+    pub(crate) fn note_manual_schema(&mut self, worker: &str) {
+        self.manual_schema.insert(worker.to_string());
+    }
+
+    pub(crate) fn manual_schema(&self, worker: &str) -> bool {
+        self.manual_schema.contains(worker)
     }
 
     /// Cached metadata of a data source (all with `None`) is stale.
@@ -232,6 +250,7 @@ impl NavState {
         self.info.retain(|(s, _, _), _| keep(s));
         // The source's console connections closed too (others switch again: harmless).
         self.worker_schema.clear();
+        self.manual_schema.clear();
     }
 
     /// The statement switching `worker` (a console or attached file) to its chosen schema,

@@ -68,7 +68,8 @@ fn database_changes_hidden_tabs_processes_and_compare() {
     h.run_steps(3);
     assert!(h.state().session.ws.layout.is_visible(ToolWindowId::DatabaseChanges));
     assert!(h.query_by_label_contains("1 table(s) with pending changes").is_some());
-    assert!(h.query_by_label_contains("SET \"title\" = 'Emma'").is_some());
+    assert!(h.query_by_label_contains("SET \"title\" = ?1").is_some());
+    assert!(h.query_by_label_contains("?1 = 'Emma'").is_some());
     h.get_by_label("Revert").click();
     h.run_steps(3);
     assert!(h.state().session.db.result(rid).is_some_and(|r| r.edits.is_empty()));

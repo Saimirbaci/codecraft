@@ -431,9 +431,11 @@ enum Streamed {
 }
 
 /// Run one statement. Returns the summary, or the error and whether the connection broke.
+#[allow(clippy::too_many_arguments)]
 async fn run(
     client: &mut Tds,
     sql: &str,
+    params: &[&dyn tiberius::ToSql],
     page_size: usize,
     sink: &mut dyn ResultSink,
     flag: &AtomicBool,
@@ -445,7 +447,7 @@ async fn run(
         (err(e), f)
     };
     if !batch_only && plain_dml(sql) {
-        let result = race(client.execute(sql, &[]), flag).await.map(|r| r.map(|r| r.total()));
+        let result = race(client.execute(sql, params), flag).await.map(|r| r.map(|r| r.total()));
         return match result {
             Some(Ok(total)) => {
                 sink.columns(&[]);
@@ -456,7 +458,7 @@ async fn run(
             None => Err(cancelled(client).await),
         };
     }
-    match stream_batch(client, sql, page_size, sink, flag, started).await {
+    match stream_batch(client, sql, params, page_size, sink, flag, started).await {
         Streamed::Done(s) => Ok(s),
         Streamed::Stopped(s) => {
             // Stop the server from producing the rest (the next request would drain it all).
@@ -566,12 +568,19 @@ impl<'a> BatchResults<'a> {
 async fn stream_batch(
     client: &mut Tds,
     sql: &str,
+    params: &[&dyn tiberius::ToSql],
     page_size: usize,
     sink: &mut dyn ResultSink,
     flag: &AtomicBool,
     started: Instant,
 ) -> Streamed {
-    let mut stream = match race(client.simple_query(sql), flag).await {
+    // With parameters the statement runs through sp_executesql (RPC); without, as a batch.
+    let opened = if params.is_empty() {
+        race(client.simple_query(sql), flag).await
+    } else {
+        race(client.query(sql, params), flag).await
+    };
+    let mut stream = match opened {
         Some(Ok(s)) => s,
         Some(Err(e)) => return Streamed::Failed(e),
         None => return Streamed::Cancelled,
@@ -605,6 +614,26 @@ async fn stream_batch(
     if stopped { Streamed::Stopped(summary) } else { Streamed::Done(summary) }
 }
 
+/// A bind value: text as `nvarchar` (the server converts it to the column's type: dates,
+/// decimals, uniqueidentifier…), integers as `bigint`, floats as `float`, booleans as `bit`,
+/// bytes as `varbinary`. Unsigned values above `i64::MAX` go as text (a decimal converts).
+fn bind_value(c: &Cell) -> DbResult<ColumnData<'static>> {
+    use std::borrow::Cow;
+    Ok(match c {
+        Cell::Null => ColumnData::String(None),
+        Cell::Bool(b) => ColumnData::Bit(Some(*b)),
+        Cell::Int(i) => ColumnData::I64(Some(*i)),
+        Cell::UInt(u) => match i64::try_from(*u) {
+            Ok(i) => ColumnData::I64(Some(i)),
+            Err(_) => ColumnData::String(Some(Cow::Owned(u.to_string()))),
+        },
+        Cell::Float(f) if f.is_finite() => ColumnData::F64(Some(*f)),
+        Cell::Float(f) => return Err(DbError::Unsupported(format!("SQL Server cannot store {f}"))),
+        Cell::Text(s) | Cell::Other(s) => ColumnData::String(Some(Cow::Owned(s.clone()))),
+        Cell::Bytes(b) => ColumnData::Binary(Some(Cow::Owned(b.clone()))),
+    })
+}
+
 /// After a cancelled request: send the attention signal and drain the acknowledgement.
 async fn cancelled(client: &mut Tds) -> (DbError, bool) {
     match tokio::time::timeout(Duration::from_secs(30), client.cancel_query()).await {
@@ -636,13 +665,25 @@ impl Connection for MssqlConn {
     }
 
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary> {
+        self.execute_bound(sql, &[], page_size, sink)
+    }
+
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
         let started = Instant::now();
         self.cancel.flag.store(false, Ordering::SeqCst);
         self.client()?;
+        let values = params.iter().map(bind_value).collect::<DbResult<Vec<ColumnData<'static>>>>()?;
+        let refs: Vec<&dyn tiberius::ToSql> = values.iter().map(|v| v as &dyn tiberius::ToSql).collect();
         let flag = self.cancel.clone();
         let rt = &self.rt;
         let Some(client) = self.client.as_mut() else { return Err(DbError::Query("not connected".into())) };
-        let r = rt.block_on(run(client, sql, page_size, sink, &flag.flag, started, self.showplan));
+        let r = rt.block_on(run(client, sql, &refs, page_size, sink, &flag.flag, started, self.showplan));
         self.cancel.flag.store(false, Ordering::SeqCst);
         if r.is_ok() {
             let words = crate::lex::words(sql, crate::Dialect::TSql);
@@ -823,6 +864,20 @@ impl Connection for MssqlConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_values_are_typed() {
+        use std::borrow::Cow;
+        let hostile = "it's ]] \\ \0 🦀 ' OR 1=1 --";
+        assert_eq!(bind_value(&Cell::Text(hostile.into())).unwrap(), ColumnData::String(Some(Cow::Owned(hostile.into()))));
+        assert_eq!(bind_value(&Cell::Bytes(vec![0, 255])).unwrap(), ColumnData::Binary(Some(Cow::Owned(vec![0, 255]))));
+        assert_eq!(bind_value(&Cell::Int(i64::MIN)).unwrap(), ColumnData::I64(Some(i64::MIN)));
+        assert_eq!(bind_value(&Cell::UInt(u64::MAX)).unwrap(), ColumnData::String(Some(Cow::Owned(u64::MAX.to_string()))));
+        assert_eq!(bind_value(&Cell::UInt(7)).unwrap(), ColumnData::I64(Some(7)));
+        assert_eq!(bind_value(&Cell::Bool(false)).unwrap(), ColumnData::Bit(Some(false)));
+        assert_eq!(bind_value(&Cell::Float(0.1)).unwrap(), ColumnData::F64(Some(0.1)));
+        assert!(bind_value(&Cell::Float(f64::INFINITY)).is_err());
+    }
 
     #[test]
     fn dates_and_times_format() {

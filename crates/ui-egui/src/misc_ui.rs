@@ -133,6 +133,11 @@ pub(crate) fn show_database_changes(ui: &mut egui::Ui, s: &mut Session, st: &mut
             for stmt in t.statements.iter().take(50) {
                 let line: String = stmt.lines().next().unwrap_or_default().chars().take(200).collect();
                 ui.label(RichText::new(format!("  {line}")).monospace().small().color(theme.text_muted));
+                // Bound values follow the statement on their own line.
+                if let Some(values) = stmt.lines().find(|l| l.starts_with("-- parameters:")) {
+                    let values: String = values.chars().take(200).collect();
+                    ui.label(RichText::new(format!("    {values}")).monospace().small().color(theme.text_muted));
+                }
             }
             if t.statements.len() > 50 {
                 ui.label(RichText::new(format!("  … {} more", t.statements.len() - 50)).small().color(theme.text_muted));

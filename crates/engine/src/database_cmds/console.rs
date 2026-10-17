@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use codecraft_db::statement_at;
 use codecraft_syntax::Language;
 
-use super::{bad, console_worker, failed, param_values, run_console, save, target_source};
+use super::{bad, console_worker, failed, run_console, save, target_source};
 use crate::commands::{CmdResult, CommandSpec, Context, always, ok, spec};
 use crate::database::exec::{ExecAction, submit};
 use crate::database::{HistoryPopup, sync_project};
@@ -41,7 +41,9 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "db.submitParameters",
             "Run with Parameters",
             None,
-            "{values?: {name: sqlText}} — run what the parameter prompt holds (values default to the prompt's fields)",
+            "{values?: {name: text}, kinds?: {name: value|text|sql}} — run what the parameter prompt holds (values \
+             default to the prompt's fields). Values are bound: `value` reads NULL, integers, true/false and 'quoted' \
+             text, `text` takes the text exactly, `sql` inserts an expression as typed",
             Context::Global,
             always,
             submit_parameters,
@@ -150,15 +152,33 @@ pub(super) fn specs() -> Vec<CommandSpec> {
 // ---------------------------------------------------------------- parameters and guard
 
 fn submit_parameters(s: &mut Session, p: &Value) -> CmdResult {
-    let prompt = s.db.param_prompt.clone().ok_or_else(|| CommandError::Disabled("no parameters to fill".into()))?;
-    let mut values: BTreeMap<String, String> =
-        prompt.params.iter().map(|f| (f.name.clone(), f.value.clone())).collect();
-    if let Some(given) = param_values(&json!({ "params": p.get("values").cloned().unwrap_or(Value::Null) }))? {
-        values.extend(given);
+    let mut prompt = s.db.param_prompt.clone().ok_or_else(|| CommandError::Disabled("no parameters to fill".into()))?;
+    // `values` replace the fields' text (read with each field's kind); `kinds` change kinds.
+    let text_of = |v: &Value| match v {
+        Value::String(t) => Some(t.clone()),
+        Value::Null => Some("NULL".into()),
+        Value::Number(_) | Value::Bool(_) => Some(v.to_string()),
+        _ => None,
+    };
+    for f in &mut prompt.params {
+        if let Some(v) = p.get("values").and_then(|m| m.get(&f.name)) {
+            f.value = text_of(v).ok_or_else(|| bad(format!("the value of {} must be text", f.name)))?;
+        }
+        if let Some(k) = p.get("kinds").and_then(|m| m.get(&f.name)).and_then(Value::as_str) {
+            f.kind = codecraft_db::bind::ParamKind::parse(k)
+                .ok_or_else(|| bad(format!("unknown kind `{k}` (value, text or sql)")))?;
+        }
     }
-    if let Some(missing) = prompt.params.iter().find(|f| values.get(&f.name).is_none_or(|v| v.trim().is_empty())) {
-        return Err(bad(format!("enter a value for {}", missing.name)));
+    // An empty Text value is the empty string; other kinds need something typed.
+    if let Some(missing) = prompt
+        .params
+        .iter()
+        .find(|f| f.kind != codecraft_db::bind::ParamKind::Text && f.value.trim().is_empty())
+    {
+        return Err(bad(format!("enter a value for {} (NULL for no value)", missing.name)));
     }
+    let values: BTreeMap<String, codecraft_db::bind::ParamValue> =
+        prompt.params.iter().map(|f| (f.name.clone(), f.to_value())).collect();
     s.db.param_prompt = None;
     let source = prompt.run.source.clone();
     let out = submit(s, prompt.run, Some(&values), false).map_err(failed)?;

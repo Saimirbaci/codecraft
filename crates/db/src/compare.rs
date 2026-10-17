@@ -471,6 +471,16 @@ pub fn compare(
 /// DELETE the rows only on the right, UPDATE the differing columns. Refuses a truncated result
 /// (some differences were not kept).
 pub fn sync_script(kind: DbKind, schema: &str, table: &str, result: &CompareResult) -> DbResult<Vec<String>> {
+    crate::edit::statements(kind, schema, table, &sync_changes(result)?)
+}
+
+/// [`sync_script`]'s statements with bind parameters: what running the sync executes.
+pub fn sync_bound(kind: DbKind, schema: &str, table: &str, result: &CompareResult) -> DbResult<Vec<crate::bind::Bound>> {
+    crate::edit::bound_statements(kind, schema, table, &sync_changes(result)?)
+}
+
+/// The row changes that make the right table equal to the left (see [`sync_script`]).
+pub fn sync_changes(result: &CompareResult) -> DbResult<Vec<RowChange>> {
     if result.truncated {
         return Err(DbError::Unsupported(
             "too many differences were found to keep them all; narrow the comparison (a WHERE) and compare again"
@@ -494,7 +504,7 @@ pub fn sync_script(kind: DbKind, schema: &str, table: &str, result: &CompareResu
     for row in &result.only_left {
         changes.push(RowChange::Insert { values: named(row, &mut (0..row.len())) });
     }
-    crate::edit::statements(kind, schema, table, &changes)
+    Ok(changes)
 }
 
 #[cfg(test)]

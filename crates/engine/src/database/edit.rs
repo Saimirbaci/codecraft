@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Serialize;
 
 use codecraft_db::edit::RowChange;
+use codecraft_db::query_table::QueryTable;
 use codecraft_db::{Cell, Column, DbKind};
 
 use super::{DbState, OutputLevel, Req, ResultSet, node_key};
@@ -197,10 +198,26 @@ impl GridEdits {
     /// The changes to submit: deletes, then updates, then inserts. `keys` are the primary key
     /// column indices.
     pub fn changes(&self, columns: &[Column], rows: &[Vec<Cell>], keys: &[usize]) -> Result<Vec<RowChange>, String> {
+        let names: Vec<Option<String>> = columns.iter().map(|c| Some(c.name.clone())).collect();
+        self.changes_mapped(&names, rows, keys)
+    }
+
+    /// [`GridEdits::changes`] where result column `i` shows table column `names[i]` (`None`:
+    /// computed by the query, so it cannot change).
+    pub fn changes_mapped(
+        &self,
+        names: &[Option<String>],
+        rows: &[Vec<Cell>],
+        keys: &[usize],
+    ) -> Result<Vec<RowChange>, String> {
         if keys.is_empty() {
             return Err("the table has no primary key".into());
         }
-        let name = |c: usize| columns.get(c).map(|c| c.name.clone()).ok_or_else(|| format!("no column {c}"));
+        let name = |c: usize| match names.get(c) {
+            Some(Some(n)) => Ok(n.clone()),
+            Some(None) => Err(format!("column {} is computed by the query and cannot be changed", c + 1)),
+            None => Err(format!("no column {c}")),
+        };
         let key_of = |row: usize| -> Result<Vec<(String, Cell)>, String> {
             let r = rows.get(row).ok_or_else(|| format!("no row {row}"))?;
             keys.iter().map(|k| Ok((name(*k)?, r.get(*k).cloned().ok_or_else(|| format!("no column {k}"))?))).collect()
@@ -226,11 +243,23 @@ impl GridEdits {
     }
 }
 
-/// The SQL shown before submitting.
+/// The SQL shown before submitting: each statement with its bound values listed after it
+/// (`-- parameters: $1 = …`), or with literals and `note` saying why the driver cannot bind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct EditPreview {
     pub result: u64,
     pub statements: Vec<String>,
+}
+
+/// Where the edits of a console query of one table go (see [`codecraft_db::query_table`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryEdit {
+    /// The schema the table resolved to (the query's own, or the console's current one).
+    pub schema: String,
+    pub table: String,
+    #[serde(skip)]
+    pub(crate) query: QueryTable,
 }
 
 /// Where a result's edits go.
@@ -239,8 +268,10 @@ pub(crate) struct EditTarget {
     pub kind: DbKind,
     pub schema: String,
     pub table: String,
-    /// Primary key column indices in the result.
+    /// Key column indices in the result (the primary key, or for a console query a unique key).
     pub keys: Vec<usize>,
+    /// The table column each result column shows (`None`: computed by the query, read-only).
+    pub columns: Vec<Option<String>>,
 }
 
 impl DbState {
@@ -256,10 +287,79 @@ impl DbState {
         }
     }
 
+    /// Whether a console query's rows are one table's rows, and which table: parsed from the
+    /// query, unqualified names resolved like the console's connection resolves them. Starts
+    /// loading the table's keys. `Err` is the reason the result stays read-only.
+    pub(crate) fn query_edit(&mut self, source: &str, worker: &str, sql: &str) -> Result<QueryEdit, String> {
+        let ds = self.source(source).ok_or_else(|| format!("no data source `{source}`"))?;
+        let kind = ds.config.kind;
+        if !kind.supports_transactions() {
+            return Err(format!("read-only: {}", codecraft_db::tx::no_transactions(kind)));
+        }
+        let query = codecraft_db::query_table::parse(kind, sql)?;
+        let schema = match &query.schema {
+            Some(s) => s.clone(),
+            None => {
+                if self.nav.manual_schema(worker) {
+                    return Err("a statement on this connection changed its schema: qualify the table \
+                                (schema.table) to edit the rows"
+                        .into());
+                }
+                // PostgreSQL and MySQL consoles may run in the schema chosen for them; SQLite
+                // and SQL Server name tables in the default schema.
+                let switched = match kind {
+                    DbKind::Postgres | DbKind::Mysql | DbKind::Mariadb => self.nav.worker_schema(worker),
+                    _ => None,
+                };
+                let default = ds.tree.info.as_ref().and_then(|i| i.default_schema.clone());
+                match (switched, default, kind) {
+                    (Some(s), _, _) => s.to_string(),
+                    (None, Some(d), _) => d,
+                    (None, None, DbKind::Sqlite) => "main".into(),
+                    (None, None, _) => {
+                        return Err("the connection's schema is not known yet: qualify the table (schema.table) \
+                                    or open the data source first"
+                            .into());
+                    }
+                }
+            }
+        };
+        let table = query.table.clone();
+        self.request_keys(source, &schema, &table);
+        Ok(QueryEdit { schema, table, query })
+    }
+
     /// Why a result cannot be edited, or where its edits go.
     pub(crate) fn edit_target(&self, r: &ResultSet) -> Result<EditTarget, String> {
-        let t = r.table.as_ref().ok_or("only table data opened from the Database tool window can be edited")?;
         let ds = self.source(&r.source).ok_or_else(|| format!("no data source `{}`", r.source))?;
+        if r.table.is_none()
+            && let Some(q) = &r.query_table
+        {
+            if ds.config.read_only {
+                return Err("the data source is read-only".into());
+            }
+            let k = node_key(&r.source, Some(&q.schema), Some(&q.table));
+            let details = match self.table_keys.get(&k) {
+                Some(KeyState::Ready(_)) => self.key_details.get(&k).ok_or("the table's keys are not loaded")?,
+                Some(KeyState::Loading) => return Err("loading the table's keys…".into()),
+                Some(KeyState::Failed(e)) => {
+                    return Err(format!("cannot read the keys of {}.{}: {e}", q.schema, q.table));
+                }
+                None => return Err("the table's keys are not loaded".into()),
+            };
+            if details.columns.is_empty() {
+                return Err(format!("no table {}.{} (a view or another schema's table?)", q.schema, q.table));
+            }
+            let names: Vec<String> = r.columns.iter().map(|c| c.name.clone()).collect();
+            let columns = codecraft_db::query_table::map_columns(&q.query, details, &names)?;
+            let keys = codecraft_db::query_table::pick_key(details, &columns)?;
+            return Ok(EditTarget { kind: ds.config.kind, schema: q.schema.clone(), table: q.table.clone(), keys, columns });
+        }
+        let t = r.table.as_ref().ok_or_else(|| {
+            r.read_only_reason.clone().unwrap_or_else(|| {
+                "only table data, or a console query of one table with a primary or unique key, can be edited".into()
+            })
+        })?;
         if ds.config.read_only {
             return Err("the data source is read-only".into());
         }
@@ -279,7 +379,23 @@ impl DbState {
                     .ok_or_else(|| format!("the result does not include the primary key column `{n}`"))
             })
             .collect::<Result<Vec<_>, String>>()?;
-        Ok(EditTarget { kind: ds.config.kind, schema: t.schema.clone(), table: t.table.clone(), keys })
+        let columns = r.columns.iter().map(|c| Some(c.name.clone())).collect();
+        Ok(EditTarget { kind: ds.config.kind, schema: t.schema.clone(), table: t.table.clone(), keys, columns })
+    }
+
+    /// Whether column `col` of an editable result can change (`Err`: computed by the query).
+    pub fn column_editable(&self, result: u64, col: usize) -> Result<(), String> {
+        let r = self.result(result).ok_or_else(|| format!("no result {result}"))?;
+        let t = self.edit_target(r)?;
+        match t.columns.get(col) {
+            Some(Some(_)) => Ok(()),
+            Some(None) => Err(format!(
+                "`{}` is computed by the query: only plain columns of {} can be edited",
+                r.columns.get(col).map(|c| c.name.as_str()).unwrap_or("?"),
+                t.table
+            )),
+            None => Err(format!("no column {col}")),
+        }
     }
 
     /// Whether a result can be edited now (`Err` says why not).
@@ -308,8 +424,8 @@ impl DbState {
     pub(crate) fn edit_statements(&self, result: u64) -> Result<Vec<String>, String> {
         let r = self.result(result).ok_or_else(|| format!("no result {result}"))?;
         let t = self.edit_target(r)?;
-        let changes = r.edits.changes(&r.columns, &r.rows, &t.keys)?;
-        codecraft_db::edit::statements(t.kind, &t.schema, &t.table, &changes).map_err(|e| e.to_string())
+        let changes = r.edits.changes_mapped(&t.columns, &r.rows, &t.keys)?;
+        preview_statements(t.kind, &t.schema, &t.table, &changes)
     }
 
     /// Send a result's pending changes to its worker (one transaction); the outcome arrives as
@@ -318,12 +434,11 @@ impl DbState {
         self.editable(result)?;
         let r = self.result(result).ok_or_else(|| format!("no result {result}"))?;
         let t = self.edit_target(r)?;
-        let changes = r.edits.changes(&r.columns, &r.rows, &t.keys)?;
+        let changes = r.edits.changes_mapped(&t.columns, &r.rows, &t.keys)?;
         if changes.is_empty() {
             return Err("no pending changes".into());
         }
-        let statements =
-            codecraft_db::edit::statements(t.kind, &t.schema, &t.table, &changes).map_err(|e| e.to_string())?;
+        let statements = preview_statements(t.kind, &t.schema, &t.table, &changes)?;
         let (worker, source) = (r.worker.clone(), r.source.clone());
         self.close_cursors(&worker, &source);
         self.ensure_worker(&worker, &source)?;
@@ -341,6 +456,25 @@ impl DbState {
         }
         Ok(statements)
     }
+}
+
+/// The statements a submit runs, as previewed and logged: placeholders with the bound values
+/// listed after each statement; for a driver that cannot bind, literals and a first line saying
+/// so.
+pub(crate) fn preview_statements(
+    kind: DbKind,
+    schema: &str,
+    table: &str,
+    changes: &[RowChange],
+) -> Result<Vec<String>, String> {
+    let bound = codecraft_db::edit::bound_statements(kind, schema, table, changes).map_err(|e| e.to_string())?;
+    let mut out: Vec<String> = bound.iter().map(|b| b.preview(kind)).collect();
+    if !codecraft_db::bind::binds_generated(kind)
+        && let (Some(why), Some(first)) = (codecraft_db::bind::literal_reason(kind), out.first_mut())
+    {
+        *first = format!("-- values are inlined as escaped literals: {why}\n{first}");
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

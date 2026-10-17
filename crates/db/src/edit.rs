@@ -1,13 +1,17 @@
 //! In-grid editing: turning pending row changes into `UPDATE`/`INSERT`/`DELETE` statements and
 //! applying them in one transaction.
 //!
-//! The drivers execute plain SQL text (no bind parameters), so values become literals escaped per
-//! dialect: strings that a dialect would read escapes from (backslashes in MySQL and PostgreSQL,
-//! NUL anywhere) are written in a form that is safe whatever the server's settings, such as
-//! `E'…'` for PostgreSQL or a hex string converted to text for MySQL and SQLite.
+//! Applied changes bind their values ([`bound_statement`], [`crate::bind`]): PostgreSQL, MySQL,
+//! MariaDB, SQLite and SQL Server get placeholders and parameters, never values inside the SQL.
+//! [`statement`] writes the same statement with literals (scripts, the clipboard, drivers that
+//! cannot bind), escaped per dialect: strings that a dialect would read escapes from
+//! (backslashes in MySQL and PostgreSQL, NUL anywhere) are written in a form that is safe
+//! whatever the server's settings, such as `E'…'` for PostgreSQL or a hex string converted to
+//! text for MySQL and SQLite.
 
 use serde::{Deserialize, Serialize};
 
+use crate::bind::{Binder, Bound};
 use crate::sql::{qualified, quote_ident};
 use crate::tx::{self, Discard, TxStatus};
 use crate::{Cell, Connection, DbError, DbKind, DbResult};
@@ -118,7 +122,7 @@ fn text_literal(kind: DbKind, s: &str) -> DbResult<String> {
     })
 }
 
-fn where_clause(kind: DbKind, key: &[(String, Cell)]) -> DbResult<String> {
+fn where_clause(kind: DbKind, key: &[(String, Cell)], b: &mut Binder) -> DbResult<String> {
     if key.is_empty() {
         return Err(DbError::Unsupported("the row has no primary key values".into()));
     }
@@ -127,14 +131,32 @@ fn where_clause(kind: DbKind, key: &[(String, Cell)]) -> DbResult<String> {
         if value.is_null() {
             parts.push(format!("{} IS NULL", quote_ident(kind, col)));
         } else {
-            parts.push(format!("{} = {}", quote_ident(kind, col), literal(kind, value)?));
+            parts.push(format!("{} = {}", quote_ident(kind, col), b.value(value)?));
         }
     }
     Ok(parts.join(" AND "))
 }
 
-/// The statement for one change. `schema` may be empty (unqualified table).
+/// The statement for one change, with literal values. `schema` may be empty (unqualified table).
 pub fn statement(kind: DbKind, schema: &str, table: &str, change: &RowChange) -> DbResult<String> {
+    let mut b = Binder::literals(kind);
+    build(kind, schema, table, change, &mut b)
+}
+
+/// The statement for one change with its values as bind parameters (literals where the driver
+/// cannot bind: [`crate::bind::binds_generated`]).
+pub fn bound_statement(kind: DbKind, schema: &str, table: &str, change: &RowChange) -> DbResult<Bound> {
+    let mut b = Binder::new(kind);
+    let sql = build(kind, schema, table, change, &mut b)?;
+    Ok(b.finish(sql))
+}
+
+/// Every change's bound statement, in order.
+pub fn bound_statements(kind: DbKind, schema: &str, table: &str, changes: &[RowChange]) -> DbResult<Vec<Bound>> {
+    changes.iter().map(|c| bound_statement(kind, schema, table, c)).collect()
+}
+
+fn build(kind: DbKind, schema: &str, table: &str, change: &RowChange, b: &mut Binder) -> DbResult<String> {
     let target = qualified(kind, schema, table);
     match change {
         RowChange::Update { key, set } => {
@@ -143,9 +165,9 @@ pub fn statement(kind: DbKind, schema: &str, table: &str, change: &RowChange) ->
             }
             let mut assignments = Vec::with_capacity(set.len());
             for (col, value) in set {
-                assignments.push(format!("{} = {}", quote_ident(kind, col), literal(kind, value)?));
+                assignments.push(format!("{} = {}", quote_ident(kind, col), b.value(value)?));
             }
-            Ok(format!("UPDATE {target} SET {} WHERE {}", assignments.join(", "), where_clause(kind, key)?))
+            Ok(format!("UPDATE {target} SET {} WHERE {}", assignments.join(", "), where_clause(kind, key, b)?))
         }
         RowChange::Insert { values } => {
             if values.is_empty() {
@@ -157,11 +179,11 @@ pub fn statement(kind: DbKind, schema: &str, table: &str, change: &RowChange) ->
             let cols: Vec<String> = values.iter().map(|(c, _)| quote_ident(kind, c)).collect();
             let mut vals = Vec::with_capacity(values.len());
             for (_, v) in values {
-                vals.push(literal(kind, v)?);
+                vals.push(b.value(v)?);
             }
             Ok(format!("INSERT INTO {target} ({}) VALUES ({})", cols.join(", "), vals.join(", ")))
         }
-        RowChange::Delete { key } => Ok(format!("DELETE FROM {target} WHERE {}", where_clause(kind, key)?)),
+        RowChange::Delete { key } => Ok(format!("DELETE FROM {target} WHERE {}", where_clause(kind, key, b)?)),
     }
 }
 
@@ -260,7 +282,7 @@ pub fn apply_changes(
     };
     let mut sqls = Vec::with_capacity(changes.len());
     for (i, c) in changes.iter().enumerate() {
-        sqls.push(statement(kind, schema, table, c).map_err(|e| fail(Some(i), None, e.to_string(), true))?);
+        sqls.push(bound_statement(kind, schema, table, c).map_err(|e| fail(Some(i), None, e.to_string(), true))?);
     }
     if sqls.is_empty() {
         return Ok(ApplyReport::default());
@@ -289,8 +311,9 @@ pub fn apply_changes(
     }
     let mut total = 0u64;
     let mut failure: Option<(usize, String, String)> = None;
-    for (i, (sql, change)) in sqls.iter().zip(changes).enumerate() {
-        match conn.execute(sql, 1, &mut Discard) {
+    for (i, (bound, change)) in sqls.iter().zip(changes).enumerate() {
+        let sql = bound.preview(kind);
+        match conn.execute_bound(&bound.sql, &bound.params, 1, &mut Discard) {
             Ok(summary) => {
                 let n = summary.rows_affected.unwrap_or(0);
                 total = total.saturating_add(n);
@@ -304,13 +327,13 @@ pub fn apply_changes(
                     } else {
                         format!("{n} rows matched one row's key")
                     };
-                    failure = Some((i, sql.clone(), why));
+                    failure = Some((i, sql, why));
                     break;
                 }
             }
             Err(e) => {
                 let why = lost(conn, &e);
-                failure = Some((i, sql.clone(), why));
+                failure = Some((i, sql, why));
                 break;
             }
         }
@@ -402,6 +425,30 @@ mod tests {
         assert_eq!(statement(DbKind::Mariadb, "", "t", &empty).unwrap(), "INSERT INTO `t` () VALUES ()");
         assert!(statement(DbKind::Sqlite, "", "t", &RowChange::Delete { key: Vec::new() }).is_err());
         assert!(statement(DbKind::Sqlite, "", "t", &RowChange::Update { key: key(1), set: Vec::new() }).is_err());
+    }
+
+    #[test]
+    fn applied_statements_bind_their_values() {
+        let up = RowChange::Update {
+            key: vec![("id".into(), Cell::Int(3)), ("k".into(), Cell::Null)],
+            set: vec![("name".into(), Cell::Text("O'Neil".into())), ("n".into(), Cell::Null)],
+        };
+        let b = bound_statement(DbKind::Postgres, "public", "users", &up).unwrap();
+        assert_eq!(b.sql, "UPDATE \"public\".\"users\" SET \"name\" = $1, \"n\" = NULL WHERE \"id\" = $2 AND \"k\" IS NULL");
+        assert_eq!(b.params, vec![Cell::Text("O'Neil".into()), Cell::Int(3)]);
+        let b = bound_statement(DbKind::Mysql, "db", "users", &up).unwrap();
+        assert_eq!(b.sql, "UPDATE `db`.`users` SET `name` = ?, `n` = NULL WHERE `id` = ? AND `k` IS NULL");
+        let b = bound_statement(DbKind::SqlServer, "dbo", "users", &up).unwrap();
+        assert_eq!(b.sql, "UPDATE [dbo].[users] SET [name] = @P1, [n] = NULL WHERE [id] = @P2 AND [k] IS NULL");
+        let ins = RowChange::Insert { values: vec![("a".into(), Cell::Bytes(vec![0, 1])), ("b".into(), Cell::Int(1))] };
+        let b = bound_statement(DbKind::Sqlite, "", "t", &ins).unwrap();
+        assert_eq!(b.sql, "INSERT INTO \"t\" (\"a\", \"b\") VALUES (?1, ?2)");
+        // Drivers that cannot bind keep escaped literals, and the text form matches.
+        let b = bound_statement(DbKind::DuckDb, "", "t", &ins).unwrap();
+        assert_eq!(b.sql, "INSERT INTO \"t\" (\"a\", \"b\") VALUES (from_hex('0001'), 1)");
+        assert!(b.params.is_empty());
+        let pg = bound_statement(DbKind::Postgres, "public", "users", &up).unwrap();
+        assert_eq!(pg.inline(DbKind::Postgres).unwrap(), statement(DbKind::Postgres, "public", "users", &up).unwrap());
     }
 
     fn sqlite() -> (tempfile::TempDir, Box<dyn Connection>) {

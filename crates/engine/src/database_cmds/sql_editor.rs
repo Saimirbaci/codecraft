@@ -129,9 +129,9 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "db.runFile",
             "Run SQL File",
             None,
-            "{path?, mode?: stop|continue|ask, confirm?: bool, params?: {name: sqlText}, dataSource?} — runs every statement \
+            "{path?, mode?: stop|continue|ask, confirm?: bool, params?: {name: value}, dataSource?} — runs every statement \
              of the file (default: the active one) on its data source: one result tab per query, an execution log \
-             (db.scriptLog). `mode` defaults to the project's script error mode",
+             (db.scriptLog). `params` are bound like db.execute's. `mode` defaults to the project's script error mode",
             Context::Global,
             always,
             run_file,
@@ -685,14 +685,14 @@ fn script_confirm(s: &mut Session, p: &Value) -> CmdResult {
         s.status = "Cancelled".into();
         return ok();
     }
-    // Run from Caret / Run Selection run the same part again (track DX).
+    // The same script (or part: Run from Caret / Run Selection) with the same values runs.
     if let Some((text, first_line, scope, values)) = c.part {
         let start = ScriptStart {
             worker: console_worker(Some(&c.path), 0),
             path: c.path,
             text,
             first_line,
-            scope: Some(scope),
+            scope,
             source: c.source,
             mode: c.mode,
             confirmed: true,

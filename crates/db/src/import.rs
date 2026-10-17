@@ -254,7 +254,8 @@ pub fn auto_mapping(file_columns: &[String], table_columns: &[String]) -> Vec<Op
     (0..table_columns.len()).map(|i| (i < file_columns.len()).then_some(i)).collect()
 }
 
-/// Multi-row INSERT statements for the mapped columns (`mapping[i]` feeds table column `i`).
+/// Multi-row INSERT statements for the mapped columns (`mapping[i]` feeds table column `i`),
+/// with literal values (scripts). [`insert_bound`] is what an import runs.
 pub fn insert_statements(
     kind: DbKind,
     schema: &str,
@@ -295,14 +296,64 @@ impl ResultSink for Discard {
     }
 }
 
+/// Multi-row INSERT statements whose values are bind parameters ([`crate::bind`]; literals
+/// where the driver cannot bind). Batches shrink so a statement stays under the server's
+/// parameter limit ([`crate::bind::max_params`]).
+pub fn insert_bound(
+    kind: DbKind,
+    schema: &str,
+    table: &str,
+    table_columns: &[String],
+    mapping: &[Option<usize>],
+    data: &ImportData,
+    batch: usize,
+) -> DbResult<Vec<crate::bind::Bound>> {
+    let pairs: Vec<(&String, usize)> =
+        table_columns.iter().zip(mapping).filter_map(|(t, m)| m.map(|m| (t, m))).collect();
+    if pairs.is_empty() {
+        return Err(DbError::Config("map at least one file column to a table column".into()));
+    }
+    let target = qualified(kind, schema, table);
+    let cols = pairs.iter().map(|(t, _)| quote_ident(kind, t)).collect::<Vec<_>>().join(", ");
+    let per_statement = if crate::bind::binds_generated(kind) {
+        (crate::bind::max_params(kind) / pairs.len().max(1)).max(1)
+    } else {
+        usize::MAX
+    };
+    let mut out = Vec::new();
+    for chunk in data.rows.chunks(batch.max(1).min(per_statement)) {
+        let mut b = crate::bind::Binder::new(kind);
+        let mut values = Vec::with_capacity(chunk.len());
+        for row in chunk {
+            let mut v = Vec::with_capacity(pairs.len());
+            for (_, src) in &pairs {
+                v.push(b.value(row.get(*src).unwrap_or(&Cell::Null))?);
+            }
+            values.push(format!("({})", v.join(", ")));
+        }
+        out.push(b.finish(format!("INSERT INTO {target} ({cols}) VALUES {}", values.join(", "))));
+    }
+    Ok(out)
+}
+
 /// Run the statements in one transaction; `progress` gets the statements done so far. Any
 /// failure rolls everything back. Returns the rows inserted.
 pub fn run_import(conn: &mut dyn Connection, statements: &[String], progress: &mut dyn FnMut(usize)) -> DbResult<u64> {
+    let bound: Vec<crate::bind::Bound> = statements.iter().map(crate::bind::Bound::plain).collect();
+    run_import_bound(conn, &bound, progress)
+}
+
+/// [`run_import`] for statements with bind parameters ([`insert_bound`]).
+pub fn run_import_bound(
+    conn: &mut dyn Connection,
+    statements: &[crate::bind::Bound],
+    progress: &mut dyn FnMut(usize),
+) -> DbResult<u64> {
     let kind = conn.kind();
     conn.execute(begin_statement(kind), 1, &mut Discard)?;
     let mut total = 0u64;
-    for (i, sql) in statements.iter().enumerate() {
-        match conn.execute(sql, 1, &mut Discard) {
+    for (i, st) in statements.iter().enumerate() {
+        match conn.execute_bound(&st.sql, &st.params, 1, &mut Discard) {
             Ok(s) => total = total.saturating_add(s.rows_affected.unwrap_or(0)),
             Err(e) => {
                 let _ = conn.execute("ROLLBACK", 1, &mut Discard);

@@ -433,7 +433,30 @@ result has more rows than it returns, `hasMore` is true and a `note` says how ma
 { "dataSource": "data/shop.db", "sql": "select count(*) from items" }
 → { "dataSource": "shop-db", "added": { "id": "shop-db", "name": "shop.db", "path": "/work/app/data/shop.db" },
     "note": "the SQLite file is now data source `shop-db` …", "results": [{ "rows": [[3]], … }], … }
+{ "dataSource": "Shop", "sql": "select id from items where name = :name and price < :max", "params": { "name": "O'Brien", "max": 9.5 } }
+{ "dataSource": "Shop", "sql": "update items set note = ? where id = ?", "params": ["it's 50% off \\ today", 7] }
 ```
+**Parameters.** Put values in `params`, never into the SQL text: an object by name (`:name`,
+`${name}`, or the bare name) or an array in order (`?`, `?2`, `$1`). The driver binds them —
+PostgreSQL, MySQL/MariaDB, SQLite, SQL Server and ClickHouse send them next to the statement
+(PostgreSQL parses each by the type it infers for the placeholder: numeric, timestamptz, uuid,
+jsonb…), so quotes, backslashes, NUL, unicode and binary arrive unchanged; the DuckDB CLI and
+Redis cannot bind, so CodeCraft writes escaped literals for them. JSON strings are text exactly
+as given, numbers, booleans and `null` are themselves, `{"hex": "00ff"}` is bytes. `params`
+never change what a statement does: `read`/`db-write` is decided by the SQL text alone, so
+`select … where name = ?` with any value stays a read. SQL expressions as values (`{"sql":
+"now()"}`) are refused for agents. SQL with placeholders and no `params` is an error naming
+the parameters. Through `codecraft_execute db.execute` the same `params` apply (there an
+`{"sql": …}` value is inlined and judged as part of the statement).
+
+**Editing results.** A query of one table (`select … from [schema.]t [where …] [order by …]`,
+no joins, aggregates, DISTINCT, GROUP BY or set operations) whose result includes the table's
+primary key — or a unique key — can be edited like Open Table: `db.editCell`, `db.addRow`,
+`db.deleteRows`, `db.previewChanges`, `db.submitChanges` with the result id (`db.getChanges`
+says `editable`, the `reason` when not, the `target` table and `editableColumns`; computed
+columns such as `upper(name)` are read-only). Inside an open transaction the submit runs under
+a savepoint and waits for Commit, exactly as for table data.
+
 Through `codecraft_execute`, adding or editing a data source (`db.addDataSource`,
 `db.editDataSource`) needs `write`; connecting, refreshing, row counts and the query history are
 reads.

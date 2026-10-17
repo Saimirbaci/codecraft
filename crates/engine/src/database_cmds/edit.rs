@@ -16,7 +16,8 @@ pub(super) fn specs() -> Vec<CommandSpec> {
             "db.editCell",
             "Edit Cell",
             None,
-            "{result?, row, column, value} — value: string/number/bool, null sets NULL; rows after the fetched ones are new rows",
+            "{result?, row, column, value} — value: string/number/bool, null sets NULL; rows after the fetched ones are new rows. \
+             Table data and console queries of one table with a primary or unique key can be edited; a query's computed columns cannot",
             Context::Global,
             always,
             edit_cell,
@@ -118,6 +119,7 @@ fn edit_cell(s: &mut Session, p: &Value) -> CmdResult {
     let id = editable(s, p)?;
     let row = req_usize(p, "row")?;
     let column = req_usize(p, "column")?;
+    s.db.column_editable(id, column).map_err(CommandError::Disabled)?;
     let value = match p.get("value") {
         None => return Err(bad("missing `value` (null sets NULL)")),
         Some(Value::Array(_) | Value::Object(_)) => return Err(bad("`value` must be a string, number, bool or null")),
@@ -178,10 +180,19 @@ fn get_changes(s: &mut Session, p: &Value) -> CmdResult {
     let editable = s.db.editable(id);
     let statements = s.db.edit_statements(id).unwrap_or_default();
     let r = s.db.result(id).ok_or_else(|| bad(format!("no result {id}")))?;
+    // Which columns can change (a console query's computed columns cannot), and where to.
+    let columns: Vec<bool> = (0..r.columns.len()).map(|c| s.db.column_editable(id, c).is_ok()).collect();
+    let target = r
+        .table
+        .as_ref()
+        .map(|t| json!({ "schema": t.schema, "table": t.table }))
+        .or_else(|| r.query_table.as_ref().map(|q| json!({ "schema": q.schema, "table": q.table, "fromQuery": true })));
     Ok(json!({
         "result": id,
         "editable": editable.is_ok(),
         "reason": editable.err(),
+        "target": target,
+        "editableColumns": columns,
         "pendingRows": r.edits.pending_rows(),
         "edits": r.edits,
         "statements": statements,

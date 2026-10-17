@@ -19,7 +19,7 @@ use codecraft_db::compare::{self, CompareResult, RowStream};
 use codecraft_db::dump::{self, DumpOptions, ExportSink, StreamWriter};
 use codecraft_db::export::{ExportFormat, InsertTarget};
 use codecraft_db::sql::{qualified, quote_ident};
-use codecraft_db::tx::{Watchdog, execute_timed};
+use codecraft_db::tx::Watchdog;
 use codecraft_db::{Cell, CollectSink, Column, Connection, DataSourceConfig, DbKind, SecretStore, TableKind};
 use codecraft_workspace::NotificationLevel;
 
@@ -662,10 +662,18 @@ impl DbState {
                     Err(e) => hit.error = Some(e.to_string()),
                 }
                 if hit.error.is_none() && !hit.searched.is_empty() {
-                    match search_sql(kind, &schema, table, &hit.searched, &text, case_sensitive, limit + 1) {
-                        Ok(sql) => {
+                    match search_bound(kind, &schema, table, &hit.searched, &text, case_sensitive, limit + 1) {
+                        Ok(st) => {
                             let mut sink = CollectSink::default();
-                            match execute_timed(conn.as_mut(), &watchdog, &sql, limit + 1, &mut sink) {
+                            let r = codecraft_db::tx::execute_timed_bound(
+                                conn.as_mut(),
+                                &watchdog,
+                                &st.sql,
+                                &st.params,
+                                limit + 1,
+                                &mut sink,
+                            );
+                            match r {
                                 Ok(_) => {
                                     hit.truncated = sink.rows.len() > limit;
                                     sink.rows.truncate(limit);
@@ -715,18 +723,52 @@ pub fn search_sql(
     case_sensitive: bool,
     limit: usize,
 ) -> Result<String, String> {
+    let mut b = codecraft_db::bind::Binder::literals(kind);
+    search_build(kind, schema, table, columns, text, case_sensitive, limit, &mut b)
+}
+
+/// [`search_sql`] with the searched text as a bind parameter (what the search runs).
+pub fn search_bound(
+    kind: DbKind,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    text: &str,
+    case_sensitive: bool,
+    limit: usize,
+) -> Result<codecraft_db::bind::Bound, String> {
+    let mut b = codecraft_db::bind::Binder::new(kind);
+    let sql = search_build(kind, schema, table, columns, text, case_sensitive, limit, &mut b)?;
+    Ok(b.finish(sql))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_build(
+    kind: DbKind,
+    schema: &str,
+    table: &str,
+    columns: &[String],
+    text: &str,
+    case_sensitive: bool,
+    limit: usize,
+    b: &mut codecraft_db::bind::Binder,
+) -> Result<String, String> {
     if columns.is_empty() {
         return Err("no text columns".into());
     }
     let escaped: String =
         text.chars().flat_map(|c| if matches!(c, '!' | '%' | '_') { vec!['!', c] } else { vec![c] }).collect();
-    let pattern = codecraft_db::edit::literal(kind, &Cell::Text(format!("%{escaped}%"))).map_err(|e| e.to_string())?;
-    let plain = codecraft_db::edit::literal(kind, &Cell::Text(text.to_string())).map_err(|e| e.to_string())?;
+    let pattern_cell = Cell::Text(format!("%{escaped}%"));
+    let plain_cell = Cell::Text(text.to_string());
+    // SQLite's case-sensitive search and ClickHouse use the plain text, the others a LIKE pattern.
+    let plain_search = matches!((kind, case_sensitive), (DbKind::Sqlite, true) | (DbKind::ClickHouse, _));
     let conds: Vec<String> = columns
         .iter()
-        .map(|c| {
+        .map(|c| -> Result<String, String> {
             let col = quote_ident(kind, c);
-            match (kind, case_sensitive) {
+            let v = b.value(if plain_search { &plain_cell } else { &pattern_cell }).map_err(|e| e.to_string())?;
+            let (pattern, plain) = (&v, &v);
+            Ok(match (kind, case_sensitive) {
                 (DbKind::Postgres, false) => format!("CAST({col} AS text) ILIKE {pattern} ESCAPE '!'"),
                 (DbKind::Postgres, true) => format!("CAST({col} AS text) LIKE {pattern} ESCAPE '!'"),
                 (DbKind::Mysql | DbKind::Mariadb, false) => format!("{col} LIKE {pattern} ESCAPE '!'"),
@@ -744,9 +786,9 @@ pub fn search_sql(
                 (DbKind::ClickHouse, false) => format!("positionCaseInsensitiveUTF8(toString({col}), {plain}) > 0"),
                 (DbKind::ClickHouse, true) => format!("position(toString({col}), {plain}) > 0"),
                 (DbKind::Redis, _) => String::new(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     if kind == DbKind::Redis {
         return Err("Redis has no tables to search; use the key browser".into());
     }

@@ -65,7 +65,11 @@ fn err(e: postgres::Error) -> DbError {
         }
         return DbError::Query(msg);
     }
-    DbError::Query(e.to_string())
+    // "error serializing parameter 1" says which; its source says why.
+    match e.source() {
+        Some(src) if !e.to_string().contains(&src.to_string()) => DbError::Query(format!("{e}: {src}")),
+        _ => DbError::Query(e.to_string()),
+    }
 }
 
 impl PgConn {
@@ -199,8 +203,28 @@ impl Connection for PgConn {
     }
 
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary> {
+        self.execute_bound(sql, &[], page_size, sink)
+    }
+
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
         let started = Instant::now();
         let stmt = self.client.prepare(sql).map_err(err)?;
+        let expected = stmt.params().len();
+        if expected != params.len() {
+            return Err(DbError::Query(format!(
+                "the statement has {expected} parameter{} but {} value{} given",
+                if expected == 1 { "" } else { "s" },
+                params.len(),
+                if params.len() == 1 { " was" } else { "s were" }
+            )));
+        }
+        let values: Vec<PgParam<'_>> = params.iter().map(PgParam).collect();
         let columns: Vec<Column> = stmt
             .columns()
             .iter()
@@ -213,7 +237,10 @@ impl Connection for PgConn {
         let mut abandoned = false;
         let token = self.client.cancel_token();
         {
-            let mut it = self.client.query_raw(&stmt, std::iter::empty::<&(dyn ToSql + Sync)>()).map_err(err)?;
+            let mut it = self
+                .client
+                .query_raw(&stmt, values.iter().map(|v| v as &(dyn ToSql + Sync)))
+                .map_err(err)?;
             while let Some(row) = it.next().map_err(err)? {
                 let cells = (0..n)
                     .map(|i| {
@@ -393,6 +420,75 @@ impl Connection for PgConn {
         let rows = self.rows(&count_rows(DbKind::Postgres, schema, table), &[])?;
         let n = rows.first().and_then(|r| r.try_get::<_, i64>(0).ok()).unwrap_or(0);
         Ok(u64::try_from(n).unwrap_or(0))
+    }
+}
+
+// ---------------------------------------------------------------- bind parameters
+
+/// A bind value. Values go in the text format, so the server parses them with the input
+/// function of the type it inferred for the placeholder (int4, numeric, timestamptz, uuid,
+/// jsonb, enums, arrays…) exactly as it would parse a literal; `bytea` goes in binary. NULL is
+/// never bound (the statements write the keyword) but encodes as NULL all the same.
+#[derive(Debug)]
+struct PgParam<'a>(&'a Cell);
+
+impl ToSql for PgParam<'_> {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> Result<postgres::types::IsNull, Box<dyn StdError + Sync + Send>> {
+        use postgres::types::IsNull;
+        let text = match self.0 {
+            Cell::Null => return Ok(IsNull::Yes),
+            Cell::Bytes(b) if *ty == Type::BYTEA => {
+                out.extend_from_slice(b);
+                return Ok(IsNull::No);
+            }
+            Cell::Bytes(b) => match std::str::from_utf8(b) {
+                Ok(s) => s.to_string(),
+                Err(_) => {
+                    let mut s = String::from("\\x");
+                    for byte in b.iter() {
+                        s.push_str(&format!("{byte:02x}"));
+                    }
+                    s
+                }
+            },
+            Cell::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+            Cell::Int(i) => i.to_string(),
+            Cell::UInt(u) => u.to_string(),
+            Cell::Float(f) if f.is_nan() => "NaN".into(),
+            Cell::Float(f) if f.is_infinite() => if *f > 0.0 { "Infinity" } else { "-Infinity" }.into(),
+            Cell::Float(f) => f.to_string(),
+            Cell::Text(s) | Cell::Other(s) => {
+                if s.contains('\0') {
+                    return Err("PostgreSQL text cannot contain NUL characters".into());
+                }
+                s.clone()
+            }
+        };
+        out.extend_from_slice(text.as_bytes());
+        Ok(IsNull::No)
+    }
+
+    fn accepts(_: &Type) -> bool {
+        true
+    }
+
+    fn to_sql_checked(
+        &self,
+        ty: &Type,
+        out: &mut postgres::types::private::BytesMut,
+    ) -> Result<postgres::types::IsNull, Box<dyn StdError + Sync + Send>> {
+        self.to_sql(ty, out)
+    }
+
+    fn encode_format(&self, ty: &Type) -> postgres::types::Format {
+        match self.0 {
+            Cell::Bytes(_) if *ty == Type::BYTEA => postgres::types::Format::Binary,
+            _ => postgres::types::Format::Text,
+        }
     }
 }
 

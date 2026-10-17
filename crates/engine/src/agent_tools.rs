@@ -718,6 +718,31 @@ fn agent_reads_only(sql: &str, dialect: codecraft_db::Dialect) -> bool {
     plain_read && !words.iter().any(|w| SIDE_EFFECT_FUNCTIONS.contains(&w.as_str()))
 }
 
+/// `sql` with the `{"sql": …}` expressions of `params` inlined (bound values stay
+/// placeholders): what decides whether the call writes.
+fn expand_sql_params(s: &Session, source: &str, sql: &str, params: Option<&Value>) -> String {
+    let Some(Value::Object(m)) = params else { return sql.to_string() };
+    let mut values = codecraft_db::bind::ParamValues::new();
+    for (k, v) in m {
+        if let Some(e) = v.get("sql").and_then(Value::as_str) {
+            values.insert(k.clone(), codecraft_db::bind::ParamValue::Sql(e.to_string()));
+        }
+    }
+    if values.is_empty() {
+        return sql.to_string();
+    }
+    let dialect = s.db.source(source).map(|d| d.config.kind.dialect()).unwrap_or(codecraft_db::Dialect::Postgres);
+    // Every expression is judged, wherever it lands (a statement after the expansion too).
+    let mut out = codecraft_db::bind::expand_sql_values(sql, dialect, &values);
+    for v in values.values() {
+        if let codecraft_db::bind::ParamValue::Sql(e) = v {
+            out.push_str(";\nSELECT ");
+            out.push_str(e);
+        }
+    }
+    out
+}
+
 /// The capability one call needs (some depend on the arguments).
 fn required_capability(s: &Session, name: &str, args: &Value) -> Result<Capability, String> {
     Ok(match name {
@@ -737,7 +762,10 @@ fn required_capability(s: &Session, name: &str, args: &Value) -> Result<Capabili
                         .and_then(Value::as_str)
                         .and_then(|d| find_source(s, d))
                         .unwrap_or_default();
-                    if sql_writes(s, &source, sql) { Capability::DbWrite } else { Capability::Read }
+                    // Bound values never change the statement; SQL expressions passed as
+                    // `{"sql": …}` values are part of it, so they are judged with it.
+                    let sql = expand_sql_params(s, &source, sql, params.get("params"));
+                    if sql_writes(s, &source, &sql) { Capability::DbWrite } else { Capability::Read }
                 }
                 _ => cap,
             }
@@ -2201,15 +2229,30 @@ fn db_query(s: &mut Session, args: &Value) -> Step {
         },
     };
     let limit = usize_arg(args, "limit", 200, 5000);
+    // `params` are bound: they travel next to the SQL and never change what it does, so they
+    // may only be values (an `{"sql": …}` expression would be SQL the policy did not judge).
+    let params = args.get("params").cloned().unwrap_or(Value::Null);
+    if let Err(e) = agent_params_ok(&params) {
+        return done_err(e);
+    }
     let before: Vec<u64> = s.db.results.iter().map(|r| r.id).collect();
     let output_before = s.db.output.len();
-    let v = match s.execute("db.execute", &json!({ "dataSource": source, "sql": sql })) {
+    let mut exec = json!({ "dataSource": source, "sql": sql });
+    if !params.is_null()
+        && let Some(o) = exec.as_object_mut()
+    {
+        o.insert("params".into(), params);
+    }
+    let v = match s.execute("db.execute", &exec) {
         Ok(v) => v,
         Err(e) => return cmd_err(e),
     };
     if v.get("prompt").and_then(Value::as_bool) == Some(true) {
         s.db.param_prompt = None;
-        return done_err("the SQL has parameters (?, $1, :name); put the values into the statement");
+        let names = v.get("parameters").cloned().unwrap_or(Value::Null);
+        return done_err(format!(
+            "the SQL has parameters {names}: pass their values in `params` (an object by name, or an array in order)"
+        ));
     }
     if v.get("confirm").and_then(Value::as_bool) == Some(true) && !s.agent_access.is_interactive() {
         s.db.confirm = None;
@@ -2222,6 +2265,20 @@ fn db_query(s: &mut Session, args: &Value) -> Step {
         return done_err("nothing to execute");
     }
     Step::Wait(Wait::Db { source, before, output_before, limit, added }, timeout_arg(args, 60_000))
+}
+
+/// Agents' `params` are values only: no `{"sql": …}` expressions.
+fn agent_params_ok(params: &Value) -> Result<(), String> {
+    let items: Vec<&Value> = match params {
+        Value::Null => return Ok(()),
+        Value::Object(m) => m.values().collect(),
+        Value::Array(a) => a.iter().collect(),
+        _ => return Err("`params` must be an object {name: value} or an array of values".into()),
+    };
+    for v in items {
+        codecraft_db::bind::param_from_json(v, false)?;
+    }
+    Ok(())
 }
 
 fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usize, limit: usize, added: Option<Value>) -> Step {

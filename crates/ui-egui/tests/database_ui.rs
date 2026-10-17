@@ -136,7 +136,9 @@ fn table_grid_shows_pending_changes_and_submits_from_the_preview() {
     assert!(h.query_by_label_contains("3 pending rows").is_some());
     h.state_mut().session.execute("db.previewChanges", &json!({ "result": rid })).unwrap();
     h.run_steps(3);
-    assert!(h.query_by_label_contains("UPDATE \"main\".\"books\" SET \"note\" = 'edited'").is_some());
+    // Values are bound: the preview lists them after the statement.
+    assert!(h.query_by_label_contains("UPDATE \"main\".\"books\" SET \"note\" = ?1").is_some());
+    assert!(h.query_by_label_contains("?1 = 'edited'").is_some());
     h.get_by_label("Submit").click();
     settle(&mut h, "submitted", |a| {
         a.session.db.result(rid).is_some_and(|r| r.edits.is_empty() && !r.edits.submitting && !r.is_running())

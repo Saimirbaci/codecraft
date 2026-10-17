@@ -391,10 +391,22 @@ pub fn execute_timed(
     page_size: usize,
     sink: &mut dyn ResultSink,
 ) -> DbResult<crate::ExecSummary> {
+    execute_timed_bound(conn, watchdog, sql, &[], page_size, sink)
+}
+
+/// [`execute_timed`] with bind parameters ([`Connection::execute_bound`]).
+pub fn execute_timed_bound(
+    conn: &mut dyn Connection,
+    watchdog: &Watchdog,
+    sql: &str,
+    params: &[crate::Cell],
+    page_size: usize,
+    sink: &mut dyn ResultSink,
+) -> DbResult<crate::ExecSummary> {
     let ticket = watchdog.arm();
     let r = {
         let mut timed = TimedSink::new(sink, watchdog);
-        conn.execute(sql, page_size, &mut timed)
+        conn.execute_bound(sql, params, page_size, &mut timed)
     };
     watchdog.disarm();
     match r {
