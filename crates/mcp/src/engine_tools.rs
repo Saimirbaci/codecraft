@@ -464,10 +464,17 @@ pub fn engine_tools() -> Vec<ToolDef> {
         tool(
             DB_QUERY,
             "Run SQL on a data source and wait for the rows. Statements that modify data need the `db-write` \
-             capability; data sources that confirm writes (production) ask the user in the IDE",
+             capability; data sources that confirm writes (production) ask the user in the IDE. Put values in \
+             `params` (bound by the driver, never spliced into the SQL) with ?, $1, :name or ${name} placeholders",
             json!({
                 "dataSource": { "type": "string", "description": "Data source id or name (db_sources)" },
                 "sql": { "type": "string" },
+                "params": {
+                    "description": "Values for the SQL's placeholders: an object by name (`{\"id\": 42}` for :id) or \
+                                    an array in order (`[\"Ann\", 3]` for ? ? or $1 $2). Strings are text exactly as \
+                                    given, numbers/booleans/null are themselves, {\"hex\": \"00ff\"} is bytes",
+                    "type": ["object", "array"],
+                },
                 "limit": { "type": "integer", "minimum": 1, "maximum": 5000, "default": 200 },
                 "timeoutMs": timeout(60_000),
             }),

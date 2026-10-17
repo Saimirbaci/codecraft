@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use codecraft_db::import::{BATCH_ROWS, ImportOptions, auto_mapping, insert_statements, read_file, run_import};
+use codecraft_db::import::{BATCH_ROWS, ImportOptions, auto_mapping, insert_bound, read_file, run_import_bound};
 use codecraft_db::{Cell, DataSourceConfig, SecretStore};
 use codecraft_workspace::NotificationLevel;
 
@@ -188,12 +188,12 @@ impl DbState {
                 let result = (|| {
                     let data = read_file(&path, &options).map_err(|e| e.to_string())?;
                     let statements =
-                        insert_statements(cfg.kind, &schema, &table, &columns, &mapping, &data, BATCH_ROWS)
+                        insert_bound(cfg.kind, &schema, &table, &columns, &mapping, &data, BATCH_ROWS)
                             .map_err(|e| e.to_string())?;
                     let total = statements.len();
                     let mut conn = connect(cfg, tunnel, password, &secrets)?;
                     let progress_events = events.clone();
-                    run_import(conn.as_mut(), &statements, &mut |done| {
+                    run_import_bound(conn.as_mut(), &statements, &mut |done| {
                         let _ = progress_events.send(Event::Import(ImportEvent::Progress { nonce, done, total }));
                     })
                     .map_err(|e| e.to_string())

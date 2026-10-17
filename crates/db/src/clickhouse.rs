@@ -370,7 +370,13 @@ impl ChConn {
     }
 
     /// Send a statement; the response streams.
-    fn send(&self, sql: &str, query_id: &str) -> DbResult<Box<dyn Read + Send + Sync + 'static>> {
+    fn send(&self, sql: &str, query_id: &str, binds: &[Cell]) -> DbResult<Box<dyn Read + Send + Sync + 'static>> {
+        // `{p1:Type}` placeholders take `param_p1` (the Escaped text format).
+        let bound: Vec<(String, String)> = binds
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("param_p{}", i + 1), crate::bind::clickhouse_param_text(v)))
+            .collect();
         let mut params: Vec<(&str, &str)> = vec![
             ("session_id", &self.session),
             ("session_timeout", "600"),
@@ -385,6 +391,9 @@ impl ChConn {
         for (k, v) in &self.settings {
             params.push((k, v));
         }
+        for (k, v) in &bound {
+            params.push((k, v));
+        }
         let cancelled = || self.cancel.cancelled.load(Ordering::SeqCst);
         match self.endpoint.post(&params).send_string(sql) {
             Ok(resp) => Ok(resp.into_reader()),
@@ -395,7 +404,7 @@ impl ChConn {
     /// Every row of an introspection query, as text.
     fn strings(&mut self, sql: &str) -> DbResult<Vec<Vec<Option<String>>>> {
         let id = new_id("q");
-        let mut r = BufReader::new(self.send(sql, &id)?);
+        let mut r = BufReader::new(self.send(sql, &id, &[])?);
         let mut types: Vec<String> = Vec::new();
         let mut out = Vec::new();
         let mut header = 0;
@@ -446,11 +455,21 @@ impl Connection for ChConn {
     }
 
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary> {
+        self.execute_bound(sql, &[], page_size, sink)
+    }
+
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
         let started = Instant::now();
         let id = new_id("q");
         self.cancel.cancelled.store(false, Ordering::SeqCst);
         *self.cancel.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(id.clone());
-        let result = self.run(sql, &id, page_size, sink, started);
+        let result = self.run(sql, params, &id, page_size, sink, started);
         *self.cancel.current.lock().unwrap_or_else(PoisonError::into_inner) = None;
         let cancelled = self.cancel.cancelled.swap(false, Ordering::SeqCst);
         match result {
@@ -571,12 +590,13 @@ impl ChConn {
     fn run(
         &mut self,
         sql: &str,
+        binds: &[Cell],
         id: &str,
         page_size: usize,
         sink: &mut dyn ResultSink,
         started: Instant,
     ) -> DbResult<ExecSummary> {
-        let body = self.send(sql, id)?;
+        let body = self.send(sql, id, binds)?;
         let mut r = BufReader::with_capacity(256 * 1024, body);
         let names = loop {
             match read_text_line(&mut r)? {

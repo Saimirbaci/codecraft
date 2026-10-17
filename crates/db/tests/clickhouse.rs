@@ -198,6 +198,11 @@ fn standard(req: &Req) -> Answer {
             &rows,
         ));
     }
+    if sql.starts_with("SELECT {p1:") {
+        // Echo the parameters as the server received them.
+        let p = |k: &str| serde_json::to_string(req.params.get(k).map(String::as_str).unwrap_or("<missing>")).unwrap();
+        return ok(rows_body(&["a", "b"], &["String", "String"], &[format!("[{},{}]", p("param_p1"), p("param_p2"))]));
+    }
     if sql.starts_with("SELECT bad") {
         return Answer {
             status: 404,
@@ -308,6 +313,29 @@ fn fake_server_queries_pages_and_introspection() {
     assert_eq!(conn.row_count("web", "hits").unwrap(), 1234);
     assert_eq!(conn.transaction_status(), codecraft_db::tx::TxStatus::Idle);
     assert!(codecraft_db::tx::begin(conn.as_mut(), None).is_err(), "no transactions");
+}
+
+#[test]
+fn parameters_travel_as_http_query_parameters() {
+    use codecraft_db::bind::{ParamValue, ParamValues, clickhouse_param_text, prepare};
+    let (port, rx) = fake(standard);
+    let mut conn = connect(&cfg(port), None).unwrap();
+    let _: Vec<Req> = rx.try_iter().collect();
+    let mut v = ParamValues::new();
+    let hostile = "it's \\ a\ttab\nline \0 🦀 ' OR 1=1 --";
+    v.insert(":s".into(), ParamValue::Value(Cell::Text(hostile.into())));
+    v.insert("n".into(), ParamValue::Value(Cell::Int(-5)));
+    let b = prepare(DbKind::ClickHouse, "SELECT :s, {n:Int32}", &v).unwrap();
+    assert_eq!(b.sql, "SELECT {p1:String}, {p2:Int32}");
+    let mut sink = CollectSink::default();
+    conn.execute_bound(&b.sql, &b.params, 500, &mut sink).unwrap();
+    let req = rx.try_iter().last().unwrap();
+    assert_eq!(req.body, "SELECT {p1:String}, {p2:Int32}", "values never enter the SQL");
+    let expected = clickhouse_param_text(&Cell::Text(hostile.into()));
+    assert_eq!(expected, "it's \\\\ a\\ttab\\nline \\0 🦀 ' OR 1=1 --");
+    assert_eq!(req.params.get("param_p1"), Some(&expected));
+    assert_eq!(req.params.get("param_p2").map(String::as_str), Some("-5"));
+    assert_eq!(sink.rows[0][1], Cell::Text("-5".into()));
 }
 
 #[test]

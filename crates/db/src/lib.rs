@@ -5,7 +5,8 @@
 //! [`Connection`]; its [`Connection::execute`] streams result pages to a sink so the caller can
 //! fetch 500 rows at a time and stop early; a [`Canceller`] obtained before running a query can
 //! cancel it from another thread. [`edit`] turns in-grid edits into DML applied in one
-//! transaction. [`split`] has the statement splitter, [`secrets`] the password
+//! transaction; [`bind`] makes the values of such statements (and of console and agent
+//! parameters) bind parameters sent next to the SQL ([`Connection::execute_bound`]). [`split`] has the statement splitter, [`secrets`] the password
 //! store (macOS Keychain), [`sql`] identifier quoting and query builders. [`params`] finds query
 //! parameters, [`explain`] builds and parses query plans, [`export`] formats results,
 //! [`import`] loads CSV/JSON files into tables and [`value`] feeds the value viewer and the
@@ -19,6 +20,7 @@
     clippy::unreachable
 )]
 
+pub mod bind;
 pub mod catalog;
 pub mod clickhouse;
 pub mod compare;
@@ -35,6 +37,7 @@ pub mod mssql;
 mod my;
 pub mod params;
 mod pg;
+pub mod query_table;
 pub mod redis;
 pub mod savepoint;
 pub mod schema_diff;
@@ -283,6 +286,22 @@ pub trait Connection: Send {
     fn canceller(&self) -> Arc<dyn Canceller>;
     /// Run one statement, streaming rows to `sink` in pages of `page_size`.
     fn execute(&mut self, sql: &str, page_size: usize, sink: &mut dyn ResultSink) -> DbResult<ExecSummary>;
+    /// Run one statement with bind parameters: `sql` uses the native placeholders
+    /// ([`bind::placeholder`]) and `params` holds their values in order. Drivers that cannot
+    /// bind ([`bind::binds`] is false) refuse parameters; callers inline literals for them
+    /// ([`bind::Binder`] does).
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
+        if params.is_empty() {
+            return self.execute(sql, page_size, sink);
+        }
+        Err(DbError::Unsupported(format!("{} cannot bind parameters", self.kind().label())))
+    }
     fn database_info(&mut self) -> DbResult<DatabaseInfo>;
     fn tables(&mut self, schema: &str) -> DbResult<Vec<TableInfo>>;
     fn table_details(&mut self, schema: &str, table: &str) -> DbResult<TableDetails>;
@@ -335,6 +354,17 @@ pub fn test_connection(cfg: &DataSourceConfig, password: Option<&str>) -> DbResu
 pub fn query_all(conn: &mut dyn Connection, sql: &str) -> DbResult<(Vec<Column>, Vec<Vec<Cell>>, ExecSummary)> {
     let mut sink = CollectSink::default();
     let summary = conn.execute(sql, PAGE_SIZE, &mut sink)?;
+    Ok((sink.columns, sink.rows, summary))
+}
+
+/// [`query_all`] with bind parameters.
+pub fn query_all_bound(
+    conn: &mut dyn Connection,
+    sql: &str,
+    params: &[Cell],
+) -> DbResult<(Vec<Column>, Vec<Vec<Cell>>, ExecSummary)> {
+    let mut sink = CollectSink::default();
+    let summary = conn.execute_bound(sql, params, PAGE_SIZE, &mut sink)?;
     Ok((sink.columns, sink.rows, summary))
 }
 

@@ -542,6 +542,9 @@ fn sync_script(s: &mut Session, p: &Value) -> CmdResult {
     }
     let statements = codecraft_db::compare::sync_script(c.right_kind, &c.right.schema, &c.right.table, &c.result)
         .map_err(|e| failed(e.to_string()))?;
+    // What running it executes: the same statements with bound values.
+    let bound = codecraft_db::compare::sync_bound(c.right_kind, &c.right.schema, &c.right.table, &c.result)
+        .map_err(|e| failed(e.to_string()))?;
     let source = c.right.data_source.clone();
     let script = statements.iter().map(|st| format!("{st};\n")).collect::<String>();
     if let Some(path) = crate::params::opt_path(p, "path") {
@@ -557,11 +560,24 @@ fn sync_script(s: &mut Session, p: &Value) -> CmdResult {
         if statements.is_empty() {
             return Ok(json!({ "statements": 0, "identical": true }));
         }
-        let mut params = json!({ "sql": script, "dataSource": source });
-        if let (Some(o), Some(c)) = (params.as_object_mut(), p.get("confirm")) {
-            o.insert("confirm".into(), c.clone());
+        // Running binds the values (the script written or copied above has literals); the
+        // read-only and production guards apply as for any statement.
+        crate::database::sync_project(s);
+        let (sqls, params): (Vec<String>, Vec<Vec<codecraft_db::Cell>>) =
+            bound.into_iter().map(|b| (b.sql, b.params)).unzip();
+        let mut run = crate::database::exec::PendingRun::new(
+            crate::database::exec::ExecAction::Execute,
+            source.clone(),
+            format!("query:{source}"),
+            "Sync".into(),
+            sqls,
+        );
+        run.bound = params;
+        let out = crate::database::exec::submit(s, run, None, bool_or(p, "confirm", false)).map_err(failed)?;
+        if out.get("run").is_some() {
+            s.status = format!("Running the sync script ({} statements)…", statements.len());
         }
-        return s.execute("db.execute", &params);
+        return Ok(out);
     }
     Ok(json!({ "statements": statements, "script": script, "dataSource": source }))
 }

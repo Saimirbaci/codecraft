@@ -130,6 +130,10 @@ fn cell(v: Option<&Value>, ty: ColumnType, charset: u16) -> Cell {
                 _ => Cell::Text(s()),
             }
         }
+        // The binary protocol sends DATE columns as dates with a zero time.
+        Value::Date(y, mo, d, 0, 0, 0, 0) if ty == ColumnType::MYSQL_TYPE_DATE => {
+            Cell::Other(format!("{y:04}-{mo:02}-{d:02}"))
+        }
         other => value_string(other).map(Cell::Other).unwrap_or(Cell::Null),
     }
 }
@@ -189,6 +193,59 @@ fn v(s: &str) -> Value {
     Value::Bytes(s.as_bytes().to_vec())
 }
 
+/// A bind value for the binary protocol: text and bytes as bytes (the server reads text in the
+/// connection's utf8mb4), numbers as numbers, booleans as 0/1.
+fn bind_value(c: &Cell) -> DbResult<Value> {
+    Ok(match c {
+        Cell::Null => Value::NULL,
+        Cell::Bool(b) => Value::Int(i64::from(*b)),
+        Cell::Int(i) => Value::Int(*i),
+        Cell::UInt(u) => Value::UInt(*u),
+        Cell::Float(f) if f.is_finite() => Value::Double(*f),
+        Cell::Float(f) => return Err(DbError::Unsupported(format!("MySQL cannot store {f}"))),
+        Cell::Text(s) | Cell::Other(s) => Value::Bytes(s.as_bytes().to_vec()),
+        Cell::Bytes(b) => Value::Bytes(b.clone()),
+    })
+}
+
+/// Page a result set (text or binary protocol) into the sink.
+fn stream<P: mysql::prelude::Protocol>(
+    mut result: mysql::QueryResult<'_, '_, '_, P>,
+    (broken, rb): (&std::cell::Cell<bool>, &std::cell::Cell<bool>),
+    opts: &Opts,
+    id: u32,
+    page_size: usize,
+    sink: &mut dyn ResultSink,
+    started: Instant,
+) -> DbResult<ExecSummary> {
+    let meta: Vec<(ColumnType, u16)> =
+        result.columns().as_ref().iter().map(|c| (c.column_type(), c.character_set())).collect();
+    let columns: Vec<Column> = result
+        .columns()
+        .as_ref()
+        .iter()
+        .map(|c| Column { name: c.name_str().into_owned(), type_name: type_name(c.column_type()) })
+        .collect();
+    sink.columns(&columns);
+    let mut pager = Pager::new(sink, page_size, started);
+    let mut abandoned = false;
+    for row in result.by_ref() {
+        let row = row.map_err(|e| tracked(broken, rb, e))?;
+        let cells = meta.iter().enumerate().map(|(i, (ty, cs))| cell(row.as_ref(i), *ty, *cs)).collect();
+        if !pager.push(cells) {
+            abandoned = true;
+            break;
+        }
+    }
+    if abandoned {
+        // Dropping the result drains it; stop the server first.
+        let _ = kill_query(opts, id);
+    }
+    let affected = columns.is_empty().then(|| result.affected_rows());
+    drop(result);
+    Ok(pager.finish(columns, affected))
+}
+
 impl Connection for MyConn {
     fn kind(&self) -> DbKind {
         self.kind
@@ -209,33 +266,27 @@ impl Connection for MyConn {
         let started = Instant::now();
         let id = self.conn.connection_id();
         let (broken, rb) = (&self.broken, &self.rolled_back);
-        let mut result = self.conn.query_iter(sql).map_err(|e| tracked(broken, rb, e))?;
-        let meta: Vec<(ColumnType, u16)> =
-            result.columns().as_ref().iter().map(|c| (c.column_type(), c.character_set())).collect();
-        let columns: Vec<Column> = result
-            .columns()
-            .as_ref()
-            .iter()
-            .map(|c| Column { name: c.name_str().into_owned(), type_name: type_name(c.column_type()) })
-            .collect();
-        sink.columns(&columns);
-        let mut pager = Pager::new(sink, page_size, started);
-        let mut abandoned = false;
-        for row in result.by_ref() {
-            let row = row.map_err(|e| tracked(broken, rb, e))?;
-            let cells = meta.iter().enumerate().map(|(i, (ty, cs))| cell(row.as_ref(i), *ty, *cs)).collect();
-            if !pager.push(cells) {
-                abandoned = true;
-                break;
-            }
+        let result = self.conn.query_iter(sql).map_err(|e| tracked(broken, rb, e))?;
+        stream(result, (broken, rb), &self.opts, id, page_size, sink, started)
+    }
+
+    fn execute_bound(
+        &mut self,
+        sql: &str,
+        params: &[Cell],
+        page_size: usize,
+        sink: &mut dyn ResultSink,
+    ) -> DbResult<ExecSummary> {
+        if params.is_empty() {
+            return self.execute(sql, page_size, sink);
         }
-        if abandoned {
-            // Dropping the result drains it; stop the server first.
-            let _ = kill_query(&self.opts, id);
-        }
-        let affected = columns.is_empty().then(|| result.affected_rows());
-        drop(result);
-        Ok(pager.finish(columns, affected))
+        let started = Instant::now();
+        let id = self.conn.connection_id();
+        let values = params.iter().map(bind_value).collect::<DbResult<Vec<Value>>>()?;
+        let (broken, rb) = (&self.broken, &self.rolled_back);
+        let result =
+            self.conn.exec_iter(sql, mysql::Params::Positional(values)).map_err(|e| tracked(broken, rb, e))?;
+        stream(result, (broken, rb), &self.opts, id, page_size, sink, started)
     }
 
     fn transaction_status(&mut self) -> crate::tx::TxStatus {
@@ -365,6 +416,23 @@ impl Connection for MyConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_values_keep_bytes_and_limits() {
+        let hostile = "it's \\ \0 🦀 ' OR 1=1 --";
+        assert_eq!(bind_value(&Cell::Text(hostile.into())).unwrap(), Value::Bytes(hostile.as_bytes().to_vec()));
+        assert_eq!(bind_value(&Cell::Bytes(vec![0, 255])).unwrap(), Value::Bytes(vec![0, 255]));
+        assert_eq!(bind_value(&Cell::Int(i64::MIN)).unwrap(), Value::Int(i64::MIN));
+        assert_eq!(bind_value(&Cell::UInt(u64::MAX)).unwrap(), Value::UInt(u64::MAX));
+        assert_eq!(bind_value(&Cell::Bool(true)).unwrap(), Value::Int(1));
+        assert_eq!(bind_value(&Cell::Null).unwrap(), Value::NULL);
+        assert_eq!(bind_value(&Cell::Text(String::new())).unwrap(), Value::Bytes(Vec::new()));
+        assert!(bind_value(&Cell::Float(f64::NAN)).is_err());
+        // The binary protocol's dates: DATE columns show the date only.
+        let d = Value::Date(2024, 2, 29, 0, 0, 0, 0);
+        assert_eq!(cell(Some(&d), ColumnType::MYSQL_TYPE_DATE, 63), Cell::Other("2024-02-29".into()));
+        assert_eq!(cell(Some(&d), ColumnType::MYSQL_TYPE_DATETIME, 63), Cell::Other("2024-02-29 00:00:00".into()));
+    }
 
     #[test]
     fn text_protocol_values_get_types() {

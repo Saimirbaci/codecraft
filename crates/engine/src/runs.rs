@@ -120,6 +120,19 @@ pub(crate) struct Runs {
     procs: Vec<Proc>,
 }
 
+/// A session dropped without `shutdown()` (a test that panicked, a window torn down) must not
+/// leave its programs running: a `RunHandle` doesn't kill its process when dropped. `kill` sends
+/// SIGTERM to the process group and returns (SIGKILL follows later if needed), so this doesn't wait.
+impl Drop for Runs {
+    fn drop(&mut self) {
+        for p in &self.procs {
+            if p.handle.is_running() {
+                let _ = p.handle.kill();
+            }
+        }
+    }
+}
+
 impl Runs {
     pub(crate) fn any_running(&self) -> bool {
         !self.procs.is_empty()
@@ -419,6 +432,36 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A session dropped without `shutdown()` stops what it started (a profiler recording left
+    /// running for a day by a test that panicked, M16).
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_session_stops_its_processes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = Session::new();
+        s.lsp_enabled = false;
+        s.isolate_home(&tmp.path().join("home"));
+        let cmd = ProcessCommand::new("sleep", &["30"], tmp.path());
+        start_process(&mut s, &cmd, "sleeper").unwrap();
+        let pid = s.runs.procs.first().map(|p| p.handle.pid()).unwrap();
+        let alive = |pid: u32| {
+            std::process::Command::new("/bin/ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|o| {
+                    let st = String::from_utf8_lossy(&o.stdout);
+                    !st.trim().is_empty() && !st.trim().starts_with('Z')
+                })
+        };
+        assert!(alive(pid));
+        drop(s);
+        let start = std::time::Instant::now();
+        while alive(pid) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(!alive(pid), "sleep {pid} still runs after its session was dropped");
+    }
 
     #[test]
     fn ansi_is_stripped() {

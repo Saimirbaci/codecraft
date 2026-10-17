@@ -7,7 +7,7 @@ use egui::{Align, Align2, Layout, RichText, ScrollArea, TextEdit, vec2};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_engine::database::ImportState;
+use codecraft_engine::database::{ImportState, ParamKind};
 
 use crate::{UiState, run_command};
 
@@ -48,18 +48,37 @@ fn params(ctx: &egui::Context, s: &mut Session, st: &UiState, cmds: &mut Cmds) {
             for stmt in prompt.run.statements.iter().take(3) {
                 ui.label(RichText::new(first_lines(stmt, 4)).monospace().size(11.5).color(theme.text_muted));
             }
-            ui.label(RichText::new("Values are inserted as typed: quote strings ('Ann').").color(theme.text_muted));
+            ui.label(
+                RichText::new(
+                    "Values are bound, never inserted into the SQL. Value: NULL, 42, true or text ('quoted' or not); \
+                     Text: exactly as typed; SQL expression: inserted as typed.",
+                )
+                .color(theme.text_muted),
+            );
             ui.add_space(4.0);
             let mut submit = false;
             let n = prompt.params.len();
-            egui::Grid::new("db-params-grid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+            egui::Grid::new("db-params-grid").num_columns(3).spacing([10.0, 6.0]).show(ui, |ui| {
                 for (i, f) in prompt.params.iter_mut().enumerate() {
                     ui.label(RichText::new(&f.name).monospace().color(theme.text));
+                    egui::ComboBox::from_id_salt(("db-param-kind", i))
+                        .selected_text(f.kind.label())
+                        .width(120.0)
+                        .show_ui(ui, |ui| {
+                            for k in [ParamKind::Auto, ParamKind::Text, ParamKind::Sql] {
+                                ui.selectable_value(&mut f.kind, k, k.label());
+                            }
+                        });
+                    let hint = match f.kind {
+                        ParamKind::Auto => "NULL, 42, Ann",
+                        ParamKind::Text => "text, exactly",
+                        ParamKind::Sql => "now(), (select …)",
+                    };
                     let resp = ui.add(
                         TextEdit::singleline(&mut f.value)
                             .id(egui::Id::new(("db-param", i)))
-                            .hint_text("NULL, 42, 'text'")
-                            .desired_width(280.0),
+                            .hint_text(hint)
+                            .desired_width(260.0),
                     );
                     if i == 0 && !ui.memory(|m| m.focused().is_some()) {
                         resp.request_focus();

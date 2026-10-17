@@ -122,7 +122,21 @@ fn explain_mssql(conn: &mut dyn Connection, sql: &str) -> DbResult<Plan> {
 
 /// Explain `sql` on `conn` (with `analyze`, where supported, the statement runs).
 pub fn explain(conn: &mut dyn Connection, sql: &str, analyze: bool) -> DbResult<Plan> {
+    explain_bound(conn, &crate::bind::Bound::plain(sql), analyze)
+}
+
+/// [`explain`] for a statement with bind parameters: `EXPLAIN …` keeps the placeholders in
+/// order, so the values bind the same way (SQL Server's SHOWPLAN runs batches, so its values
+/// are inlined as literals).
+pub fn explain_bound(conn: &mut dyn Connection, stmt: &crate::bind::Bound, analyze: bool) -> DbResult<Plan> {
     let kind = conn.kind();
+    let inlined;
+    let (sql, params): (&str, &[Cell]) = if kind == DbKind::SqlServer && stmt.has_params() {
+        inlined = stmt.inline(kind)?;
+        (&inlined, &[])
+    } else {
+        (&stmt.sql, &stmt.params)
+    };
     if kind == DbKind::Redis {
         return Err(DbError::Unsupported(format!(
             "Explain Plan is not available for {}; run EXPLAIN in the console",
@@ -133,7 +147,7 @@ pub fn explain(conn: &mut dyn Connection, sql: &str, analyze: bool) -> DbResult<
     let mut plan = if kind == DbKind::SqlServer {
         explain_mssql(conn, &statement)?
     } else {
-        let (_, rows, _) = query_all(conn, &statement)?;
+        let (_, rows, _) = crate::query_all_bound(conn, &statement, params)?;
         explain_rows(kind, &rows, analyzed)?
     };
     plan.analyzed = analyzed;

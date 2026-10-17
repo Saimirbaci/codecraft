@@ -227,9 +227,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     `db.addRow`/`db.deleteRows`/`db.revertChanges`/`db.previewChanges`/`db.submitChanges`/
     `db.getChanges`; PostgreSQL TLS via the platform TLS stack with `sslmode`
     disable/prefer/require/verify-ca/verify-full, `sslrootcert` and client certificates
-    (`sslcert`/`sslkey`, PKCS#8 PEM)). Remaining: no PostgreSQL TLS on Linux (needs OpenSSL), no
-    MySQL TLS; console query results are read-only (only Open Table results are editable);
-    values are sent as escaped literals, not bind parameters.
+    (`sslcert`/`sslkey`, PKCS#8 PEM)). 2026-10-16 (track DQ, item 64): console query results of
+    one table with a primary or unique key are editable too, and values are bind parameters.
+    Remaining: no PostgreSQL TLS on Linux (needs OpenSSL), no MySQL TLS.
 
 ## M3b editor depth (2026-10-13)
 
@@ -509,7 +509,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     rows; Compare Data keeps 5,000 differences per kind and needs keys that sort alike on both
     sides; no live progress for psql/pg_restore input; tool paths only per data source;
     full-text search is LIKE/ILIKE without full-text indexes or paging; exported INSERTs can't
-    target another dialect.
+    target another dialect. 2026-10-16 (track DQ, item 64): running a Compare Data sync script,
+    imports and full-text search bind their values (the script written to a file or copied
+    keeps literals).
 41. Database schema tools (track DA): Create/Modify Table with a live SQL preview (PostgreSQL and
     SQLite in one transaction, SQLite via a rebuild that keeps views, triggers and foreign keys;
     MySQL statement by statement with exact reporting), Drop/Rename/Truncate with preview, SQL
@@ -1419,6 +1421,53 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     run at once (others wait their turn) and buffers over 4 M chars are analyzed on save only;
     `waitMs` waits only through `codecraft_execute` (a direct `analysis.fileFindings` answers at
     once with a note).
+
+64. DataGrip queries (track DQ): **bind parameters everywhere CodeCraft sends values**
+    (`codecraft_db::bind`, `Connection::execute_bound`). Grid edits (Open Table and console
+    results), data import (multi-row INSERTs, batches split under each server's parameter limit:
+    SQL Server 2,000, SQLite 32,000), running a Compare Data sync script, full-text search
+    (Data Tools), the console parameter prompt, `db.execute`/`db.runFile` `params`, Explain with
+    parameters and agents' `db_query {sql, params}` all send values next to the SQL in the
+    driver's native placeholders: PostgreSQL `$n` (extended protocol, text format typed by the
+    server's inference — numeric, timestamptz, uuid, json/jsonb, enums, arrays parse as the
+    server parses literals; bytea binary), MySQL/MariaDB `?` (binary protocol), SQLite `?n`,
+    SQL Server `@Pn` (sp_executesql: nvarchar/bigint/float/bit/varbinary), ClickHouse
+    `{pn:Type}` as HTTP `param_pn` in the Escaped format (and the user's own `{name:Type}`).
+    NULL is always the `NULL` keyword. Previews and the Output log show the statement with
+    placeholders and a `-- parameters: $1 = …` line (long values shortened); where a driver
+    can't bind (DuckDB CLI, Redis) or generated bulk statements would put values in a URL
+    (ClickHouse imports/sync) escaped literals remain and the preview says so on its first line.
+    The prompt has a kind per parameter: Value (NULL, canonical integers, true/false, `'quoted'`
+    text, else text — `007` stays text), Text (exactly as typed), SQL expression (inserted as
+    typed); kinds are remembered per console. `params` take an object by name (with or without
+    the sigil) or an array in order; strings are text, `{"hex": …}` bytes, `{"sql": …}` an
+    expression (refused for agents; through `codecraft_execute db.execute` it is judged as part
+    of the SQL, so the read-only classification never depends on values). Round trips of
+    quotes, backslashes, NUL (SQLite text; PostgreSQL refuses NUL in text with a clear error
+    and nothing is saved), unicode, emoji, 1 MiB text, all 256 byte values, NULL vs empty text,
+    i16/i64/f64 limits, NaN/±Infinity, numeric(38 digits), json/jsonb, uuid, timestamps with
+    zones and dates: SQLite and a real local PostgreSQL (`crates/db/tests/bind_params.rs`,
+    `crates/engine/tests/database_dq.rs`); MySQL, SQL Server and ClickHouse bind values by unit
+    tests and the ClickHouse fake server. **Console query results are editable** when the
+    query reads one table (`codecraft_db::query_table`: no joins, subqueries, aggregates,
+    window functions, DISTINCT, GROUP BY/HAVING, set operations, table functions, other
+    databases or several statements) and the result shows its primary key, else a unique key;
+    plain column references (aliases too) are editable, computed columns read-only
+    (`db.getChanges` lists `editableColumns` and the `target`). Unqualified tables resolve in
+    the console's schema (the IDE's switch, else the data source's default); after a typed
+    `USE`/`SET search_path`/`SET ROLE`/… on that connection they must be qualified. The same
+    pending-changes UI, savepoint submit inside an open transaction, exact errors and reload as
+    Open Table; otherwise the grid toolbar says `read-only: <reason>`. Fixed on the way: the
+    production-guard confirmation of a whole SQL file dropped its parameter values. Remaining:
+    Create/Modify Table default values stay literals (no server binds parameters in DDL);
+    the "open hit" filter of full-text search and hand-typed filters are SQL text; the grid
+    still lets a computed column's cell enter edit mode (the engine refuses the change with the
+    reason); a search_path changed inside a PostgreSQL function (or a server-side default
+    the meta connection does not share) is not noticed, so qualify tables in such sessions;
+    SQL Server's dbo fallback for names missing from the user's default schema is not followed
+    (that result stays read-only); MySQL, MariaDB, SQL Server and
+    ClickHouse binding not run against real servers here (none available); Explain on SQL
+    Server inlines literals (SHOWPLAN runs batches).
 
 65. Signed builds and CI (track SN, `docs/release.md`): `cargo xtask bundle --sign <identity>`
     (default ad hoc `-`, or `CODECRAFT_SIGN_IDENTITY`) signs nested code inside-out (nested

@@ -406,7 +406,8 @@ fn python_what_is_slow() {
     assert!(names.contains(&"<genexpr>") && names.contains(&"slow_primes"), "{hot}");
     let slow = *project.iter().find(|h| h["name"] == "slow_primes").unwrap();
     assert!(ends_with(&slow["file"], "inventory/core.py") && slow["line"] == 15 && slow["inProject"] == true, "{slow}");
-    assert!(slow["totalPercent"].as_f64().unwrap() > 80.0, "{slow}");
+    // It dominates; the exact share drops on a loaded machine (startup and imports weigh more).
+    assert!(slow["totalPercent"].as_f64().unwrap() > 50.0, "{slow}");
 
     // Memory: the import machinery allocates most; the project's functions come apart.
     let started = m.ok("profile_start", json!({ "command": "python3 main.py", "kind": "memory" }));

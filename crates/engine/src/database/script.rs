@@ -11,7 +11,6 @@
 //! failed statement. Statement outcomes arrive through [`on_statement`]; [`on_run_done`] closes
 //! a segment.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -129,6 +128,9 @@ pub struct ScriptRun {
     segments: usize,
     #[serde(skip)]
     manual: bool,
+    /// What each statement runs: native placeholders and bound values.
+    #[serde(skip)]
+    pub(crate) bound: Vec<codecraft_db::bind::Bound>,
 }
 
 impl ScriptRun {
@@ -166,8 +168,9 @@ impl ScriptRun {
     }
 }
 
-/// Part of a file waiting for confirmation: its text, first line, scope label and parameter values.
-pub(crate) type ScriptPart = (String, usize, String, Option<BTreeMap<String, String>>);
+/// The script waiting for confirmation: its text, first line, scope label (`None`: the whole
+/// file) and parameter values.
+pub(crate) type ScriptPart = (String, usize, Option<String>, Option<codecraft_db::bind::ParamValues>);
 
 /// The production guard's question for a script.
 #[derive(Clone, Debug, Serialize)]
@@ -250,7 +253,7 @@ pub(crate) struct ScriptStart {
     pub worker: String,
     pub mode: ScriptMode,
     pub confirmed: bool,
-    pub values: Option<BTreeMap<String, String>>,
+    pub values: Option<codecraft_db::bind::ParamValues>,
 }
 
 /// Start running a script; returns its id (or `Ok(None)` when it waits for confirmation).
@@ -278,23 +281,26 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
             }
         }
     }
-    if !names.is_empty() {
+    // Values are bound: each statement keeps placeholders (native ones) and its own values.
+    let bound: Vec<codecraft_db::bind::Bound> = if names.is_empty() {
+        stmts.iter().map(|(st, _)| codecraft_db::bind::Bound::plain(st.clone())).collect()
+    } else {
         let Some(values) = &values else {
             return Err(format!("the script has parameters ({}): pass their values in `params`", names.join(", ")));
         };
-        for (st, _) in &mut stmts {
-            *st = codecraft_db::params::substitute(st, dialect, values)
-                .map_err(|n| format!("no value for parameter `{n}`"))?;
-        }
-    }
-    let writes: Vec<String> =
-        stmts.iter().filter(|(st, _)| codecraft_db::is_modifying(st, dialect)).map(|(st, _)| st.clone()).collect();
+        stmts.iter().map(|(st, _)| codecraft_db::bind::prepare(cfg.kind, st, values)).collect::<Result<_, _>>()?
+    };
+    let writes: Vec<String> = bound
+        .iter()
+        .filter(|b| codecraft_db::is_modifying(&b.sql, dialect))
+        .map(|b| b.preview(cfg.kind))
+        .collect();
     if !writes.is_empty() && cfg.read_only {
         let first = writes.first().map(|w| w.lines().next().unwrap_or("").to_string()).unwrap_or_default();
         return Err(format!("{} is read-only; this statement modifies data: {first}", cfg.name));
     }
     if !writes.is_empty() && cfg.confirm_writes && !confirmed {
-        let part = scope.map(|sc| (text.clone(), first_line, sc, values.clone()));
+        let part = Some((text.clone(), first_line, scope, values.clone()));
         s.db.scripts.confirm = Some(ScriptConfirm { path, source, source_name: cfg.name.clone(), mode, writes, part });
         s.status = format!("Confirm data modification on {}", cfg.name);
         return Ok(None);
@@ -331,6 +337,7 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
             .into_iter()
             .map(|(text, line)| ScriptStmt { text, line, status: StmtStatus::Pending })
             .collect(),
+        bound,
         state: ScriptPhase::Running,
         elapsed_ms: None,
         started: Some(Instant::now()),
@@ -352,7 +359,12 @@ pub(crate) fn start(s: &mut Session, req: ScriptStart) -> Result<Option<u64>, St
 /// Send statements `from..` of script `id` to its worker.
 fn start_segment(s: &mut Session, id: u64, from: usize) -> Result<(), String> {
     let Some(sc) = s.db.scripts.runs.iter_mut().find(|r| r.id == id) else { return Err(format!("no script {id}")) };
-    let statements: Vec<String> = sc.statements.iter().skip(from).map(|st| st.text.clone()).collect();
+    let (statements, params): (Vec<String>, Vec<Vec<codecraft_db::Cell>>) = if sc.bound.len() == sc.statements.len() {
+        sc.bound.iter().skip(from).map(|b| (b.sql.clone(), b.params.clone())).unzip()
+    } else {
+        sc.statements.iter().skip(from).map(|st| (st.text.clone(), Vec::new())).unzip()
+    };
+    let params = if params.iter().any(|p| !p.is_empty()) { params } else { Vec::new() };
     if statements.is_empty() {
         finish(&mut s.db, id, ScriptPhase::Done);
         return Ok(());
@@ -365,6 +377,7 @@ fn start_segment(s: &mut Session, id: u64, from: usize) -> Result<(), String> {
         owner: format!("script:{}#{}", sc.path.display(), sc.segments),
         title: sc.title.clone(),
         statements,
+        params,
         manual: sc.manual,
         keep_going: sc.mode == ScriptMode::Continue,
         ..RunSpec::default()

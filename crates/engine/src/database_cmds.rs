@@ -132,9 +132,11 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "db.execute",
             "Execute",
             Some("Cmd+Enter"),
-            "{sql?, dataSource?, params?: {name: sqlText}, confirm?: bool} — the selection or the statement at the caret \
-             of the active SQL console; statements with parameters (?, $1, :name, ${name}) open the parameter prompt unless \
-             `params` has values; on a production data source data modifications ask first unless `confirm`",
+            "{sql?, dataSource?, params?: {name: value} | [values], confirm?: bool} — the selection or the statement at \
+             the caret of the active SQL console; statements with parameters (?, $1, :name, ${name}) open the parameter \
+             prompt unless `params` has values, which are bound (never inserted into the SQL): strings are text as given, \
+             numbers/booleans/null themselves, {\"hex\": \"00ff\"} bytes, {\"sql\": \"now()\"} an expression inserted as \
+             typed; on a production data source data modifications ask first unless `confirm`",
             Context::Editor,
             always,
             |s, p| run_sql(s, p, false),
@@ -814,13 +816,7 @@ pub(super) fn console_run(
         let stmts: Vec<String> =
             split_statements(sql_text, dialect_of(s, Some(&source))).into_iter().map(|st| st.text).collect();
         let worker = format!("query:{source}");
-        return Ok((!stmts.is_empty()).then(|| PendingRun {
-            action,
-            source,
-            worker,
-            title: "Query".into(),
-            statements: stmts,
-        }));
+        return Ok((!stmts.is_empty()).then(|| PendingRun::new(action, source, worker, "Query".into(), stmts)));
     }
     let Some((e, d)) = s.ws.active() else {
         return Err(CommandError::Disabled("open an SQL console (db.newConsole) or pass `sql`".into()));
@@ -858,25 +854,16 @@ pub(super) fn console_run(
         .and_then(|p| p.file_stem())
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "console".into());
-    Ok(Some(PendingRun { action, source, worker: console_worker(path.as_deref(), d.id.0), title, statements: stmts }))
+    Ok(Some(PendingRun::new(action, source, console_worker(path.as_deref(), d.id.0), title, stmts)))
 }
 
-/// `{name: value}` from `params` (numbers and booleans as their SQL text).
-pub(super) fn param_values(p: &Value) -> Result<Option<std::collections::BTreeMap<String, String>>, CommandError> {
+/// `{name: value}` from `params`, bound as values: strings are text exactly as given, numbers,
+/// booleans and null are themselves, `{"hex": "00ff"}` is bytes and `{"sql": "now()"}` an SQL
+/// expression inserted as typed.
+pub(super) fn param_values(p: &Value) -> Result<Option<codecraft_db::bind::ParamValues>, CommandError> {
     match p.get("params") {
         None | Some(Value::Null) => Ok(None),
-        Some(Value::Object(m)) => Ok(Some(
-            m.iter()
-                .map(|(k, v)| {
-                    let text = match v {
-                        Value::String(t) => t.clone(),
-                        Value::Null => "NULL".into(),
-                        other => other.to_string(),
-                    };
-                    (k.clone(), text)
-                })
-                .collect(),
-        )),
+        Some(v @ Value::Object(_)) => codecraft_db::bind::values_from_json(&[], v, true).map_err(bad),
         Some(_) => Err(bad("`params` must be an object {name: value}")),
     }
 }
@@ -893,7 +880,8 @@ pub(super) fn run_console(s: &mut Session, p: &Value, all: bool, action: ExecAct
     let from_console = opt_str(p, "sql").is_none();
     let source = run.source.clone();
     let n = run.statements.len();
-    let values = param_values(p)?;
+    // `params`: an object by name, or an array of positional values.
+    let values = crate::database::exec::json_values(s, &run, p.get("params"), true).map_err(bad)?;
     let out = crate::database::exec::submit(s, run, values.as_ref(), bool_or(p, "confirm", false)).map_err(failed)?;
     if from_console {
         let _ = ensure_connected(s, &source);

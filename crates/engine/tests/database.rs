@@ -318,8 +318,9 @@ fn sqlite_grid_editing() {
     assert_eq!(
         statements,
         [
-            "UPDATE \"main\".\"authors\" SET \"name\" = 'Ann O''Hara' WHERE \"id\" = 1",
-            "INSERT INTO \"main\".\"authors\" (\"name\") VALUES ('Cy')",
+            // Values are bound: the preview lists them after the statement.
+            "UPDATE \"main\".\"authors\" SET \"name\" = ?1 WHERE \"id\" = ?2\n-- parameters: ?1 = 'Ann O''Hara', ?2 = 1",
+            "INSERT INTO \"main\".\"authors\" (\"name\") VALUES (?1)\n-- parameters: ?1 = 'Cy'",
         ]
     );
     assert!(s.db.edit_preview.is_some());
@@ -353,11 +354,15 @@ fn sqlite_grid_editing() {
         s.db.result(rid).is_some_and(|r| !r.edits.submitting && !r.is_running() && r.rows.len() == 2)
     });
 
-    // Query results and read-only data sources are not editable.
+    // A query of one table with its key is editable (track DQ); other query results are not.
     s.execute("db.execute", &json!({ "dataSource": id, "sql": "select * from authors" })).unwrap();
     let q = wait_result(&mut s, Some(rid));
-    assert!(s.execute("db.editCell", &json!({ "result": q, "row": 0, "column": 1, "value": "x" })).is_err());
-    assert!(s.execute("db.getChanges", &json!({ "result": q })).unwrap()["reason"].as_str().is_some());
+    pump_until(&mut s, "keys", |s| s.db.editable(q).is_ok());
+    s.execute("db.execute", &json!({ "dataSource": id, "sql": "select count(*) from authors" })).unwrap();
+    let q = wait_result(&mut s, Some(q));
+    assert!(s.execute("db.editCell", &json!({ "result": q, "row": 0, "column": 0, "value": "x" })).is_err());
+    let reason = s.execute("db.getChanges", &json!({ "result": q })).unwrap()["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("aggregates"), "{reason}");
 }
 
 fn rows_of(s: &mut Session, source: &str, sql: &str) -> Vec<Vec<Cell>> {
