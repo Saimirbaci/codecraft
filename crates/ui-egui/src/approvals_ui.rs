@@ -174,10 +174,11 @@ fn card(
                 if ui.add(allow).on_hover_text("Allow once (Enter when the card is focused)").clicked() {
                     decision = Some("allow");
                 }
-                if ui
-                    .button("Always")
-                    .on_hover_text(format!("Allow this and later requests from {} for this session", req.source))
-                    .clicked()
+                if !req.once
+                    && ui
+                        .button("Always")
+                        .on_hover_text(format!("Allow this and later requests from {} for this session", req.source))
+                        .clicked()
                 {
                     decision = Some("allowAlways");
                 }

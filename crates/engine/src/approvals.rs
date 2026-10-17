@@ -56,6 +56,10 @@ pub struct ApprovalRequest {
     /// One-line summary for the card header.
     pub title: String,
     pub kind: ApprovalKind,
+    /// Asked every time: no "Always" (an earlier "Always" for the source doesn't answer it, and
+    /// choosing it counts as Allow once). Used for calls that act on SSH hosts and containers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub once: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,9 +88,23 @@ impl ApprovalSink {
         title: impl Into<String>,
         kind: ApprovalKind,
     ) -> (ApprovalId, Receiver<Decision>) {
+        self.send(source.into(), title.into(), kind, false)
+    }
+
+    /// [`ApprovalSink::ask`] for a request that must be asked every time (no "Always").
+    pub fn ask_once(
+        &self,
+        source: impl Into<String>,
+        title: impl Into<String>,
+        kind: ApprovalKind,
+    ) -> (ApprovalId, Receiver<Decision>) {
+        self.send(source.into(), title.into(), kind, true)
+    }
+
+    fn send(&self, source: String, title: String, kind: ApprovalKind, once: bool) -> (ApprovalId, Receiver<Decision>) {
         let id = ApprovalId(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
         let (tx, rx) = crossbeam_channel::bounded(1);
-        let req = ApprovalRequest { id, source: source.into(), title: title.into(), kind };
+        let req = ApprovalRequest { id, source, title, kind, once };
         if self.tx.send((req, tx)).is_err() {
             log::warn!("approval queue closed; request {id:?} denied");
         }
@@ -121,7 +139,7 @@ impl Approvals {
         let mut changed = false;
         while let Ok((req, tx)) = self.rx.try_recv() {
             changed = true;
-            if self.always.contains(&req.source) {
+            if !req.once && self.always.contains(&req.source) {
                 let _ = tx.send(Decision::Allow);
             } else {
                 self.pending.push((req, tx));
@@ -146,6 +164,7 @@ impl Approvals {
     pub fn decide(&mut self, id: ApprovalId, decision: Decision) -> bool {
         let Some(pos) = self.pending.iter().position(|(r, _)| r.id == id) else { return false };
         let (req, tx) = self.pending.remove(pos);
+        let decision = if req.once && decision == Decision::AllowAlways { Decision::Allow } else { decision };
         if decision == Decision::AllowAlways && !self.always.contains(&req.source) {
             self.always.push(req.source.clone());
         }
@@ -177,6 +196,34 @@ impl Approvals {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A once-only request is never answered by an earlier "Always", and "Always" on it counts
+    /// as Allow once.
+    #[test]
+    fn once_only_requests_are_asked_every_time() {
+        let mut a = Approvals::default();
+        let sink = a.sink();
+        let (_, rx) = sink.ask("agent · write", "w", ApprovalKind::Command { command: "x".into(), cwd: None });
+        a.pump();
+        let id = a.pending().next().unwrap().id;
+        a.decide(id, Decision::AllowAlways);
+        assert_eq!(rx.try_recv(), Ok(Decision::AllowAlways));
+        let (_, rx) = sink.ask_once("agent · write", "w", ApprovalKind::Command { command: "x".into(), cwd: None });
+        a.pump();
+        assert_eq!(a.len(), 1, "an earlier Always doesn't answer a once-only request");
+        let req = a.pending().next().unwrap().clone();
+        assert!(req.once);
+        a.decide(req.id, Decision::AllowAlways);
+        assert_eq!(rx.try_recv(), Ok(Decision::Allow));
+        assert!(a.is_empty());
+        let (_, _rx) = sink.ask_once("agent · remote", "r", ApprovalKind::Command { command: "x".into(), cwd: None });
+        a.pump();
+        let id = a.pending().next().unwrap().id;
+        a.decide(id, Decision::AllowAlways);
+        let (_, _rx) = sink.ask("agent · remote", "r", ApprovalKind::Command { command: "x".into(), cwd: None });
+        a.pump();
+        assert_eq!(a.len(), 1, "\"Always\" on a once-only request isn't remembered for its source");
+    }
 
     #[test]
     fn ask_decide_roundtrip() {

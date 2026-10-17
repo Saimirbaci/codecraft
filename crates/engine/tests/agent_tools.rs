@@ -915,3 +915,66 @@ fn inspect_with_glob_scope_and_profile() {
     let v = ok(&mut s, "inspect", json!({ "profile": "Default", "analyzers": ["ruff"], "timeoutMs": 120_000 }));
     assert!(v["findings"].as_array().unwrap().iter().any(|f| f["file"].as_str().is_some_and(|p| p.ends_with("out.py"))), "{v}");
 }
+
+/// Agents always ask before acting on an SSH host or Docker container (M16, the user's rule):
+/// a once-only card even when the base capability is allowed, again on every call, refused
+/// headless; a data source behind an SSH tunnel counts too; local calls are unchanged.
+#[test]
+fn remote_targets_are_always_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = project(tmp.path());
+    let mut s = session(&tmp.path().join("home"));
+    open(&mut s, &dir);
+    for cap in ["run", "debug", "write", "db-write"] {
+        s.execute("agentAccess.set", &json!({ "capability": cap, "level": "allow" })).unwrap();
+    }
+    assert!(s.execute("agentAccess.set", &json!({ "capability": "remote", "level": "allow" })).is_err());
+
+    let card = |s: &mut Session| {
+        pump_until(s, "the remote approval card", |s| s.approvals.len() == 1);
+        s.approvals.pending().next().unwrap().clone()
+    };
+    // A Docker command: asked although `run` is allowed; "Always" counts as once.
+    let docker = json!({ "id": "docker.list" });
+    let slot = submit(&mut s, "Claude Code", "codecraft_execute", docker.clone());
+    let req = card(&mut s);
+    assert!(req.once && req.source.ends_with("remote"), "{req:?}");
+    assert!(req.title.contains("docker.list"), "{}", req.title);
+    s.approvals.decide(req.id, Decision::AllowAlways);
+    let r = wait_answer(&mut s, &slot);
+    assert!(!result_text(&r).contains("denied"), "{}", result_text(&r));
+    let slot = submit(&mut s, "Claude Code", "codecraft_execute", docker.clone());
+    let req = card(&mut s);
+    s.approvals.decide(req.id, Decision::Deny);
+    assert!(result_text(&wait_answer(&mut s, &slot)).contains("denied by the user"));
+
+    // A run on an SSH target names it on the card.
+    let slot = submit(&mut s, "Claude Code", "run_start", json!({ "config": 0, "target": "ssh:web" }));
+    let req = card(&mut s);
+    assert!(req.title.contains("SSH") && req.title.contains("web"), "{}", req.title);
+    s.approvals.decide(req.id, Decision::Deny);
+    assert!(wait_answer(&mut s, &slot).is_error);
+
+    // A data source behind an SSH tunnel.
+    s.execute(
+        "db.addDataSource",
+        &json!({ "kind": "postgres", "name": "Prod", "host": "10.0.0.5", "database": "app", "ssh": "deploy@bastion:22" }),
+    )
+    .unwrap();
+    let slot = submit(&mut s, "Claude Code", "db_query", json!({ "dataSource": "Prod", "sql": "select 1" }));
+    let req = card(&mut s);
+    assert!(req.once && req.title.contains("SSH tunnel"), "{}", req.title);
+    s.approvals.decide(req.id, Decision::Deny);
+    assert!(wait_answer(&mut s, &slot).is_error);
+
+    // Local calls don't ask.
+    let r = agent_tools::call_blocking(&mut s, Caller::new("Claude Code"), "run_configurations", json!({}), LONG);
+    assert!(!r.is_error, "{}", result_text(&r));
+    assert!(s.approvals.is_empty());
+
+    // Headless: refused, even with `remote` passed to the policy.
+    s.agent_access = AgentAccess::headless(&[Capability::Run, Capability::Remote]);
+    let r = agent_tools::call_blocking(&mut s, Caller::new("cli"), "codecraft_execute", docker, LONG);
+    assert!(r.is_error && result_text(&r).contains("headless"), "{}", result_text(&r));
+    s.shutdown();
+}

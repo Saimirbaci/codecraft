@@ -181,7 +181,7 @@ pub fn resolve_ref(s: &mut Session, v: &Value) -> Result<RunTarget, CommandError
 // ---------------------------------------------------------------- the `target` param
 
 /// Commands that take a `target` (name or object) and run there.
-const TARGET_COMMANDS: &[&str] = &[
+pub(crate) const TARGET_COMMANDS: &[&str] = &[
     "run.run",
     "run.debug",
     "run.contextConfiguration",

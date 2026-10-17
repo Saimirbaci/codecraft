@@ -59,7 +59,8 @@ pub struct ScanOptions {
     pub respect_gitignore: bool,
     /// Show dotfiles (other than `.git`, which is always hidden).
     pub show_hidden: bool,
-    /// Directory names never descended into (RustRover marks `target` as excluded).
+    /// Directory names never descended into (RustRover marks `target` as excluded; `.codecraft`
+    /// holds CodeCraft's own state, hidden like `.idea`).
     pub exclude_dirs: Vec<String>,
     /// Stop after this many entries; the tree reports `truncated()`.
     pub max_entries: usize,
@@ -70,7 +71,13 @@ impl Default for ScanOptions {
         Self {
             respect_gitignore: true,
             show_hidden: true,
-            exclude_dirs: vec!["target".into(), ".git".into(), ".idea".into(), "node_modules".into()],
+            exclude_dirs: vec![
+                "target".into(),
+                ".git".into(),
+                ".idea".into(),
+                ".codecraft".into(),
+                "node_modules".into(),
+            ],
             max_entries: 200_000,
         }
     }

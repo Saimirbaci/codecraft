@@ -151,6 +151,12 @@ Settings › Tools › Agent Access (commands `agentAccess.get/set/reset/clearSe
 | `profile` | start/stop the profiler | Ask |
 | `write` | `file_write`, `file_edit`, any command that edits the project | Ask |
 | `db-write` | SQL that is not a plain read: INSERT/UPDATE/DELETE/DDL, `SET`/`BEGIN`/`PREPARE`, `SELECT … INTO`, `EXPLAIN ANALYZE`, and reads that call a function known to change state (`nextval`, `pg_terminate_backend`, `dblink_exec`, `GET_LOCK`, `load_extension`, …) | Ask |
+| `remote` | Acting on an SSH host or Docker container: a run, test, debug or profile with a remote `target` (or a configuration whose target is remote), `docker.*`, `remote.*`, deployment and SSH commands through `codecraft_execute`, remote Python interpreters, `debug.pythonRemote`, and SQL on a data source behind an SSH tunnel. Needed in addition to the call's own capability | Ask, every time |
+
+**`remote` is always asked, for now.** It can be Off or Ask, never Allow: every such call shows a
+card (without "Always"), also for agent jobs in Auto mode and when the call's own capability is
+Allow; "Always" approvals never cover it; a headless `codecraft-cli mcp` refuses it (there is no
+`--allow remote`, and `--allow all` leaves it out).
 
 Each is Off, Ask or Allow. **Ask** shows an approval card in the IDE (the tool and its JSON input;
 **Allow** once, **Always** for this session and this caller and capability, **Deny**); the call

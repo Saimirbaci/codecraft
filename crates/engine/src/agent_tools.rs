@@ -583,6 +583,91 @@ fn sqlite_candidates(s: &Session, max: usize) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Commands that act on an SSH host or a Docker container whatever their params (M16: asked
+/// every time through `remote`).
+const REMOTE_PREFIXES: &[&str] = &[
+    "remote.",
+    "docker.",
+    "ssh.",
+    "tools.deployment.",
+    "tools.startSshSession",
+    "tools.services.docker",
+    "file.remoteDevelopment",
+    "python.remoteInterpreters.detect",
+    "python.remoteInterpreters.packages",
+    "run.manageTargets.resolve",
+    "debug.pythonRemote",
+];
+
+/// What a call would act on remotely (an SSH host or Docker container: a run target, a
+/// configuration whose target is remote, Docker/deployment/remote-host commands, remote
+/// debugging, a data source behind an SSH tunnel), for the approval card; `None` = local.
+fn remote_reason(s: &mut Session, name: &str, args: &Value) -> Option<String> {
+    fn label(s: &mut Session, v: &Value) -> Option<String> {
+        match crate::target_exec::resolve_ref(s, v) {
+            Ok(t) if t.is_local() => None,
+            Ok(t) => Some(t.label()),
+            // Unknown: it fails later with its own error, but it may name a remote target.
+            Err(_) => Some(format!("target {v}")),
+        }
+    }
+    // `defer`: the tool waits for the project to load before it runs and is judged again then
+    // (`Wait::ProjectLoad`), so an unknown configuration while loading isn't decided yet.
+    fn config(s: &Session, v: Option<&Value>, defer: bool) -> Option<String> {
+        let v = v.filter(|v| !v.is_null())?;
+        match config_index(s, v) {
+            Ok(i) => s
+                .run_configs
+                .get(i)
+                .filter(|c| !c.target.is_local())
+                .map(|c| format!("{} ({})", c.target.label(), c.name)),
+            // While the project loads its configurations aren't known yet: one of them may be remote.
+            Err(_) if s.project_loading() && !defer => {
+                Some(format!("configuration {v} (the project is still loading)"))
+            }
+            Err(_) => None,
+        }
+    }
+    fn tunnel(s: &Session, v: Option<&Value>) -> Option<String> {
+        let id = find_source(s, v?.as_str()?)?;
+        let d = s.db.sources.iter().find(|d| d.config.id == id)?;
+        let ssh = d.config.ssh.is_some() || d.config.ssh_tunnel.as_deref().is_some_and(|t| !t.trim().is_empty());
+        ssh.then(|| format!("data source {} (through an SSH tunnel)", d.config.name))
+    }
+    match name {
+        t::DEBUG_START | t::PROFILE_START | t::TEST_RUN | t::RUN_START => match args.get("target").filter(|v| !v.is_null()) {
+            Some(v) => label(s, v),
+            None if args.get("config").is_some_and(|c| !c.is_null()) => config(s, args.get("config"), true),
+            // A file, test or program: the configuration picked for it may be remote, so a
+            // project with remote configurations asks unless the call says `target: "local"`.
+            None => s
+                .run_configs
+                .iter()
+                .find(|c| !c.target.is_local())
+                .map(|c| format!("a remote configuration, maybe ({}: {}); pass target \"local\" to stay here", c.name, c.target.label())),
+        },
+        t::DB_QUERY => tunnel(s, args.get("dataSource")),
+        t::EXECUTE => {
+            let id = crate::registry().canonical(args.get("id").and_then(Value::as_str)?);
+            let params = args.get("params").cloned().unwrap_or(Value::Null);
+            if REMOTE_PREFIXES.iter().any(|p| id.starts_with(p)) {
+                return Some(format!("`{id}`"));
+            }
+            if id.starts_with("db.")
+                && let Some(on) = tunnel(s, params.get("dataSource"))
+            {
+                return Some(on);
+            }
+            match params.get("target").filter(|v| !v.is_null()) {
+                Some(v) if crate::target_exec::TARGET_COMMANDS.contains(&id) => label(s, v),
+                _ if matches!(id, "run.run" | "run.debug" | "run.profile") => config(s, params.get("config"), false),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The data source an agent named (by id or name, or a SQLite file a data source points at).
 fn find_source(s: &Session, wanted: &str) -> Option<String> {
     if let Some(id) = find_source_by_name(s, wanted) {
@@ -858,17 +943,36 @@ pub fn submit_call(s: &mut Session, caller: Caller, key: Option<CallKey>, name: 
     if caller.root.is_some() && cap == Capability::Write && job_mode == Some(crate::approvals::AgentMode::Review) {
         job_mode = Some(crate::approvals::AgentMode::Auto);
     }
-    match s.agent_access.verdict(&caller.name, job_mode, cap) {
+    // A call that acts on an SSH host or Docker container also needs `remote`, which is asked
+    // every time (once-only card, Auto jobs too, refused headless).
+    let remote = remote_reason(s, name, &args);
+    let verdict = match s.agent_access.verdict(&caller.name, job_mode, cap) {
+        Verdict::Deny(why) => Verdict::Deny(why),
+        base => match &remote {
+            None => base,
+            Some(_) => s.agent_access.verdict(&caller.name, job_mode, Capability::Remote),
+        },
+    };
+    match verdict {
         Verdict::Deny(why) => {
             s.agent_tools.answered += 1;
             respond(ToolResult::error(why));
         }
         Verdict::Allow => start(s, caller, key, name, args, respond),
         Verdict::Ask => {
-            let source = crate::agent_access::approval_source(&caller.name, cap);
-            let title = format!("{} wants to use {name} ({})", caller.name, cap.label().to_lowercase());
             let kind = ApprovalKind::ToolUse { tool: name.to_string(), input: args.clone() };
-            let (approval, rx) = s.approvals.sink().ask(source, title, kind);
+            let (cap, (approval, rx)) = match &remote {
+                Some(on) => {
+                    let source = crate::agent_access::approval_source(&caller.name, Capability::Remote);
+                    let title = format!("{} wants to use {name} on {on} ({})", caller.name, cap.label().to_lowercase());
+                    (Capability::Remote, s.approvals.sink().ask_once(source, title, kind))
+                }
+                None => {
+                    let source = crate::agent_access::approval_source(&caller.name, cap);
+                    let title = format!("{} wants to use {name} ({})", caller.name, cap.label().to_lowercase());
+                    (cap, s.approvals.sink().ask(source, title, kind))
+                }
+            };
             s.status = format!("{} asks to use {name}", caller.name);
             s.agent_tools.pending.push(PendingCall {
                 caller,
@@ -1201,6 +1305,19 @@ fn poll(s: &mut Session, caller: &Caller, wait: &mut Wait) -> Option<Step> {
                 return None;
             }
             let (tool, args) = (tool.clone(), args.clone());
+            // Judged before the configurations were known: one of them may run remotely.
+            if let Some(on) = remote_reason(s, &tool, &args) {
+                let job_mode = caller.job.and_then(|j| s.agents.job(j)).map(|j| j.mode);
+                if let Verdict::Deny(why) = s.agent_access.verdict(&caller.name, job_mode, Capability::Remote) {
+                    return Some(done_err(why));
+                }
+                let source = crate::agent_access::approval_source(&caller.name, Capability::Remote);
+                let title = format!("{} wants to use {tool} on {on}", caller.name);
+                let kind = ApprovalKind::ToolUse { tool: tool.clone(), input: args.clone() };
+                let (approval, rx) = s.approvals.sink().ask_once(source, title, kind);
+                let wait = Wait::Approval { approval, rx, cap: Capability::Remote, tool, args };
+                return Some(Step::Wait(wait, s.agent_tools.approval_timeout));
+            }
             Some(run_tool(s, caller, &tool, &args))
         }
         Wait::Approval { rx, cap, tool, args, .. } => match rx.try_recv() {

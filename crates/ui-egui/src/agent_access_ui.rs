@@ -19,7 +19,8 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
     ui.label(
         RichText::new(
             "Agents use CodeCraft's tools to debug, analyze, profile, test and query your project. Ask shows an \
-             approval prompt (Allow once / Always for this session / Deny); agent jobs in Auto mode are not asked.",
+             approval prompt (Allow once / Always for this session / Deny); agent jobs in Auto mode are not asked. \
+             SSH hosts and Docker containers are always asked, every time, also in Auto mode.",
         )
         .color(theme.text_muted),
     );
@@ -39,9 +40,14 @@ pub(crate) fn page(ui: &mut egui::Ui, s: &mut Session, st: &UiState, cmds: &mut 
             let current = s.agent_access.level(cap);
             ui.horizontal(|ui| {
                 for level in Level::ALL {
+                    // SSH hosts and Docker containers are always asked for now (no Allow).
+                    if cap == Capability::Remote && level == Level::Allow {
+                        continue;
+                    }
                     let button = egui::Button::selectable(current == level, level.label());
                     let hint = match level {
                         Level::Off => "Agents may never do this",
+                        Level::Ask if cap == Capability::Remote => "Ask me every time (no Always)",
                         Level::Ask => "Ask me each time (or allow for the rest of the session)",
                         Level::Allow => "Agents may do this without asking",
                     };

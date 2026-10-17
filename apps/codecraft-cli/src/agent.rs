@@ -118,13 +118,19 @@ fn parse_allow(values: &[&str]) -> Result<Vec<Capability>, String> {
     for v in values {
         for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             let cap = if part == "all" {
-                caps.extend(Capability::ALL);
+                // `all` never includes `remote`: SSH hosts and Docker containers are always asked.
+                caps.extend(Capability::ALL.into_iter().filter(|c| *c != Capability::Remote));
                 continue;
             } else {
                 Capability::parse(part).ok_or_else(|| {
                     format!("unknown capability `{part}` (read, run, debug, profile, write, db-write, all)")
                 })?
             };
+            if cap == Capability::Remote {
+                return Err("`remote` can't be allowed: acting on SSH hosts and Docker containers needs the user's \
+                            approval in the IDE every time, so a headless server refuses it"
+                    .into());
+            }
             caps.push(cap);
         }
     }
@@ -528,7 +534,10 @@ mod tests {
             parse_allow(&["run,debug", "db-write"]).unwrap(),
             vec![Capability::Run, Capability::Debug, Capability::DbWrite]
         );
-        assert_eq!(parse_allow(&["all"]).unwrap().len(), Capability::ALL.len());
+        // `all` leaves out `remote`, which can't be allowed at all (always asked in the IDE).
+        assert_eq!(parse_allow(&["all"]).unwrap().len(), Capability::ALL.len() - 1);
+        assert!(!parse_allow(&["all"]).unwrap().contains(&Capability::Remote));
+        assert!(parse_allow(&["run,remote"]).unwrap_err().contains("can't be allowed"));
         assert!(parse_allow(&["root"]).is_err());
         let a = Args::parse(
             &["p".into(), "--json".into(), "--eval".into(), "x".into(), "--eval".into(), "y".into()],

@@ -835,7 +835,10 @@ fn agents_debug_on_a_target_through_the_mcp_tool() {
     let f = fake();
     std::fs::write(f.project.join("main.py"), PY).unwrap();
     let mut s = f.session();
-    s.agent_access = AgentAccess::headless(&[Capability::Debug, Capability::Run]);
+    // Debug and run are allowed, but a target is an SSH host: every such call is asked (`remote`,
+    // once-only cards), and a headless policy refuses it.
+    s.execute("agentAccess.set", &json!({ "capability": "debug", "level": "allow" })).unwrap();
+    s.execute("agentAccess.set", &json!({ "capability": "run", "level": "allow" })).unwrap();
     s.execute("run.manageTargets.add", &json!({ "name": "web py", "target": "ssh:web", "python": python })).unwrap();
     s.execute("runConfig.create", &json!({ "name": "Main", "kind": "python", "command": "main.py" })).unwrap();
     let main = f.project.join("main.py");
@@ -844,16 +847,34 @@ fn agents_debug_on_a_target_through_the_mcp_tool() {
         assert!(!r.is_error, "{name} {args}: {}", result_text(&r));
         result_json(&r)
     };
+    // Submit, approve the remote card (checking it is once-only), and wait for the answer.
+    let approved = |s: &mut Session, name: &str, args: Value, on: &str| {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let out = std::sync::Arc::clone(&slot);
+        agent_tools::submit(s, Caller::new("test agent"), name, args, Box::new(move |r| *out.lock().unwrap() = Some(r)));
+        pump_until(s, "the remote approval card", |s| s.approvals.len() == 1);
+        let req = s.approvals.pending().next().unwrap().clone();
+        assert!(req.once && req.title.contains(on), "{req:?}");
+        s.approvals.decide(req.id, codecraft_engine::approvals::Decision::Allow);
+        pump_until(s, "the answer", |_| slot.lock().unwrap().is_some());
+        slot.lock().unwrap().take().unwrap()
+    };
     call(&mut s, "debug_breakpoint_set", json!({ "path": main, "line": line_of(PY, "@print") }));
-    let started = call(&mut s, "debug_start", json!({ "config": "Main", "target": "web py" }));
+    let r = approved(&mut s, "debug_start", json!({ "config": "Main", "target": "web py" }), "SSH");
+    assert!(!r.is_error, "{}", result_text(&r));
+    let started = result_json(&r);
     assert_eq!(started["started"], json!(true), "{started}");
     let stop = call(&mut s, "debug_wait_for_stop", json!({ "timeoutMs": 120_000 }));
     assert_eq!(stop["state"], json!("stopped"), "{stop}");
     assert_eq!(stop["frames"][0]["file"], json!(main.display().to_string()), "local path for agents: {stop}");
     call(&mut s, "debug_control", json!({ "action": "stop" }));
     pump_until(&mut s, "the session to end", |s| !s.debug.busy());
-    // A bad target is a clear error.
-    let r = agent_tools::call_blocking(&mut s, Caller::new("t"), "run_start", json!({ "config": "Main", "target": "nowhere" }), WAIT);
+    // A bad target is a clear error (asked first: it might have named a remote target).
+    let r = approved(&mut s, "run_start", json!({ "config": "Main", "target": "nowhere" }), "nowhere");
     assert!(r.is_error && result_text(&r).contains("unknown target `nowhere`"), "{}", result_text(&r));
+    // Headless, a remote target is refused outright.
+    s.agent_access = AgentAccess::headless(&[Capability::Debug, Capability::Run]);
+    let r = agent_tools::call_blocking(&mut s, Caller::new("t"), "debug_start", json!({ "config": "Main", "target": "web py" }), WAIT);
+    assert!(r.is_error && result_text(&r).contains("headless"), "{}", result_text(&r));
     s.shutdown();
 }

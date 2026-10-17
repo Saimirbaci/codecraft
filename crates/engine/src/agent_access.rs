@@ -47,16 +47,22 @@ pub enum Capability {
     Write,
     /// SQL that modifies data.
     DbWrite,
+    /// Anything that runs on, connects to or changes an SSH host or a Docker container (remote
+    /// run targets, remote debugging, deployment, data sources behind an SSH tunnel). For now
+    /// this is always asked, once per call: it can be Off or Ask, never Allow, "Always for this
+    /// session" doesn't apply, Auto jobs are asked too, and headless servers refuse it.
+    Remote,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 6] = [
+    pub const ALL: [Capability; 7] = [
         Capability::Read,
         Capability::Run,
         Capability::Debug,
         Capability::Profile,
         Capability::Write,
         Capability::DbWrite,
+        Capability::Remote,
     ];
 
     pub fn id(self) -> &'static str {
@@ -67,6 +73,7 @@ impl Capability {
             Self::Profile => "profile",
             Self::Write => "write",
             Self::DbWrite => "db-write",
+            Self::Remote => "remote",
         }
     }
 
@@ -78,6 +85,7 @@ impl Capability {
             Self::Profile => "Profile",
             Self::Write => "Edit files",
             Self::DbWrite => "Modify databases",
+            Self::Remote => "Act on SSH hosts and Docker containers",
         }
     }
 
@@ -91,6 +99,10 @@ impl Capability {
             Self::Profile => "Record CPU profiles of run configurations",
             Self::Write => "Change files and run commands that edit the project",
             Self::DbWrite => "INSERT/UPDATE/DELETE/DDL on data sources (read-only queries only need Read)",
+            Self::Remote => {
+                "Run, debug, test or profile on an SSH host or Docker container, deployment, remote hosts, and \
+                 data sources behind an SSH tunnel. Always asked, every time (never Allow)"
+            }
         }
     }
 
@@ -184,7 +196,7 @@ impl AgentAccess {
     /// denied (nobody can approve). Not saved.
     pub fn headless(allowed: &[Capability]) -> Self {
         let mut levels = default_levels();
-        for c in allowed {
+        for c in allowed.iter().filter(|c| **c != Capability::Remote) {
             levels.insert(*c, Level::Allow);
         }
         Self { levels, interactive: false, ephemeral: true, loaded: true, ..Self::default() }
@@ -195,11 +207,15 @@ impl AgentAccess {
     }
 
     pub fn level(&self, cap: Capability) -> Level {
-        self.levels.get(&cap).copied().unwrap_or(Level::Ask)
+        let level = self.levels.get(&cap).copied().unwrap_or(Level::Ask);
+        if cap == Capability::Remote && level == Level::Allow { Level::Ask } else { level }
     }
 
     /// Change one capability (saved unless ephemeral).
     pub fn set_level(&mut self, cap: Capability, level: Level) -> Result<(), String> {
+        if cap == Capability::Remote && level == Level::Allow {
+            return Err("SSH hosts and Docker containers are always asked for now: `remote` can be off or ask".into());
+        }
         self.ensure_loaded();
         self.levels.insert(cap, level);
         self.session.retain(|(_, c)| *c != cap);
@@ -236,6 +252,17 @@ impl AgentAccess {
                 "denied: agent access to `{}` is off (Settings › Tools › Agent Access)",
                 cap.id()
             ));
+        }
+        if cap == Capability::Remote {
+            // Always asked, once per call: no Allow level, no session approval, no Auto bypass.
+            if !self.interactive {
+                return Verdict::Deny(
+                    "denied: acting on an SSH host or Docker container needs the user's approval in the IDE, \
+                     and this server is headless (there is no --allow for it)"
+                        .to_string(),
+                );
+            }
+            return Verdict::Ask;
         }
         if job_mode == Some(AgentMode::Review) && cap == Capability::Write {
             return Verdict::Deny(
@@ -342,8 +369,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "agentAccess.set",
             "Set Agent Access",
             None,
-            "{capability: read|run|debug|profile|write|db-write, level: off|ask|allow} — what agents connected over MCP \
-             may do (Settings › Tools › Agent Access)",
+            "{capability: read|run|debug|profile|write|db-write|remote, level: off|ask|allow} — what agents connected \
+             over MCP may do (Settings › Tools › Agent Access; `remote` is off or ask)",
             Context::Global,
             always,
             set,
@@ -380,7 +407,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
 fn set(s: &mut Session, p: &Value) -> CmdResult {
     let cap_id = req_str(p, "capability")?;
     let cap = Capability::parse(cap_id).ok_or_else(|| {
-        CommandError::BadParams(format!("unknown capability `{cap_id}` (read, run, debug, profile, write, db-write)"))
+        CommandError::BadParams(format!("unknown capability `{cap_id}` (read, run, debug, profile, write, db-write, remote)"))
     })?;
     let level_id = opt_str(p, "level").ok_or_else(|| CommandError::BadParams("missing `level`".into()))?;
     let level = Level::parse(level_id)
@@ -399,6 +426,33 @@ mod tests {
 
     fn temp_policy(dir: &std::path::Path) -> AgentAccess {
         AgentAccess { path_override: Some(dir.join(FILE_NAME)), ..AgentAccess::default() }
+    }
+
+    /// SSH hosts and Docker containers are always asked (M16, the user's rule): never Allow, no
+    /// session approval, Auto jobs asked too, headless refused, a saved Allow loads as Ask.
+    #[test]
+    fn remote_is_always_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = temp_policy(dir.path());
+        assert_eq!(a.verdict("x", None, Capability::Remote), Verdict::Ask);
+        assert_eq!(a.verdict("x", Some(AgentMode::Auto), Capability::Remote), Verdict::Ask);
+        a.allow_for_session("x", Capability::Remote);
+        assert_eq!(a.verdict("x", None, Capability::Remote), Verdict::Ask);
+        assert!(a.set_level(Capability::Remote, Level::Allow).is_err());
+        assert_eq!(a.level(Capability::Remote), Level::Ask);
+        a.set_level(Capability::Remote, Level::Off).unwrap();
+        assert!(matches!(a.verdict("x", None, Capability::Remote), Verdict::Deny(_)));
+        // A hand-edited file that says allow still asks.
+        std::fs::write(dir.path().join(FILE_NAME), r#"{"levels":{"remote":"allow"}}"#).unwrap();
+        let mut b = temp_policy(dir.path());
+        assert_eq!(b.verdict("x", None, Capability::Remote), Verdict::Ask);
+        // Headless: refused even when listed.
+        let mut h = AgentAccess::headless(&[Capability::Run, Capability::Remote]);
+        assert_eq!(h.verdict("cli", None, Capability::Run), Verdict::Allow);
+        match h.verdict("cli", None, Capability::Remote) {
+            Verdict::Deny(why) => assert!(why.contains("headless"), "{why}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

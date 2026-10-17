@@ -1606,3 +1606,16 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     (left alone: other tracks own those files; CI's Windows job runs `cargo check` only); programs run from
     CodeCraft can't use the camera or microphone under the hardened runtime (entitlements not
     requested); the tree still needs a one-time `cargo fmt` before CI can check formatting.
+
+66. Lead follow-ups (2026-10-17): `.codecraft/` is excluded from the project scan like `.idea`
+    (Project view, Search Everywhere, Go to File, Find in Files, the TODO scan and the file
+    watcher all use the default `ScanOptions`); its files still open by path. Agents always ask
+    before acting on an SSH host or Docker container: a `remote` capability (Off or Ask, never
+    Allow) is needed in addition to the call's own one for remote run targets (a `target` param
+    or a configuration whose target is remote), `docker.*`, `remote.*`, deployment, SSH,
+    remote-interpreter and `debug.pythonRemote` commands, and SQL on data sources behind an SSH
+    tunnel; its approval card is once-only (no "Always", Auto jobs asked too) and headless
+    servers refuse it. Remaining: a built-in agent's own shell tool (e.g. Claude Code running
+    `ssh` or `docker` itself) is outside CodeCraft's tools and governed by that agent's own
+    permission prompts and mode; when a call names no target or configuration (`debug_start {file}`), a project with any
+    remote configuration asks (pass `target: "local"` to stay local).

@@ -310,6 +310,22 @@ pub(crate) mod tests {
         assert_eq!(listing(&tree), ["crates/", "crates/a/", "crates/a/src/", "crates/a/src/lib.rs", "target.rs"]);
     }
 
+    /// CodeCraft's own `.codecraft` folder is hidden like `.idea` (Project view, Search
+    /// Everywhere, Find in Files and the watcher all use the default options).
+    #[test]
+    fn codecraft_state_is_excluded_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        touch(dir.path(), ".codecraft/workspace.json", "{}");
+        touch(dir.path(), ".codecraft/local-history/a.rs", "x");
+        touch(dir.path(), "sub/.codecraft/x.json", "{}");
+        touch(dir.path(), ".idea/workspace.xml", "x");
+        touch(dir.path(), "src/main.rs", "x");
+        let o = ScanOptions { respect_gitignore: false, ..ScanOptions::default() };
+        let tree = scan(dir.path(), &o).unwrap();
+        check_invariants(&tree);
+        assert_eq!(listing(&tree), ["src/", "src/main.rs", "sub/"]);
+    }
+
     #[test]
     fn truncates_at_max_entries() {
         let dir = tempfile::tempdir().unwrap();

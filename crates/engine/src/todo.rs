@@ -287,8 +287,8 @@ pub fn scan_project_with(
 ) -> (BTreeMap<PathBuf, Vec<TodoItem>>, bool) {
     let mut out = BTreeMap::new();
     let Some(re) = &pats.any else { return (out, false) };
-    let mut opts = codecraft_fs::FindOptions { max_results: MAX_ITEMS * 4, max_file_size: MAX_FILE_BYTES, ..Default::default() };
-    opts.scan.exclude_dirs.push(".codecraft".into());
+    // `.codecraft` (local history, scratch copies) is excluded by the default scan options.
+    let opts = codecraft_fs::FindOptions { max_results: MAX_ITEMS * 4, max_file_size: MAX_FILE_BYTES, ..Default::default() };
     let Ok(matches) = codecraft_fs::find_in_files(root, re, &opts, cancel) else { return (out, false) };
     let mut paths: Vec<PathBuf> = matches.into_iter().map(|m| m.path).collect();
     paths.dedup();
