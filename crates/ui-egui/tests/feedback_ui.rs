@@ -132,6 +132,27 @@ fn the_toolbar_button_on_the_left_opens_the_overlay() {
 }
 
 #[test]
+fn the_right_stripe_button_under_remote_host_opens_the_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    // Hide the main toolbar: the stripe button is still there.
+    h.state_mut().session.execute("view.appearance.toolbar", &json!({ "on": false })).unwrap();
+    h.run_steps(2);
+    assert!(h.query_by_label("✏ Feedback").is_none(), "the toolbar is hidden");
+    let button = h.get_by_label("✏");
+    let remote = h.get_by_label("🖥");
+    let (r, host) = (button.rect(), remote.rect());
+    assert!(r.min.x > 1200.0, "on the right stripe: {r:?}");
+    assert!(
+        r.min.y > host.max.y - 1.0 && (r.center().x - host.center().x).abs() < 2.0,
+        "under Remote Host: {r:?} {host:?}"
+    );
+    button.click();
+    h.run_steps(2);
+    assert!(h.state().session.feedback.active, "the stripe button opens the overlay");
+}
+
+#[test]
 fn escape_does_not_reach_popups_underneath() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = harness(dir.path());

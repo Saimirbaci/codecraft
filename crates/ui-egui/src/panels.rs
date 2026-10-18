@@ -72,6 +72,25 @@ fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolW
     }
 }
 
+/// The feedback overlay on the right stripe, under Remote Host (also on the toolbar and in Tools).
+fn feedback_stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, size: f32) {
+    let glyph = (16.0 * size / STRIPE_BUTTON).max(12.0);
+    let active = s.feedback.active;
+    let resp = ui
+        .add(
+            egui::Button::new(RichText::new("✏").size(glyph).color(st.theme.annotation))
+                .frame(false)
+                .min_size(vec2(size, size)),
+        )
+        .on_hover_text("Draw Feedback for an Agent (⌥⇧⌘F)");
+    if active {
+        ui.painter().rect_filled(resp.rect.shrink(1.0), CornerRadius::same(6), Color32::from_white_alpha(14));
+    }
+    if resp.clicked() {
+        run_command(s, st, "feedback.toggle", &Value::Null);
+    }
+}
+
 /// The left and right stripes (RustRover's New UI puts bottom tool windows low on the left stripe).
 pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let frame = Frame::new()
@@ -128,7 +147,8 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     });
     egui::Panel::right("stripe-right").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
         let right: Vec<ToolWindowId> = IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right).collect();
-        let (size, _) = stripe_fit(ui, right.len());
+        // + 1: the feedback button under the tool windows.
+        let (size, _) = stripe_fit(ui, right.len() + 1);
         ScrollArea::vertical()
             .id_salt("stripe-right-scroll")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
@@ -137,6 +157,7 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                     for tw in right {
                         stripe_button(ui, s, st, tw, size);
                     }
+                    feedback_stripe_button(ui, s, st, size);
                 });
             });
     });
