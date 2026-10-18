@@ -594,3 +594,64 @@ fn feedback_jobs_are_saved_and_linked_to_their_session() {
     });
     s.shutdown();
 }
+
+#[test]
+fn feedback_follow_ups_continue_the_same_agent_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, proj) = (tmp.path().join("home"), tmp.path().join("proj"));
+    std::fs::create_dir_all(&proj).unwrap();
+    let log = tmp.path().join("args.log");
+    let fake = fake_claude(tmp.path(), &log);
+    let mut s = session(&home, &proj);
+    s.feedback.dir = Some(tmp.path().join("records"));
+    s.feedback.source_dir = Some(proj.clone());
+    s.execute("agent.settings", &json!({ "binaries": { "claude": fake } })).unwrap();
+    s.feedback.window = [800.0, 600.0];
+    let first = s
+        .execute(
+            "feedback.submit",
+            &json!({ "confirm": true, "text": "Add a toolbar button @@wait@@", "backend": "claude", "mode": "auto" }),
+        )
+        .unwrap();
+    let key = first["session"].as_str().unwrap().to_string();
+    let job = first["job"].as_u64().unwrap();
+    let first_id = first["id"].as_str().unwrap().to_string();
+    let records = tmp.path().join("records");
+    let count = || std::fs::read_dir(&records).unwrap().count();
+
+    // While the agent still works, a follow-up is refused and nothing is saved.
+    wait(&mut s, "the feedback job to run", |s| status(s, job) == JobStatus::Running);
+    s.execute("feedback.continue", &json!({ "id": first_id })).unwrap();
+    assert_eq!(s.feedback.draft.session.as_deref(), Some(key.as_str()));
+    let busy = s.execute("feedback.submit", &json!({ "confirm": true, "text": "Also make it red" })).unwrap_err();
+    assert!(busy.to_string().contains("still working"), "{busy}");
+    assert_eq!(count(), 1, "no record for a refused follow-up");
+
+    std::fs::write(tmp.path().join("go"), "").unwrap();
+    wait(&mut s, "the feedback job", |s| status(s, job) == JobStatus::Finished);
+    std::fs::write(&log, "").unwrap();
+    let r = s.execute("feedback.submit", &json!({ "confirm": true, "text": "Also make it red" })).unwrap();
+    assert_eq!(r["resumed"], true, "{r}");
+    assert_eq!(r["job"], job, "the same job continues");
+    assert_eq!(r["session"], key.as_str());
+    wait(&mut s, "the follow-up turn", |s| status(s, job) == JobStatus::Finished);
+    let args = std::fs::read_to_string(&log).unwrap();
+    assert!(args.contains("--resume\nsess-A"), "the agent's own session is resumed: {args}");
+    assert!(args.contains("follow-up on the feedback you worked on earlier in this session"), "{args}");
+    let rec: Value = serde_json::from_str(
+        &std::fs::read_to_string(PathBuf::from(r["dir"].as_str().unwrap()).join("feedback.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(rec["parent"], first_id.as_str());
+    assert_eq!(rec["session"], key.as_str());
+
+    // One thread with both requests, its session the same saved one.
+    let h = s.execute("feedback.history", &json!({ "open": false })).unwrap();
+    let threads = h["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 1, "{h}");
+    assert_eq!(threads[0]["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(threads[0]["session"], key.as_str());
+    let files = std::fs::read_dir(s.agents.sessions.project_dir(&proj).unwrap()).unwrap().count();
+    assert_eq!(files, 1, "the follow-up went into the same saved session");
+    s.shutdown();
+}

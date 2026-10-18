@@ -7,7 +7,7 @@ use egui::{
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_engine::feedback::{MODES, Target};
+use codecraft_engine::feedback::{MODES, Target, Thread};
 
 use super::{PALETTE, Tool, WIDTHS, begin_submit, color32};
 use crate::theme::Theme;
@@ -180,15 +180,24 @@ fn body(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
     });
     ui.separator();
 
-    section(ui, theme, "What should change?");
+    if let Some(thread) = s.feedback.thread.clone() {
+        thread_box(ui, s, st, theme, &thread);
+    }
+    let continuing = s.feedback.thread.is_some();
+    section(ui, theme, if continuing { "What should change next?" } else { "What should change?" });
+    let hint = if s.feedback.draft.session.is_some() {
+        "More to add, or something not done right? The agent continues where it left off."
+    } else {
+        "Describe the feature or bug. Your drawings show where."
+    };
     ui.add(
         egui::TextEdit::multiline(&mut s.feedback.draft.text)
             .id(Id::new("codecraft-feedback-description"))
-            .hint_text("Describe the feature or bug. Your drawings show where.")
+            .hint_text(hint)
             .desired_rows(5)
             .desired_width(f32::INFINITY),
     );
-    if let Some(parent) = &s.feedback.draft.parent {
+    if !continuing && let Some(parent) = &s.feedback.draft.parent {
         ui.label(RichText::new(format!("Revision of {parent}")).size(11.0).color(theme.text_muted));
     }
 
@@ -203,42 +212,51 @@ fn body(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
     });
 
     section(ui, theme, "Agent");
-    ui.horizontal_wrapped(|ui| {
-        let backends = s.feedback.backends.clone();
-        for b in &backends {
-            let selected = s.feedback.draft.backend == b.id;
-            let mut r = ui.add_enabled(b.available, egui::Button::selectable(selected, b.label.as_str()));
-            if let Some(note) = &b.note {
-                r = r.on_hover_text(note).on_disabled_hover_text(note);
+    // A follow-up goes to the thread's own agent session: its agent and mode are fixed.
+    let fixed = s.feedback.draft.session.is_some();
+    let fixed_tip =
+        format!("This thread continues in its {} session; New thread to choose another", s.feedback.draft.backend);
+    ui.add_enabled_ui(!fixed, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let backends = s.feedback.backends.clone();
+            for b in &backends {
+                let selected = s.feedback.draft.backend == b.id;
+                let mut r = ui.add_enabled(b.available, egui::Button::selectable(selected, b.label.as_str()));
+                if let Some(note) = &b.note {
+                    r = r.on_hover_text(note).on_disabled_hover_text(note);
+                }
+                if r.clicked() {
+                    run_command(s, st, "feedback.set", &json!({ "backend": b.id }));
+                }
             }
-            if r.clicked() {
-                run_command(s, st, "feedback.set", &json!({ "backend": b.id }));
-            }
+        });
+        if let Some(note) = &s.feedback.backends_note {
+            ui.label(RichText::new(note).size(11.0).color(theme.text_muted));
         }
-    });
-    if let Some(note) = &s.feedback.backends_note {
-        ui.label(RichText::new(note).size(11.0).color(theme.text_muted));
-    }
-    let current = s.feedback.backends.iter().find(|b| b.id == s.feedback.draft.backend).cloned();
-    ui.horizontal(|ui| {
-        for m in MODES {
-            let (label, tip) = mode_label(m);
-            let why = current.as_ref().and_then(|b| b.mode_unavailable(m));
-            let r = ui
-                .add_enabled(why.is_none(), egui::Button::selectable(s.feedback.draft.mode == m, label))
-                .on_hover_text(tip)
-                .on_disabled_hover_text(why.unwrap_or(tip));
-            if r.clicked() {
-                s.feedback.draft.mode = m.to_string();
+        let current = s.feedback.backends.iter().find(|b| b.id == s.feedback.draft.backend).cloned();
+        ui.horizontal(|ui| {
+            for m in MODES {
+                let (label, tip) = mode_label(m);
+                let why = current.as_ref().and_then(|b| b.mode_unavailable(m));
+                let r = ui
+                    .add_enabled(why.is_none(), egui::Button::selectable(s.feedback.draft.mode == m, label))
+                    .on_hover_text(tip)
+                    .on_disabled_hover_text(why.unwrap_or(tip));
+                if r.clicked() {
+                    s.feedback.draft.mode = m.to_string();
+                }
             }
-        }
-    });
+        });
+    })
+    .response
+    .on_disabled_hover_text(fixed_tip);
     ui.label(RichText::new(mode_label(&s.feedback.draft.mode).1).size(11.0).color(theme.text_muted));
     ui.separator();
 
     ui.horizontal(|ui| {
         let ready = !s.feedback.draft.text.trim().is_empty();
-        let send = egui::Button::new(RichText::new("Send to agent").color(Color32::WHITE)).fill(theme.accent);
+        let label = if s.feedback.draft.session.is_some() { "Send follow-up" } else { "Send to agent" };
+        let send = egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(theme.accent);
         if ui.add_enabled(ready, send).on_disabled_hover_text("Describe the change first").clicked() {
             begin_submit(s, st);
         }
@@ -251,7 +269,114 @@ fn body(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
             }
         });
     });
+    if !continuing {
+        recent(ui, s, st, theme);
+    }
     last_submission(ui, s, st, theme);
+}
+
+/// `2026-10-12T14:25:30.000Z` → `2026-10-12 14:25`.
+fn when(created: &str) -> String {
+    created.get(..16).unwrap_or(created).replace('T', " ")
+}
+
+fn ellipsize(text: &str, max: usize) -> String {
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
+/// The thread the draft continues: its earlier requests and what the next send does.
+fn thread_box(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, thread: &Thread) {
+    let mut action: Option<(&'static str, Value)> = None;
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new(format!("Thread: {}", ellipsize(&thread.title, 60))).strong());
+        let how = match &s.feedback.draft.session {
+            Some(_) => format!("Sent to the same {} session: the agent remembers its earlier work.", thread.backend),
+            None => "A new agent run that gets the earlier requests.".to_string(),
+        };
+        ui.label(RichText::new(how).size(11.0).color(theme.text_muted));
+        let n = thread.entries.len();
+        egui::CollapsingHeader::new(format!("Earlier requests ({n})"))
+            .id_salt("codecraft-feedback-thread-entries")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                    for e in &thread.entries {
+                        ui.label(RichText::new(when(&e.created)).font(FontId::monospace(10.0)).color(theme.text_muted));
+                        let text = if e.text.trim().is_empty() { e.title.as_str() } else { e.text.as_str() };
+                        ui.label(ellipsize(text.trim(), 600));
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+        ui.horizontal_wrapped(|ui| {
+            if let Some(session) = &thread.session
+                && ui
+                    .small_button("Agent session")
+                    .on_hover_text("Open the agent's work so far in the Agent tool window")
+                    .clicked()
+            {
+                action = Some(("agent.sessions.open", json!({ "session": session })));
+            }
+            if let Some(target) = build_target(thread.session.as_ref(), thread.job)
+                && ui.small_button("Build & run").on_hover_text("Build and run the agent's version").clicked()
+            {
+                action = Some(("feedback.runIteration", target));
+            }
+            if ui.small_button("New thread").on_hover_text("Start new feedback instead of following up").clicked() {
+                action = Some(("feedback.newThread", Value::Null));
+            }
+        });
+    });
+    if let Some((cmd, params)) = action {
+        run_command(s, st, cmd, &params);
+    }
+}
+
+/// Build & run's target: the saved session outlives the job id (restarts).
+fn build_target(session: Option<&String>, job: Option<u64>) -> Option<Value> {
+    match (session, job) {
+        (Some(session), _) => Some(json!({ "session": session })),
+        (None, Some(job)) => Some(json!({ "job": job })),
+        (None, None) => None,
+    }
+}
+
+/// The latest threads, to follow up on without opening the history.
+fn recent(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
+    if s.feedback.threads.is_empty() {
+        return;
+    }
+    ui.separator();
+    section(ui, theme, "Recent feedback");
+    let mut action = None;
+    for t in s.feedback.threads.iter().take(3) {
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("Continue")
+                    .on_hover_text("Follow up on this thread: add more or fix what was not done right")
+                    .clicked()
+                {
+                    action = Some(t.id.clone());
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(ellipsize(&t.title, 40)).truncate()).on_hover_text(&t.title);
+                });
+            });
+        });
+        let updates = t.entries.len();
+        let meta =
+            format!("{} · {} · {updates} request{}", when(&t.updated), t.backend, if updates == 1 { "" } else { "s" });
+        ui.label(RichText::new(meta).size(10.0).color(theme.text_muted));
+    }
+    if let Some(id) = action {
+        run_command(s, st, "feedback.continue", &json!({ "id": id }));
+    }
 }
 
 /// "Sent to …" and the Build & run action for the last job.
@@ -273,7 +398,8 @@ fn last_submission(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme
     }
 }
 
-/// Past feedback: revise (re-open as a revision) or build the job's result.
+/// Past feedback by thread: continue a thread, revise a request, open the agent session or build
+/// its result.
 pub(super) fn history(ctx: &egui::Context, s: &mut Session, st: &mut UiState, on_top: bool) {
     let id = Id::new(HISTORY);
     let theme = st.theme.clone();
@@ -284,51 +410,81 @@ pub(super) fn history(ctx: &egui::Context, s: &mut Session, st: &mut UiState, on
         .order(Order::Foreground)
         .open(&mut open)
         .collapsible(false)
-        .default_size(vec2(520.0, 360.0))
+        .default_size(vec2(560.0, 380.0))
         .show(ctx, |ui| {
-            if s.feedback.history.is_empty() {
+            if s.feedback.threads.is_empty() {
                 ui.label(RichText::new("No feedback yet.").color(theme.text_muted));
             }
-            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
-                for r in &s.feedback.history {
+            egui::ScrollArea::vertical().max_height(460.0).show(ui, |ui| {
+                for t in &s.feedback.threads {
                     ui.horizontal(|ui| {
-                        let when = r.created.get(..16).unwrap_or(&r.created).replace('T', " ");
-                        ui.label(RichText::new(when).font(FontId::monospace(11.0)).color(theme.text_muted));
-                        let title = if r.title.is_empty() { "(no description)" } else { r.title.as_str() };
-                        ui.label(title).on_hover_text(&r.id);
+                        ui.label(RichText::new(when(&t.updated)).font(FontId::monospace(11.0)).color(theme.text_muted));
+                        ui.label(RichText::new(ellipsize(&t.title, 60)).strong()).on_hover_text(&t.id);
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            // The saved session outlives the job id (restarts).
-                            let target = match (&r.session, r.job) {
-                                (Some(session), _) => Some(json!({ "session": session })),
-                                (None, Some(job)) => Some(json!({ "job": job })),
-                                (None, None) => None,
-                            };
-                            if let Some(target) = target
-                                && ui.small_button("Build & run").on_hover_text("Build and run the agent's version").clicked()
+                            if let Some(target) = build_target(t.session.as_ref(), t.job)
+                                && ui
+                                    .small_button("Build & run")
+                                    .on_hover_text("Build and run the agent's version")
+                                    .clicked()
                             {
                                 action = Some(("feedback.runIteration", target));
                             }
-                            if let Some(session) = &r.session
+                            if let Some(session) = &t.session
                                 && ui
                                     .small_button("Session")
-                                    .on_hover_text("Open the agent session in the Agents tool window")
+                                    .on_hover_text("Open the agent session in the Agent tool window")
                                     .clicked()
                             {
                                 action = Some(("agent.sessions.open", json!({ "session": session })));
                             }
-                            if ui.small_button("Revise").on_hover_text("Re-open as a revision").clicked() {
-                                action = Some(("feedback.reopen", json!({ "id": r.id })));
+                            if ui
+                                .small_button("Continue")
+                                .on_hover_text("Follow up on this thread in the same agent session")
+                                .clicked()
+                            {
+                                action = Some(("feedback.continue", json!({ "id": t.id })));
                             }
-                            let mut meta = r.backend.clone();
-                            if let Some(job) = r.job {
-                                meta.push_str(&format!(" · job {job}"));
-                            }
-                            if r.parent.is_some() {
-                                meta.push_str(" · revision");
-                            }
-                            ui.label(RichText::new(meta).size(11.0).color(theme.text_muted));
+                            ui.label(RichText::new(&t.backend).size(11.0).color(theme.text_muted));
                         });
                     });
+                    egui::CollapsingHeader::new(
+                        RichText::new(format!(
+                            "{} request{}",
+                            t.entries.len(),
+                            if t.entries.len() == 1 { "" } else { "s" }
+                        ))
+                        .size(11.0)
+                        .color(theme.text_muted),
+                    )
+                    .id_salt(("codecraft-feedback-history-thread", &t.id))
+                    .show(ui, |ui| {
+                        for e in &t.entries {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(when(&e.created))
+                                        .font(FontId::monospace(10.0))
+                                        .color(theme.text_muted),
+                                );
+                                let title = if e.title.is_empty() { "(no description)" } else { e.title.as_str() };
+                                ui.label(title).on_hover_text(ellipsize(&e.text, 600));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button("Revise")
+                                        .on_hover_text("Edit this request and send it as a new run")
+                                        .clicked()
+                                    {
+                                        action = Some(("feedback.reopen", json!({ "id": e.id })));
+                                    }
+                                    if let Some(job) = e.job {
+                                        ui.label(
+                                            RichText::new(format!("job {job}")).size(10.0).color(theme.text_muted),
+                                        );
+                                    }
+                                });
+                            });
+                        }
+                    });
+                    ui.separator();
                 }
             });
         });

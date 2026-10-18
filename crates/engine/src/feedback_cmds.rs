@@ -75,7 +75,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "feedback.submit",
             "Send Feedback to Agent",
             None,
-            "{confirm: true, text?, target?, backend?, mode?, screenshot?: path, annotated?: path}: save the record and start the agent (`confirm` is required: this starts a paid agent run)",
+            "{confirm: true, text?, target?, backend?, mode?, screenshot?: path, annotated?: path}: save the record and start the agent, or follow up in the thread's agent session after feedback.continue (`confirm` is required: this starts a paid agent run)",
             Context::Global,
             always,
             submit,
@@ -84,7 +84,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "feedback.history",
             "Feedback History",
             None,
-            "{open?: bool}: show past feedback; returns the records",
+            "{open?: bool}: show past feedback; returns the records and their threads",
             Context::Global,
             always,
             history,
@@ -97,6 +97,31 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Context::Global,
             always,
             reopen,
+        ),
+        spec(
+            "feedback.continue",
+            "Continue Feedback Thread",
+            None,
+            "{id}: follow up on a past record's thread: the next feedback goes to the same agent session \
+             (or, when that session is gone, a new run that gets the earlier requests)",
+            Context::Global,
+            always,
+            continue_thread,
+        ),
+        spec(
+            "feedback.newThread",
+            "New Feedback Thread",
+            None,
+            "stop continuing a thread: the next feedback starts a new agent run",
+            Context::Global,
+            always,
+            |s, _| {
+                let fb = &mut s.feedback;
+                fb.draft.parent = None;
+                fb.draft.session = None;
+                fb.thread = None;
+                ok()
+            },
         ),
         spec(
             "feedback.runIteration",
@@ -125,6 +150,7 @@ fn toggle(s: &mut Session, p: &Value) -> CmdResult {
         fb.backends = backends;
         fb.backends_note = note;
         fit_mode(fb);
+        fb.refresh_history();
         if s.ws.project.is_none() {
             s.feedback.draft.target = Target::CodeCraft;
         }
@@ -150,6 +176,10 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(b) = opt_str(p, "backend") {
         if !valid_backend(b) {
             return Err(CommandError::BadParams(format!("bad backend `{b}`")));
+        }
+        // Another agent cannot continue this one's session: a new run with the earlier requests.
+        if s.feedback.draft.backend != b {
+            s.feedback.draft.session = None;
         }
         s.feedback.draft.backend = b.to_string();
         fit_mode(&mut s.feedback);
@@ -261,11 +291,22 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::BadParams("pass {\"confirm\": true}: submitting starts an agent run".into()));
     }
     set(s, p)?;
-    let draft = s.feedback.draft.clone();
+    let mut draft = s.feedback.draft.clone();
     if draft.text.trim().is_empty() {
         return Err(CommandError::BadParams("describe the change first".into()));
     }
     let cwd = target_cwd(s, draft.target)?;
+    // A follow-up: the thread's agent session when it still exists, else a new run.
+    let mut resume_job = None;
+    let mut fallback_note = None;
+    if let Some(session) = draft.session.clone() {
+        resume_job = resumable_job(s, &session)?;
+        if resume_job.is_none() {
+            fallback_note = Some(format!("agent session {session} is gone, so a new run got the earlier requests"));
+            draft.session = None;
+        }
+    }
+    let earlier: Vec<feedback::Summary> = s.feedback.thread.as_ref().map(|t| t.entries.clone()).unwrap_or_default();
     let base = s.feedback.records_dir()?;
     std::fs::create_dir_all(&base)
         .map_err(|e| CommandError::Failed(format!("cannot create {}: {e}", base.display())))?;
@@ -317,15 +358,19 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
         context: s.feedback.context.clone(),
         attachments,
         job: None,
-        session: None,
+        session: draft.session.clone(),
     };
     write_record(&dir, &record)?;
 
-    let prompt = feedback::build_prompt(&record, &dir, &cwd);
+    let prompt = if draft.parent.is_some() && (resume_job.is_some() || !earlier.is_empty()) {
+        feedback::follow_up_prompt(&record, &dir, &cwd, &earlier, resume_job.is_some())
+    } else {
+        feedback::build_prompt(&record, &dir, &cwd)
+    };
     let paths: Vec<String> = record.attachments.iter().map(|a| dir.join(a).display().to_string()).collect();
     let title: String =
         draft.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(60).collect();
-    let params = json!({
+    let mut params = json!({
         "backend": draft.backend,
         "mode": draft.mode,
         "prompt": prompt,
@@ -333,24 +378,40 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
         "cwd": cwd,
         "title": format!("Feedback: {title}"),
     });
-    let started = match s.feedback.launcher {
-        Some(launch) => launch(s, &params),
-        None => s.execute("agent.start", &params),
+    if let (Some(job), Some(session), Some(obj)) = (resume_job, &draft.session, params.as_object_mut()) {
+        obj.insert("job".into(), json!(job));
+        obj.insert("session".into(), json!(session));
+    }
+    let started = match (s.feedback.launcher, resume_job) {
+        (Some(launch), _) => launch(s, &params),
+        (None, Some(job)) => s
+            .execute("agent.followUp", &json!({ "job": job, "prompt": prompt }))
+            .map(|_| json!({ "job": job, "session": draft.session })),
+        (None, None) => s.execute("agent.start", &params),
     };
     match started {
         Ok(v) => {
             let job = v.get("job").and_then(Value::as_u64);
             record.job = job;
-            record.session = v.get("session").and_then(Value::as_str).map(str::to_string);
+            record.session =
+                v.get("session").and_then(Value::as_str).map(str::to_string).or_else(|| draft.session.clone());
             write_record(&dir, &record)?;
             s.feedback.last = Some(Submitted { id: id.clone(), dir: dir.clone(), job, backend: draft.backend.clone() });
             s.feedback.reset_draft();
             s.feedback.active = false;
+            s.feedback.refresh_history();
+            let what = if resume_job.is_some() { "Follow-up sent" } else { "Feedback sent" };
             s.status = match job {
-                Some(j) => format!("Feedback sent to {} (job {j})", draft.backend),
-                None => format!("Feedback sent to {}", draft.backend),
+                Some(j) => format!("{what} to {} (job {j})", draft.backend),
+                None => format!("{what} to {}", draft.backend),
             };
-            Ok(json!({ "id": id, "dir": dir, "job": job, "session": record.session, "prompt": prompt }))
+            if let Some(note) = &fallback_note {
+                s.status.push_str(&format!("; {note}"));
+            }
+            Ok(json!({
+                "id": id, "dir": dir, "job": job, "session": record.session, "prompt": prompt,
+                "resumed": resume_job.is_some(), "note": fallback_note,
+            }))
         }
         Err(e) => {
             let reason = match e {
@@ -370,9 +431,9 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
 fn history(s: &mut Session, p: &Value) -> CmdResult {
     let open = p.get("open").and_then(Value::as_bool).unwrap_or(!s.feedback.history_open);
     let dir = s.feedback.records_dir()?;
-    s.feedback.history = feedback::list_records(&dir);
+    s.feedback.refresh_history();
     s.feedback.history_open = open;
-    Ok(json!({ "open": open, "dir": dir, "records": s.feedback.history }))
+    Ok(json!({ "open": open, "dir": dir, "records": s.feedback.history, "threads": s.feedback.threads }))
 }
 
 fn reopen(s: &mut Session, p: &Value) -> CmdResult {
@@ -384,8 +445,10 @@ fn reopen(s: &mut Session, p: &Value) -> CmdResult {
     if !s.feedback.active {
         toggle(s, &json!({ "open": true }))?;
     }
+    let thread = thread_of(s, &r);
     let fb = &mut s.feedback;
     fb.reset_draft();
+    fb.thread = Some(thread);
     fb.draft.text = r.text;
     fb.draft.shapes = r.shapes;
     fb.draft.parent = Some(r.id.clone());
@@ -400,6 +463,90 @@ fn reopen(s: &mut Session, p: &Value) -> CmdResult {
     }
     s.feedback.history_open = false;
     Ok(json!({ "parent": r.id }))
+}
+
+/// The thread `r` belongs to (just `r` when it is older than the listed history).
+fn thread_of(s: &mut Session, r: &Record) -> feedback::Thread {
+    s.feedback.refresh_history();
+    if let Some(t) = s.feedback.threads.iter().find(|t| t.entries.iter().any(|e| e.id == r.id)) {
+        return t.clone();
+    }
+    let summary = feedback::Summary {
+        id: r.id.clone(),
+        created: r.created.clone(),
+        title: r.text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default().trim().chars().take(80).collect(),
+        backend: r.backend.clone(),
+        target: r.target,
+        parent: r.parent.clone(),
+        job: r.job,
+        shapes: r.shapes.len(),
+        session: r.session.clone(),
+        root: r.id.clone(),
+        text: r.text.chars().take(4_000).collect(),
+    };
+    feedback::threads(&[summary]).into_iter().next().unwrap_or_else(|| feedback::Thread {
+        id: r.id.clone(),
+        title: String::new(),
+        updated: r.created.clone(),
+        backend: r.backend.clone(),
+        target: r.target,
+        session: r.session.clone(),
+        job: r.job,
+        entries: Vec::new(),
+    })
+}
+
+/// `feedback.continue`: an empty draft that follows up on the thread of record `id`.
+fn continue_thread(s: &mut Session, p: &Value) -> CmdResult {
+    let id = req_str(p, "id")?;
+    if !feedback::valid_id(id) {
+        return Err(CommandError::BadParams(format!("bad feedback id `{id}`")));
+    }
+    let dir = s.feedback.records_dir()?;
+    // `id` may be any record of the thread; the follow-up hangs off the newest one.
+    let first = feedback::read_record(&dir.join(id))?;
+    let thread = thread_of(s, &first);
+    let latest_id = thread.latest().map_or_else(|| first.id.clone(), |e| e.id.clone());
+    let latest = if latest_id == first.id { first } else { feedback::read_record(&dir.join(&latest_id))? };
+    if !s.feedback.active {
+        toggle(s, &json!({ "open": true }))?;
+    }
+    let fb = &mut s.feedback;
+    fb.reset_draft();
+    fb.draft.parent = Some(latest.id.clone());
+    fb.draft.session = thread.session.clone();
+    fb.thread = Some(thread.clone());
+    if latest.target != Target::Project || s.ws.project.is_some() {
+        s.feedback.draft.target = latest.target;
+    }
+    if valid_backend(&latest.backend) {
+        s.feedback.draft.backend = latest.backend;
+    }
+    if feedback::MODES.contains(&latest.mode.as_str()) {
+        s.feedback.draft.mode = latest.mode;
+    }
+    s.feedback.history_open = false;
+    Ok(json!({ "thread": thread.id, "parent": latest.id, "session": thread.session, "entries": thread.entries.len() }))
+}
+
+/// Reopen the thread's saved agent session for a follow-up. `Ok(None)`: it is gone (a new run
+/// takes over); an error: the agent is still busy with it.
+fn resumable_job(s: &mut Session, session: &str) -> Result<Option<u64>, CommandError> {
+    let job = match s.execute("agent.sessions.open", &json!({ "session": session })) {
+        Ok(v) => v.get("job").and_then(Value::as_u64),
+        Err(CommandError::Failed(m)) if m.contains("another CodeCraft window") => {
+            return Err(CommandError::Failed(format!("the agent is still working on this thread: {m}")));
+        }
+        Err(_) => None,
+    };
+    let Some(job) = job else { return Ok(None) };
+    let busy = s.agents.job(crate::agents::JobId(job)).and_then(|j| j.can_follow_up().err());
+    match busy {
+        Some(why) => Err(CommandError::Failed(format!(
+            "{why} on this thread (job {job}); send the follow-up when it has finished, or stop it in the Agent tool window"
+        ))),
+        None => Ok(Some(job)),
+    }
 }
 
 fn run_iteration(s: &mut Session, p: &Value) -> CmdResult {
@@ -535,7 +682,7 @@ mod tests {
         let rec2 = feedback::read_record(Path::new(r2["dir"].as_str().unwrap())).unwrap();
         assert_eq!(rec2.parent.as_deref(), Some(id.as_str()));
         assert!(!rec2.attachments.contains(&"annotated.png".to_string()));
-        assert!(r2["prompt"].as_str().unwrap().contains("revision of earlier feedback"));
+        assert!(r2["prompt"].as_str().unwrap().contains("follows earlier feedback"));
     }
 
     #[test]
@@ -617,6 +764,71 @@ mod tests {
         }
         s.execute("feedback.cancel", &Value::Null).unwrap();
         assert!(s.feedback.draft.shapes.is_empty() && !s.feedback.active);
+    }
+
+    #[test]
+    fn continue_follows_up_on_the_thread() {
+        fn agent(s: &mut Session, p: &Value) -> CmdResult {
+            s.status = serde_json::to_string(p).unwrap_or_default();
+            Ok(json!({ "job": 9, "session": "sess-new" }))
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = session(tmp.path());
+        // Saved agent sessions live in the temp home, never the user's.
+        s.isolate_home(&tmp.path().join("home"));
+        s.feedback.launcher = Some(agent);
+        let first = s.execute("feedback.submit", &json!({"confirm": true, "text": "Add a Feedback button"})).unwrap();
+        let first_id = first["id"].as_str().unwrap().to_string();
+        assert_eq!(first["session"], "sess-new");
+        assert!(!s.feedback.threads.is_empty(), "the history is refreshed after sending");
+
+        // Opening the overlay lists the thread.
+        s.execute("feedback.toggle", &json!({"open": true})).unwrap();
+        assert_eq!(s.feedback.threads.len(), 1);
+        assert_eq!(s.feedback.threads[0].session.as_deref(), Some("sess-new"));
+
+        // Continue: an empty draft that hangs off the newest record, in the thread's session.
+        s.feedback.draft.text = "leftover".into();
+        let c = s.execute("feedback.continue", &json!({"id": first_id})).unwrap();
+        assert_eq!(c["parent"], first_id.as_str());
+        assert_eq!(c["session"], "sess-new");
+        assert!(s.feedback.draft.text.is_empty() && s.feedback.draft.shapes.is_empty());
+        assert_eq!(s.feedback.draft.session.as_deref(), Some("sess-new"));
+        assert_eq!(s.feedback.thread.as_ref().unwrap().entries.len(), 1);
+
+        // The saved session is gone (nothing in the temp home): a new run with the earlier requests.
+        let r = s.execute("feedback.submit", &json!({"confirm": true, "text": "It is the wrong colour"})).unwrap();
+        assert_eq!(r["resumed"], false);
+        assert!(r["note"].as_str().unwrap().contains("sess-new is gone"));
+        let prompt = r["prompt"].as_str().unwrap();
+        assert!(
+            prompt.contains("another agent run already worked on") && prompt.contains("Add a Feedback button"),
+            "{prompt}"
+        );
+        let rec = feedback::read_record(Path::new(r["dir"].as_str().unwrap())).unwrap();
+        assert_eq!(rec.parent.as_deref(), Some(first_id.as_str()));
+        assert_eq!(rec.session.as_deref(), Some("sess-new"), "the new run's session continues the thread");
+        assert!(s.feedback.thread.is_none() && s.feedback.draft.session.is_none(), "reset after sending");
+        assert!(s.status.contains("gone"), "{}", s.status);
+
+        // Both records are one thread; continuing from the first hangs off the newest.
+        let h = s.execute("feedback.history", &json!({"open": false})).unwrap();
+        assert_eq!(h["threads"].as_array().unwrap().len(), 1, "{h}");
+        assert_eq!(h["threads"][0]["entries"].as_array().unwrap().len(), 2);
+        let c = s.execute("feedback.continue", &json!({"id": first_id})).unwrap();
+        assert_eq!(c["parent"], rec.id.as_str());
+        assert_eq!(c["entries"], 2);
+
+        // Another agent can't continue this session: the draft leaves it.
+        s.execute("feedback.set", &json!({"backend": "codex"})).unwrap();
+        assert!(s.feedback.draft.session.is_none());
+        assert!(s.feedback.draft.parent.is_some(), "still in the thread, as a new run");
+        s.execute("feedback.newThread", &Value::Null).unwrap();
+        assert!(s.feedback.draft.parent.is_none() && s.feedback.thread.is_none());
+
+        for bad in [json!({}), json!({"id": "../x"}), json!({"id": "missing"})] {
+            assert!(s.execute("feedback.continue", &bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

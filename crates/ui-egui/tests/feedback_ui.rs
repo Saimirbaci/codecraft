@@ -30,6 +30,10 @@ fn fake_agent(_: &mut Session, _: &Value) -> Result<Value, CommandError> {
     Ok(json!({ "job": 42 }))
 }
 
+fn fake_agent_with_session(_: &mut Session, _: &Value) -> Result<Value, CommandError> {
+    Ok(json!({ "job": 43, "session": "sess-ui" }))
+}
+
 fn harness(dir: &Path) -> Harness<'static, App> {
     let main = project(dir);
     let records = dir.join("records");
@@ -37,6 +41,7 @@ fn harness(dir: &Path) -> Harness<'static, App> {
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(move |_| {
         let mut app = App::ephemeral(Some(main));
         // Never write to the user's home or start a real agent.
+        app.session.isolate_home(&source.join("home"));
         app.session.feedback.dir = Some(records);
         app.session.feedback.source_dir = Some(source);
         app.session.feedback.launcher = Some(fake_agent);
@@ -203,4 +208,49 @@ fn submit_captures_screenshots_and_writes_the_record() {
     assert_eq!(rec["text"], "Make the gutter wider");
     assert!(rec["context"]["activeFile"].as_str().unwrap().ends_with("main.rs"));
     assert_eq!(rec["window"]["width"], 1280.0);
+}
+
+#[test]
+fn past_feedback_shows_on_reopen_and_continues_in_its_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    h.state_mut().session.feedback.launcher = Some(fake_agent_with_session);
+    h.state_mut()
+        .session
+        .execute("feedback.submit", &json!({ "confirm": true, "text": "Add a rename action to the tabs" }))
+        .unwrap();
+    h.run_steps(2);
+
+    // Reopening the overlay shows the earlier feedback.
+    h.key_press_modifiers(TOGGLE, Key::F);
+    h.run_steps(2);
+    assert!(h.query_by_label("Recent feedback").is_some(), "the recent threads are listed");
+    assert!(h.query_by_label("Add a rename action to the tabs").is_some());
+    h.get_by_label("Continue").click();
+    h.run_steps(3);
+
+    // The thread: its earlier request, the same agent session, and a follow-up to send.
+    let fb = &h.state().session.feedback;
+    assert!(fb.thread.is_some() && fb.draft.session.as_deref() == Some("sess-ui"));
+    assert!(h.query_by_label("Thread: Add a rename action to the tabs").is_some());
+    assert!(h.query_by_label("Earlier requests (1)").is_some());
+    assert!(h.query_by_label("Send follow-up").is_some());
+    assert!(h.query_by_label("Recent feedback").is_none(), "the list makes room for the thread");
+    assert!(h.query_by_label("Agent session").is_some());
+    // The follow-up goes to the thread's own agent: the choice is locked.
+    h.get_by_label("Codex").click();
+    h.run_steps(2);
+    assert_eq!(h.state().session.feedback.draft.backend, "claude");
+    assert_eq!(h.state().session.feedback.draft.session.as_deref(), Some("sess-ui"));
+
+    // New thread leaves it.
+    h.get_by_label("New thread").click();
+    h.run_steps(2);
+    assert!(h.state().session.feedback.thread.is_none());
+    assert!(h.query_by_label("Send to agent").is_some());
+
+    // The history lists the thread with Continue too.
+    h.get_by_label("History…").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("1 request").is_some(), "grouped by thread");
 }
