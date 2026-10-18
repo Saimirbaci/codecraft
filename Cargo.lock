@@ -817,7 +817,7 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codecraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecraft-engine",
  "codecraft-ui-egui",
@@ -828,7 +828,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-cargo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -853,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecraft-engine",
  "codecraft-workspace",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-dap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -877,7 +877,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "futures-util",
@@ -901,7 +901,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-engine"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecraft-agent",
  "codecraft-cargo",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-fs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "ignore",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-http"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "serde",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-lsp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "getrandom 0.3.4",
@@ -982,7 +982,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-profile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "flate2",
  "log",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-remote"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "log",
  "serde",
@@ -1005,7 +1005,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-syntax"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ra-ap-rustc_lexer",
  "serde",
@@ -1013,7 +1013,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "crossbeam-channel",
@@ -1029,7 +1029,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-text"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "ropey",
@@ -1039,7 +1039,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-ui-egui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -1066,7 +1066,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-vcs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "log",
@@ -1079,7 +1079,7 @@ dependencies = [
 
 [[package]]
 name = "codecraft-workspace"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "codecraft-cargo",
  "codecraft-fs",
@@ -6156,7 +6156,7 @@ checksum = "e450f9b2ed1dff33c94c12589a87338689467b9c4f5d8a5710bd09a847d2c8a7"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "png",
  "serde",
