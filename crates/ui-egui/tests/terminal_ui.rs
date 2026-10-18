@@ -152,3 +152,27 @@ fn renaming_a_tab_in_place() {
     assert_eq!(h.state().session.terminal.active_tab().unwrap().title(), "API server");
     h.state_mut().session.shutdown();
 }
+
+/// Shift+Enter sends a line feed (a new line in Claude Code's prompt), Enter a carriage return.
+#[test]
+fn shift_enter_sends_a_line_feed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let mut h =
+        Harness::builder().with_size(egui::vec2(1200.0, 800.0)).build_eframe(move |_| App::ephemeral(Some(root)));
+    h.run_steps(2);
+    h.state_mut().session.execute("terminal.new", &json!({})).unwrap();
+    settle(&mut h, "the shell prompt", |a| {
+        a.session.terminal.active_tab().is_some_and(|t| t.screen.text().contains('$'))
+    });
+    h.run_steps(2);
+
+    // Raw mode: the program sees the keys' bytes untranslated and prints them in hex.
+    type_text(&mut h, "stty raw -echo; v=$(head -c 2 | od -An -tx1); stty sane; echo \"bytes:$v\" | tr -s ' '");
+    h.key_press(Key::Enter);
+    h.run_steps(5);
+    std::thread::sleep(Duration::from_millis(300));
+    h.key_press_modifiers(Modifiers::SHIFT, Key::Enter);
+    h.key_press(Key::Enter);
+    settle(&mut h, "the bytes of Shift+Enter, Enter", |a| screen_has_line(a, "bytes: 0a 0d"));
+}

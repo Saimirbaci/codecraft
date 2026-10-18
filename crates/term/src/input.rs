@@ -135,6 +135,9 @@ pub fn encode_key(key: Key, mods: Mods, app_cursor: bool) -> Option<Vec<u8>> {
                 with_meta(c.encode_utf8(&mut buf).as_bytes().to_vec())
             }
         }
+        // Shift+Enter is a line feed (Ctrl+J), as in Zed and other terminals: Claude Code and
+        // other prompt-style programs insert a new line for it; shells run the line as for Enter.
+        Key::Enter if mods.shift && !mods.ctrl => with_meta(vec![b'\n']),
         Key::Enter => with_meta(vec![b'\r']),
         Key::Tab if mods.shift => b"\x1b[Z".to_vec(),
         Key::Tab => with_meta(vec![b'\t']),
@@ -274,6 +277,9 @@ mod tests {
         assert_eq!(key("Ctrl+["), vec![0x1b]);
         assert_eq!(key("Ctrl+Space"), vec![0]);
         assert_eq!(key("Enter"), b"\r");
+        assert_eq!(key("Shift+Enter"), b"\n", "a new line in Claude Code, not a submit");
+        assert_eq!(key("Alt+Enter"), b"\x1b\r");
+        assert_eq!(key("Ctrl+Shift+Enter"), b"\r");
         assert_eq!(key("Tab"), b"\t");
         assert_eq!(key("Shift+Tab"), b"\x1b[Z");
         assert_eq!(key("Backspace"), vec![0x7f]);
