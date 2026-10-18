@@ -120,6 +120,18 @@ fn draw_a_rectangle_then_escape_closes() {
 }
 
 #[test]
+fn the_toolbar_button_on_the_left_opens_the_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = harness(dir.path());
+    let button = h.get_by_label("✏ Feedback");
+    let r = button.rect();
+    assert!(r.max.x < 640.0 && r.min.y < 80.0, "on the left of the main toolbar: {r:?}");
+    button.click();
+    h.run_steps(2);
+    assert!(h.state().session.feedback.active, "the toolbar button opens the overlay");
+}
+
+#[test]
 fn escape_does_not_reach_popups_underneath() {
     let dir = tempfile::tempdir().unwrap();
     let mut h = harness(dir.path());

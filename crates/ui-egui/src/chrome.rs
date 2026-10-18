@@ -85,16 +85,22 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             });
             // Git branch widget (also draws the Git dialogs).
             crate::vcs_panels::branch_widget(ui, s, st);
+            // Feedback overlay: labelled, on the left, so it is easy to find.
+            ui.add_space(8.0);
+            let label = RichText::new("✏ Feedback").color(st.theme.annotation);
+            if ui
+                .add(egui::Button::new(label).frame(false))
+                .on_hover_text("Draw Feedback for an Agent (⌥⇧⌘F)")
+                .clicked()
+            {
+                run_command(s, st, "feedback.toggle", &Value::Null);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if tool_button(ui, st, "⚙", "Settings (⌘,)", true, None) {
                     run_command(s, st, "app.settings", &Value::Null);
                 }
                 if tool_button(ui, st, "🔍", "Search Everywhere (⇧⇧)", true, None) {
                     run_command(s, st, "navigate.searchEverywhere", &Value::Null);
-                }
-                if tool_button(ui, st, "✏", "Draw Feedback for an Agent (⌥⇧⌘F)", true, Some(st.theme.annotation))
-                {
-                    run_command(s, st, "feedback.toggle", &Value::Null);
                 }
                 ui.add_space(8.0);
                 let has_project = s.ws.project.is_some();

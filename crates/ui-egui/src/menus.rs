@@ -55,6 +55,8 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("File", "file.scratches"),
     // File › New › From Template… (the templates saved with File › Save File as Template…).
     ("File › New", "file.newFromTemplate"),
+    // CodeCraft's own: the feedback overlay (also on the toolbar).
+    ("Tools", "feedback.toggle"),
 ];
 
 pub(crate) fn visible(item: &CatalogItem) -> bool {
