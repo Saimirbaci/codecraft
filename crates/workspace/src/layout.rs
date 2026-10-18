@@ -207,6 +207,10 @@ pub struct Layout {
     /// Remembered size (width, or height for bottom windows) of each tool window, by key.
     #[serde(default)]
     pub tool_sizes: BTreeMap<String, f32>,
+    /// Remembered size of the resizable panes inside tool windows (the Git log's details pane,
+    /// the commit message/files split, ...), by pane key.
+    #[serde(default)]
+    pub pane_sizes: BTreeMap<String, f32>,
     /// Distraction-free: hide all tool windows (Cmd+Shift+F12, "Hide All Tool Windows").
     pub all_hidden: bool,
     /// The tool window shown last (Window › Active Tool Window acts on it).
@@ -233,6 +237,7 @@ impl Default for Layout {
             bottom_height: 260.0,
             right_width: 300.0,
             tool_sizes: BTreeMap::new(),
+            pane_sizes: BTreeMap::new(),
             all_hidden: false,
             last_active: None,
             maximized: None,
@@ -253,6 +258,23 @@ impl Layout {
         if size.is_finite() && size > 0.0 {
             self.tool_sizes.insert(tw.key().to_string(), size);
         }
+    }
+
+    /// The remembered size of the pane `key` inside a tool window, or `fallback`.
+    pub fn pane_size(&self, key: &str, fallback: f32) -> f32 {
+        self.pane_sizes.get(key).copied().filter(|v| v.is_finite() && *v > 0.0).unwrap_or(fallback)
+    }
+
+    /// Remember the size of the pane `key` (ignores non-finite or non-positive values; the map
+    /// is capped so a runaway caller cannot grow it without bound).
+    pub fn remember_pane(&mut self, key: &str, size: f32) {
+        if !size.is_finite() || size <= 0.0 {
+            return;
+        }
+        if self.pane_sizes.len() >= 256 && !self.pane_sizes.contains_key(key) {
+            return;
+        }
+        self.pane_sizes.insert(key.to_string(), size);
     }
 
     pub fn slot(&self, side: Side) -> Option<ToolWindowId> {
@@ -343,6 +365,21 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_sizes_are_remembered_and_hostile_values_ignored() {
+        let mut l = Layout::default();
+        assert_eq!(l.pane_size("git.details", 300.0), 300.0);
+        l.remember_pane("git.details", 410.0);
+        assert_eq!(l.pane_size("git.details", 300.0), 410.0);
+        l.remember_pane("git.details", f32::NAN);
+        l.remember_pane("git.details", -1.0);
+        assert_eq!(l.pane_size("git.details", 300.0), 410.0);
+        for i in 0..1000 {
+            l.remember_pane(&format!("k{i}"), 100.0);
+        }
+        assert!(l.pane_sizes.len() <= 256);
+    }
 
     #[test]
     fn toggle_replaces_on_same_side() {

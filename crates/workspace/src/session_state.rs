@@ -483,6 +483,13 @@ fn sanitize_layout(l: &Layout) -> Layout {
             .take(MAX_TOOL_SIZES)
             .map(|(k, v)| (k.clone(), *v))
             .collect(),
+        pane_sizes: l
+            .pane_sizes
+            .iter()
+            .filter(|(k, v)| k.len() <= 64 && v.is_finite() && (40.0..=10_000.0).contains(*v))
+            .take(MAX_TOOL_SIZES)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
         all_hidden: l.all_hidden,
         last_active: l.last_active,
         group_tabs: l.group_tabs,
@@ -655,6 +662,7 @@ mod tests {
         }
         let mut layout = Layout { left_width: f32::NAN, bottom_height: -5.0, right_width: 1e30, ..Layout::default() };
         layout.tool_sizes.insert("x".into(), f32::NAN);
+        layout.pane_sizes.insert("x".into(), f32::INFINITY);
         let snaps = [
             SessionSnapshot {
                 split: deep,
@@ -689,6 +697,7 @@ mod tests {
             }
             assert!(rws.layout.left_width.is_finite() && rws.layout.bottom_height > 0.0);
             assert!(rws.layout.tool_sizes.is_empty());
+            assert!(rws.layout.pane_sizes.is_empty());
             for id in rws.all_tabs() {
                 let e = rws.editor(id).unwrap();
                 assert!(e.scroll_line.is_finite() && e.scroll_x.is_finite());

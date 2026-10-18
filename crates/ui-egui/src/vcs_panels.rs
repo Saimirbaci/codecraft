@@ -356,9 +356,10 @@ fn changes_view(
         .show(ui, |ui| commit_box(ui, s, st, theme, cmd));
     // The selected change's diff.
     if let Some(preview) = s.vcs.preview.clone() {
-        egui::Panel::bottom("vcs-change-preview")
+        let preview_h = s.ws.layout.pane_size(PANE_PREVIEW, ui.available_height() * 0.45);
+        let resp = egui::Panel::bottom("vcs-change-preview")
             .resizable(true)
-            .default_size(ui.available_height() * 0.45)
+            .default_size(preview_h)
             .size_range(80.0..=1200.0)
             .frame(Frame::new().inner_margin(Margin::symmetric(0, 4)))
             .show(ui, |ui| {
@@ -379,6 +380,7 @@ fn changes_view(
                 });
                 file_diff_view(ui, st, theme, "vcs-preview", &preview, ui.available_height());
             });
+        s.ws.layout.remember_pane(PANE_PREVIEW, resp.response.rect.height());
     }
     let changes: Vec<FileStatus> = s.vcs.changes().into_iter().cloned().collect();
     let unversioned: Vec<FileStatus> = s.vcs.unversioned().into_iter().cloned().collect();
@@ -836,12 +838,14 @@ fn log_view(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd: 
     }
     // Details on the right.
     if s.vcs.log.selected.is_some() {
-        egui::Panel::right("vcs-log-details")
+        let details_w = s.ws.layout.pane_size(PANE_LOG_DETAILS, ui.available_width() * 0.42);
+        let resp = egui::Panel::right("vcs-log-details")
             .resizable(true)
-            .default_size(ui.available_width() * 0.42)
+            .default_size(details_w)
             .size_range(200.0..=1400.0)
             .frame(Frame::new().inner_margin(Margin::symmetric(6, 2)))
             .show(ui, |ui| details_view(ui, s, st, theme, cmd));
+        s.ws.layout.remember_pane(PANE_LOG_DETAILS, resp.response.rect.width());
     }
     // The commit list.
     let row_h = 22.0;
@@ -930,6 +934,12 @@ fn log_view(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd: 
     });
 }
 
+/// Keys of the resizable panes inside the Git and Commit tool windows (`Layout::pane_sizes`).
+const PANE_PREVIEW: &str = "commit.preview";
+const PANE_LOG_DETAILS: &str = "git.log.details";
+const PANE_LOG_MESSAGE: &str = "git.log.message";
+const PANE_LOG_FILES: &str = "git.log.files";
+
 fn details_view(
     ui: &mut Ui,
     s: &mut Session,
@@ -943,44 +953,62 @@ fn details_view(
         }
         return;
     };
-    let files_h = (ui.available_height() * 0.35).max(80.0);
-    egui::ScrollArea::vertical().id_salt("vcs-commit-message").max_height(ui.available_height() * 0.3).show(ui, |ui| {
-        let mut lines = d.message.lines();
-        ui.label(RichText::new(lines.next().unwrap_or_default()).strong());
-        let body: Vec<&str> = lines.collect();
-        if !body.is_empty() {
-            ui.label(body.join("\n").trim());
-        }
-        ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            let short = d.hash.get(..8).unwrap_or(&d.hash).to_string();
-            if ui.link(RichText::new(&short).monospace()).on_hover_text("Copy the full hash").clicked() {
-                ui.ctx().copy_text(d.hash.clone());
-            }
-            ui.label(RichText::new(format!("{} <{}>", d.author, d.email)).color(theme.text_muted).small());
-            ui.label(RichText::new(format!("on {}", date(d.time))).color(theme.text_muted).small());
+    // The message and the file list are panes the user can drag; their sizes are remembered, so
+    // selecting another commit (or restarting) keeps them.
+    let message_h = s.ws.layout.pane_size(PANE_LOG_MESSAGE, (ui.available_height() * 0.3).max(60.0));
+    let resp = egui::Panel::top("vcs-commit-message")
+        .resizable(true)
+        .default_size(message_h)
+        .size_range(40.0..=1200.0)
+        .frame(Frame::new())
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical().id_salt("vcs-commit-message").auto_shrink([false, false]).show(ui, |ui| {
+                let mut lines = d.message.lines();
+                ui.label(RichText::new(lines.next().unwrap_or_default()).strong());
+                let body: Vec<&str> = lines.collect();
+                if !body.is_empty() {
+                    ui.label(body.join("\n").trim());
+                }
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    let short = d.hash.get(..8).unwrap_or(&d.hash).to_string();
+                    if ui.link(RichText::new(&short).monospace()).on_hover_text("Copy the full hash").clicked() {
+                        ui.ctx().copy_text(d.hash.clone());
+                    }
+                    ui.label(RichText::new(format!("{} <{}>", d.author, d.email)).color(theme.text_muted).small());
+                    ui.label(RichText::new(format!("on {}", date(d.time))).color(theme.text_muted).small());
+                });
+                if d.committer != d.author {
+                    ui.label(RichText::new(format!("committed by {}", d.committer)).color(theme.text_muted).small());
+                }
+            });
         });
-        if d.committer != d.author {
-            ui.label(RichText::new(format!("committed by {}", d.committer)).color(theme.text_muted).small());
-        }
-    });
-    ui.separator();
-    ui.label(
-        RichText::new(format!("{} changed file{}", d.files.len(), if d.files.len() == 1 { "" } else { "s" }))
-            .small()
-            .color(theme.text_muted),
-    );
-    egui::ScrollArea::vertical().id_salt("vcs-commit-files").max_height(files_h).show(ui, |ui| {
-        for f in &d.files {
-            let selected = s.vcs.log.selected_file.as_deref() == Some(f.path.as_str());
-            let (name, dir) = file_name(&f.path);
-            let text = RichText::new(if dir.is_empty() { name.to_string() } else { format!("{name}  {dir}") })
-                .color(state_color(theme, f.state));
-            if ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false)).clicked() {
-                *cmd = Some(("vcs.selectCommitFile", json!({ "path": f.path })));
-            }
-        }
-    });
+    s.ws.layout.remember_pane(PANE_LOG_MESSAGE, resp.response.rect.height());
+    let files_h = s.ws.layout.pane_size(PANE_LOG_FILES, (ui.available_height() * 0.35).max(80.0));
+    let resp = egui::Panel::top("vcs-commit-files")
+        .resizable(true)
+        .default_size(files_h)
+        .size_range(40.0..=1200.0)
+        .frame(Frame::new())
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new(format!("{} changed file{}", d.files.len(), if d.files.len() == 1 { "" } else { "s" }))
+                    .small()
+                    .color(theme.text_muted),
+            );
+            egui::ScrollArea::vertical().id_salt("vcs-commit-files").auto_shrink([false, false]).show(ui, |ui| {
+                for f in &d.files {
+                    let selected = s.vcs.log.selected_file.as_deref() == Some(f.path.as_str());
+                    let (name, dir) = file_name(&f.path);
+                    let text = RichText::new(if dir.is_empty() { name.to_string() } else { format!("{name}  {dir}") })
+                        .color(state_color(theme, f.state));
+                    if ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false)).clicked() {
+                        *cmd = Some(("vcs.selectCommitFile", json!({ "path": f.path })));
+                    }
+                }
+            });
+        });
+    s.ws.layout.remember_pane(PANE_LOG_FILES, resp.response.rect.height());
     if let Some(diff) = s.vcs.log.file_diff.clone() {
         ui.separator();
         ui.horizontal(|ui| {
