@@ -357,7 +357,7 @@ fn changes_view(
     // The selected change's diff.
     if let Some(preview) = s.vcs.preview.clone() {
         let preview_h = s.ws.layout.pane_size(PANE_PREVIEW, ui.available_height() * 0.45);
-        let resp = egui::Panel::bottom("vcs-change-preview")
+        let resp = egui::Panel::bottom(crate::panels::window_panel_id(ui, "vcs-change-preview"))
             .resizable(true)
             .default_size(preview_h)
             .size_range(80.0..=1200.0)
@@ -839,7 +839,7 @@ fn log_view(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme, cmd: 
     // Details on the right.
     if s.vcs.log.selected.is_some() {
         let details_w = s.ws.layout.pane_size(PANE_LOG_DETAILS, ui.available_width() * 0.42);
-        let resp = egui::Panel::right("vcs-log-details")
+        let resp = egui::Panel::right(crate::panels::window_panel_id(ui, "vcs-log-details"))
             .resizable(true)
             .default_size(details_w)
             .size_range(200.0..=1400.0)
@@ -956,7 +956,7 @@ fn details_view(
     // The message and the file list are panes the user can drag; their sizes are remembered, so
     // selecting another commit (or restarting) keeps them.
     let message_h = s.ws.layout.pane_size(PANE_LOG_MESSAGE, (ui.available_height() * 0.3).max(60.0));
-    let resp = egui::Panel::top("vcs-commit-message")
+    let resp = egui::Panel::top(crate::panels::window_panel_id(ui, "vcs-commit-message"))
         .resizable(true)
         .default_size(message_h)
         .size_range(40.0..=1200.0)
@@ -985,7 +985,7 @@ fn details_view(
         });
     s.ws.layout.remember_pane(PANE_LOG_MESSAGE, resp.response.rect.height());
     let files_h = s.ws.layout.pane_size(PANE_LOG_FILES, (ui.available_height() * 0.35).max(80.0));
-    let resp = egui::Panel::top("vcs-commit-files")
+    let resp = egui::Panel::top(crate::panels::window_panel_id(ui, "vcs-commit-files"))
         .resizable(true)
         .default_size(files_h)
         .size_range(40.0..=1200.0)

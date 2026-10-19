@@ -227,6 +227,14 @@ fn fill_panel(ui: &mut egui::Ui) {
     }
 }
 
+/// The id of a resizable panel in this window. egui keeps a panel's dragged size under its id in
+/// the context shared by every project window, so an id without the window would make all windows
+/// follow one another's size; the viewport keeps each window's sizes its own (the remembered
+/// sizes live in the window's `Layout`, saved with the project).
+pub(crate) fn window_panel_id(ui: &egui::Ui, name: impl std::hash::Hash + std::fmt::Debug) -> egui::Id {
+    egui::Id::new(("window-panel", ui.ctx().viewport_id(), name))
+}
+
 pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     if s.ws.layout.all_hidden {
         return;
@@ -239,7 +247,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let maximized = s.ws.layout.maximized;
     if let Some(tw) = s.ws.layout.bottom {
         let size = s.ws.layout.size_of(tw, s.ws.layout.bottom_height);
-        let mut panel = egui::Panel::bottom(format!("tw-bottom-{}-{rev}", tw.key()))
+        let mut panel = egui::Panel::bottom(window_panel_id(ui, ("tw-bottom", tw.key(), rev)))
             .resizable(true)
             .default_size(size)
             .size_range(80.0..=1200.0)
@@ -261,7 +269,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
     if let Some(tw) = s.ws.layout.left {
         let size = s.ws.layout.size_of(tw, s.ws.layout.left_width);
-        let mut panel = egui::Panel::left(format!("tw-left-{}-{rev}", tw.key()))
+        let mut panel = egui::Panel::left(window_panel_id(ui, ("tw-left", tw.key(), rev)))
             .resizable(true)
             .default_size(size)
             .size_range(140.0..=900.0)
@@ -283,7 +291,7 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
     if let Some(tw) = s.ws.layout.right {
         let size = s.ws.layout.size_of(tw, s.ws.layout.right_width);
-        let mut panel = egui::Panel::right(format!("tw-right-{}-{rev}", tw.key()))
+        let mut panel = egui::Panel::right(window_panel_id(ui, ("tw-right", tw.key(), rev)))
             .resizable(true)
             .default_size(size)
             .size_range(160.0..=900.0)
@@ -983,7 +991,7 @@ fn notifications_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 
 #[cfg(test)]
 mod tests {
-    use super::find_location;
+    use super::{find_location, window_panel_id};
 
     #[test]
     fn console_locations() {
@@ -995,5 +1003,23 @@ mod tests {
         assert!(find_location("file.rs:x").is_none());
         let (_, l, c, _) = find_location("at /abs/path/ünï.rs:7").unwrap();
         assert_eq!((l, c), (7, 1));
+    }
+
+    #[test]
+    fn panel_ids_differ_per_window_so_sizes_are_not_shared() {
+        let ctx = egui::Context::default();
+        let id_in = |viewport: egui::ViewportId| {
+            let mut raw = egui::RawInput { viewport_id: viewport, ..Default::default() };
+            raw.viewports.insert(viewport, egui::ViewportInfo::default());
+            let mut id = None;
+            let mut out = ctx.run_ui(raw, |ui| id = Some(window_panel_id(ui, ("tw-bottom", "terminal", 0_u64))));
+            out.textures_delta.clear();
+            id
+        };
+        let a = egui::ViewportId::from_hash_of("window-a");
+        let b = egui::ViewportId::from_hash_of("window-b");
+        assert!(id_in(a).is_some());
+        assert_eq!(id_in(a), id_in(a));
+        assert_ne!(id_in(a), id_in(b));
     }
 }
