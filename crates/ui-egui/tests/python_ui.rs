@@ -81,6 +81,42 @@ fn packages_window_lists_and_uninstalls_with_confirmation() {
 }
 
 #[test]
+fn virtualenv_menu_and_run_configuration_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    std::fs::write(root.join("main.py"), "print(1)\n").unwrap();
+    // A virtualenv with an unconventional name is selected on its own.
+    fake_venv(&root.join("linkedin_env"), &root.join("calls.log"));
+    std::fs::create_dir_all(root.join(".codecraft")).unwrap();
+    std::fs::write(
+        root.join(".codecraft/run-configurations.json"),
+        r#"{"configurations":[{"name":"Run main","kind":"python","command":"main.py"}]}"#,
+    )
+    .unwrap();
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 1000.0)).build_eframe({
+        let root = root.clone();
+        move |_| App::ephemeral(Some(root))
+    });
+    h.state_mut().session.python.probe = Some(Probe::isolated(Vec::new()));
+    settle(&mut h, "project", |a| a.session.python.root.is_some() && a.session.ws.project.is_some());
+    h.run_steps(2);
+    assert!(h.query_by_label("Python 3.12 (linkedin_env)").is_some(), "status bar interpreter widget");
+    // The status bar menu offers a virtualenv from any folder.
+    h.get_by_label("Python 3.12 (linkedin_env)").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Add Existing Virtualenv…").is_some(), "the status bar menu");
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+
+    // Edit Configurations has a Virtual env row for Python configurations.
+    h.state_mut().session.execute("run.editConfigurations", &json!({})).unwrap();
+    settle(&mut h, "dialog", |a| a.session.python.detected);
+    h.run_steps(4);
+    assert!(h.query_by_label("Virtual env:").is_some(), "the Virtual env row");
+    assert!(h.query_by_label("Browse…").is_some());
+}
+
+#[test]
 fn console_window_shows_results_and_variables() {
     let has_python = std::process::Command::new("python3").arg("--version").output().is_ok_and(|o| o.status.success());
     if !has_python {

@@ -26,7 +26,8 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
              command?: string, env?: \"A=1;B=2\"|{A: \"1\"}, envFile?: string (a .env file, relative to the project), \
              workingDir?: string, beforeLaunch?: [{kind: build}|{kind: runConfiguration, name}|{kind: external, \
              command, workingDir?}], debugger?: {initCommands?: [string], stopAtEntry?: bool, env?, justMyCode?: bool, \
-             subProcess?: bool}, storeAsProjectFile?: bool, executable?: string (cmake)} → {index}. A new configuration starts from \
+             subProcess?: bool}, storeAsProjectFile?: bool, executable?: string (cmake), pythonInterpreter?: string (python, django, fastapi, flask: \
+             a Python executable or virtualenv folder; default the project's)} → {index}. A new configuration starts from \
              its kind's template (runConfig.template.update). Cargo commands omit `cargo` (`run --bin app -- --port 80`); \
              python: `main.py --arg` or `-m pytest`; cpp: sources and flags, then `-- args` (compiled and run); \
              zig: `build run`; npm: `run dev`; cmake: a CMake target, then `-- args` (built, then its executable runs); \
@@ -52,7 +53,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             None,
             "{index: int, name?, kind?, command?, env?, envFile?: string|null, workingDir?, target?: {kind: local|docker|ssh, …}|null, \
              beforeLaunch?: [task]|null, debugger?: {initCommands?, stopAtEntry?, env?}|null, storeAsProjectFile?: bool, \
-             executable?: string} — change a user configuration (see runConfig.create)",
+             executable?, pythonInterpreter?: string|null} — change a user configuration (see runConfig.create)",
             Context::Global,
             has_project,
             update,
@@ -142,7 +143,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "Edit Run Configuration Template",
             None,
             "{kind: string, command?, env?, envFile?, workingDir?, target?, beforeLaunch?, debugger?, \
-             storeAsProjectFile?, executable?, reset?: bool} — change the defaults new configurations of that kind \
+             storeAsProjectFile?, executable?, pythonInterpreter?, reset?: bool} — change the defaults new configurations of that kind \
              start from (in the dialog's draft while Edit Configurations is open)",
             Context::Global,
             has_project,
@@ -322,6 +323,7 @@ fn describe(c: &UserRunConfig, root: &std::path::Path) -> Value {
         "debugger": c.debugger,
         "storeAsProjectFile": c.store_as_project_file,
         "executable": c.executable,
+        "pythonInterpreter": c.python_interpreter,
         "projectFile": c.store_as_project_file.then(|| {
             format!("{}/{}", run_config_store::PROJECT_FILES_DIR, run_config_store::project_file_name(&c.name))
         }),
@@ -429,6 +431,12 @@ fn fill(c: &mut UserRunConfig, p: &Value) -> Result<(), String> {
         c.executable = match v {
             Value::Null => String::new(),
             v => v.as_str().ok_or("`executable` must be text")?.trim().to_string(),
+        };
+    }
+    if let Some(v) = p.get("pythonInterpreter") {
+        c.python_interpreter = match v {
+            Value::Null => String::new(),
+            v => v.as_str().ok_or("`pythonInterpreter` must be text")?.trim().to_string(),
         };
     }
     Ok(())

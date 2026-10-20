@@ -90,16 +90,100 @@ pub fn venv_python(dir: &Path) -> Option<PathBuf> {
     ["bin/python", "bin/python3", "Scripts/python.exe"].iter().map(|rel| dir.join(rel)).find(|p| p.is_file())
 }
 
-/// The project's own virtualenv interpreter (`.venv`, `venv`, `.env`, `env`).
+/// The project's own virtualenv interpreter: `.venv`, `venv`, `.env`, `env`, else any other
+/// virtualenv directly in the project (`linkedin_env`, `.virtualenv`).
 pub fn project_venv(root: &Path) -> Option<PathBuf> {
-    VENV_DIRS.iter().map(|d| root.join(d)).filter(|d| is_venv_dir(d) || d.join("bin/python").is_file()).find_map(|d| {
-        // `.env` and `env` are often dotenv files or unrelated folders: they need a pyvenv.cfg.
+    let standard =
+        VENV_DIRS.iter().map(|d| root.join(d)).filter(|d| is_venv_dir(d) || d.join("bin/python").is_file()).find_map(
+            |d| {
+                // `.env` and `env` are often dotenv files or unrelated folders: they need a pyvenv.cfg.
+                let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(name, ".env" | "env") && !is_venv_dir(&d) {
+                    return None;
+                }
+                venv_python(&d)
+            },
+        );
+    standard.or_else(|| find_venvs(root, 1).into_iter().find_map(|d| venv_python(&d)))
+}
+
+/// Directories never searched for virtualenvs.
+const VENV_SCAN_SKIP: [&str; 8] =
+    ["node_modules", "target", ".git", "__pycache__", "site-packages", ".idea", "dist", "build"];
+/// Virtualenvs listed per project.
+const MAX_PROJECT_VENVS: usize = 16;
+/// Directory entries read per directory while looking for virtualenvs.
+const MAX_SCAN_ENTRIES: usize = 2000;
+
+/// The virtualenv directories (a `pyvenv.cfg` and an interpreter) under `root`, up to `depth`
+/// levels down (1 = directly in the project, 2 = `backend/.venv`). Virtualenvs are not searched
+/// inside; the conventional names come first, then the rest by path.
+pub fn find_venvs(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    scan_venvs(root, depth, &mut found);
+    let rank = |d: &PathBuf| {
         let name = d.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if matches!(name, ".env" | "env") && !is_venv_dir(&d) {
-            return None;
+        let standard = d.parent() == Some(root) && VENV_DIRS.contains(&name);
+        (!standard, d.components().count(), d.clone())
+    };
+    found.sort_by_key(rank);
+    found
+}
+
+fn scan_venvs(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
+    if depth == 0 || found.len() >= MAX_PROJECT_VENVS {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut subdirs: Vec<PathBuf> = rd
+        .flatten()
+        .take(MAX_SCAN_ENTRIES)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| !e.file_name().to_str().is_some_and(|n| VENV_SCAN_SKIP.contains(&n)))
+        .map(|e| e.path())
+        .collect();
+    subdirs.sort();
+    for sub in subdirs {
+        if is_venv_dir(&sub) && venv_python(&sub).is_some() {
+            if found.len() < MAX_PROJECT_VENVS {
+                found.push(sub);
+            }
+        } else {
+            scan_venvs(&sub, depth - 1, found);
         }
-        venv_python(&d)
-    })
+    }
+}
+
+/// The interpreter a path stands for: the executable itself, or the interpreter inside a
+/// virtualenv / environment directory (`<dir>/bin/python`, `<dir>/Scripts/python.exe`,
+/// `<dir>/python.exe`).
+pub fn resolve_interpreter(path: &Path) -> Result<PathBuf, String> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if path.is_dir() {
+        return venv_python(path)
+            .or_else(|| Some(path.join("python.exe")).filter(|p| p.is_file()))
+            .ok_or_else(|| format!("{} is not a virtualenv: no Python interpreter inside", path.display()));
+    }
+    Err(format!("{} does not exist", path.display()))
+}
+
+/// The variables `activate` would set for a virtualenv interpreter: `VIRTUAL_ENV`, and the
+/// virtualenv's `bin` first on `PATH` (so `pip`, `pytest`, `flask` and subprocesses resolve there).
+/// Empty for an interpreter outside a virtualenv.
+pub fn venv_env(python: &Path) -> Vec<(String, String)> {
+    let Some(venv) = venv_of(python) else { return Vec::new() };
+    let Some(bin) = python.parent() else { return Vec::new() };
+    let mut paths = vec![bin.to_path_buf()];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    let mut env = vec![("VIRTUAL_ENV".to_string(), venv.display().to_string())];
+    if let Ok(path) = std::env::join_paths(paths) {
+        env.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
+    }
+    env
 }
 
 /// A directory with a `pyvenv.cfg` (made by `venv`, virtualenv or uv).
@@ -183,7 +267,7 @@ pub fn python_tool(root: &Path, name: &str) -> Option<PathBuf> {
 
 /// Whether the directory looks like a Python project.
 pub fn is_python_project(root: &Path) -> bool {
-    ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "manage.py"]
+    ["pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "manage.py", "main.py", "app.py"]
         .iter()
         .any(|f| root.join(f).is_file())
         || project_venv(root).is_some()
@@ -375,6 +459,13 @@ pub fn detect(root: Option<&Path>, probe: &Probe) -> Vec<Interpreter> {
             }
             if let Some(py) = venv_python(&dir) {
                 found.add(py, InterpreterKind::Venv, d.to_string(), pyvenv_version(&dir));
+            }
+        }
+        // Every other virtualenv in the project (`linkedin_env`, `backend/.venv`).
+        for dir in find_venvs(root, 2) {
+            if let Some(py) = venv_python(&dir) {
+                let name = dir.strip_prefix(root).map(|r| r.display().to_string()).unwrap_or_else(|_| dir_name(&dir));
+                found.add(py, InterpreterKind::Venv, name, pyvenv_version(&dir));
             }
         }
         if let Some(sel) = selected_interpreter(root) {
@@ -571,6 +662,64 @@ mod tests {
         // A corrupt selection file is ignored.
         std::fs::write(root.join(SELECTION_FILE), "{{{").unwrap();
         assert_eq!(project_python(root), Some(py));
+    }
+
+    #[test]
+    fn finds_virtualenvs_under_the_project_whatever_their_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(find_venvs(root, 2).is_empty());
+        let custom = venv(&root.join("linkedin_env"), "3.11.2");
+        let nested = venv(&root.join("backend/.venv"), "3.12.1");
+        // Not virtualenvs: no pyvenv.cfg, or inside skipped / too deep folders.
+        script(&root.join("plain/bin/python"), "true");
+        venv(&root.join("node_modules/pkg/venv"), "3.9.0");
+        venv(&root.join("a/b/c/venv"), "3.9.0");
+        assert_eq!(find_venvs(root, 1), vec![root.join("linkedin_env")]);
+        assert_eq!(find_venvs(root, 2), vec![root.join("linkedin_env"), root.join("backend/.venv")]);
+        // A directly-contained virtualenv with an unconventional name is the project's.
+        assert_eq!(project_venv(root), Some(custom.clone()));
+        assert_eq!(project_python(root), Some(custom.clone()));
+        assert!(is_python_project(root));
+        // The conventional names win over it.
+        let std_venv = venv(&root.join(".venv"), "3.12.1");
+        assert_eq!(project_venv(root), Some(std_venv.clone()));
+        assert_eq!(find_venvs(root, 1).first(), Some(&root.join(".venv")));
+        // Detection lists them all, named by their path in the project.
+        let found = detect(Some(root), &Probe::isolated(Vec::new()));
+        let names: Vec<(&str, &Path)> = found.iter().map(|i| (i.name.as_str(), i.path.as_path())).collect();
+        assert!(names.contains(&(".venv", std_venv.as_path())), "{names:?}");
+        assert!(names.contains(&("linkedin_env", custom.as_path())), "{names:?}");
+        assert!(names.contains(&("backend/.venv", nested.as_path())), "{names:?}");
+        assert!(found.iter().all(|i| i.kind == InterpreterKind::Venv));
+    }
+
+    #[test]
+    fn a_main_py_makes_a_python_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_python_project(tmp.path()));
+        std::fs::write(tmp.path().join("main.py"), "print(1)\n").unwrap();
+        assert!(is_python_project(tmp.path()));
+    }
+
+    #[test]
+    fn resolves_a_virtualenv_directory_or_an_interpreter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py = venv(&tmp.path().join("elsewhere/env1"), "3.12.1");
+        assert_eq!(resolve_interpreter(&py), Ok(py.clone()));
+        assert_eq!(resolve_interpreter(&tmp.path().join("elsewhere/env1")), Ok(py));
+        assert!(resolve_interpreter(tmp.path()).unwrap_err().contains("not a virtualenv"));
+        assert!(resolve_interpreter(&tmp.path().join("nope")).unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn venv_env_activates_the_virtualenv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let py = venv(&tmp.path().join("v"), "3.12.1");
+        let env: std::collections::HashMap<_, _> = venv_env(&py).into_iter().collect();
+        assert_eq!(env.get("VIRTUAL_ENV"), Some(&tmp.path().join("v").display().to_string()));
+        assert!(env.get("PATH").is_some_and(|p| p.starts_with(&tmp.path().join("v/bin").display().to_string())));
+        assert!(venv_env(Path::new("/usr/bin/python3")).is_empty());
     }
 
     #[test]

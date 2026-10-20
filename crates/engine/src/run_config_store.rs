@@ -244,6 +244,11 @@ pub struct UserRunConfig {
     /// target's artifact.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub executable: String,
+    /// Python kinds only: the interpreter or virtualenv folder this configuration runs in
+    /// (relative = from the project; it may be outside the project). Empty = the project's
+    /// interpreter.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub python_interpreter: String,
 }
 
 /// One "Before launch" task of a run configuration.
@@ -681,6 +686,25 @@ impl UserRunConfig {
         if p.is_absolute() { p } else { project.join(p) }
     }
 
+    /// Whether the kind runs in a Python interpreter (so `python_interpreter` applies).
+    pub fn runs_in_python(&self) -> bool {
+        matches!(self.kind, RunKind::Python | RunKind::Django | RunKind::FastApi | RunKind::Flask)
+    }
+
+    /// The interpreter this configuration runs in: its own `python_interpreter` (a Python
+    /// executable or a virtualenv folder), else the project's.
+    pub fn python_program(&self, project: &Path) -> Result<String, String> {
+        let chosen = self.python_interpreter.trim();
+        if chosen.is_empty() {
+            return Ok(crate::run_configs::python_in(project, &self.cwd(project, project)));
+        }
+        let path = PathBuf::from(chosen);
+        let path = if path.is_absolute() { path } else { project.join(path) };
+        crate::python_env::resolve_interpreter(&path)
+            .map(|p| p.display().to_string())
+            .map_err(|e| format!("`{}`: Python interpreter: {e}", self.name.trim()))
+    }
+
     /// The `.env` file, resolved against `project` (`None` when the configuration has none).
     pub fn env_file_path(&self, project: &Path) -> Option<PathBuf> {
         let f = self.env_file.trim();
@@ -876,9 +900,18 @@ impl UserRunConfig {
         let env = self.effective_env(project);
         let words = || split_words(&self.command).map_err(|e| format!("`{name}`: {e}"));
         let process = |program: String, args: Vec<String>| {
-            let mut cmd = ProcessCommand::new(program, &[], self.cwd(project, project));
+            let mut cmd = ProcessCommand::new(program.clone(), &[], self.cwd(project, project));
             cmd.args = args;
             cmd.env = env.clone();
+            // Python in a virtualenv runs as if the virtualenv were activated; the configuration's
+            // own variables win.
+            if self.runs_in_python() {
+                for (k, v) in crate::python_env::venv_env(Path::new(&program)) {
+                    if !cmd.env.iter().any(|(o, _)| *o == k) {
+                        cmd.env.push((k, v));
+                    }
+                }
+            }
             Ok(RunConfig::process(name.clone(), cmd))
         };
         match self.kind {
@@ -898,7 +931,7 @@ impl UserRunConfig {
                 if args.is_empty() {
                     return Err(format!("`{name}`: the command is empty"));
                 }
-                process(crate::run_configs::python_in(project, &self.cwd(project, project)), args)
+                process(self.python_program(project)?, args)
             }
             RunKind::Zig => {
                 let args = words()?;
@@ -920,11 +953,7 @@ impl UserRunConfig {
                     return Err(format!("`{name}`: the command is empty"));
                 }
                 let (program, args) =
-                    crate::python_project::framework_command(
-                    self.kind,
-                    crate::run_configs::python_in(project, &self.cwd(project, project)),
-                    args,
-                );
+                    crate::python_project::framework_command(self.kind, self.python_program(project)?, args);
                 process(program, args)
             }
             RunKind::Dockerfile => {
@@ -1459,6 +1488,49 @@ mod tests {
         assert!(c.read_env_file(dir.path()).is_err());
         // Running with the file gone still builds the configuration, with the explicit env only.
         assert_eq!(c.to_run_config(dir.path(), dir.path()).unwrap().command.unwrap().env.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn python_configurations_run_in_their_own_virtualenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let make_venv = |d: &Path| {
+            std::fs::create_dir_all(d.join("bin")).unwrap();
+            std::fs::write(d.join("bin/python"), "").unwrap();
+            std::fs::write(d.join("pyvenv.cfg"), "version = 3.12.1\n").unwrap();
+        };
+        make_venv(&project.join("linkedin_env"));
+        let other = dir.path().join("elsewhere/shared-env");
+        make_venv(&other);
+        let mut c = UserRunConfig { name: "Run".into(), kind: RunKind::Python, command: "main.py".into(), ..Default::default() };
+        let program = |c: &UserRunConfig| c.to_run_config(&project, &project).unwrap().command.unwrap();
+        // No choice: the project's virtualenv, activated.
+        let cmd = program(&c);
+        assert_eq!(cmd.program, project.join("linkedin_env/bin/python").display().to_string());
+        assert!(cmd.env.iter().any(|(k, v)| k == "VIRTUAL_ENV" && v.ends_with("linkedin_env")), "{:?}", cmd.env);
+        // A virtualenv folder outside the project.
+        c.python_interpreter = other.display().to_string();
+        let cmd = program(&c);
+        assert_eq!(cmd.program, other.join("bin/python").display().to_string());
+        assert!(cmd.env.iter().any(|(k, v)| k == "VIRTUAL_ENV" && v.ends_with("shared-env")));
+        // The configuration's own variables win over the activation.
+        c.env = vec![("VIRTUAL_ENV".into(), "mine".into())];
+        assert!(program(&c).env.iter().any(|(k, v)| k == "VIRTUAL_ENV" && v == "mine"));
+        c.env.clear();
+        // Relative to the project, and for the framework kinds.
+        c.python_interpreter = "linkedin_env".into();
+        assert_eq!(program(&c).program, project.join("linkedin_env/bin/python").display().to_string());
+        c.kind = RunKind::Flask;
+        c.python_interpreter = other.join("bin/python").display().to_string();
+        assert_eq!(program(&c).program, other.join("bin/python").display().to_string());
+        // A missing one is an error that names it; the choice does not leak into other kinds.
+        c.python_interpreter = "nope".into();
+        assert!(c.validate(&project).unwrap_err().contains("Python interpreter"));
+        c.kind = RunKind::Command;
+        c.command = "ls".into();
+        assert!(c.validate(&project).is_ok());
+        assert!(!program(&c).env.iter().any(|(k, _)| k == "VIRTUAL_ENV"));
     }
 
     #[test]

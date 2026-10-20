@@ -560,6 +560,17 @@ impl App {
                 Effect::OpenProjectWindow(p) => st.window_requests.push(project_windows::Request::Open(p)),
                 Effect::SwitchProjectWindow(d) => st.window_requests.push(project_windows::Request::Switch(d)),
                 Effect::SetFullScreen(on) => ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on)),
+                Effect::PickFolder { title, command, param } => {
+                    let mut dialog = rfd::FileDialog::new().set_title(title);
+                    if let Some(dir) = s.project_root() {
+                        dialog = dialog.set_directory(dir);
+                    }
+                    if let Some(p) = dialog.pick_folder() {
+                        let mut params = serde_json::Map::new();
+                        params.insert(param, json!(p));
+                        run_command(s, st, &command, &Value::Object(params));
+                    }
+                }
                 Effect::PickFile { title, command, param, save, extensions, default_name } => {
                     let mut dialog = rfd::FileDialog::new().set_title(title);
                     if let Some(dir) = s.project_root() {

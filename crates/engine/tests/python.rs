@@ -131,6 +131,72 @@ fn selection_drives_run_configurations_and_persists() {
 }
 
 #[test]
+fn virtualenvs_are_found_in_the_project_and_chosen_from_any_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("proj");
+    let log = tmp.path().join("calls.log");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("main.py"), "print(1)\n").unwrap();
+    std::fs::write(root.join("requirements.txt"), "requests\n").unwrap();
+    // An unconventionally named virtualenv in the project is picked up on its own.
+    let project_py = venv(&root.join("linkedin_env"), &log);
+    let shared_py = venv(&tmp.path().join("shared/ml-env"), &log);
+
+    let mut s = open(&root, Vec::new());
+    assert!(s.python.python_project);
+    assert_eq!(s.python.interpreter.as_deref(), Some(project_py.as_path()));
+    assert!(!s.python.explicit);
+    let run = s.run_configs.iter().find(|c| c.name == "Run main.py").expect("derived main.py config");
+    assert_eq!(run.command.as_ref().unwrap().program, project_py.display().to_string());
+    s.execute("python.interpreter.detect", &Value::Null).unwrap();
+    wait(&mut s, |s| s.python.detected);
+    let list = s.execute("python.interpreter.list", &Value::Null).unwrap();
+    assert_eq!(list["interpreters"][0]["name"], "linkedin_env");
+
+    // Without a path the browse command asks the shell for a folder, then selects it.
+    s.effects.clear();
+    s.execute("python.interpreter.browse", &Value::Null).unwrap();
+    assert!(matches!(
+        s.effects.last(),
+        Some(codecraft_engine::Effect::PickFolder { command, param, .. })
+            if command == "python.interpreter.select" && param == "path"
+    ));
+    // A virtualenv folder outside the project selects the interpreter inside it and stays listed.
+    s.execute("python.interpreter.browse", &json!({ "path": tmp.path().join("shared/ml-env") })).unwrap();
+    assert!(s.python.explicit);
+    assert_eq!(s.python.interpreter.as_deref(), Some(shared_py.as_path()));
+    assert_eq!(s.python.interpreter_label(), "Python 3.12 (ml-env)");
+    let list = s.execute("python.interpreter.list", &Value::Null).unwrap();
+    assert!(list["interpreters"].as_array().unwrap().iter().any(|i| i["path"] == shared_py.display().to_string()));
+    let run = s.run_configs.iter().find(|c| c.name == "Run main.py").unwrap();
+    assert_eq!(run.command.as_ref().unwrap().program, shared_py.display().to_string());
+    // A folder that is not a virtualenv is refused.
+    assert!(matches!(
+        s.execute("python.interpreter.select", &json!({ "path": tmp.path() })),
+        Err(CommandError::Failed(_))
+    ));
+
+    // One configuration can run in its own virtualenv, whatever the project uses.
+    s.execute(
+        "runConfig.create",
+        &json!({ "name": "In project env", "kind": "python", "command": "main.py",
+                 "pythonInterpreter": "linkedin_env" }),
+    )
+    .unwrap();
+    let cmd = s.run_configs.iter().find(|c| c.name == "In project env").unwrap().command.clone().unwrap();
+    assert_eq!(cmd.program, project_py.display().to_string());
+    assert!(cmd.env.iter().any(|(k, v)| k == "VIRTUAL_ENV" && v.ends_with("linkedin_env")));
+    let listed = s.execute("runConfig.list", &Value::Null).unwrap();
+    assert_eq!(listed["user"][0]["pythonInterpreter"], "linkedin_env");
+    // A missing virtualenv is rejected with the configuration unchanged.
+    let bad = s.execute("runConfig.update", &json!({ "index": 0, "pythonInterpreter": "gone" }));
+    assert!(matches!(bad, Err(CommandError::BadParams(e)) if e.contains("Python interpreter")));
+    s.execute("runConfig.update", &json!({ "index": 0, "pythonInterpreter": null })).unwrap();
+    let cmd = s.run_configs.iter().find(|c| c.name == "In project env").unwrap().command.clone().unwrap();
+    assert_eq!(cmd.program, shared_py.display().to_string());
+}
+
+#[test]
 fn packages_list_install_upgrade_uninstall_with_pip() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("proj");

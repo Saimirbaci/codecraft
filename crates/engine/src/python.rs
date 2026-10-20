@@ -325,19 +325,36 @@ pub(crate) fn start_detect(s: &mut Session) {
     s.python.detect_rx = Some(rx);
 }
 
+/// Keep the chosen interpreter (a virtualenv from another folder) in the detected list.
+fn remember_interpreter(s: &mut Session) {
+    let Some(path) = s.python.interpreter.clone() else { return };
+    if s.python.interpreters.iter().any(|i| i.path == path) {
+        return;
+    }
+    let venv = python_env::venv_of(&path);
+    let name = venv
+        .as_deref()
+        .and_then(Path::file_name)
+        .or_else(|| path.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let version = venv.as_deref().and_then(python_env::pyvenv_version);
+    let kind = if venv.is_some() { python_env::InterpreterKind::Venv } else { python_env::InterpreterKind::System };
+    s.python.interpreters.insert(0, python_env::Interpreter { path, version, kind, name });
+}
+
 /// Select (or with `None` clear) the project's interpreter: persisted, then the Python language
 /// server restarts with it.
 pub(crate) fn select(s: &mut Session, path: Option<&Path>) -> Result<(), String> {
     let root = s.project_root().ok_or("no project is open")?;
-    if let Some(p) = path
-        && !p.is_file()
-    {
-        return Err(format!("{} is not an interpreter", p.display()));
-    }
+    // A virtualenv directory stands for the interpreter inside it.
+    let resolved = path.map(python_env::resolve_interpreter).transpose()?;
+    let path = resolved.as_deref();
     let old = crate::run_configs::python_for(&root);
     python_env::save_selection(&root, path)?;
     s.python.explicit = path.is_some();
     s.python.interpreter = python_env::project_python(&root);
+    remember_interpreter(s);
     // Derived Python run configurations (pytest, manage.py, …) follow the new interpreter.
     let new = crate::run_configs::python_for(&root);
     for c in &mut s.run_store.derived {

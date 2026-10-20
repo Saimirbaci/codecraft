@@ -333,6 +333,10 @@ pub fn status_widget(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             cmds.push(("python.interpreter.select", json!({ "path": null })));
             ui.close();
         }
+        if ui.button("Add Existing Virtualenv…").on_hover_text("Use a virtualenv from any folder").clicked() {
+            cmds.push(("python.interpreter.browse", Value::Null));
+            ui.close();
+        }
         if ui.button("Create Virtualenv…").clicked() {
             cmds.push(("python.interpreter.createVenv", Value::Null));
             ui.close();

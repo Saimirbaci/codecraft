@@ -220,6 +220,8 @@ pub enum Effect {
     /// Ask for a file to open (or, with `save`, a file to write), then run `command` with the
     /// chosen path as param `param`. `extensions` filter the dialog (`["json"]`).
     PickFile { title: String, command: String, param: String, save: bool, extensions: Vec<String>, default_name: Option<String> },
+    /// Ask for a folder, then run `command` with the chosen path as param `param`.
+    PickFolder { title: String, command: String, param: String },
 }
 
 /// State of the language server connection, for the status bar.

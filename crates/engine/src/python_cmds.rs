@@ -79,10 +79,21 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "Select Python Interpreter",
             None,
             "{path: string|null} — use this interpreter for the project (run configurations, debugger, tests, \
-             language server, packages, console); null goes back to the project's virtualenv",
+             language server, packages, console); `path` is a Python executable or a virtualenv folder \
+             (also one outside the project); null goes back to the project's virtualenv",
             Context::Global,
             has_project,
             select_interpreter,
+        ),
+        spec(
+            "python.interpreter.browse",
+            "Add Existing Virtualenv…",
+            None,
+            "{path?: string} — use a virtualenv (or interpreter) from any folder, like PyCharm's Add Interpreter › \
+             Existing; without `path` asks for the virtualenv folder",
+            Context::Global,
+            has_project,
+            browse_interpreter,
         ),
         spec(
             "python.interpreter.createVenv",
@@ -272,6 +283,18 @@ fn select_interpreter(s: &mut Session, p: &Value) -> CmdResult {
     });
     python::select(s, path.as_deref()).map_err(CommandError::Failed)?;
     Ok(json!({ "selected": s.python.interpreter, "label": s.python.interpreter_label() }))
+}
+
+fn browse_interpreter(s: &mut Session, p: &Value) -> CmdResult {
+    if p.get("path").is_some_and(|v| !v.is_null()) {
+        return select_interpreter(s, p);
+    }
+    s.effects.push(crate::Effect::PickFolder {
+        title: "Select Virtualenv Folder".into(),
+        command: "python.interpreter.select".into(),
+        param: "path".into(),
+    });
+    ok()
 }
 
 fn create_venv(s: &mut Session, p: &Value) -> CmdResult {

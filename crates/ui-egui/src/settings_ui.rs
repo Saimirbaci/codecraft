@@ -78,6 +78,8 @@ pub(crate) struct RunForm {
     pub(crate) debugger_sub_process: bool,
     store_as_project_file: bool,
     executable: String,
+    /// Python kinds: the interpreter or virtualenv folder (empty = the project's).
+    python_interpreter: String,
 }
 
 impl RunForm {
@@ -100,6 +102,7 @@ impl RunForm {
             debugger_sub_process: c.debugger.sub_process.unwrap_or(true),
             store_as_project_file: c.store_as_project_file,
             executable: c.executable.clone(),
+            python_interpreter: c.python_interpreter.clone(),
         }
     }
 
@@ -118,6 +121,7 @@ impl RunForm {
             },
             "storeAsProjectFile": self.store_as_project_file,
             "executable": self.executable,
+            "pythonInterpreter": self.python_interpreter,
         });
         match self.template {
             Some(kind) => p["kind"] = json!(kind.id()),
@@ -981,6 +985,11 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         }
         (None, _) => st.prefs.run_form = None,
     }
+    if !s.python.detected {
+        cmds_detect(s, st);
+    }
+    let interpreters = s.python.interpreters.clone();
+    let project_interpreter = s.python.interpreter_label();
     let config_names: Vec<String> =
         dialog.draft.iter().map(|c| c.name.clone()).chain(derived.iter().map(|(n, _)| n.clone())).collect();
     let theme = st.theme.clone();
@@ -1143,10 +1152,10 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                     cmds.push(("runConfig.template.update", json!({ "kind": f.kind.id(), "reset": true })));
                 }
                 ui.add_space(4.0);
-                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names);
+                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names, (&interpreters, &project_interpreter));
             }
             (Some(Selection { derived: false, .. }), Some(f)) => {
-                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names);
+                run_form(ui, &theme, f, &root, st.prefs.run_error.as_deref(), &config_names, (&interpreters, &project_interpreter));
             }
             (Some(Selection { derived: true, index }), _) => {
                 if let Some((name, line)) = derived.get(index) {
@@ -1316,6 +1325,60 @@ fn run_target_row(ui: &mut egui::Ui, target: &mut codecraft_engine::run_targets:
     }
 }
 
+/// Start interpreter detection (the Virtual env choices) once per project.
+fn cmds_detect(s: &mut Session, st: &mut UiState) {
+    crate::run_command(s, st, "python.interpreter.detect", &Value::Null);
+}
+
+/// "Virtual env:" of a Python configuration: the project's interpreter, a virtualenv found in the
+/// project or on the machine, or one picked from any folder.
+fn python_interpreter_row(
+    ui: &mut egui::Ui,
+    f: &mut RunForm,
+    root: &std::path::Path,
+    (interpreters, project_interpreter): (&[codecraft_engine::python_env::Interpreter], &str),
+) {
+    use codecraft_engine::python_env::InterpreterKind;
+    let chosen = f.python_interpreter.trim().to_string();
+    let shown = match interpreters.iter().find(|i| i.path.display().to_string() == chosen) {
+        _ if chosen.is_empty() => format!("Project interpreter ({project_interpreter})"),
+        Some(i) => format!("{}  ·  {}", i.label(), i.kind.label()),
+        None => chosen.clone(),
+    };
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("run-config-python")
+            .selected_text(shown)
+            .width((ui.available_width() - 90.0).max(120.0))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(chosen.is_empty(), format!("Project interpreter ({project_interpreter})"))
+                    .clicked()
+                {
+                    f.python_interpreter.clear();
+                }
+                let in_project = |i: &&codecraft_engine::python_env::Interpreter| {
+                    i.kind == InterpreterKind::Venv && i.path.starts_with(root)
+                };
+                let project_venvs = interpreters.iter().filter(in_project);
+                let others = interpreters.iter().filter(|i| !in_project(i));
+                for i in project_venvs.chain(others) {
+                    let value = i.path.display().to_string();
+                    let text = format!("{}  ·  {}", i.label(), i.kind.label());
+                    if ui.selectable_label(chosen == value, text).on_hover_text(&value).clicked() {
+                        f.python_interpreter = value;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("The interpreter or virtualenv this configuration runs in");
+        if ui.button("Browse…").on_hover_text("Choose a virtualenv folder (or a Python executable)").clicked()
+            && let Some(p) = rfd::FileDialog::new().set_title("Select Virtualenv Folder").set_directory(root).pick_folder()
+        {
+            f.python_interpreter = p.display().to_string();
+        }
+    });
+}
+
 fn run_form(
     ui: &mut egui::Ui,
     theme: &Theme,
@@ -1323,6 +1386,7 @@ fn run_form(
     root: &std::path::Path,
     error: Option<&str>,
     config_names: &[String],
+    python: (&[codecraft_engine::python_env::Interpreter], &str),
 ) {
     let is_template = f.template.is_some();
     egui::Grid::new("run-config-form").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
@@ -1368,6 +1432,11 @@ fn run_form(
             TextEdit::singleline(&mut f.working_dir).hint_text(root.display().to_string()).desired_width(f32::INFINITY),
         );
         ui.end_row();
+        if matches!(f.kind, RunKind::Python | RunKind::Django | RunKind::FastApi | RunKind::Flask) {
+            ui.label("Virtual env:");
+            python_interpreter_row(ui, f, root, python);
+            ui.end_row();
+        }
         if f.kind == RunKind::CMake {
             ui.label("Executable:");
             ui.add(
