@@ -270,7 +270,10 @@ impl Session {
         if !self.lsp_enabled {
             return;
         }
-        let command = if kind == ServerKind::RustAnalyzer {
+        if self.remote.project.is_some() && self.remote.absolute_root.is_none() { return; }
+        let command = if self.remote.project.is_some() {
+            Some(codecraft_lsp::ServerCommand { program: PathBuf::from(kind.label()), args: Vec::new(), name: format!("{} (SSH)", kind.label()) })
+        } else if kind == ServerKind::RustAnalyzer {
             self.ws
                 .settings
                 .rust_analyzer_path
@@ -333,7 +336,13 @@ impl Session {
             _ => {}
         }
         let name = command.name.clone();
-        match LspClient::spawn(config) {
+        let spawned = if self.remote.project.is_some() {
+            match crate::remote::lsp_transport(self, kind, &mut config) {
+                Ok(mapper) => LspClient::spawn_mapped(config, mapper),
+                Err(error) => { self.set_status(kind, LspStatus::Unavailable(error.to_string())); return; }
+            }
+        } else { LspClient::spawn(config) };
+        match spawned {
             Ok((client, events)) => {
                 let pid = client.pid();
                 self.servers.insert(
@@ -815,7 +824,8 @@ impl Session {
                 }
             }
             ServerEvent::Exited { code } => {
-                let msg = format!("{name} stopped (exit code {})", code.map_or("unknown".into(), |c| c.to_string()));
+                let detail = self.servers.get(&kind).map(|server| server.client.stderr_tail().join("\n")).unwrap_or_default();
+                let msg = format!("{name} stopped (exit code {}): {detail}", code.map_or("unknown".into(), |c| c.to_string()));
                 self.servers.remove(&kind);
                 self.server_memory_mb.remove(&kind);
                 self.set_status(kind, LspStatus::Stopped(msg.clone()));
@@ -1056,6 +1066,11 @@ impl Session {
             }
         }
         if let [(path, range)] = locs.as_slice() {
+            match crate::remote::fetch_external_lsp(self, path, range.start.line as usize, range.start.character as usize) {
+                Ok(true) => return,
+                Err(error) => { self.status = error.to_string(); return; }
+                Ok(false) => {}
+            }
             let item = self.location_item(path, range);
             if let Err(e) = self.navigate_to_position(path, item.line, item.column) {
                 self.status = e.to_string();
@@ -1306,6 +1321,14 @@ fn incremental_changes(od: &codecraft_workspace::OpenDocument) -> Option<Vec<lt:
     }
     // The replay must land on the document's text (cheap check; a mismatch means a gap).
     (shadow.len_chars() == od.doc.len_chars()).then_some(out)
+}
+
+impl Session {
+    pub(crate) fn remote_files_changed(&self, paths: &[PathBuf]) {
+        let changes: Vec<_> = paths.iter().filter_map(|p| codecraft_lsp::path_to_uri(p).ok().map(|uri|
+            json!({"uri":uri, "type": if p.exists() { 2 } else { 3 }}))).collect();
+        for server in self.servers.values() { let _ = server.client.notify_raw("workspace/didChangeWatchedFiles", json!({"changes":changes})); }
+    }
 }
 
 #[cfg(test)]

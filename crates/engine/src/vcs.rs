@@ -1607,7 +1607,10 @@ where
     s.status = format!("{label}…");
     let tx = s.vcs.tx.clone();
     let label = label.to_string();
+    let network_only = label == "Fetch" || label.starts_with("Push") || matches!(kind, OpKind::PullRequest { .. } | OpKind::Gh { .. } | OpKind::Patch { .. });
+    let mirror = s.remote.project.as_ref().filter(|_| !network_only).and_then(|_| s.project_root()).map(|root| crate::remote::mirror_lock(&root));
     spawn("op", move || {
+        let _guard = mirror.as_ref().map(|lock| lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         let result = f(&git);
         let _ = tx.send(Event::OpDone { label, kind, result });
     });

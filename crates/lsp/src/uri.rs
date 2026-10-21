@@ -65,7 +65,7 @@ fn keep_unencoded(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"-._~/!$&'()*+,;=:@".contains(&byte)
 }
 
-fn percent_encode_into(bytes: &[u8], out: &mut String) {
+pub(crate) fn percent_encode_into(bytes: &[u8], out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &byte in bytes {
         if keep_unencoded(byte) {
@@ -80,7 +80,7 @@ fn percent_encode_into(bytes: &[u8], out: &mut String) {
 }
 
 /// Decodes `%XX` escapes. `None` for a malformed escape (a parsed `Uri` never has one).
-fn percent_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn percent_decode(text: &str) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len());
     let mut bytes = text.bytes();
     while let Some(byte) = bytes.next() {

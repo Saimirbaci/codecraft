@@ -150,7 +150,7 @@ fn remote_development_dialog_and_sync_preview_render() {
     let mut h = harness(&f);
     h.state_mut().session.execute("file.remoteDevelopment", &json!({})).unwrap();
     h.run_steps(3);
-    assert!(h.query_by_label("Open Project").is_some());
+    assert!(h.query_by_label("Open Project in New Window").is_some());
     h.get_by_label("Cancel").click();
     h.run_steps(3);
     assert!(h.state().session.remote.remote_dev.is_none());
@@ -174,4 +174,88 @@ fn remote_development_dialog_and_sync_preview_render() {
     h.get_by_label("Cancel").click();
     h.run_steps(3);
     assert!(h.state().session.remote.sync_preview.is_none());
+}
+
+#[test]
+fn remote_development_browses_folders_in_the_dialog() {
+    let f = fake();
+    std::fs::create_dir_all(f.remote.join("projects/app")).unwrap();
+    let mut h = harness(&f);
+    h.state_mut().session.execute("file.remoteDevelopment", &json!({})).unwrap();
+    h.state_mut().session.remote.remote_dev.as_mut().unwrap().path = "~/projects".into();
+    h.run_steps(3);
+    h.get_by_label("Browse Folders…").click_accesskit();
+    settle(&mut h, "folders", |app| !app.session.remote.busy());
+    h.run_steps(3);
+    assert!(h.query_by_label("Use This Folder").is_some());
+    h.get_by_label("Use This Folder").click_accesskit();
+    h.run_steps(3);
+    assert_eq!(
+        h.state().session.remote.remote_dev.as_ref().unwrap().path,
+        f.remote.join("projects").display().to_string()
+    );
+}
+
+#[test]
+fn remote_status_exposes_connection_and_reconnect_action() {
+    let f = fake();
+    std::fs::create_dir_all(f.remote.join("projects/app")).unwrap();
+    let mut h = harness(&f);
+    h.state_mut().session.remote.auto_refresh = false;
+    h.state_mut().session.remote.project = Some(codecraft_engine::remote::RemoteProject {
+        server: "web".into(),
+        destination: "deploy@web.example".into(),
+        remote: "~/projects/app".into(),
+        connection: codecraft_engine::remote::ConnectionState::Disconnected,
+        error: None,
+        pending_uploads: Default::default(),
+    });
+    h.run_steps(3);
+    h.get_by_label("SSH deploy@web.example · disconnected").click_accesskit();
+    h.run_steps(3);
+    assert!(h.query_by_label("Reconnect").is_some());
+    h.get_by_label("Reconnect").click_accesskit();
+    settle(&mut h, "reconnect", |app| !app.session.remote.busy());
+    assert_eq!(
+        h.state().session.remote.project.as_ref().unwrap().connection,
+        codecraft_engine::remote::ConnectionState::Connected
+    );
+}
+
+#[test]
+fn remote_conflict_controls_compare_and_take_incoming_and_pause_refresh() {
+    use codecraft_engine::remote::{ConnectionState, RemoteProject};
+    let f = fake();
+    let mut h = harness(&f);
+    let incoming = f.root.join(".snapshots/project");
+    let baseline = f.root.join(".baselines/project");
+    std::fs::create_dir_all(&incoming).unwrap();
+    std::fs::create_dir_all(&baseline).unwrap();
+    std::fs::write(incoming.join("a.txt"), "incoming\n").unwrap();
+    std::fs::write(baseline.join("a.txt"), "base\n").unwrap();
+    {
+        let s = &mut h.state_mut().session;
+        s.remote.auto_refresh = false;
+        s.remote.project = Some(RemoteProject { server: "web".into(), destination: "web.example".into(),
+            remote: "~/project".into(), connection: ConnectionState::Connected, error: None, pending_uploads: Default::default() });
+        s.remote.conflicts = vec![PathBuf::from("a.txt")];
+        s.execute("remote.project.conflicts", &json!({})).unwrap();
+        s.ws.layout.show(ToolWindowId::FileTransfer);
+    }
+    h.run_steps(3);
+    for label in ["Compare", "Keep Mine", "Take Remote", "Merge", "Resume Auto-refresh"] {
+        assert!(h.query_all_by_label(label).next().is_some(), "missing {label}");
+    }
+    h.get_by_label("Compare").click(); h.run_steps(2);
+    assert_eq!(h.state().session.misc.compare.as_ref().unwrap().right, "incoming\n");
+    h.state_mut().session.execute("compare.close", &json!({})).unwrap();
+    h.run_steps(2);
+    h.get_by_label("Take Remote").click(); h.run_steps(3);
+    assert_eq!(std::fs::read_to_string(f.project.join("a.txt")).unwrap(), "incoming\n");
+    assert!(h.state().session.remote.conflicts.is_empty());
+    h.get_by_label("Resume Auto-refresh").click(); h.run_steps(2);
+    assert!(h.state().session.remote.auto_refresh);
+    assert!(!codecraft_engine::deployment::load(&f.project).unwrap().pause_remote_refresh);
+    h.get_by_label("Pause Auto-refresh").click(); h.run_steps(2);
+    assert!(!h.state().session.remote.auto_refresh);
 }

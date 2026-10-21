@@ -16,6 +16,9 @@ use crate::{CommandError, Effect, Session};
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
+        spec("terminal.newRemote", "New Remote Terminal", None, "{} — shell in the remote project's directory", Context::Global,
+            |s| if s.remote.project.is_some() { Ok(()) } else { Err("open a remote project first".into()) },
+            |s, _| { let id = terminal::open(s, NewTab::default())?; Ok(json!({"tab": id})) }),
         spec(
             "terminal.new",
             "New Terminal Tab",

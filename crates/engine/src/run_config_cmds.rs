@@ -504,11 +504,13 @@ fn create(s: &mut Session, p: &Value) -> CmdResult {
     };
     let templates =
         s.run_store.dialog.as_ref().map(|d| d.templates.clone()).unwrap_or_else(|| s.run_store.templates.clone());
+    let default_target = crate::target_exec::effective(s, &crate::run_targets::RunTarget::Local);
     let index = edit(s, |list| {
         if list.len() >= 500 {
             return Err("too many run configurations".into());
         }
         let mut c = run_config_store::from_template(&templates, kind);
+        if c.target.is_local() { c.target = default_target; }
         fill(&mut c, p)?;
         if c.command.is_empty() {
             c.command = c.kind.default_command().into();

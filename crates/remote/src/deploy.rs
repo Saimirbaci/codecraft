@@ -43,6 +43,8 @@ pub struct DeploymentConfig {
     pub default_server: Option<String>,
     /// Upload saved files to the default server (Tools › Deployment › Automatic Upload).
     pub auto_upload: bool,
+    /// Pause automatic remote-project refresh without pausing checked saves.
+    pub pause_remote_refresh: bool,
     /// Sync deletes target items whose source is gone (Options… "Delete target items when
     /// source ones do not exist").
     pub delete_target_items: bool,

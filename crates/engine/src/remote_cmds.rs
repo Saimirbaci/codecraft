@@ -151,10 +151,69 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "Remote Development…",
             None,
             "{server?: string, path?: remote folder} — without both, opens the dialog; with both, mirrors \
-             the folder into $CODECRAFT_HOME/remote and opens it with automatic upload and an SSH run target",
+             the folder into $CODECRAFT_HOME/remote and opens a NEW project window with automatic upload and an SSH run target",
             Context::Global,
             always,
             remote_development,
+        ),
+        simple("remote.project.status", "Remote Project: Status", has_project, |s, _| {
+            Ok(json!({"project": s.remote.project, "autoRefresh": s.remote.auto_refresh, "refreshMode": s.remote.auto_refresh_mode(), "conflicts": s.remote.conflicts}))
+        }),
+        spec("remote.project.autoRefresh", "Remote Project: Automatic Refresh", None,
+            "{paused?: bool} — toggle or set the persistent automatic refresh setting", Context::Global, has_project, |s, p| {
+                let root = deployment::project_root(s)?;
+                let mut cfg = deployment::load(&root).map_err(failed)?;
+                cfg.pause_remote_refresh = p.get("paused").and_then(Value::as_bool).unwrap_or(s.remote.auto_refresh);
+                deployment::save(&root, &cfg).map_err(failed)?;
+                s.remote.auto_refresh = !cfg.pause_remote_refresh;
+                Ok(json!({"paused": cfg.pause_remote_refresh}))
+            }),
+        spec("remote.project.conflicts", "Remote Project: Resolve Conflicts", None,
+            "{} — list and show conflicts", Context::Global, has_project, |s, _| {
+                s.remote.conflicts_open = true;
+                s.ws.layout.show(ToolWindowId::FileTransfer);
+                Ok(json!({"conflicts": s.remote.conflicts}))
+            }),
+        spec("remote.project.resolve", "Remote Project: Resolve Conflict", None,
+            "{path: relative path, action: compare|keepMine|takeRemote|merge}", Context::Global, has_project, resolve_conflict),
+        spec(
+            "remote.project.disconnect",
+            "Remote Project: Disconnect",
+            None,
+            "{} — pause automatic uploads and close this project's shared SSH connection; saved edits remain local",
+            Context::Global,
+            has_project,
+            disconnect_project,
+        ),
+        spec(
+            "remote.project.reconnect",
+            "Remote Project: Reconnect",
+            None,
+            "{} — test/reconnect the project's SSH host and resume checked uploads; conflicts pause the queue",
+            Context::Global,
+            has_project,
+            reconnect_project,
+        ),
+        spec(
+            "remote.project.chooseFolder",
+            "Remote Project: Use Browsed Folder",
+            None,
+            "{} — use the Remote Host browser's current folder in the Remote Development dialog",
+            Context::Global,
+            always,
+            |s, _| {
+                let d = s
+                    .remote
+                    .remote_dev
+                    .as_mut()
+                    .ok_or_else(|| CommandError::Failed("open Remote Development first".into()))?;
+                let b = &s.remote.browser;
+                if b.loading || b.error.is_some() || b.server.as_deref() != Some(&d.server) {
+                    return Err(CommandError::Failed("browse a folder on the selected server first".into()));
+                }
+                d.path = b.path.clone();
+                ok()
+            },
         ),
         // ------------------------------------------------ servers
         simple("remote.servers.list", "SSH Servers: List", always, list_servers),
@@ -957,9 +1016,12 @@ fn remote_development(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn start_remote_dev(s: &mut Session, server_name: &str, path: &str) -> CmdResult {
+    if s.remote.busy() {
+        return Err(CommandError::Failed("wait for the current remote operation to finish".into()));
+    }
     let server = deployment::server(s, server_name)?;
     rcmd::transfer_path(path).map_err(failed)?;
-    if matches!(path.trim_end_matches('/'), "" | "~" | "/") {
+    if path.split('/').any(|part| part == "..") || matches!(path.trim_end_matches('/'), "" | "~" | "/" | "." | "~/.") {
         return Err(CommandError::Failed("choose a project folder, not the home or root folder".into()));
     }
     let cache = s
@@ -972,21 +1034,95 @@ fn start_remote_dev(s: &mut Session, server_name: &str, path: &str) -> CmdResult
         crate::remote::safe_name(leaf),
         crate::remote::short_hash(path).get(..8).unwrap_or("")
     ));
-    let excludes: Vec<String> =
-        ["target", ".codecraft", "node_modules", "__pycache__"].iter().map(|x| (*x).to_string()).collect();
-    let steps = deployment::folder_steps(s, &server, codecraft_remote::Direction::Download, &local, path, &excludes)?;
-    // The upload step of folder_steps is a mkdir on the remote side; a download starts with a
-    // local mkdir, so the steps are used as they are.
-    let follow = Follow::RemoteDev { server: server_name.to_string(), remote: path.to_string(), local: local.clone() };
+    let steps = project_refresh_steps(s, &server, &local, path)?;
+    let follow = Follow::RemoteDev {
+        server: server_name.to_string(),
+        remote: path.to_string(),
+        local: local.clone(),
+        open_window: true,
+    };
     let id = start_op(s, server_name, format!("Mirror {server_name}:{path}"), steps, follow, true)?;
     s.ws.layout.show(ToolWindowId::FileTransfer);
     Ok(json!({ "operation": id, "local": local }))
 }
 
+fn project_refresh_steps(
+    s: &mut Session,
+    server: &codecraft_remote::SshServer,
+    local: &Path,
+    remote: &str,
+) -> Result<Vec<Step>, CommandError> {
+    if !s.remote.has_rsync() {
+        return Err(CommandError::Failed("Remote projects require rsync locally and on the server for bounded, incremental sync; install rsync and retry".into()));
+    }
+    let (incoming, baseline) = crate::remote::mirror_paths(local)?;
+    let opts = s.remote.ssh_options(&server.name);
+    let args = rcmd::project_download_args(server, &opts, &incoming, remote).map_err(failed)?;
+    s.remote.ensure_master(server);
+    Ok(vec![
+        Step::Mkdir(incoming.clone()),
+        Step::run(&s.remote.programs.rsync, args),
+        Step::RefreshMirror { local: local.to_path_buf(), incoming, baseline, protected: s.remote.protected.clone() },
+    ])
+}
+
+fn disconnect_project(s: &mut Session, _: &Value) -> CmdResult {
+    if s.remote.busy() {
+        return Err(CommandError::Failed("wait for remote transfers to finish before disconnecting".into()));
+    }
+    let project =
+        s.remote.project.as_mut().ok_or_else(|| CommandError::Failed("this is not a remote project".into()))?;
+    project.connection = crate::remote::ConnectionState::Disconnected;
+    project.error = None;
+    let server = project.server.clone();
+    crate::remote::stop_project_servers(s);
+    crate::runs::stop_all(s);
+    crate::remote::disconnect_master(s, &server);
+    s.status = "Remote project disconnected; edits are kept locally".into();
+    ok()
+}
+
+fn reconnect_project(s: &mut Session, _: &Value) -> CmdResult {
+    let project =
+        s.remote.project.as_mut().ok_or_else(|| CommandError::Failed("this is not a remote project".into()))?;
+    project.connection = crate::remote::ConnectionState::Connecting;
+    let server = project.server.clone();
+    let result: CmdResult = (|| {
+        let host = deployment::server(s, &server)?;
+        let opts = s.remote.ssh_options(&server);
+        s.remote.ensure_master(&host);
+        let directory = s.remote.project.as_ref().map(|p| p.remote.as_str()).unwrap_or(".");
+        let script = codecraft_remote::quote::sh_c(&format!("cd {} && printf 'CODECRAFT-ROOT=' && pwd -P", codecraft_remote::quote::quote_path(directory)));
+        let args = rcmd::ssh_exec(&host, &opts, &script).map_err(failed)?;
+        let operation = start_op(
+            s,
+            &server,
+            "Reconnect remote project",
+            vec![Step::run(&opts.program, args)],
+            Follow::Test { server: server.clone() },
+            false,
+        )?;
+        Ok(json!({"operation": operation}))
+    })();
+    if let Err(error) = &result
+        && let Some(project) = &mut s.remote.project
+    {
+        project.connection = crate::remote::ConnectionState::Failed;
+        project.error = Some(error.to_string());
+    }
+    result
+}
+
 /// The mirror is in place: write its deployment (mapping, default server, automatic upload) and
 /// an SSH run configuration, then open it.
 pub(crate) fn remote_dev_ready(s: &mut Session, server: &str, remote: &str, local: &Path) {
-    let mut cfg = deployment::load(local).unwrap_or_default();
+    let mut cfg = match deployment::load(local) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            s.notify(codecraft_workspace::NotificationLevel::Error, "Remote Development", error);
+            return;
+        }
+    };
     if let Some(dep) = cfg.ensure_server(server) {
         dep.mappings = vec![PathMapping { local: String::new(), remote: remote.to_string() }];
     }
@@ -1004,6 +1140,7 @@ pub(crate) fn remote_dev_ready(s: &mut Session, server: &str, remote: &str, loca
             command: "run".into(),
             target: crate::run_targets::RunTarget::Ssh(crate::ssh_target::SshTarget {
                 server: server.to_string(),
+                sync: false,
                 ..Default::default()
             }),
             ..Default::default()
@@ -1018,13 +1155,36 @@ pub(crate) fn remote_dev_ready(s: &mut Session, server: &str, remote: &str, loca
         }
     }
     s.remote.remote_dev = None;
-    s.open_project(local);
-    s.status = format!("Remote Development: {server}:{remote} (automatic upload on)");
+    s.ws.note_recent_project(local.to_path_buf());
+    s.effects.push(crate::Effect::OpenProjectWindow(local.to_path_buf()));
+    s.status = format!("Remote Development: opening {server}:{remote} in a new window");
 }
 
-fn sync_from_remote(s: &mut Session, p: &Value) -> CmdResult {
+pub(crate) fn sync_from_remote(s: &mut Session, p: &Value) -> CmdResult {
     let root = deployment::project_root(s)?;
     let cfg = deployment::load(&root).map_err(CommandError::Failed)?;
+    if cfg.remote_development.is_some() {
+        if s.remote.busy() {
+            return Err(CommandError::Failed(
+                "finish remote operations and save or close modified buffers before refreshing".into(),
+            ));
+        }
+        let project =
+            s.remote.project.clone().ok_or_else(|| CommandError::Failed("reopen the remote project first".into()))?;
+        if project.connection != crate::remote::ConnectionState::Connected {
+            return Err(CommandError::Failed("reconnect the remote project before refreshing".into()));
+        }
+        let server = deployment::server(s, &project.server)?;
+        let steps = project_refresh_steps(s, &server, &root, &project.remote)?;
+        let follow = Follow::RemoteDev {
+            server: project.server.clone(),
+            remote: project.remote,
+            local: root,
+            open_window: false,
+        };
+        let id = start_op(s, &project.server, "Refresh remote project (preserve conflicts)", steps, follow, true)?;
+        return Ok(json!({"operation": id}));
+    }
     let name = match opt_str(p, "server").filter(|x| !x.is_empty()) {
         Some(n) => n.to_string(),
         None => cfg
@@ -1066,6 +1226,66 @@ fn set_tunnel(s: &mut Session, p: &Value) -> CmdResult {
     // Saves the data sources (an edit without changes keeps the new field).
     s.execute("db.editDataSource", &json!({ "dataSource": id, "name": name }))?;
     Ok(json!({ "dataSource": id, "sshTunnel": server }))
+}
+
+
+fn resolve_conflict(s: &mut Session, p: &Value) -> CmdResult {
+    if s.remote.busy() { return Err(failed("wait for remote transfers before resolving conflicts")); }
+    let root = deployment::project_root(s)?;
+    let rel = PathBuf::from(req_str(p, "path")?);
+    if !s.remote.conflicts.contains(&rel) || rel.is_absolute() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Err(failed("choose a listed conflict inside the project"));
+    }
+    let (incoming, baseline) = crate::remote::mirror_paths(&root)?;
+    let local = root.join(&rel);
+    let remote = incoming.join(&rel);
+    let base = baseline.join(&rel);
+    if local.is_dir() || remote.is_dir() || base.is_dir() {
+        return Err(failed("Directory conflicts need manual reconciliation; no files were changed. Compare the mirror with its incoming snapshot, then refresh"));
+    }
+    let read = |p: &Path| -> Result<String, CommandError> {
+        if !p.exists() { return Ok(String::new()); }
+        codecraft_fs::read_text_file(p).map_err(failed)
+    };
+    let ours = s.ws.doc_by_path(&local).and_then(|id| s.ws.doc(id)).map(|d| d.doc.text()).unwrap_or(read(&local)?);
+    match req_str(p, "action")? {
+        "compare" => {
+            s.misc.compare = Some(crate::misc::CompareView { title: format!("Remote conflict: {}", rel.display()),
+                left_title: "Mine".into(), right_title: "Incoming remote snapshot".into(), left: ours, right: read(&remote)? });
+        }
+        "merge" => {
+            s.vcs.merge = Some(crate::vcs_merge::MergeView::new(rel.to_string_lossy().into_owned(), local,
+                read(&base)?, ours, read(&remote)?, ("Mine".into(), if remote.is_file() { "Remote" } else { "Remote (deleted)" }.into())));
+        }
+        "keepMine" | "takeRemote" => {
+            let take = req_str(p, "action")? == "takeRemote";
+            // Explicit acceptance advances to the reviewed snapshot. The next checked save still
+            // compares against the host, so a change after review cannot be silently overwritten.
+            if remote.is_file() { codecraft_remote::mirror::capture(&remote, &base).map_err(failed)?; }
+            else if base.is_file() { std::fs::remove_file(&base).map_err(failed)?; }
+            if take {
+                if let Some(project) = &mut s.remote.project { project.pending_uploads.remove(&local); }
+                if remote.is_file() { codecraft_remote::mirror::capture(&remote, &local).map_err(failed)?; }
+                else if local.is_file() { std::fs::remove_file(&local).map_err(failed)?; }
+                let text = read(&remote)?;
+                if let Some(id) = s.ws.doc_by_path(&local) && let Some(d) = s.ws.doc_mut(id) {
+                    d.doc.replace_all(&text, &codecraft_text::SelectionSet::caret(0)).map_err(failed)?;
+                    d.doc.mark_saved();
+                }
+                crate::remote::persist_uploads(s);
+                let _ = s.execute("file.synchronize", &Value::Null);
+            } else {
+                if let Some(id) = s.ws.doc_by_path(&local) && s.ws.doc(id).is_some_and(|d| d.doc.is_modified()) {
+                    s.save_all()?;
+                }
+                if local.exists() { crate::remote::after_save(s, &[local]); }
+                else if remote.exists() { crate::remote::tree_operation(s, &local, None, false, false)?; }
+            }
+            s.remote.conflicts.retain(|r| r != &rel);
+        }
+        _ => return Err(failed("action must be compare, keepMine, takeRemote or merge")),
+    }
+    ok()
 }
 
 #[cfg(test)]

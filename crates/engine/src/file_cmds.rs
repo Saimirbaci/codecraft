@@ -267,6 +267,9 @@ fn new_item(s: &mut Session, p: &Value, kind: NewItemKind) -> CmdResult {
             s.jobs_rescan();
         }
     }
+    if s.remote.project.is_some() {
+        crate::remote::tree_operation(s, &path, None, path.is_dir(), true)?;
+    }
     if let Some(proj) = &mut s.ws.project {
         proj.reveal(&path);
     }

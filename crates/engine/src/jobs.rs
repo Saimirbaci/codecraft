@@ -53,6 +53,7 @@ impl Session {
         self.close_project();
         self.ws.project = Some(Project::new(root.clone()));
         self.ws.note_recent_project(root.clone());
+        crate::remote::project_opened(self, &root);
         crate::session_store::restore_on_open(self);
         crate::hot_exit::restore_on_open(self);
         self.ws.tasks.insert(
@@ -93,6 +94,8 @@ impl Session {
             self.ws.close_editor(t);
         }
         self.ws.project = None;
+        self.remote.project = None;
+        crate::remote::stop_project_watcher(self);
         self.ws.find = None;
         self.ws.runs.clear();
         self.ws.active_run = None;

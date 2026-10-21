@@ -249,3 +249,30 @@ fn zsh_tabs_run_the_users_files_and_keep_their_own_history() {
     run(&mut s, tab, "echo \"h=$(fc -ln 1 | grep -v h= | grep -c 'echo zsh-')\"", "h=1");
     s.shutdown();
 }
+
+#[test]
+fn a_saved_local_claude_shell_keeps_its_machine_in_a_remote_project() {
+    if !Path::new("/bin/bash").is_file() { return; }
+    let e = env();
+    let mut s = session(&e, "/bin/bash");
+    s.terminal.env.push(("PATH".into(), format!("{}:/usr/bin:/bin", e.bin.display())));
+    s.remote.programs.ssh = e.bin.join("no-real-ssh").display().to_string();
+    s.remote.auto_refresh = false;
+    s.remote.project = Some(codecraft_engine::remote::RemoteProject {
+        server: "fixture-only".into(), destination: "fixture-only".into(), remote: "~/project".into(),
+        connection: codecraft_engine::remote::ConnectionState::Disconnected, error: None, pending_uploads: Default::default(),
+    });
+    let mut snapshot = codecraft_engine::session_store::snapshot(&s);
+    snapshot.terminals = vec![codecraft_workspace::TerminalSnapshot {
+        cwd: e.root.clone(),
+        claude: Some(codecraft_workspace::ClaudeSnapshot { session: "shell-session-1".into(), transcript: None }),
+        ..Default::default()
+    }];
+    codecraft_engine::session_store::restore(&mut s, &snapshot);
+    let tab = s.terminal.tabs.first().expect("restored local Claude shell");
+    assert!(!tab.remote);
+    let id = tab.id;
+    let output = wait_text(&mut s, id, "fake-claude ready shell-session-1");
+    assert!(output.contains("--resume shell-session-1") && output.contains("--settings "));
+    s.shutdown();
+}

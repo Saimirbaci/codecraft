@@ -613,6 +613,7 @@ impl App {
         let focus_changes: Vec<bool> = ctx.input(|i| {
             i.events.iter().filter_map(|e| if let Event::WindowFocused(f) = e { Some(*f) } else { None }).collect()
         });
+        s.remote.window_focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
         for focused in focus_changes {
             if focused {
                 run_command(s, st, "file.synchronize", &Value::Null);

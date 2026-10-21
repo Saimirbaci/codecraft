@@ -317,12 +317,57 @@ pub fn parse_packages(output: &str) -> Option<Vec<RemotePackage>> {
     Some(rows.into_iter().take(10_000).map(|(name, version)| RemotePackage { name, version }).collect())
 }
 
+/// A managed SSH run owns a new remote process group. The state is private to this run;
+/// cancellation can arrive before the child writes its pid (the tombstone closes that race).
+pub fn managed_run(state: &str, script: &str) -> (String, String) {
+    let state = crate::quote::quote_path(state);
+    let child = format!("umask 077; printf '%s\\n' \"$$\" > {state}/pgid; test ! -e {state}/cancel || exit 143; exec sh -c {}", sh_quote(script));
+    // macOS/BSD hosts need not have util-linux's setsid executable. Python can create the
+    // same session before exec, retaining the child's pid and the process-group Stop contract.
+    let session_exec = sh_quote("import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])");
+    let launch = format!("umask 077; mkdir -p {state} || exit 1; cc_session() {{ if command -v setsid >/dev/null 2>&1; then exec setsid \"$@\"; elif command -v python3 >/dev/null 2>&1; then exec python3 -c {session_exec} \"$@\"; elif command -v python >/dev/null 2>&1; then exec python -c {session_exec} \"$@\"; else echo 'Remote runs require setsid (install util-linux) or Python' >&2; exit 127; fi; }}; cc_session sh -c {} & cc_child=$!; wait \"$cc_child\"", sh_quote(&child));
+    let stop = format!("umask 077; mkdir -p {state} || exit 1; : > {state}/cancel; if test -f {state}/pgid; then read -r cc_pid < {state}/pgid; case \"$cc_pid\" in ''|*[!0-9]*|0|1) exit 1;; esac; kill -TERM -- -\"$cc_pid\" 2>/dev/null; sleep 0.1; kill -KILL -- -\"$cc_pid\" 2>/dev/null; rm -f {state}/pgid {state}/cancel; rmdir {state} 2>/dev/null; fi; exit 0");
+    (launch, stop)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn sh(script: &str) -> std::process::Output {
         std::process::Command::new("sh").arg("-c").arg(script).output().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_run_without_setsid_runs_in_a_new_session_and_preserves_status() {
+        use std::os::unix::fs::symlink;
+
+        let python = sh("command -v python3");
+        if !python.status.success() {
+            eprintln!("skipping: no python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        // Exclude setsid even on Linux, so this exercises the macOS/BSD fallback.
+        for (name, path) in [("sh", "/bin/sh"), ("mkdir", "/bin/mkdir")] {
+            symlink(path, bin.join(name)).unwrap();
+        }
+        symlink(String::from_utf8_lossy(&python.stdout).trim(), bin.join("python3")).unwrap();
+        let script = "python3 -c 'import os; print(os.getsid(0), flush=True)'; exit 7";
+        let (launch, _) = managed_run(&dir.path().join("run state").to_string_lossy(), script);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &launch])
+            .env("PATH", &bin)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(7), "{output:?}");
+        let pid = std::fs::read_to_string(dir.path().join("run state/pgid")).unwrap();
+        assert!(pid.trim().parse::<u32>().is_ok());
+        // The recorded shell pid must own the session used by its subprocesses.
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), pid.trim());
     }
 
     #[test]

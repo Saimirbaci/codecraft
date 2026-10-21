@@ -200,6 +200,27 @@ pub(crate) enum Step {
         stdout_to: Option<PathBuf>,
     },
     Mkdir(PathBuf),
+    RefreshMirror {
+        local: PathBuf,
+        incoming: PathBuf,
+        baseline: PathBuf,
+        protected: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    },
+    CheckedTree {
+        root: PathBuf, server: SshServer, options: SshOptions,
+        from: PathBuf, to: Option<PathBuf>, directory: bool, create: bool,
+        remote_from: String, remote_to: Option<String>, baseline: PathBuf,
+        rsync: String,
+    },
+    CheckedUpload {
+        root: PathBuf,
+        server: SshServer,
+        options: SshOptions,
+        local: PathBuf,
+        remote: String,
+        baseline: PathBuf,
+        snapshot: PathBuf,
+    },
     Rename {
         from: PathBuf,
         to: PathBuf,
@@ -220,13 +241,18 @@ impl Step {
 #[derive(Clone, Debug)]
 pub(crate) enum Follow {
     Nothing,
+    ProjectUpload {
+        local: PathBuf,
+    },
     /// Reload open documents that changed on disk.
     Reload,
+    AutoProbe,
     Listing {
         server: String,
         path: String,
     },
     RefreshBrowser,
+    ExternalSource { local: PathBuf, line: usize, column: usize, utf16: bool },
     OpenRemote {
         server: String,
         remote: String,
@@ -251,7 +277,31 @@ pub(crate) enum Follow {
         server: String,
         remote: String,
         local: PathBuf,
+        open_window: bool,
     },
+}
+
+/// Connection state shown in a remote project's status bar and command responses.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConnectionState {
+    Cached,
+    Connecting,
+    Connected,
+    Disconnected,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteProject {
+    pub server: String,
+    pub destination: String,
+    pub remote: String,
+    pub connection: ConnectionState,
+    pub error: Option<String>,
+    /// Saved files awaiting a checked upload; failures pause the queue without discarding it.
+    pub pending_uploads: std::collections::BTreeSet<PathBuf>,
 }
 
 struct OpDone {
@@ -287,12 +337,25 @@ pub struct RemoteState {
     /// Tools › Deployment › Options… is open.
     pub options_open: bool,
     pub remote_dev: Option<RemoteDevDialog>,
+    pub project: Option<RemoteProject>,
+    /// Engine commands and pump hold the mirror lock; nested commands reuse it.
+    pub(crate) mirror_guard_active: bool,
+    pub(crate) protected: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
+    pub auto_refresh: bool,
+    pub(crate) absolute_root: Option<String>,
+    pub window_focused: bool,
+    pub(crate) last_refresh: Instant,
+    pub conflicts: Vec<PathBuf>,
+    pub conflicts_open: bool,
+    tree_queue: std::collections::VecDeque<(String, Step)>,
+    watcher: Option<(Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>)>,
     /// Test Connection results by server.
     pub tests: BTreeMap<String, TestStatus>,
     servers: Option<(Vec<SshServer>, Vec<String>)>,
     /// Files opened from Remote Host: local cache file → (server, remote path).
     opened: HashMap<PathBuf, (String, String)>,
     masters: HashMap<String, Master>,
+    control_generation: HashMap<String, u64>,
     ops: HashMap<u64, (Follow, bool)>,
     tx: Sender<OpDone>,
     rx: Receiver<OpDone>,
@@ -325,10 +388,22 @@ impl Default for RemoteState {
             dialog: None,
             options_open: false,
             remote_dev: None,
+            project: None,
+            mirror_guard_active: false,
+            protected: Default::default(),
+            auto_refresh: true,
+            absolute_root: None,
+            window_focused: true,
+            last_refresh: Instant::now(),
+            conflicts: Vec::new(),
+            conflicts_open: false,
+            tree_queue: Default::default(),
+            watcher: None,
             tests: BTreeMap::new(),
             servers: None,
             opened: HashMap::new(),
             masters: HashMap::new(),
+            control_generation: HashMap::new(),
             ops: HashMap::new(),
             tx,
             rx,
@@ -370,8 +445,14 @@ pub(crate) fn safe_name(s: &str) -> String {
 
 impl RemoteState {
     /// Whether background work is in flight.
+    pub fn auto_refresh_mode(&self) -> &'static str {
+        if !self.auto_refresh { "paused" }
+        else if self.watcher.as_ref().is_some_and(|(_, streaming, _)| streaming.load(Ordering::Acquire)) { "inotify" }
+        else { "polling" }
+    }
+
     pub fn busy(&self) -> bool {
-        !self.ops.is_empty()
+        !self.ops.is_empty() || !self.tree_queue.is_empty()
     }
 
     /// `$CODECRAFT_HOME`, else `~/.codecraft`.
@@ -476,7 +557,13 @@ impl RemoteState {
     /// The control socket of a server for this session (short: macOS limits socket paths).
     fn control_path(&self, server: &str) -> Option<PathBuf> {
         let dir = self.control_dir()?;
-        let name = format!("{}-{}-{}", std::process::id(), self.nonce, short_hash(server).get(..12).unwrap_or(""));
+        let generation = self.control_generation.get(server).copied().unwrap_or(0);
+        let name = format!(
+            "{}-{}-{generation}-{}",
+            std::process::id(),
+            self.nonce,
+            short_hash(server).get(..12).unwrap_or("")
+        );
         Some(dir.join(name))
     }
 
@@ -497,7 +584,8 @@ impl RemoteState {
         }
         if let Some(m) = self.masters.get_mut(&server.name) {
             let alive = m.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
-            if alive || m.started.elapsed() < MASTER_RETRY {
+            let persistent = m.options.control_path.as_ref().is_some_and(|p| Path::new(p).exists());
+            if alive || persistent || m.started.elapsed() < MASTER_RETRY {
                 return;
             }
         }
@@ -584,6 +672,12 @@ pub(crate) fn load_servers_at(ssh_config: Option<&Path>, servers_file: Option<&P
 }
 
 fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SSH socket directory must not be a symlink",
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -687,6 +781,14 @@ fn run_process(
 }
 
 fn run_steps(steps: &[Step], cancel: &AtomicBool) -> Result<Vec<String>, String> {
+    // Serialize the entire transfer, including the snapshot download, against other windows'
+    // uploads. Local saves use a separate short-lived lock and can queue during network I/O.
+    let transfer = steps.iter().find_map(|step| match step {
+        Step::RefreshMirror { local, .. } => Some(transfer_lock(local)),
+        Step::CheckedUpload { root, .. } | Step::CheckedTree { root, .. } => Some(transfer_lock(root)),
+        _ => None,
+    });
+    let _transfer_guard = transfer.as_ref().map(|lock| lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
     let mut outputs = Vec::new();
     for step in steps {
         if cancel.load(Ordering::Relaxed) {
@@ -695,6 +797,88 @@ fn run_steps(steps: &[Step], cancel: &AtomicBool) -> Result<Vec<String>, String>
         match step {
             Step::Run { program, args, stdin, stdout_to } => {
                 outputs.push(run_process(program, args, stdin.as_deref(), stdout_to.as_deref(), cancel)?);
+            }
+            Step::CheckedTree { root, server, options, from, to, directory, create, remote_from, remote_to, baseline, rsync } => {
+                use codecraft_remote::quote::{quote_path, sh_c};
+                let source = baseline.join(from.strip_prefix(root).map_err(|e| e.to_string())?);
+                let stage = format!("{remote_from}.codecraft-tree-{}", short_hash(&format!("{}-{}", std::process::id(), now_ms())));
+                let p = quote_path(remote_from);
+                let absent = |path: &str| format!("test ! -e {} && test ! -L {}", quote_path(path), quote_path(path));
+                if !create {
+                    if !source.exists() { return Err("No accepted baseline for this path; refresh and compare before changing the remote tree".into()); }
+                    let spec = rcmd::RsyncSpec { direction: Direction::Upload, local: &source, remote: &stage, dir: *directory,
+                        excludes: &[], dry_run: false, delete: false, update: false, files_from: None };
+                    let args = rcmd::rsync_args(server, options, &spec).map_err(|e| e.to_string())?;
+                    run_process(rsync, &args, None, None, cancel)?;
+                }
+                let check = if *create { absent(remote_from) } else if *directory {
+                    format!("test -d {p} && test ! -L {p} && diff -qr {p} {} >/dev/null", quote_path(&stage))
+                } else { format!("test -f {p} && test ! -L {p} && cmp -s {p} {}", quote_path(&stage)) };
+                let action = if *create { format!("mkdir -p -- {p}") }
+                    else if let Some(dest) = remote_to { format!("{} && mv -- {p} {}", absent(dest), quote_path(dest)) }
+                    else { format!("rm -r -- {p}") };
+                let cleanup = format!("rm -r -f -- {}", quote_path(&stage));
+                let command = sh_c(&format!("trap {} 0; if {check}; then {action}; else echo 'Remote tree changed: refresh and compare before retrying' >&2; exit 3; fi", codecraft_remote::quote::sh_quote(&cleanup)));
+                let args = rcmd::ssh_exec(server, options, &command).map_err(|e| e.to_string())?;
+                run_process(&options.program, &args, None, None, cancel)?;
+                let lock = mirror_lock(root);
+                let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *create { std::fs::create_dir_all(source).map_err(|e| e.to_string())?; }
+                else if let Some(to) = to {
+                    let dest = baseline.join(to.strip_prefix(root).map_err(|e| e.to_string())?);
+                    if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+                    std::fs::rename(source, dest).map_err(|e| e.to_string())?;
+                } else if *directory { std::fs::remove_dir_all(source).map_err(|e| e.to_string())?; }
+                else { std::fs::remove_file(source).map_err(|e| e.to_string())?; }
+            }
+            Step::CheckedUpload { root, server, options, local, remote, baseline, snapshot } => {
+                let lock = mirror_lock(root);
+                let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                if let Some(parent) = snapshot.parent() {
+                    create_private_dir(parent).map_err(|e| e.to_string())?;
+                }
+                codecraft_remote::mirror::capture(local, snapshot).map_err(|e| e.to_string())?;
+                let expected = snapshot.with_extension("base");
+                let has_base = baseline.is_file();
+                if has_base {
+                    codecraft_remote::mirror::capture(baseline, &expected).map_err(|e| e.to_string())?;
+                }
+                drop(guard);
+                let token = short_hash(&snapshot.display().to_string());
+                let expected_remote = format!("{remote}.codecraft-base-{token}");
+                let result = (|| -> Result<String, String> {
+                    if has_base {
+                        let command = codecraft_remote::quote::sh_c(&format!(
+                            "umask 077; {}",
+                            rcmd::put_command(&expected_remote)
+                        ));
+                        let args = rcmd::ssh_exec(server, options, &command).map_err(|e| e.to_string())?;
+                        run_process(&options.program, &args, Some(&expected), None, cancel)?;
+                    }
+                    let command =
+                        rcmd::checked_put_command(remote, has_base.then_some(expected_remote.as_str()), &token);
+                    let args = rcmd::ssh_exec(server, options, &command).map_err(|e| e.to_string())?;
+                    run_process(&options.program, &args, Some(snapshot), None, cancel)
+                })();
+                if result.is_ok() {
+                    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    codecraft_remote::mirror::capture(snapshot, baseline).map_err(|e| e.to_string())?;
+                }
+                let _ = std::fs::remove_file(snapshot);
+                let _ = std::fs::remove_file(expected);
+                outputs.push(result?);
+            }
+            Step::RefreshMirror { local, incoming, baseline, protected } => {
+                let lock = mirror_lock(local);
+                let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if cancel.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                let report = codecraft_remote::mirror::refresh_protected(local, incoming, baseline, &protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).map_err(|e| e.to_string())?;
+                outputs.push(serde_json::to_string(&report).map_err(|e| e.to_string())?);
             }
             Step::Mkdir(p) => std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?,
             Step::Rename { from, to } => {
@@ -778,12 +962,118 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         }
         finish(s, follow, done.result);
     }
+    if s.remote.ops.is_empty() && let Some((server, step)) = s.remote.tree_queue.pop_front() {
+        if let Err(error) = start_op(s, &server, "Apply checked remote tree operation", vec![step], Follow::Reload, true) {
+            s.notify(NotificationLevel::Error, "Remote tree operation", error.to_string());
+        }
+        changed = true;
+    }
+    // A mirror's saves and refreshes share one queue. Snapshot and check each upload against
+    // the last accepted remote contents; a failure pauses the queue without discarding edits.
+    if !s.remote.busy() && s.remote.conflicts.is_empty()
+        && s.remote
+            .project
+            .as_ref()
+            .is_some_and(|p| p.connection == ConnectionState::Connected && !p.pending_uploads.is_empty())
+    {
+        let automatic =
+            s.project_root().and_then(|root| crate::deployment::load(&root).ok()).is_some_and(|cfg| cfg.auto_upload);
+        let next = s
+            .remote
+            .project
+            .as_mut()
+            .filter(|p| p.connection == ConnectionState::Connected && automatic)
+            .and_then(|p| p.pending_uploads.pop_first().map(|path| (p.server.clone(), path)));
+        if let Some((server, local)) = next {
+            let result = (|| -> Result<(), CommandError> {
+                let root = s.project_root().ok_or_else(|| failed("remote project is closed"))?;
+                let rel = codecraft_remote::deploy::rel_path(&root, &local)
+                    .ok_or_else(|| failed("pending upload is outside the project"))?;
+                let cfg = crate::deployment::load(&root).map_err(failed)?;
+                let dep = cfg
+                    .server(&server)
+                    .ok_or_else(|| failed("restore the remote project's deployment mapping before uploading"))?;
+                if let Some(remote) = dep.remote_for(&rel) {
+                    crate::deployment::upload_file_op(s, &server, &local, &remote, "Upload")?;
+                } else {
+                    persist_uploads(s);
+                }
+                Ok(())
+            })();
+            if let Err(error) = result
+                && let Some(project) = &mut s.remote.project
+            {
+                project.pending_uploads.insert(local);
+                project.connection = ConnectionState::Failed;
+                project.error = Some(error.to_string());
+                persist_uploads(s);
+            }
+            changed = true;
+        }
+    }
+    maintain_watcher(s);
+    let interval = Duration::from_secs(if s.remote.window_focused { 3 } else { 15 });
+    if s.remote.auto_refresh && !s.remote.busy()
+        && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected && (p.pending_uploads.is_empty() || !s.remote.conflicts.is_empty()))
+        && s.remote.last_refresh.elapsed() >= interval
+    {
+        s.remote.last_refresh = Instant::now();
+        let changed_on_host = s.remote.watcher.as_ref().is_none_or(|(_, streaming, changed)|
+            !streaming.load(Ordering::Acquire) || changed.swap(false, Ordering::AcqRel));
+        if !changed_on_host { return changed; }
+        let streaming = s.remote.watcher.as_ref().is_some_and(|(_, streaming, _)| streaming.load(Ordering::Acquire));
+        let refresh = if streaming { s.execute("remote.syncFromRemote", &Value::Null).map(|_| ()) } else { auto_probe(s) };
+        if let Err(error) = refresh {
+            s.notify(NotificationLevel::Warning, "Automatic remote refresh", error.to_string());
+        }
+        changed = true;
+    }
     changed
+}
+
+pub(crate) fn protect_buffers(s: &Session) {
+    let paths = s.project_root().map(|root| s.ws.docs().filter(|d| d.doc.is_modified())
+        .filter_map(|d| d.path.as_ref()?.strip_prefix(&root).ok().map(Path::to_path_buf)).collect()).unwrap_or_default();
+    *s.remote.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
 }
 
 fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) {
     match follow {
         Follow::Nothing => {}
+        Follow::AutoProbe => match result {
+            Ok(output) if output.iter().any(|s| !s.trim().is_empty()) => {
+                if let Err(error) = s.execute("remote.syncFromRemote", &Value::Null) {
+                    s.notify(NotificationLevel::Error, "Automatic remote refresh", error.to_string());
+                }
+            }
+            Err(error) => if let Some(project) = &mut s.remote.project { project.connection = ConnectionState::Failed; project.error = Some(error); },
+            _ => {}
+        },
+        Follow::ProjectUpload { local } => {
+            let conflict = result.as_ref().err().is_some_and(|error| error.contains("Remote file changed"));
+            if result.is_ok() {
+                s.lsp_did_save(&local);
+                if let Some(project) = &mut s.remote.project { project.error = None; }
+            }
+            if let Err(error) = result
+                && let Some(project) = &mut s.remote.project
+                && s.ws.project.as_ref().is_some_and(|p| local.starts_with(&p.root))
+            {
+                project.pending_uploads.insert(local.clone());
+                project.connection = if conflict { ConnectionState::Connected } else { ConnectionState::Failed };
+                project.error = Some(error);
+            }
+            if conflict {
+                if let Some(rel) = s.project_root().and_then(|root| local.strip_prefix(root).ok().map(Path::to_path_buf))
+                    && !s.remote.conflicts.contains(&rel) { s.remote.conflicts.push(rel); }
+                // Pause uploads, fetch the incoming copy, and leave resolution usable without
+                // a reconnect/retry loop. Transport failures still pause the disconnected queue.
+                if let Err(error) = s.execute("remote.syncFromRemote", &Value::Null) {
+                    s.notify(NotificationLevel::Error, "Fetch remote conflict", error.to_string());
+                }
+            }
+            persist_uploads(s);
+        }
         Follow::Reload => {
             if result.is_ok() {
                 let _ = s.execute("file.synchronize", &Value::Null);
@@ -818,6 +1108,18 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
                 s.remote.browser.error = Some(e.clone());
             }
             let _ = refresh_browser(s);
+        }
+        Follow::ExternalSource { local, line, column, utf16 } => {
+            let column = if utf16 {
+                codecraft_fs::read_text_file(&local).ok().map(|text| {
+                    let document = codecraft_text::Document::from_text(&text);
+                    let offset = document.utf16_to_offset(u32::try_from(line).unwrap_or(u32::MAX), u32::try_from(column).unwrap_or(u32::MAX));
+                    document.offset_to_position(offset).column
+                }).unwrap_or(0)
+            } else { column };
+            if result.is_ok() && let Err(error) = s.navigate_to_position(&local, line, column) {
+                s.notify(NotificationLevel::Error, "Cannot open remote source", error.to_string());
+            }
         }
         Follow::OpenRemote { server, remote, local } => {
             if result.is_ok() {
@@ -879,6 +1181,10 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
             s.status = if n == 0 { "Sync: no differences".into() } else { format!("Sync: {n} difference(s)") };
         }
         Follow::Test { server } => {
+            let absolute = result.as_ref().ok().and_then(|outputs| outputs.iter().flat_map(|s| s.lines())
+                .find_map(|line| line.strip_prefix("CODECRAFT-ROOT=").filter(|p| p.starts_with('/')).map(str::to_owned)));
+            let restart = absolute.is_some() && s.remote.project.as_ref().is_some_and(|p| p.server == server);
+            if restart { s.remote.absolute_root = absolute; }
             let status = match result {
                 Ok(_) => TestStatus::Ok("Connected".into()),
                 Err(e) => TestStatus::Failed(e),
@@ -888,13 +1194,59 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
                 TestStatus::Failed(e) => format!("{server}: {e}"),
                 TestStatus::Running => String::new(),
             };
+            if let Some(p) = &mut s.remote.project
+                && p.server == server
+            {
+                match &status {
+                    TestStatus::Ok(_) => {
+                        p.connection = ConnectionState::Connected;
+                        p.error = None;
+                    }
+                    TestStatus::Failed(e) => {
+                        p.connection = ConnectionState::Failed;
+                        p.error = Some(e.clone());
+                    }
+                    TestStatus::Running => p.connection = ConnectionState::Connecting,
+                }
+            }
             s.remote.tests.insert(server, status);
-        }
-        Follow::RemoteDev { server, remote, local } => {
-            if result.is_ok() {
-                crate::remote_cmds::remote_dev_ready(s, &server, &remote, &local);
+            if restart && s.lsp_enabled {
+                let kinds: std::collections::BTreeSet<_> = s.servers.keys().copied()
+                    .chain(s.ws.docs().filter_map(|d| crate::lsp::server_kind(d.language))).collect();
+                stop_project_servers(s);
+                if let Some(root) = s.project_root() { s.start_lsp(&root); }
+                for kind in kinds { s.ensure_server(kind); }
             }
         }
+        Follow::RemoteDev { server, remote, local, open_window } => match result {
+            Ok(outputs) => {
+                if let Some(report) = outputs.last().and_then(|t| serde_json::from_str::<codecraft_remote::mirror::Refresh>(t).ok()) {
+                    let paths: Vec<_> = report.changed.iter().map(|p| local.join(p)).collect();
+                    s.remote_files_changed(&paths);
+                    s.remote.conflicts = report.conflicts.clone();
+                    if !report.conflicts.is_empty() {
+                    s.notify(NotificationLevel::Warning, "Remote sync conflicts", format!(
+                            "Preserved {} local file(s): {}. Incoming versions are in the sibling .snapshots folder. Compare before uploading.",
+                            report.conflicts.len(), report.conflicts.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                        ));
+                }
+                }
+                if open_window {
+                    crate::remote_cmds::remote_dev_ready(s, &server, &remote, &local);
+                } else {
+                    let _ = s.execute("file.synchronize", &Value::Null);
+                }
+            }
+            Err(error) => {
+                if let Some(d) = &mut s.remote.remote_dev {
+                    d.error = Some(error.clone());
+                }
+                if let Some(p) = &mut s.remote.project {
+                    p.connection = ConnectionState::Failed;
+                    p.error = Some(error);
+                }
+            }
+        },
     }
 }
 
@@ -928,6 +1280,37 @@ pub(crate) fn failed(e: impl std::fmt::Display) -> CommandError {
 /// project's mapped files to the default deployment server.
 pub(crate) fn after_save(s: &mut Session, saved: &[PathBuf]) {
     if saved.is_empty() {
+        return;
+    }
+    if s.remote.project.is_some() {
+        let paths = s
+            .project_root()
+            .and_then(|root| {
+                let cfg = crate::deployment::load(&root).ok()?;
+                if !cfg.auto_upload {
+                    return None;
+                }
+                let dep = cfg.default_deployment()?;
+                Some(
+                    saved
+                        .iter()
+                        .filter(|path| {
+                            codecraft_remote::deploy::rel_path(&root, path)
+                                .and_then(|rel| dep.remote_for(&rel))
+                                .is_some()
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        if let Some(project) = &mut s.remote.project {
+            project.pending_uploads.extend(paths);
+            if project.connection != ConnectionState::Connected {
+                s.status = "Remote upload paused: reconnect and review remote changes before uploading".into();
+            }
+        }
+        persist_uploads(s);
         return;
     }
     let mut remote_files: Vec<(String, String, PathBuf)> = Vec::new();
@@ -964,6 +1347,7 @@ pub(crate) fn after_save(s: &mut Session, saved: &[PathBuf]) {
 
 /// Stop background work and close every connection (window closing).
 pub(crate) fn shutdown(s: &mut Session) {
+    stop_watcher(&mut s.remote);
     s.remote.cancel.store(true, Ordering::Relaxed);
     let masters: Vec<Master> = s.remote.masters.drain().map(|(_, m)| m).collect();
     for mut m in masters {
@@ -1011,6 +1395,373 @@ pub fn transfers_running(s: &Session) -> bool {
     s.remote.log.iter().any(|e| e.status == TransferStatus::Running)
 }
 
+/// Restore the remote marker when a cached mirror is opened (including Recent Projects).
+pub(crate) fn project_opened(s: &mut Session, root: &Path) {
+    stop_watcher(&mut s.remote);
+    s.remote.project = None;
+    s.remote.conflicts.clear();
+    s.remote.absolute_root = None;
+    s.remote.last_refresh = Instant::now();
+    let Ok(cfg) = crate::deployment::load(root) else { return };
+    s.remote.auto_refresh = !cfg.pause_remote_refresh;
+    let Some(name) = cfg.remote_development.clone() else { return };
+    let Some(remote) = cfg.server(&name).and_then(|d| d.remote_for("")) else { return };
+    let destination = s
+        .remote
+        .server(&name)
+        .map(|server| match server.user {
+            Some(user) => format!("{user}@{}", server.host),
+            None => server.host,
+        })
+        .unwrap_or_else(|| name.clone());
+    let pending_uploads = match load_uploads(root) {
+        Ok(paths) => paths,
+        Err(error) => {
+            s.notify(
+                NotificationLevel::Warning,
+                "Cannot restore pending remote uploads",
+                format!("{error}. Saved files remain local; review and upload them explicitly."),
+            );
+            Default::default()
+        }
+    };
+    s.remote.project = Some(RemoteProject {
+        server: name,
+        destination,
+        remote,
+        connection: ConnectionState::Cached,
+        error: None,
+        pending_uploads,
+    });
+    let _ = s.execute("remote.project.reconnect", &Value::Null);
+}
+
+/// Close this host's master off the UI thread. Other hosts remain usable.
+pub(crate) fn disconnect_master(s: &mut Session, server: &str) {
+    stop_watcher(&mut s.remote);
+    let generation = s.remote.control_generation.entry(server.into()).or_default();
+    *generation = generation.saturating_add(1);
+    if let Some(mut master) = s.remote.masters.remove(server) {
+        std::thread::spawn(move || {
+            if let Ok(Some(args)) = rcmd::ssh_exit_master(&master.server, &master.options) {
+                let _ = run_process(&master.options.program, &args, None, None, &AtomicBool::new(false));
+            }
+            if let Some(child) = &mut master.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            if let Some(path) = master.options.control_path {
+                let _ = std::fs::remove_file(path);
+            }
+        });
+    }
+}
+
+/// Persistent snapshots used by both refresh and checked uploads.
+pub(crate) fn mirror_paths(local: &Path) -> Result<(PathBuf, PathBuf), CommandError> {
+    let parent = local.parent().ok_or_else(|| failed("remote cache has no parent"))?;
+    let leaf = local.file_name().ok_or_else(|| failed("remote cache has no name"))?;
+    Ok((parent.join(".snapshots").join(leaf), parent.join(".baselines").join(leaf)))
+}
+
+/// Serialize mirror writes across project windows. UI saves use try_lock and retain the buffer
+/// when a worker owns the mirror; only workers may wait for the lock.
+type MirrorLocks = std::sync::Mutex<BTreeMap<PathBuf, std::sync::Weak<std::sync::Mutex<()>>>>;
+
+pub(crate) fn mirror_lock(root: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<MirrorLocks> = std::sync::OnceLock::new();
+    shared_lock(&LOCKS, root)
+}
+
+fn transfer_lock(root: &Path) -> Arc<std::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<MirrorLocks> = std::sync::OnceLock::new();
+    shared_lock(&LOCKS, root)
+}
+
+fn shared_lock(locks: &std::sync::OnceLock<MirrorLocks>, root: &Path) -> Arc<std::sync::Mutex<()>> {
+    let mut locks = locks.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = crate::normalize_path(root);
+    if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(std::sync::Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+const PENDING_UPLOADS: &str = ".codecraft/remote-pending.json";
+
+fn load_uploads(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>, String> {
+    let file = match File::open(root.join(PENDING_UPLOADS)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut text = String::new();
+    file.take(1024 * 1024 + 1).read_to_string(&mut text).map_err(|e| e.to_string())?;
+    if text.len() > 1024 * 1024 {
+        return Err("pending remote uploads exceed the 1 MiB metadata limit".into());
+    }
+    let paths: Vec<String> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if paths.len() > 10000 {
+        return Err("pending remote uploads exceed 10000 files".into());
+    }
+    let mut result = std::collections::BTreeSet::new();
+    for rel in paths {
+        let path = crate::normalize_path(&root.join(&rel));
+        if codecraft_remote::deploy::rel_path(root, &path).is_none_or(|p| p.is_empty()) {
+            return Err("pending remote upload path is outside the project".into());
+        }
+        result.insert(path);
+    }
+    Ok(result)
+}
+
+pub(crate) fn persist_uploads(s: &mut Session) {
+    let Some(root) = s.project_root() else { return };
+    let Some(project) = &s.remote.project else { return };
+    let paths: Vec<_> =
+        project.pending_uploads.iter().filter_map(|p| codecraft_remote::deploy::rel_path(&root, p)).collect();
+    let result = serde_json::to_string(&paths)
+        .map_err(|e| e.to_string())
+        .and_then(|text| write_atomic(&root.join(PENDING_UPLOADS), &text));
+    if let Err(error) = result {
+        s.notify(NotificationLevel::Error, "Cannot remember pending remote uploads", error);
+    }
+}
+
+/// Stop remote language services without waiting for their shutdown handshakes on the UI thread.
+pub(crate) fn stop_project_servers(s: &mut Session) {
+    for server in std::mem::take(&mut s.servers).into_values() {
+        std::thread::spawn(move || server.shutdown());
+    }
+    s.server_status.clear();
+    s.lsp_status = crate::LspStatus::Off;
+    for doc in s.ws.docs_mut() { doc.lsp_synced = None; }
+}
+
+pub(crate) fn external_cache(s: &Session) -> Option<PathBuf> {
+    let project = s.remote.project.as_ref()?;
+    Some(s.remote.cache_dir()?.join(".sources").join(safe_name(&project.server)))
+}
+
+/// Translate server configuration into an SSH stdio process; no network work runs here.
+pub(crate) fn lsp_transport(s: &mut Session, kind: codecraft_lsp::ServerKind, config: &mut codecraft_lsp::ServerConfig)
+    -> Result<Arc<dyn codecraft_lsp::path_mapper::PathMapper>, CommandError>
+{
+    let project = s.remote.project.clone().ok_or_else(|| failed("no remote project"))?;
+    let remote = s.remote.absolute_root.clone().ok_or_else(|| failed("Reconnect to resolve the remote workspace before starting language services"))?;
+    if project.connection != ConnectionState::Connected { return Err(failed("remote language services are paused; Reconnect to resume")); }
+    let server = crate::deployment::server(s, &project.server)?;
+    let opts = s.remote.ssh_options(&project.server);
+    let tool = match kind {
+        codecraft_lsp::ServerKind::RustAnalyzer => "rust-analyzer",
+        codecraft_lsp::ServerKind::Clangd => "clangd",
+        codecraft_lsp::ServerKind::Python => "basedpyright-langserver",
+        _ => return Err(failed("this language has no SSH language transport yet")),
+    };
+    let launch = if kind == codecraft_lsp::ServerKind::Python {
+        "if command -v basedpyright-langserver >/dev/null 2>&1; then exec basedpyright-langserver --stdio; elif command -v pyright-langserver >/dev/null 2>&1; then exec pyright-langserver --stdio; else echo 'Install basedpyright or pyright on the remote host' >&2; exit 127; fi".to_owned()
+    } else {
+        format!("command -v {tool} >/dev/null 2>&1 || {{ echo {} >&2; exit 127; }}; exec {tool}", codecraft_remote::quote::sh_quote(&format!("Missing {tool} on the remote host: {}", kind.install_hint())))
+    };
+    let script = format!("{}{}", codecraft_remote::target_script::prelude(&remote, &[]).map_err(failed)?, launch);
+    config.command = resolve_program(&opts.program);
+    config.args = rcmd::ssh_exec(&server, &opts, &codecraft_remote::quote::sh_c(&script)).map_err(failed)?;
+    config.args.insert(0, "-T".into());
+    let mut mapper = codecraft_lsp::path_mapper::RootMapper::new(&config.root.to_string_lossy(), &remote);
+    if let Some(cache) = external_cache(s) { mapper = mapper.with_external_cache(&cache.to_string_lossy()); }
+    Ok(Arc::new(mapper))
+}
+
+/// Fetch external source files on demand. Cache files never participate in deployment saves.
+pub(crate) fn fetch_external(s: &mut Session, local: &Path, line: usize, column: usize) -> Result<bool, CommandError> {
+    fetch_external_position(s, local, line, column, false)
+}
+
+pub(crate) fn fetch_external_lsp(s: &mut Session, local: &Path, line: usize, column: usize) -> Result<bool, CommandError> {
+    fetch_external_position(s, local, line, column, true)
+}
+
+fn fetch_external_position(s: &mut Session, local: &Path, line: usize, column: usize, utf16: bool) -> Result<bool, CommandError> {
+    let Some(cache) = external_cache(s) else { return Ok(false) };
+    let Ok(rel) = local.strip_prefix(&cache) else { return Ok(false) };
+    if local.is_file() { return Ok(false); }
+    if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) || rel.as_os_str().is_empty() {
+        return Err(failed("invalid remote source cache path"));
+    }
+    let project = s.remote.project.clone().ok_or_else(|| failed("remote project closed"))?;
+    let host = crate::deployment::server(s, &project.server)?;
+    let opts = s.remote.ssh_options(&project.server);
+    let remote = format!("/{}", rel.to_string_lossy());
+    let q = codecraft_remote::quote::quote_path(&remote);
+    let script = codecraft_remote::quote::sh_c(&format!("test -f {q} && test ! -L {q} && test \"$(wc -c < {q})\" -le {MAX_OPEN_BYTES} && head -c {MAX_OPEN_BYTES} -- {q}"));
+    let args = rcmd::ssh_exec(&host, &opts, &script).map_err(failed)?;
+    let parent = local.parent().ok_or_else(|| failed("cache source has no parent"))?.to_path_buf();
+    let temp = local.with_extension("codecraft-fetch");
+    start_op(s, &project.server, format!("Fetch remote source {remote}"), vec![Step::Mkdir(parent),
+        Step::Run { program: opts.program, args, stdin: None, stdout_to: Some(temp.clone()) },
+        Step::Rename { from: temp, to: local.to_path_buf() }],
+        Follow::ExternalSource { local: local.to_path_buf(), line, column, utf16 }, true)?;
+    Ok(true)
+}
+
+/// Queue resource operations after their local transaction. A failed check preserves the local
+/// result and the old baseline; the transfer log tells the user how to reconcile it.
+pub(crate) fn tree_operation(s: &mut Session, from: &Path, to: Option<&Path>, directory: bool, create: bool) -> Result<(), CommandError> {
+    let Some(project) = s.remote.project.clone() else { return Ok(()) };
+    let root = s.project_root().ok_or_else(|| failed("project closed"))?;
+    let relative = codecraft_remote::deploy::rel_path(&root, from).filter(|p| !p.is_empty()).ok_or_else(|| failed("tree operation is outside the remote project"))?;
+    let cfg = crate::deployment::load(&root).map_err(failed)?;
+    let dep = cfg.server(&project.server).ok_or_else(|| failed("restore deployment mapping"))?;
+    let remote_from = dep.remote_for(&relative).ok_or_else(|| failed("path is excluded from deployment"))?;
+    let remote_to = to.map(|p| codecraft_remote::deploy::rel_path(&root, p).and_then(|rel| dep.remote_for(&rel))
+        .ok_or_else(|| failed("destination is outside deployment mapping"))).transpose()?;
+    if project.connection != ConnectionState::Connected { return Err(failed("Reconnect before changing the remote project tree; local changes are preserved")); }
+    if create && !directory { after_save(s, &[from.to_path_buf()]); return Ok(()); }
+    let server = crate::deployment::server(s, &project.server)?;
+    let options = s.remote.ssh_options(&project.server);
+    let (_, baseline) = mirror_paths(&root)?;
+    let step = Step::CheckedTree { root, server, options, from: from.to_path_buf(), to: to.map(Path::to_path_buf),
+        directory, create, remote_from, remote_to, baseline, rsync: s.remote.programs.rsync.clone() };
+    s.remote.tree_queue.push_back((project.server, step));
+    if let Some(to) = to {
+        if let Some(project) = &mut s.remote.project {
+            let moved: Vec<_> = project.pending_uploads.iter().filter_map(|p| p.strip_prefix(from).ok().map(|rel| (p.clone(), to.join(rel)))).collect();
+            for (old, new) in moved { project.pending_uploads.remove(&old); project.pending_uploads.insert(new); }
+        }
+        let mut saved = vec![];
+        if to.is_file() { saved.push(to.to_path_buf()); }
+        saved.extend(s.ws.docs().filter_map(|d| d.path.as_ref().filter(|p| p.starts_with(to)).cloned()));
+        after_save(s, &saved);
+    } else if !create && let Some(project) = &mut s.remote.project {
+        project.pending_uploads.retain(|p| !p.starts_with(from));
+    }
+    Ok(())
+}
+
+pub(crate) fn map_output_path(s: &Session, path: &Path) -> PathBuf {
+    use codecraft_lsp::path_mapper::Direction;
+    let normalized = crate::normalize_path(path);
+    let path = normalized.as_path();
+    let Some(root) = s.project_root() else { return path.to_path_buf() };
+    if path.starts_with(&root) || external_cache(s).is_some_and(|cache| path.starts_with(cache)) { return path.to_path_buf(); }
+    let Some(remote) = &s.remote.absolute_root else { return path.to_path_buf() };
+    let mut mapper = codecraft_lsp::path_mapper::RootMapper::new(&root.to_string_lossy(), remote);
+    if let Some(cache) = external_cache(s) { mapper = mapper.with_external_cache(&cache.to_string_lossy()); }
+    mapper.map_path(&path.to_string_lossy(), Direction::ToClient).map(PathBuf::from).unwrap_or_else(|| path.to_path_buf())
+}
+
+pub(crate) fn map_output_line(s: &Session, line: &str) -> String {
+    match (s.project_root(), s.remote.absolute_root.as_ref()) {
+        (Some(root), Some(remote)) if !remote.is_empty() => {
+            let mut output = String::with_capacity(line.len());
+            let mut cursor = 0;
+            for (start, matched) in line.match_indices(remote) {
+                let end = start.saturating_add(matched.len());
+                if line.get(end..).is_some_and(|tail| tail.is_empty() || tail.starts_with('/')) {
+                    output.push_str(line.get(cursor..start).unwrap_or_default());
+                    output.push_str(&root.to_string_lossy());
+                    cursor = end;
+                }
+            }
+            output.push_str(line.get(cursor..).unwrap_or_default());
+            output
+        },
+        _ => line.to_owned(),
+    }
+}
+
+// rsync's metadata probe is one batched SSH command and honors exactly the download's
+// per-directory .gitignore rules, size cap and exclusions (unlike a bare find/stat walk).
+fn auto_probe(s: &mut Session) -> Result<(), CommandError> {
+    let project = s.remote.project.clone().ok_or_else(|| failed("project closed"))?;
+    let root = s.project_root().ok_or_else(|| failed("project closed"))?;
+    let server = crate::deployment::server(s, &project.server)?;
+    let options = s.remote.ssh_options(&project.server);
+    let (incoming, _) = mirror_paths(&root)?;
+    let mut args = rcmd::project_download_args(&server, &options, &incoming, &project.remote).map_err(failed)?;
+    args.retain(|a| a != "--checksum");
+    args.insert(0, "--dry-run".into());
+    start_op(s, &project.server, "Probe remote project changes", vec![Step::run(&s.remote.programs.rsync.clone(), args)], Follow::AutoProbe, false)?;
+    Ok(())
+}
+
+fn stop_watcher(remote: &mut RemoteState) {
+    if let Some((cancel, _, _)) = remote.watcher.take() { cancel.store(true, Ordering::Release); }
+}
+
+/// inotify is an optional optimization. A failed/missing watcher leaves the bounded,
+/// ignore-aware rsync poll active; both transports reuse the project's ControlMaster.
+fn maintain_watcher(s: &mut Session) {
+    let connected = s.remote.auto_refresh && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected);
+    if !connected { stop_watcher(&mut s.remote); return; }
+    if s.remote.watcher.is_some() { return; }
+    let Some(project) = s.remote.project.clone() else { return };
+    let Some(server) = s.remote.server(&project.server) else { return };
+    let opts = s.remote.ssh_options(&project.server);
+    let command = codecraft_remote::quote::sh_c(&format!(
+        "cd {} || exit 1; command -v inotifywait >/dev/null 2>&1 || exit 42; printf 'ready\\n'; exec inotifywait -m -r -q -P -e modify,create,delete,move,attrib --format changed --exclude '(^|/)(\\.git|\\.codecraft|target|node_modules|__pycache__)(/|$)' .",
+        codecraft_remote::quote::quote_path(&project.remote)));
+    let Ok(mut args) = rcmd::ssh_exec(&server, &opts, &command) else { return };
+    args.insert(0, "-T".into());
+    let cancel = Arc::new(AtomicBool::new(false));
+    let streaming = Arc::new(AtomicBool::new(false));
+    let dirty = Arc::new(AtomicBool::new(true));
+    let flags = (cancel.clone(), streaming.clone(), dirty.clone());
+    let spawned = std::thread::Builder::new().name("remote-watch".into()).spawn(move || {
+        let mut command = Command::new(resolve_program(&opts.program));
+        command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let Ok(mut child) = command.spawn() else { return };
+        if let Some(mut output) = child.stdout.take() {
+            let running = streaming.clone();
+            let _ = std::thread::Builder::new().name("remote-watch-events".into()).spawn(move || {
+                let mut ready = [0; 6];
+                if output.read_exact(&mut ready).is_err() || &ready != b"ready\n" { return; }
+                running.store(true, Ordering::Release);
+                let mut bytes = [0; 4096];
+                while let Ok(n) = output.read(&mut bytes) {
+                    if n == 0 { break; }
+                    dirty.store(true, Ordering::Release);
+                }
+                running.store(false, Ordering::Release);
+            });
+        }
+        while !cancel.load(Ordering::Acquire) && matches!(child.try_wait(), Ok(None)) { std::thread::sleep(Duration::from_millis(50)); }
+        if cancel.load(Ordering::Acquire) {
+            #[cfg(unix)]
+            { let _ = Command::new("kill").args(["-TERM", "--", &format!("-{}", child.id())]).stdout(Stdio::null()).stderr(Stdio::null()).status(); }
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        streaming.store(false, Ordering::Release);
+    });
+    if spawned.is_ok() { s.remote.watcher = Some(flags); }
+}
+
+pub(crate) fn stop_project_watcher(s: &mut Session) { stop_watcher(&mut s.remote); }
+
+impl Drop for RemoteState {
+    fn drop(&mut self) {
+        stop_watcher(self);
+        self.cancel.store(true, Ordering::Release);
+        for master in self.masters.values_mut() { if let Some(child) = &mut master.child { let _ = child.kill(); } }
+    }
+}
+
+/// Resolve terminal links using the remote shell's saved directory and the mirror mapping.
+pub fn terminal_path(s: &Session, tab: usize, raw: &str) -> Option<PathBuf> {
+    let shell = s.terminal.tabs.get(tab)?;
+    if !shell.remote { return s.terminal.resolve_path(tab, raw, s.project_root().as_deref()); }
+    let path = PathBuf::from(raw);
+    let path = if path.is_absolute() { path } else { shell.cwd.join(path) };
+    let mapped = map_output_path(s, &path);
+    (mapped.is_file() || external_cache(s).is_some_and(|cache| mapped.starts_with(cache))).then_some(mapped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,5 +1795,55 @@ mod tests {
         assert!(run_process("/nonexistent/prog", &[], None, None, &cancel).is_err());
         let cancel = AtomicBool::new(true);
         assert!(run_process("sh", &["-c".into(), "sleep 5".into()], None, None, &cancel).is_err());
+    }
+}
+
+#[cfg(test)]
+mod pending_upload_tests {
+    use super::*;
+
+    #[test]
+    fn network_transfer_lock_does_not_block_saving_local_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one").unwrap();
+        let mut session = Session::new();
+        session.isolate_home(&dir.path().join("home"));
+        session.lsp_enabled = false;
+        session.ws.project = Some(codecraft_workspace::Project::new(root.clone()));
+        session.remote.project = Some(RemoteProject {
+            server: "fixture".into(),
+            destination: "fixture".into(),
+            remote: "~/project".into(),
+            connection: ConnectionState::Disconnected,
+            error: None,
+            pending_uploads: Default::default(),
+        });
+        session.open_file(&root.join("a.txt")).unwrap();
+        let id = session.ws.active().unwrap().1.id;
+        session
+            .ws
+            .doc_mut(id)
+            .unwrap()
+            .doc
+            .replace_all("saved during transfer", &codecraft_text::SelectionSet::caret(0))
+            .unwrap();
+        let lock = transfer_lock(&root);
+        let _guard = lock.lock().unwrap();
+        assert_eq!(session.save_all().unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "saved during transfer");
+    }
+
+    #[test]
+    fn malformed_and_escaping_pending_paths_are_actionable_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".codecraft")).unwrap();
+        std::fs::write(dir.path().join(PENDING_UPLOADS), "[").unwrap();
+        assert!(load_uploads(dir.path()).is_err());
+        std::fs::write(dir.path().join(PENDING_UPLOADS), r#"["../outside"]"#).unwrap();
+        assert!(load_uploads(dir.path()).unwrap_err().contains("outside"));
+        std::fs::write(dir.path().join(PENDING_UPLOADS), r#"["src/a.rs"]"#).unwrap();
+        assert!(load_uploads(dir.path()).unwrap().contains(&dir.path().join("src/a.rs")));
     }
 }

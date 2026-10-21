@@ -113,6 +113,7 @@ struct Proc {
     root: PathBuf,
     /// Run next when this one succeeds (Rebuild = clean, then build).
     then: Option<CargoInvocation>,
+    stopping: bool,
 }
 
 #[derive(Default)]
@@ -126,7 +127,7 @@ pub(crate) struct Runs {
 impl Drop for Runs {
     fn drop(&mut self) {
         for p in &self.procs {
-            if p.handle.is_running() {
+            if !p.stopping && p.handle.is_running() {
                 let _ = p.handle.kill();
             }
         }
@@ -208,6 +209,15 @@ pub(crate) fn start_chain(
     title: &str,
     build: bool,
 ) -> Result<RunTabId, CommandError> {
+    if let Some(target) = crate::target_exec::override_target(s) {
+        let first = cargo_command(&inv);
+        let mut command = if let Some(next) = &then {
+            ProcessCommand::shell(format!("{} && {}", first.command_line(), cargo_command(next).command_line()), &inv.cwd)
+        } else { first };
+        command.env = inv.env.clone();
+        command.build = build;
+        return start_on_target(s, &command, title, &target);
+    }
     let (handle, events) = codecraft_cargo::spawn(&inv).map_err(|e| CommandError::Failed(e.to_string()))?;
     let tab = s.ws.add_run(title, inv.command_line(), build);
     crate::testing::track_cargo(s, tab, &inv, title);
@@ -215,7 +225,7 @@ pub(crate) fn start_chain(
         s.ws.clear_cargo_problems();
     }
     s.ws.layout.show(if build { ToolWindowId::Build } else { ToolWindowId::Run });
-    s.runs.procs.push(Proc { tab, handle, events, root: inv.cwd.clone(), then });
+    s.runs.procs.push(Proc { tab, handle, events, root: inv.cwd.clone(), then, stopping: false });
     s.status = format!("{title}: running");
     Ok(tab)
 }
@@ -275,7 +285,7 @@ fn spawn_tracked(
     let tab = s.ws.add_run(title, display.unwrap_or_else(|| cmd.command_line()), cmd.build);
     crate::testing::track_process(s, tab, configured, junit, title);
     s.ws.layout.show(if cmd.build { ToolWindowId::Build } else { ToolWindowId::Run });
-    s.runs.procs.push(Proc { tab, handle, events, root: cmd.cwd.clone(), then: None });
+    s.runs.procs.push(Proc { tab, handle, events, root: cmd.cwd.clone(), then: None, stopping: false });
     s.status = format!("{title}: running");
     Ok(tab)
 }
@@ -342,6 +352,9 @@ pub(crate) fn start_on_target(
 pub(crate) fn stop(s: &mut Session, tab: RunTabId) -> bool {
     let Some(p) = s.runs.procs.iter_mut().find(|p| p.tab == tab) else { return false };
     p.then = None;
+    // A second TERM can interrupt an SSH wrapper's remote cleanup trap.
+    if p.stopping { return true; }
+    p.stopping = true;
     if let Err(e) = p.handle.kill() {
         log::warn!("stop: {e}");
     }
@@ -412,19 +425,22 @@ fn apply_event(s: &mut Session, tab: RunTabId, root: &Path, ev: RunEvent) -> boo
     match ev {
         RunEvent::Started { .. } => false,
         RunEvent::Stdout(line) => {
+            let line = crate::remote::map_output_line(s, &line);
             if let Some(t) = s.ws.run_mut(tab) {
                 t.push(ConsoleKind::Stdout, strip_ansi(&line));
             }
             false
         }
         RunEvent::Stderr(line) => {
+            let line = crate::remote::map_output_line(s, &line);
             if let Some(t) = s.ws.run_mut(tab) {
                 t.push(ConsoleKind::Stderr, strip_ansi(&line));
             }
             false
         }
         RunEvent::Message(CargoMessage::CompilerMessage { diagnostic, .. }) => {
-            if let Some(problem) = problem_from_diagnostic(root, &diagnostic) {
+            if let Some(mut problem) = problem_from_diagnostic(root, &diagnostic) {
+                problem.path = crate::remote::map_output_path(s, &problem.path);
                 s.ws.add_cargo_problem(problem);
             }
             false

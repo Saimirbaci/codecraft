@@ -86,7 +86,7 @@ pub fn ssh_master(server: &SshServer, opts: &SshOptions) -> RemoteResult<Option<
     }
     out.extend(opt("ControlMaster=yes"));
     out.extend(opt(format!("ControlPath={path}")));
-    out.extend(opt("ControlPersist=no"));
+    out.extend(opt("ControlPersist=60"));
     out.extend(opt("ServerAliveInterval=30"));
     out.push("-N".into());
     out.extend(server.connect_options());
@@ -284,6 +284,50 @@ pub fn rsync_args(server: &SshServer, opts: &SshOptions, spec: &RsyncSpec<'_>) -
     Ok(out)
 }
 
+/// Bounded, incremental remote-project snapshot. Symlinks are skipped; the working copy is
+/// refreshed separately against a baseline, never by an unconditional rsync overwrite.
+/// Per-directory gitignore filters support common ignore patterns (not Git's full semantics).
+pub fn project_download_args(
+    server: &SshServer,
+    opts: &SshOptions,
+    local: &Path,
+    remote: &str,
+) -> RemoteResult<Vec<String>> {
+    let excludes: Vec<String> = crate::deploy::DEFAULT_EXCLUDES
+        .iter()
+        .copied()
+        .chain(["*.codecraft-base-*", "*.codecraft-upload-*"])
+        .map(str::to_string)
+        .collect();
+    let mut args = rsync_args(
+        server,
+        opts,
+        &RsyncSpec {
+            direction: Direction::Download,
+            local,
+            remote,
+            dir: true,
+            excludes: &excludes,
+            dry_run: false,
+            delete: true,
+            update: false,
+            files_from: None,
+        },
+    )?;
+    // Insert before positional arguments (works with rsync 2.6.9 shipped on macOS).
+    let at = args.len().saturating_sub(2);
+    args.splice(
+        at..at,
+        [
+            "--no-links".into(),
+            "--checksum".into(),
+            format!("--max-size={}", crate::mirror::MAX_FILE_BYTES),
+            "--filter=:- .gitignore".into(),
+        ],
+    );
+    Ok(args)
+}
+
 /// `scp` arguments (rsync fallback). A directory upload copies its contents into `remote`
 /// (`local/.`); a directory download copies `remote` into the parent of `local`, so the two must
 /// share a base name.
@@ -353,6 +397,31 @@ pub fn put_command(path: &str) -> String {
         quote::quote_path(&tmp),
         quote::quote_path(&tmp),
         quote::quote_path(path)
+    ))
+}
+
+/// Receive an upload into a temporary file, then compare against the accepted baseline before
+/// renaming. Checking after the stream prevents edits made during a slow upload being lost.
+/// `expected` is a separately uploaded immutable baseline; `None` requires an absent target.
+pub fn checked_put_command(path: &str, expected: Option<&str>, token: &str) -> String {
+    let parent = parent_of(path);
+    let tmp = format!("{path}.codecraft-upload-{token}");
+    let p = quote::quote_path(path);
+    let check = match expected {
+        Some(base) => format!("test -f {p} && test ! -L {p} && cmp -s -- {p} {}", quote::quote_path(base)),
+        None => format!("test ! -e {p} && test ! -L {p}"),
+    };
+    let cleanup = match expected {
+        Some(base) => format!("rm -f -- {} {}", quote::quote_path(&tmp), quote::quote_path(base)),
+        None => format!("rm -f -- {}", quote::quote_path(&tmp)),
+    };
+    quote::sh_c(&format!(
+        "umask 077; mkdir -p -- {} && trap {} 0 && {{ if test -f {p} && test ! -L {p}; then cp -p -- {p} {}; fi; }} && cat > {} && if {check}; then mv -f -- {} {p}; else echo 'Remote file changed: refresh and compare before uploading' >&2; exit 3; fi",
+        quote::quote_path(&parent),
+        quote::sh_quote(&cleanup),
+        quote::quote_path(&tmp),
+        quote::quote_path(&tmp),
+        quote::quote_path(&tmp)
     ))
 }
 
@@ -579,6 +648,25 @@ mod tests {
     }
 
     #[test]
+    fn project_snapshot_is_incremental_bounded_and_filtered() {
+        let args = project_download_args(&alias(), &shared(), Path::new("/cache/snapshot"), "~/app").unwrap();
+        for flag in [
+            "--delete",
+            "--checksum",
+            "--no-links",
+            "--max-size=52428800",
+            "--filter=:- .gitignore",
+            "--exclude=target",
+            "--exclude=node_modules",
+            "--exclude=.git",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
+        }
+        assert_eq!(args.last().map(String::as_str), Some("/cache/snapshot/"));
+        assert!(ssh_master(&alias(), &shared()).unwrap().unwrap().iter().any(|a| a == "ControlPersist=60"));
+    }
+
+    #[test]
     fn scp_fallback() {
         let up =
             scp_args(&own(), &SshOptions::default(), Direction::Upload, Path::new("/p/d"), "/srv/d", true).unwrap();
@@ -606,6 +694,48 @@ mod tests {
         assert!(delete_command(&["/a/..".into()]).is_err());
         assert_eq!(delete_command(&["/a b".into()]).unwrap(), quote::sh_c("rm -rf -- '/a b'"));
         assert!(rename_command("/a", "/b").contains("mv -- /a /b"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_upload_compares_after_receiving_and_removes_temporary_files() {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a file");
+        let base = dir.path().join("expected");
+        std::fs::write(&target, "remote edit").unwrap();
+        std::fs::write(&base, "accepted").unwrap();
+        let script = checked_put_command(target.to_str().unwrap(), Some(base.to_str().unwrap()), "fixture");
+        let mut child =
+            Command::new("sh").arg("-c").arg(script).stdin(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"local edit").unwrap();
+        assert!(!child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "remote edit");
+        assert!(!base.exists());
+        assert!(!dir.path().join("a file.codecraft-upload-fixture").exists());
+        let script = checked_put_command(target.to_str().unwrap(), None, "fixture");
+        assert!(
+            !Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "remote edit");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&base, "remote edit").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = checked_put_command(target.to_str().unwrap(), Some(base.to_str().unwrap()), "success");
+        let mut child = Command::new("sh").arg("-c").arg(script).stdin(Stdio::piped()).spawn().unwrap();
+        child.stdin.take().unwrap().write_all(b"accepted local edit").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "accepted local edit");
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
+        assert!(!base.exists());
     }
 
     #[test]

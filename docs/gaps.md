@@ -414,8 +414,9 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     process; tunnels connect through 127.0.0.1, so PostgreSQL `verify-full` fails its hostname
     check; the SSH run target's server is a text field; Remote Host has no drag and drop or
     multi-select; `Match` blocks in `~/.ssh/config` aren't evaluated; BatchMode means no password
-    or passphrase prompts (accept host keys once via Start SSH Session); Remote Development opens
-    the mirror in the current window, with no remote language server or file watching; no WSL.
+    or passphrase prompts (accept host keys once via Start SSH Session); Remote Development has no
+    remote language server or automatic remote file watching; no WSL. M17 (partial, item 69)
+    opens the mirror in a new window and adds explicit conflict-preserving refresh.
     M16 track RT (item 62): SSH targets now debug (debugpy / gdb-remote over `ssh -L`), test
     (reports copied back) and profile (snapshots copied back) with the deployment mapping, and
     the target's Python interpreter is chosen per configuration (the server field is still text
@@ -1649,3 +1650,75 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     AppImage/Flatpak, Homebrew cask or winget manifest; no in-app update check; file names keep
     `CodeCraft` (`CodeCraft.app`, `CodeCraft-<version>.dmg`); feedback on "CodeCraft itself"
     needs `CODECRAFT_SOURCE_DIR` in packaged builds (the build folder isn't on users' machines).
+
+## M17 — SSH projects (pass 2, partial, 2026-10-20)
+
+69. Remote projects retain pass 1's new-window opening, persistent marker/status, private
+    ControlMaster, bounded ignore-aware rsync snapshots, conflict-preserving baseline and checked
+    save uploads. Pass 2 adds automatic detection: optional inotify over SSH, throttled to 3 s
+    focused / 15 s unfocused; a batched rsync metadata probe when inotify is absent or fails.
+    `remote.project.autoRefresh` persists pause/resume and is exposed in the status menu and
+    File Transfer. Disconnect stops detection; Reconnect resumes it. Engine commands, pump,
+    saves and repository-changing Git workers coordinate mirror writes; dirty buffers stay
+    protected even when edited during download. Clean editors reload and LSP gets watcher events.
+
+    New files/folders and refactor create/rename/delete propagate through a serialized checked
+    operation queue. Destructive operations compare the accepted file/directory baseline on the
+    host; failures retain local results and report how to reconcile them. Closed-file refactor
+    edits use checked uploads. File Transfer lists conflicts with command-driven Compare,
+    Keep Mine, Take Remote and Merge, reusing the diff/three-way merge views; editor tabs show
+    a warning. Refused uploads fetch incoming conflicts and pause the upload queue while keeping
+    the connection usable for resolution. Merge Apply refuses a changed incoming snapshot, and uploads still check the host.
+
+    Rust-analyzer, clangd and basedpyright/pyright use SSH stdio. The standalone L0 mapper handles
+    both directions at the JSON-RPC boundary: roots/options, URI object keys, diagnostics,
+    locations, workspace/resource edits, watcher patterns and progress titles, with buffer/edit
+    text left intact. Canonical roots resolve on reconnect; open-buffer server kinds restart.
+    External sources fetch into a bounded read-only cache; refactoring refuses cache writes.
+    Checked save completion sends didSave after upload; rust-analyzer's check/clippy runs remotely.
+    Missing tools provide the host install hint.
+
+    New/restored shell terminals use SSH with a tty in the remote directory; session identity,
+    titles/output and mapped OSC-7 cwd are retained. `terminal.newRemote` is explicit; ordinary
+    new terminals default to it in a remote project. Local Claude tabs and known local Claude shell resumes keep their original machine.
+    New/rebuilt run configurations and Run/Test/Debug/Profile default to the project's SSH
+    target. Pending checked saves are reported before a run. Managed runs record a remote pgid
+    under a private per-run directory, require setsid, and kill that group through SSH on Stop,
+    Disconnect, close and quit. Stop is idempotent so repeat signals cannot cut off cleanup.
+    Console/compiler paths map back to the mirror or the external source cache.
+
+    Remaining (M17 is **not complete**): fallback polling uses rsync metadata rather than
+    find-newer/stat to share download filters; same-size/same-timestamp edits require inotify
+    or an explicit checksum refresh. Per-directory .gitignore is enforced by rsync rather than
+    the inotify event filter, so ignored events can trigger extra work. Generic recursive copy
+    and generated populated subtrees still need full publication; directory operations refuse
+    excluded remote contents absent from the baseline. File/directory type conflicts require
+    manual reconciliation; file resolution actions refuse them without changing local contents.
+    Remote root transfer paths keep the existing safe-character restriction. Tree intents are ordered but in-memory;
+    durable reopen/reconnect replay remains track 6. Run starts require retry after pending
+    uploads rather than waiting automatically. Remote terminal per-tab history and remote Claude
+    hooks are not provided (ordinary host history and existing local Claude behavior remain).
+
+    External processes cannot honor the in-process mirror lock, and there is no server-side
+    atomic synchronization protocol. Cross-window/process queue ownership, physical-host alias
+    deduplication, abandoned transfer/run-state cleanup, live byte progress and cancelling a busy
+    transfer remain incomplete. Mirrored projects exclude .git; remote VCS is not implemented.
+    Remote Debug/Profile target defaults do not replace track 5 debugger/profiler validation.
+    Track 6 still owns ssh -G / Match, askpass, automatic reconnect and robust retained queues.
+
+    Verification: 30 focused engine, 108 LSP, 6 remote UI and 2 remote-mirror permission checks
+    pass; all-target clippy, layers and regenerated parity pass. Focused engine/fake-SSH
+    regressions cover automatic detection and dirty/clean
+    editors, pause/reconnect, tree checks and refusals, conflict actions, source fetching, default
+    targets, terminal restore and remote child cleanup. The LSP transport round trip uses a fake
+    ssh/mock server with initialize, didOpen, diagnostics, definition and rename; pure cases
+    include encoded/non-ASCII paths and Windows separators. No real SSH host, credentials,
+    ~/.ssh or ~/.codecraft is used by these fixtures. Full touched-crate testing is attempted,
+    but existing socket/process-inspection, watcher/font-cache and notebook failures prevent a
+    green global gate here; agent-service integration tests time out because the sandbox refuses
+    loopback listeners. The full UI run timed out in debug_sessions_ui under a 360-second limit.
+    The new local Claude shell-resume regression passes; the existing combined terminal history/
+    Claude test cannot identify its running child through process inspection here. Remote has
+    50 passes and two blocked loopback tests; xtask has 34 passes and its existing iconutil failure.
+    Actual authentication, ControlPersist, remote inotify/LSP/cargo, tty job control, forwarding
+    and debugger breakpoint/stop remain unverified on a real host. See docs/m17-plan.md.

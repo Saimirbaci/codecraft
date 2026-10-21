@@ -23,6 +23,7 @@
 pub mod command;
 pub mod deploy;
 pub mod listing;
+pub mod mirror;
 pub mod quote;
 pub mod rsync;
 pub mod server;

@@ -347,7 +347,27 @@ pub(crate) fn apply(s: &mut Session, allow_unresolved: bool) -> Result<(), Comma
         )));
     }
     let (abs, rel) = (view.abs.clone(), view.path.clone());
+    // The viewer keeps its remote origin even if a later refresh clears the conflict list.
+    let remote_conflict = s.remote.project.is_some() && view.ours_label == "Mine"
+        && matches!(view.theirs_label.as_str(), "Remote" | "Remote (deleted)");
+    let mut remote_baseline = None;
+    if remote_conflict {
+        if s.remote.busy() { return Err(CommandError::Failed("Wait for remote transfers before applying the merge".into())); }
+        let root = s.project_root().ok_or_else(|| CommandError::Failed("project closed".into()))?;
+        let (incoming, baseline) = crate::remote::mirror_paths(&root)?;
+        let source = incoming.join(&rel);
+        let dest = baseline.join(&rel);
+        let current = if source.is_file() { codecraft_fs::read_text_file(&source).map_err(crate::remote::failed)? } else { String::new() };
+        if current != view.theirs || source.is_file() != (view.theirs_label != "Remote (deleted)") {
+            return Err(CommandError::Failed("Remote snapshot changed while merging; keep the merge result and reopen Compare before applying".into()));
+        }
+        remote_baseline = Some((source, dest));
+    }
     codecraft_fs::write_text_file_atomic(&abs, &text).map_err(|e| CommandError::Failed(e.to_string()))?;
+    if let Some((source, dest)) = remote_baseline {
+        if source.is_file() { codecraft_remote::mirror::capture(&source, &dest).map_err(crate::remote::failed)?; }
+        else if dest.is_file() { std::fs::remove_file(dest).map_err(crate::remote::failed)?; }
+    }
     // An open editor shows the result (undoably) and is in sync with the disk.
     if let Some(id) = s.ws.doc_by_path(&abs) {
         let editor = s.ws.editor_for_doc(id);
@@ -362,6 +382,11 @@ pub(crate) fn apply(s: &mut Session, allow_unresolved: bool) -> Result<(), Comma
         }
     }
     s.vcs.merge = None;
+    if remote_conflict {
+        s.remote.conflicts.retain(|p| p != std::path::Path::new(&rel));
+        crate::remote::after_save(s, &[abs]);
+        return Ok(());
+    }
     if unresolved > 0 {
         s.notify(NotificationLevel::Warning, "Merge", format!("{rel} saved with {unresolved} unresolved conflicts"));
         return Ok(());

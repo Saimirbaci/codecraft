@@ -603,6 +603,33 @@ const REMOTE_PREFIXES: &[&str] = &[
 /// configuration whose target is remote, Docker/deployment/remote-host commands, remote
 /// debugging, a data source behind an SSH tunnel), for the approval card; `None` = local.
 fn remote_reason(s: &mut Session, name: &str, args: &Value) -> Option<String> {
+    // Editing/saving a mirror can enqueue an SSH upload even without an explicit target.
+    // Apply the remote gate before the local write capability can trigger that side effect.
+    if let Some(project) = &s.remote.project {
+        let writes_mirror = matches!(name, t::FILE_WRITE | t::FILE_EDIT)
+            || (name == t::EXECUTE
+                && args
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| command_capability(id) == Some(Capability::Write)));
+        if writes_mirror {
+            return Some(format!("remote project {} (checked save uploads)", project.server));
+        }
+        let target_default = matches!(name, t::RUN_START | t::DEBUG_START | t::PROFILE_START | t::TEST_RUN)
+            && args.get("target").is_none_or(Value::is_null);
+        let command = (name == t::EXECUTE).then(|| args.get("id").and_then(Value::as_str)).flatten();
+        let params = args.get("params").unwrap_or(&Value::Null);
+        let command_default = command.is_some_and(|id| crate::target_exec::TARGET_COMMANDS.contains(&id)
+            && params.get("target").is_none_or(Value::is_null));
+        let terminal = command.is_some_and(|id| id == "terminal.newRemote"
+            || (id == "terminal.new" && params.get("command").is_none_or(Value::is_null))
+            || (matches!(id, "terminal.sendText" | "terminal.sendKey" | "terminal.paste" | "terminal.close")
+                && params.get("tab").and_then(Value::as_u64).and_then(|id| s.terminal.tabs.iter().find(|t| t.id == id))
+                    .or_else(|| s.terminal.tabs.get(s.terminal.active)).is_some_and(|t| t.remote)));
+        if target_default || command_default || terminal {
+            return Some(format!("remote project {} (default SSH execution)", project.server));
+        }
+    }
     fn label(s: &mut Session, v: &Value) -> Option<String> {
         match crate::target_exec::resolve_ref(s, v) {
             Ok(t) if t.is_local() => None,
@@ -650,6 +677,16 @@ fn remote_reason(s: &mut Session, name: &str, args: &Value) -> Option<String> {
         t::EXECUTE => {
             let id = crate::registry().canonical(args.get("id").and_then(Value::as_str)?);
             let params = args.get("params").cloned().unwrap_or(Value::Null);
+            // Reopening a cached mirror starts its SSH connection before any tool runs.
+            if id == "file.open" && let Some(path) = params.get("path").and_then(Value::as_str) {
+                let path = crate::normalize_path(std::path::Path::new(path));
+                let root = if path.is_dir() { Some(path) }
+                    else if s.ws.project.is_none() { codecraft_cargo::find_manifest(&path).and_then(|p| p.parent().map(std::path::Path::to_path_buf)) }
+                    else { None };
+                if let Some(server) = root.and_then(|root| crate::deployment::load(&root).ok()).and_then(|cfg| cfg.remote_development) {
+                    return Some(format!("reopen remote project {server}"));
+                }
+            }
             if REMOTE_PREFIXES.iter().any(|p| id.starts_with(p)) {
                 return Some(format!("`{id}`"));
             }

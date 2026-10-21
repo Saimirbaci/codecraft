@@ -32,6 +32,7 @@ mod rust_ext;
 mod servers;
 mod transport;
 mod uri;
+pub mod path_mapper;
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -166,6 +167,12 @@ impl LspClient {
     /// Spawn the server process and start the handshake.
     pub fn spawn(config: ServerConfig) -> Result<(Self, Receiver<ServerEvent>)> {
         let (inner, events) = client::spawn(config)?;
+        Ok((Self { inner }, events))
+    }
+
+    /// Spawn with a pure mapper applied to every outgoing and incoming JSON-RPC message.
+    pub fn spawn_mapped(config: ServerConfig, mapper: Arc<dyn path_mapper::PathMapper>) -> Result<(Self, Receiver<ServerEvent>)> {
+        let (inner, events) = client::spawn_mapped(config, Some(mapper))?;
         Ok((Self { inner }, events))
     }
 

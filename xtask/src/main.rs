@@ -470,6 +470,23 @@ struct CliCatalogItem {
     live: bool,
 }
 
+#[derive(Deserialize)]
+struct CliCommand {
+    id: String,
+    label: String,
+    params: String,
+}
+
+/// Control actions supplement observed menus without changing the menu parity counts.
+fn remote_project_commands(md: &mut String, commands: &[CliCommand]) {
+    md.push_str("\n## Remote project control commands\n\nRegistered engine/CLI actions supplementing File › Remote Development (not additional observed menu items).\n\n");
+    for command in commands.iter().filter(|c| c.id.starts_with("remote.project.") || c.id == "remote.syncFromRemote") {
+        let params = command.params.split_whitespace().collect::<Vec<_>>().join(" ");
+        let params = if params.is_empty() { "{}".to_string() } else { params };
+        let _ = writeln!(md, "- [x] {} — `{}`: {}", command.label, command.id, params);
+    }
+}
+
 fn parity(root: &Path) -> Result<(), String> {
     let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
         .current_dir(root)
@@ -525,6 +542,13 @@ fn parity(root: &Path) -> Result<(), String> {
         let later = if i.scope == "Later" { " _(later)_" } else { "" };
         let _ = writeln!(md, "- [{mark}] {sub}{}{sc} — `{}`{later}", i.label, i.id);
     }
+    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(root)
+        .args(["run", "--quiet", "-p", "codecraft-cli", "--", "commands", "--json"])
+        .output().map_err(|e| e.to_string())?;
+    if !output.status.success() { return Err(String::from_utf8_lossy(&output.stderr).into_owned()); }
+    let commands: Vec<CliCommand> = serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())?;
+    remote_project_commands(&mut md, &commands);
     std::fs::write(root.join(PARITY_MD), md).map_err(|e| e.to_string())?;
     println!(
         "wrote {PARITY_MD}: core {core_live}/{core_total} ({:.0}%), in scope {in_scope_live}/{in_scope_total} ({:.0}%)",
@@ -532,4 +556,24 @@ fn parity(root: &Path) -> Result<(), String> {
         pct(in_scope_live, in_scope_total)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod remote_project_command_tests {
+    use super::*;
+
+    #[test]
+    fn includes_registered_remote_controls_and_parameter_docs_only() {
+        let mut md = String::new();
+        remote_project_commands(&mut md, &[
+            CliCommand { id: "remote.project.reconnect".into(), label: "Reconnect".into(), params: "{} — retry\n the host".into() },
+            CliCommand { id: "remote.syncFromRemote".into(), label: "Refresh".into(), params: "{server?: string}".into() },
+            CliCommand { id: "remote.project.status".into(), label: "Status".into(), params: String::new() },
+            CliCommand { id: "editor.type".into(), label: "Type".into(), params: "{}".into() },
+        ]);
+        assert!(md.contains("`remote.project.reconnect`: {} — retry the host"));
+        assert!(md.contains("`remote.syncFromRemote`: {server?: string}"));
+        assert!(md.contains("`remote.project.status`: {}\n"));
+        assert!(!md.contains("editor.type"));
+    }
 }

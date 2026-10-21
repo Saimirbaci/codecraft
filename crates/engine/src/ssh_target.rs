@@ -83,6 +83,14 @@ pub(crate) struct Resolved {
 
 /// Resolve `t` (reads the server list and the deployment mapping; no network).
 pub(crate) fn resolve(s: &mut Session, t: &SshTarget) -> Result<Resolved, CommandError> {
+    if let Some(project) = &s.remote.project {
+        if project.connection != crate::remote::ConnectionState::Connected {
+            return Err(CommandError::Failed("Reconnect the remote project before running tools".into()));
+        }
+        if s.remote.busy() || !project.pending_uploads.is_empty() {
+            return Err(CommandError::Failed("Wait for checked remote saves and tree operations to finish before running; review File Transfer if an upload failed".into()));
+        }
+    }
     let name = t.server.trim();
     if name.is_empty() {
         return Err(CommandError::Failed("choose an SSH server for the run target".into()));
@@ -114,6 +122,9 @@ pub(crate) fn resolve(s: &mut Session, t: &SshTarget) -> Result<Resolved, Comman
 
 /// The words of the project upload (`rsync …` or the `scp` fallback), the program first.
 pub(crate) fn upload_words(s: &Session, r: &Resolved) -> Result<Vec<String>, CommandError> {
+    if s.remote.project.is_some() {
+        return Err(CommandError::Failed("Remote projects use checked save uploads. Disable 'sync before run' on the SSH target and wait for File Transfer to finish before running".into()));
+    }
     if s.remote.has_rsync() {
         let spec = RsyncSpec {
             direction: Direction::Upload,
@@ -209,7 +220,12 @@ pub(crate) fn wrap_with(
     let args: Vec<String> =
         cmd.args.iter().map(|a| map_local(a, &root, &cwd_rel).unwrap_or_else(|| a.clone())).collect();
     let script = quote::run_script(&remote_cwd, &cmd.env, &program, &args).map_err(failed)?;
-    let mut run = exec_words(&r, &script)?;
+    static NEXT_RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let token = format!("{}-{}-{}", std::process::id(), crate::remote::now_ms(), NEXT_RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let state = rcmd::join(&r.remote_root, &format!(".codecraft/remote-run/{token}"));
+    let (launch, stop) = codecraft_remote::target_script::managed_run(&state, &script);
+    let run = exec_words(&r, &launch)?;
+    let cleanup = quote::join(&exec_words(&r, &stop)?);
     let mut tail = String::new();
     for (remote, local) in downloads {
         let remote = if remote.starts_with('/') || remote.starts_with('~') {
@@ -221,15 +237,8 @@ pub(crate) fn wrap_with(
         let parent = local.parent().map(|p| p.display().to_string()).unwrap_or_else(|| ".".into());
         tail.push_str(&format!("; mkdir -p {} && {} >/dev/null", quote::sh_quote(&parent), quote::join(&words)));
     }
-    if !t.sync && tail.is_empty() {
-        let program = run.remove(0);
-        return Ok(ProcessCommand { program, args: run, cwd: root, env: Vec::new(), build: cmd.build });
-    }
-    let run_line = if tail.is_empty() {
-        format!("exec {}", quote::join(&run))
-    } else {
-        format!("{}; cc_st=$?{tail}; exit $cc_st", quote::join(&run))
-    };
+    let cleanup_fn = format!("cc_cleanup() {{ {cleanup} >/dev/null 2>&1; }}; trap 'cc_cleanup; exit 143' HUP INT TERM; ");
+    let run_line = format!("{cleanup_fn}{} & cc_ssh=$!; wait \"$cc_ssh\"; cc_st=$?; trap - HUP INT TERM; cc_cleanup{tail}; exit $cc_st", quote::join(&run));
     let line = if t.sync { format!("{} && {{ {run_line}; }}", sync_line(s, &r)?) } else { run_line };
     let mut wrapped = ProcessCommand::shell(line, root);
     wrapped.build = cmd.build;

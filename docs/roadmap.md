@@ -1,6 +1,6 @@
 # Roadmap
 
-Status as of 2026-10-16: **M0–M16 have landed** (M4 delivered M3b and M6–M9 in parallel
+Status as of 2026-10-20: **M0–M16 have landed** (M4 delivered M3b and M6–M9 in parallel
 tracks, see `docs/m4-plan.md`). Menu parity (after capturing the lazily filled submenus): 192/192 core and 407/407 in-scope items
 live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gaps.md`.
 
@@ -22,6 +22,8 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 | M14 Debug, analyze, profile for people and agents | MCP control plane over the engine (IDE and headless) with an access policy; debugging depth for Rust, C/C++ and Python verified with real adapters; Inspect Code with scopes, profiles, baselines and SARIF; CPU and memory profiling for native code and Python; a hands-on QA pass. Plan: `docs/m14-plan.md` | ✅ (2026-10-15) |
 | M15 The daily loop, polished | Analysis findings in the editor and on save, managed basedpyright, Python settings; several debug sessions at once; profiling a single test, time ranges, memory over time; MCP tools for every agent CLI, Review jobs in their worktree, cancellation; a second QA pass. Plan: `docs/m15-plan.md` | ✅ (2026-10-15) |
 | M16 Remote targets, live analysis, safer SQL, shippable builds | Run, debug, test and profile on SSH and Docker targets; analysis while typing in every language; bind parameters and editable console results; Developer ID signing, notarization and CI workflows. Plan: `docs/m16-plan.md` | ✅ (2026-10-16) |
+
+| M17 SSH remote projects | Pass 2: automatic detection/conflict UI, checked tree operations, SSH language services/path mapping/read-only sources, remote terminal/run defaults and process-group Stop. Plan: `docs/m17-plan.md`; remaining limits: gaps item 69 | Partial — fake-transport regressions; global test gate has sandbox failures; tracks 5–6 and documented sync/terminal limits remain |
 
 ## Current focus
 

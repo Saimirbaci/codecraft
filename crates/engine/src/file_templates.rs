@@ -158,6 +158,7 @@ fn new_from_template(s: &mut Session, p: &Value) -> CmdResult {
         s.jobs_rescan();
     }
     s.open_file(&path)?;
+    crate::remote::after_save(s, std::slice::from_ref(&path));
     Ok(json!({ "path": path }))
 }
 

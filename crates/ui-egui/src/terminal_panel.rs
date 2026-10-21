@@ -633,7 +633,7 @@ fn open_link(s: &Session, target: &LinkTarget) -> Action {
     match target {
         LinkTarget::Url(url) => Action::OpenUrl(url.clone()),
         LinkTarget::File { path, line, column } => {
-            let resolved = s.terminal.resolve_path(s.terminal.active, path, s.project_root().as_deref());
+            let resolved = codecraft_engine::remote::terminal_path(s, s.terminal.active, path);
             Action::Command(
                 "navigate.openLocation",
                 json!({
@@ -665,7 +665,7 @@ fn link_at(s: &Session, tab: usize, row: usize, col: usize) -> Option<(usize, us
             continue;
         }
         if let LinkTarget::File { path, .. } = &link.target
-            && s.terminal.resolve_path(tab, path, s.project_root().as_deref()).is_none()
+            && codecraft_engine::remote::terminal_path(s, tab, path).is_none()
         {
             return None;
         }

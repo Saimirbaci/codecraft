@@ -51,6 +51,26 @@ pub fn show_file_transfer(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) 
             cmds.push(("tools.deployment.configuration", json!({})));
         }
     });
+    if s.remote.project.is_some() {
+        ui.horizontal(|ui| {
+            if ui.button(if s.remote.auto_refresh { "Pause Auto-refresh" } else { "Resume Auto-refresh" }).clicked() {
+                cmds.push(("remote.project.autoRefresh", json!({})));
+            }
+            if ui.button(format!("Conflicts ({})", s.remote.conflicts.len())).clicked() {
+                cmds.push(("remote.project.conflicts", json!({})));
+            }
+        });
+        if s.remote.conflicts_open {
+            for path in s.remote.conflicts.clone() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(theme.warning, path.display().to_string());
+                    for (label, action) in [("Compare", "compare"), ("Keep Mine", "keepMine"), ("Take Remote", "takeRemote"), ("Merge", "merge")] {
+                        if ui.button(label).clicked() { cmds.push(("remote.project.resolve", json!({"path": path, "action": action}))); }
+                    }
+                });
+            }
+        }
+    }
     ui.separator();
     if s.remote.log.is_empty() {
         ui.label(
@@ -696,8 +716,8 @@ fn remote_development(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         .show(ctx, |ui| {
             ui.label(
                 RichText::new(
-                    "Mirror a folder of an SSH server into a local cache and open it. Saved files upload automatically; \
-                     run configurations run on the server.",
+                    "Open an SSH project in a new window. Saved files upload automatically while connected. \
+                     Remote refreshes preserve local changes and report conflicts.",
                 )
                 .color(theme.text_muted),
             );
@@ -713,11 +733,51 @@ fn remote_development(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 ui.add(TextEdit::singleline(&mut d.path).hint_text("~/projects/app").desired_width(320.0));
                 ui.end_row();
             });
+            if ui.add_enabled(!d.server.is_empty() && !s.remote.busy(), egui::Button::new("Browse Folders…")).clicked()
+            {
+                cmds.push(("tools.deployment.browseRemoteHost", json!({"server": d.server, "path": d.path})));
+            }
+            let browser = &s.remote.browser;
+            if browser.server.as_deref() == Some(&d.server) {
+                ui.label(format!("Remote folder: {}", browser.path));
+                if browser.loading {
+                    ui.spinner();
+                }
+                if let Some(error) = &browser.error {
+                    ui.label(RichText::new(error).color(theme.error));
+                }
+                if !browser.loading && browser.error.is_none() {
+                    if ui.button("Parent Folder").clicked() {
+                        cmds.push(("remote.host.up", json!({})));
+                    }
+                    ScrollArea::vertical().id_salt("remote-dev-folders").max_height(180.0).show(ui, |ui| {
+                        for entry in
+                            browser.entries.iter().filter(|e| e.kind == codecraft_engine::remote::EntryKind::Dir)
+                        {
+                            if ui.button(format!("📁 {}", entry.name)).clicked() {
+                                cmds.push(("remote.host.open", json!({"name": entry.name})));
+                            }
+                        }
+                    });
+                    if ui.button("Use This Folder").clicked() {
+                        cmds.push(("remote.project.chooseFolder", json!({})));
+                    }
+                }
+            }
+            if s.remote.busy() {
+                ui.label("Transferring… See File Transfer for progress and errors.");
+            }
             if let Some(e) = &d.error {
                 ui.label(RichText::new(e).color(theme.error));
             }
             ui.horizontal(|ui| {
-                if ui.add_enabled(!d.server.is_empty() && !d.path.trim().is_empty(), egui::Button::new("Open Project")).clicked() {
+                if ui
+                    .add_enabled(
+                        !s.remote.busy() && !d.server.is_empty() && !d.path.trim().is_empty(),
+                        egui::Button::new("Open Project in New Window"),
+                    )
+                    .clicked()
+                {
                     cmds.push(("file.remoteDevelopment", json!({ "server": d.server, "path": d.path.trim() })));
                 }
                 if ui.button("Cancel").clicked() {
@@ -732,4 +792,52 @@ fn remote_development(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
         cmds.push(("remote.dialog.close", json!({ "which": "remoteDevelopment" })));
     }
     run_all(s, st, cmds);
+}
+
+/// The remote marker survives status-message changes and recent-project reopen.
+pub(crate) fn status_widget(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let Some(project) = s.remote.project.clone() else { return };
+    let state = match project.connection {
+        codecraft_engine::remote::ConnectionState::Cached => "cached",
+        codecraft_engine::remote::ConnectionState::Connecting => "connecting",
+        codecraft_engine::remote::ConnectionState::Connected => "connected",
+        codecraft_engine::remote::ConnectionState::Disconnected => "disconnected",
+        codecraft_engine::remote::ConnectionState::Failed => "connection failed",
+    };
+    ui.menu_button(
+        RichText::new(format!("SSH {} · {state}", project.destination)).color(st.theme.text_muted).size(12.0),
+        |ui| {
+            ui.label(format!("{}:{}", project.server, project.remote));
+            if let Some(error) = &project.error {
+                ui.label(RichText::new(error).color(st.theme.error));
+            }
+            if !project.pending_uploads.is_empty() {
+                ui.label(format!("{} saved file(s) await review and upload", project.pending_uploads.len()));
+            }
+            if ui.button(if s.remote.auto_refresh { "Pause Auto-refresh" } else { "Resume Auto-refresh" }).clicked() {
+                run_command(s, st, "remote.project.autoRefresh", &Value::Null);
+            }
+            if !s.remote.conflicts.is_empty() && ui.button(format!("Resolve {} Conflict(s)…", s.remote.conflicts.len())).clicked() {
+                run_command(s, st, "remote.project.conflicts", &Value::Null);
+                s.ws.layout.show(codecraft_workspace::ToolWindowId::FileTransfer);
+            }
+            let connected = project.connection == codecraft_engine::remote::ConnectionState::Connected;
+            if ui
+                .add_enabled(!s.remote.busy(), egui::Button::new(if connected { "Disconnect" } else { "Reconnect" }))
+                .clicked()
+            {
+                ui.close();
+                run_command(
+                    s,
+                    st,
+                    if connected { "remote.project.disconnect" } else { "remote.project.reconnect" },
+                    &Value::Null,
+                );
+            }
+            if ui.add_enabled(connected && !s.remote.busy(), egui::Button::new("Refresh from Remote")).clicked() {
+                ui.close();
+                run_command(s, st, "remote.syncFromRemote", &Value::Null);
+            }
+        },
+    );
 }

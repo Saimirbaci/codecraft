@@ -150,6 +150,7 @@ pub(crate) struct Inner {
     stderr_done: Latch,
     workspace_folders: Value,
     configuration: Option<Value>,
+    mapper: Option<Arc<dyn crate::path_mapper::PathMapper>>,
 }
 
 struct Streams {
@@ -167,10 +168,14 @@ pub(crate) fn connect(
     configuration: Option<Value>,
 ) -> Result<(Arc<Inner>, Receiver<ServerEvent>)> {
     let root = Root::new(&root)?;
-    start(Streams { reader, writer, child: None, stderr: None }, &root, initialization_options, configuration)
+    start(Streams { reader, writer, child: None, stderr: None }, &root, initialization_options, configuration, None)
 }
 
 pub(crate) fn spawn(config: ServerConfig) -> Result<(Arc<Inner>, Receiver<ServerEvent>)> {
+    spawn_mapped(config, None)
+}
+
+pub(crate) fn spawn_mapped(config: ServerConfig, mapper: Option<Arc<dyn crate::path_mapper::PathMapper>>) -> Result<(Arc<Inner>, Receiver<ServerEvent>)> {
     let root = Root::new(&config.root)?;
     let command_name = config.command.display().to_string();
     let mut command = Command::new(&config.command);
@@ -199,7 +204,7 @@ pub(crate) fn spawn(config: ServerConfig) -> Result<(Arc<Inner>, Receiver<Server
     log::info!("started language server {command_name} (pid {})", child.id());
     let streams =
         Streams { reader: Box::new(stdout), writer: Box::new(stdin), child: Some(child), stderr: Some(stderr) };
-    start(streams, &root, config.initialization_options, config.configuration)
+    start(streams, &root, config.initialization_options, config.configuration, mapper)
 }
 
 fn start(
@@ -207,6 +212,7 @@ fn start(
     root: &Root,
     initialization_options: Option<Value>,
     configuration: Option<Value>,
+    mapper: Option<Arc<dyn crate::path_mapper::PathMapper>>,
 ) -> Result<(Arc<Inner>, Receiver<ServerEvent>)> {
     let Streams { reader, writer, child, stderr } = streams;
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -223,6 +229,7 @@ fn start(
         stderr_done: Latch::default(),
         workspace_folders: root.workspace_folders(),
         configuration,
+        mapper,
     });
     {
         // `initialize` goes first and straight to the writer; everything else waits for its answer.
@@ -433,7 +440,8 @@ impl Inner {
 
     fn writer_loop(self: Arc<Self>, rx: &Receiver<WriterMsg>, writer: Box<dyn Write + Send>) {
         let mut out = BufWriter::new(writer);
-        while let Ok(WriterMsg::Send(message)) = rx.recv() {
+        while let Ok(WriterMsg::Send(mut message)) = rx.recv() {
+            if let Some(mapper) = &self.mapper { mapper.translate(&mut message, crate::path_mapper::Direction::ToServer); }
             log::trace!("lsp → {message}");
             if let Err(e) = transport::write_message(&mut out, &message) {
                 if !self.shutdown_requested.load(Ordering::SeqCst) {
@@ -450,7 +458,8 @@ impl Inner {
         let mut malformed = 0u32;
         loop {
             match frames.next_message() {
-                Incoming::Message(message) => {
+                Incoming::Message(mut message) => {
+                    if let Some(mapper) = &self.mapper { mapper.translate(&mut message, crate::path_mapper::Direction::ToClient); }
                     malformed = 0;
                     self.dispatch(message);
                 }

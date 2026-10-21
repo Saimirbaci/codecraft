@@ -200,6 +200,7 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 {
                     ui.label(small(format!("{mb} MB"))).on_hover_text("Memory used by CodeCraft");
                 }
+                crate::remote_ui::status_widget(ui, s, st);
                 crate::python_ui::status_widget(ui, s, st);
                 crate::database_data_ui::status_widget(ui, s, st);
                 crate::debug_dbg_ui::status_widget(ui, s, st);
@@ -639,11 +640,13 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
                         .as_deref()
                         .is_some_and(|p| s.ws.problems_for(p).iter().any(|p| p.severity == Severity::Error));
                     let mut title = d.title();
+                    let remote_conflict = d.path.as_ref().is_some_and(|path| s.project_root().is_some_and(|root| path.strip_prefix(root).ok().is_some_and(|rel| s.remote.conflicts.iter().any(|p| p == rel))));
+                    if remote_conflict { title = format!("⚠ {title}"); }
                     if e.pinned {
                         title = format!("📌 {title}");
                     }
                     let vcs_color = d.path.as_deref().and_then(|p| crate::vcs_panels::file_color(s, &theme, p));
-                    let color = if has_errors {
+                    let color = if remote_conflict { theme.warning } else if has_errors {
                         theme.error
                     } else if let Some(c) = vcs_color {
                         c

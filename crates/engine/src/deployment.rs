@@ -95,6 +95,38 @@ pub(crate) fn upload_file_op(
     let server = server(s, server_name)?;
     let opts = s.remote.ssh_options(server_name);
     s.remote.ensure_master(&server);
+    if s.remote.project.is_some() {
+        if s.remote.busy() {
+            return Err(failed("wait for the current remote operation before uploading"));
+        }
+        let root = project_root(s)?;
+        let rel = deploy::rel_path(&root, local).ok_or_else(|| failed("file is outside the remote project"))?;
+        let (_, baseline) = crate::remote::mirror_paths(&root)?;
+        let snapshot =
+            s.remote.cache_dir().ok_or_else(|| failed("cannot locate remote cache"))?.join(".uploads").join(format!(
+                "{}-{}-{}",
+                std::process::id(),
+                crate::remote::now_ms(),
+                crate::remote::short_hash(&local.display().to_string())
+            ));
+        let step = Step::CheckedUpload {
+            root,
+            server,
+            options: opts,
+            local: local.to_path_buf(),
+            remote: remote.into(),
+            baseline: baseline.join(rel),
+            snapshot,
+        };
+        return start_op(
+            s,
+            server_name,
+            format!("{verb} {} (check remote changes)", local.display()),
+            vec![step],
+            Follow::ProjectUpload { local: local.to_path_buf() },
+            true,
+        );
+    }
     let args = rcmd::ssh_exec(&server, &opts, &rcmd::put_command(remote)).map_err(failed)?;
     let step = Step::Run { program: opts.program.clone(), args, stdin: Some(local.to_path_buf()), stdout_to: None };
     let name = local.file_name().and_then(|n| n.to_str()).unwrap_or("file");

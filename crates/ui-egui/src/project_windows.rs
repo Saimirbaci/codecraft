@@ -91,6 +91,11 @@ impl ProjectWindows {
         persisted.apply(&mut session);
         session.ws.settings = main.ws.settings.clone();
         session.lsp_enabled = main.lsp_enabled;
+        session.remote.home_override = main.remote.home_override.clone();
+        session.remote.ssh_config_override = main.remote.ssh_config_override.clone();
+        session.remote.control_dir_override = main.remote.control_dir_override.clone();
+        session.remote.programs = main.remote.programs.clone();
+        session.remote.share_connections = main.remote.share_connections;
         session.run_store.generate.auto = main.run_store.generate.auto;
         session.rust.deps.online = main.rust.deps.online;
         session.rust.deps.auto = main.rust.deps.auto;

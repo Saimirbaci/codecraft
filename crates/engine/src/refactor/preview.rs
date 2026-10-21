@@ -386,6 +386,12 @@ impl Session {
                 }
                 continue;
             }
+            if crate::remote::external_cache(self).is_some_and(|cache| e.path().starts_with(&cache)
+                || matches!(&e.kind, EntryKind::Rename { to, .. } if to.starts_with(&cache))) {
+                report.skipped += 1;
+                report.errors.push("Remote toolchain and registry sources are read-only".into());
+                continue;
+            }
             let resolve = |p: &Path| -> PathBuf {
                 let mut out = p.to_path_buf();
                 for (to, from) in alias.iter().rev() {
@@ -432,6 +438,26 @@ impl Session {
         }
         if file_ops {
             self.jobs_rescan();
+        }
+        if self.remote.project.is_some() {
+            // Publish only entries whose local transaction succeeded. Content-only edits remain
+            // unsaved buffers and use the usual checked upload when saved.
+            for entry in preview.entries.iter().filter(|entry| entry.include) {
+                let result = match &entry.kind {
+                    EntryKind::Create { path, .. } if report.files.contains(path) => crate::remote::tree_operation(self, path, None, false, true),
+                    EntryKind::Rename { from, to, .. } if renamed.iter().any(|(a,b)| a == from && b == to) => crate::remote::tree_operation(self, from, Some(to), to.is_dir(), false),
+                    EntryKind::Delete { path, .. } if report.files.contains(path) => {
+                        let directory = self.project_root().and_then(|root| crate::remote::mirror_paths(&root).ok().map(|(_, base)| (root, base)))
+                            .and_then(|(root, base)| path.strip_prefix(root).ok().map(|p| base.join(p).is_dir())).unwrap_or(false);
+                        crate::remote::tree_operation(self, path, None, directory, false)
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(error) = result { report.errors.push(error.to_string()); }
+            }
+            let saved: Vec<_> = report.files.iter().filter(|path| path.is_file() && self.ws.doc_by_path(path)
+                .and_then(|id| self.ws.doc(id)).is_none_or(|d| !d.doc.is_modified())).cloned().collect();
+            crate::remote::after_save(self, &saved);
         }
         if preview.notify_renames && !renamed.is_empty() {
             self.notify_did_rename(&renamed);

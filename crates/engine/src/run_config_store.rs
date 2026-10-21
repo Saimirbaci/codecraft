@@ -1382,6 +1382,9 @@ pub(crate) fn rebuild(s: &mut Session) {
         .cloned()
         .collect();
     list.extend(derived);
+    if s.remote.project.is_some() {
+        for config in &mut list { config.target = crate::target_exec::effective(s, &config.target); }
+    }
     s.run_configs = list;
     s.selected_run_config = selected.and_then(|n| s.run_configs.iter().position(|c| c.name == n)).unwrap_or(0);
 }

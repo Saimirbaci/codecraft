@@ -978,3 +978,58 @@ fn remote_targets_are_always_asked() {
     assert!(r.is_error && result_text(&r).contains("headless"), "{}", result_text(&r));
     s.shutdown();
 }
+
+#[test]
+fn saving_a_remote_mirror_also_requires_the_remote_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = project(tmp.path());
+    let mut s = session(&tmp.path().join("home"));
+    open(&mut s, &dir);
+    s.remote.project = Some(codecraft_engine::remote::RemoteProject {
+        server: "fixture-only".into(),
+        destination: "fixture-only".into(),
+        remote: "~/project".into(),
+        connection: codecraft_engine::remote::ConnectionState::Disconnected,
+        error: None,
+        pending_uploads: Default::default(),
+    });
+    s.execute("agentAccess.set", &json!({"capability": "write", "level": "allow"})).unwrap();
+    s.execute("agentAccess.set", &json!({"capability": "remote", "level": "off"})).unwrap();
+    let result = call(&mut s, "codecraft_execute", json!({"id": "file.saveAll"}));
+    assert!(result.is_error, "{}", result_text(&result));
+    assert!(result_text(&result).contains("remote"), "{}", result_text(&result));
+    assert!(!s.remote.busy());
+    s.execute("agentAccess.set", &json!({"capability":"run", "level":"allow"})).unwrap();
+    for id in ["terminal.new", "terminal.newRemote", "run.run", "run.testsInFile", "run.profile", "run.debug", "cargo.check", "cargo.clippy"] {
+        let result = call(&mut s, "codecraft_execute", json!({"id":id}));
+        assert!(result.is_error && result_text(&result).contains("remote"), "{id}: {}", result_text(&result));
+    }
+    assert!(s.terminal.tabs.is_empty());
+    assert!(!s.remote.busy());
+    s.shutdown();
+}
+
+#[test]
+fn opening_a_remote_mirror_also_requires_the_remote_capability() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = project(tmp.path());
+    let mirror = tmp.path().join("mirror");
+    let mut s = session(&tmp.path().join("home"));
+    open(&mut s, &dir);
+    s.remote.programs.ssh = tmp.path().join("no-real-ssh").display().to_string();
+    let mut cfg = codecraft_remote::DeploymentConfig {
+        remote_development: Some("fixture".into()), ..Default::default()
+    };
+    cfg.ensure_server("fixture").unwrap().mappings.push(codecraft_remote::PathMapping {
+        local: String::new(), remote: "~/fixture".into(),
+    });
+    codecraft_engine::deployment::save(&mirror, &cfg).unwrap();
+    s.execute("agentAccess.set", &json!({"capability": "write", "level": "allow"})).unwrap();
+    s.execute("agentAccess.set", &json!({"capability": "remote", "level": "off"})).unwrap();
+    let result = call(&mut s, "codecraft_execute", json!({"id": "file.open", "params": {"path": mirror}}));
+    assert!(result.is_error, "{}", result_text(&result));
+    assert!(result_text(&result).contains("remote"), "{}", result_text(&result));
+    assert_eq!(s.ws.project.as_ref().unwrap().root, dir);
+    assert!(!s.remote.busy());
+    s.shutdown();
+}

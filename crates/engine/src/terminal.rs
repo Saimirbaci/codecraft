@@ -68,6 +68,7 @@ pub struct TerminalTab {
     pub cwd: PathBuf,
     /// The command line it runs (`None` for the login shell).
     pub command: Option<String>,
+    pub remote: bool,
     /// Stable across restarts: the tab's own command history and saved output are kept under it.
     pub key: String,
     /// The tab runs Claude Code itself (Open Claude Code in Terminal).
@@ -255,6 +256,8 @@ pub(crate) struct NewTab {
     pub claude: Option<String>,
     /// Text shown above the program's output (a restored tab's earlier output).
     pub preface: Option<String>,
+    /// A saved local Claude session must resume on its original machine.
+    pub local_shell: bool,
 }
 
 fn default_cwd(s: &Session) -> PathBuf {
@@ -294,7 +297,8 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         return Err(CommandError::Failed(format!("too many terminal tabs (at most {MAX_TABS})")));
     }
     let cwd = new.cwd.clone().unwrap_or_else(|| default_cwd(s));
-    if !cwd.is_dir() {
+    let remote_shell = !new.local_shell && new.command.is_none() && s.remote.project.is_some();
+    if !cwd.is_dir() && !remote_shell {
         return Err(CommandError::Failed(format!("not a directory: {}", cwd.display())));
     }
     let shell = shell(s);
@@ -315,7 +319,7 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
             extra_env.push((shell_int::ENV_CLAUDE_PID.into(), "0".into()));
         }
     }
-    let (program, args) = match (&new.command, &new.args) {
+    let (mut program, mut args) = match (&new.command, &new.args) {
         (None, _) => match shell_program {
             Some((program, args)) => (Some(program), args),
             None => (None, Vec::new()),
@@ -327,6 +331,22 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
             (Some(sh), vec!["-l".into(), "-i".into(), "-c".into(), line.clone()])
         }
     };
+    // Keep command=None in the tab model so shell snapshots restore through this same path.
+    if remote_shell {
+        let project = s.remote.project.clone().ok_or_else(|| CommandError::Failed("remote project closed".into()))?;
+        let server = crate::deployment::server(s, &project.server)?;
+        let opts = s.remote.ssh_options(&project.server);
+        s.remote.ensure_master(&server);
+        args = codecraft_remote::command::ssh_interactive(&server, &opts).map_err(crate::remote::failed)?;
+        args.insert(0, "-tt".into());
+        let rel = s.project_root().and_then(|root| codecraft_remote::deploy::rel_path(&root, &cwd)).unwrap_or_default();
+        let directory = if s.project_root().is_some_and(|root| cwd.starts_with(root)) {
+            codecraft_remote::command::join(&project.remote, &rel)
+        } else { cwd.to_string_lossy().into_owned() };
+        args.push(codecraft_remote::quote::sh_c(&format!("cd {} || exit 1; exec \"${{SHELL:-/bin/sh}}\" -l", codecraft_remote::quote::quote_path(&directory))));
+        program = Some(opts.program);
+        extra_env.clear();
+    }
     let mut env = s.ide.env_for_child();
     env.extend(new.env.iter().cloned());
     env.extend(s.terminal.env.iter().cloned());
@@ -349,7 +369,7 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         program,
         args,
         shell,
-        cwd: Some(cwd.clone()),
+        cwd: if remote_shell { s.project_root() } else { Some(cwd.clone()) },
         env,
         env_remove: ENV_REMOVE.iter().map(|k| (*k).to_string()).collect(),
         cols: 80,
@@ -363,7 +383,8 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
     s.terminal.next_id += 1;
     let title = new.title.as_deref().map(str::trim).filter(|t| !t.is_empty());
     let renamed = new.renamed && title.is_some();
-    let name = unique_name(s, title, new.command.as_deref());
+    let remote_title = s.remote.project.as_ref().filter(|_| remote_shell).map(|p| format!("SSH: {}", p.destination));
+    let name = unique_name(s, title.or(remote_title.as_deref()), new.command.as_deref());
     let screen = term.screen();
     s.terminal.tabs.push(TerminalTab {
         id,
@@ -372,6 +393,7 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         osc_title: None,
         cwd,
         command: new.command.clone(),
+        remote: remote_shell,
         key,
         claude: new.claude.is_some(),
         claude_session: new.claude.clone().filter(|c| !c.is_empty()),
@@ -441,6 +463,7 @@ pub(crate) fn close(s: &mut Session, index: usize) -> bool {
 pub(crate) fn pump(s: &mut Session) -> bool {
     let mut changed = false;
     let mut effects = Vec::new();
+    let mapping = s.project_root().zip(s.remote.absolute_root.as_ref()).map(|(root, remote)| codecraft_lsp::path_mapper::RootMapper::new(&root.to_string_lossy(), remote));
     for tab in &mut s.terminal.tabs {
         tab.term.tick();
         for event in tab.term.poll_events() {
@@ -451,7 +474,8 @@ pub(crate) fn pump(s: &mut Session) -> bool {
                 TermEvent::Bell => tab.bell = true,
                 TermEvent::Clipboard(text) => effects.push(Effect::CopyToClipboard(text)),
                 TermEvent::Cwd(dir) => {
-                    if dir.is_dir() {
+                    let dir = if tab.remote { mapping.as_ref().and_then(|m| m.map_path(&dir.to_string_lossy(), codecraft_lsp::path_mapper::Direction::ToClient)).map(PathBuf::from).unwrap_or(dir) } else { dir };
+                    if dir.is_dir() || tab.remote {
                         tab.cwd = dir;
                     }
                 }
@@ -502,7 +526,7 @@ fn poll_cwds(s: &mut Session) {
 
 /// The processes of live shell tabs (the ones a session snapshot keeps).
 fn shell_pids(state: &TerminalState) -> Vec<u32> {
-    state.tabs.iter().filter(|t| t.command.is_none() && t.alive()).filter_map(|t| t.term.pid()).collect()
+    state.tabs.iter().filter(|t| t.command.is_none() && !t.remote && t.alive()).filter_map(|t| t.term.pid()).collect()
 }
 
 fn apply_cwds(state: &mut TerminalState, found: &[(u32, PathBuf)]) {
@@ -609,10 +633,10 @@ pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Optio
     for (i, tab) in saved.iter().take(MAX_TERMINALS.min(MAX_TABS)).enumerate() {
         let name = tab.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).map(|n| n.chars().take(100).collect());
         let renamed = name.is_some();
-        let cwd = Some(tab.cwd.clone()).filter(|d| d.is_absolute() && d.is_dir());
+        let cwd = Some(tab.cwd.clone()).filter(|d| d.is_absolute() && (d.is_dir() || s.remote.project.is_some()));
         let key = tab.key.clone().filter(|k| shell_int::valid_id(k));
         let resume = resumable(tab.claude.as_ref());
-        let base = NewTab { cwd, title: name, renamed, background: true, key, ..NewTab::default() };
+        let base = NewTab { cwd, title: name, renamed, background: true, key, local_shell: resume.is_some(), ..NewTab::default() };
         let result = match tab.kind {
             TerminalKind::ClaudeCode => {
                 crate::terminal_cmds::claude_tab(s, resume.as_deref(), base).and_then(|new| open(s, new))

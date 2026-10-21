@@ -182,6 +182,15 @@ pub fn resolve_ref(s: &mut Session, v: &Value) -> Result<RunTarget, CommandError
 
 /// Commands that take a `target` (name or object) and run there.
 pub(crate) const TARGET_COMMANDS: &[&str] = &[
+    "build.buildProject",
+    "build.rebuildProject",
+    "cargo.check",
+    "cargo.clippy",
+    "cargo.test",
+    "cargo.doc",
+    "cargo.runTarget",
+    "run.rerun",
+    "tools.rust.reformatCargoProjectWithRustfmt",
     "run.run",
     "run.debug",
     "run.contextConfiguration",
@@ -205,7 +214,7 @@ pub(crate) fn scope(s: &mut Session, id: &str, params: &Value) -> Result<Option<
         return Ok(None);
     }
     match params.get("target") {
-        None | Some(Value::Null) => Ok(None),
+        None | Some(Value::Null) => Ok(s.remote.project.as_ref().map(|p| RunTarget::Ssh(SshTarget { server: p.server.clone(), sync: false, ..Default::default() }))),
         Some(v) => resolve_ref(s, v).map(Some),
     }
 }
@@ -220,13 +229,17 @@ pub(crate) fn with_target<R>(s: &mut Session, target: RunTarget, f: impl FnOnce(
 
 /// The target a command's `target` param chose (`None`: none, or `local`).
 pub(crate) fn override_target(s: &Session) -> Option<RunTarget> {
-    s.targets.scoped.clone().filter(|t| !t.is_local())
+    match &s.targets.scoped {
+        Some(target) => (!target.is_local()).then(|| target.clone()),
+        None => s.remote.project.as_ref().map(|p| RunTarget::Ssh(SshTarget { server: p.server.clone(), sync: false, ..Default::default() })),
+    }
 }
 
 /// Where something configured to run on `configured` runs: the `target` param wins.
 pub(crate) fn effective(s: &Session, configured: &RunTarget) -> RunTarget {
     match &s.targets.scoped {
         Some(t) => t.clone(),
+        None if configured.is_local() => s.remote.project.as_ref().map(|p| RunTarget::Ssh(SshTarget { server: p.server.clone(), sync: false, ..Default::default() })).unwrap_or_else(|| configured.clone()),
         None => configured.clone(),
     }
 }
@@ -296,7 +309,7 @@ impl Ctx {
             RunTarget::Local => Err(CommandError::Failed("the local machine is not a remote target".into())),
             RunTarget::Ssh(t) => {
                 let r = crate::ssh_target::resolve(s, t)?;
-                let sync_line = crate::ssh_target::sync_line(s, &r)?;
+                let sync_line = if t.sync { crate::ssh_target::sync_line(s, &r)? } else { String::new() };
                 let rsync = s.remote.has_rsync().then(|| s.remote.programs.rsync.clone());
                 Ok(Ctx {
                     target: target.clone(),

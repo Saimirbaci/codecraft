@@ -470,6 +470,23 @@ impl Session {
 
     /// Run a command by id. Never panics: a panic inside a command is caught and reported.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
+        let lock = (!self.remote.mirror_guard_active && self.remote.project.is_some())
+            .then(|| self.project_root().map(|r| remote::mirror_lock(&r))).flatten();
+        let _guard = match lock.as_ref().map(|l| l.try_lock()) {
+            Some(Ok(g)) => Some(g),
+            Some(Err(std::sync::TryLockError::Poisoned(e))) => Some(e.into_inner()),
+            Some(Err(std::sync::TryLockError::WouldBlock)) => return Err(CommandError::Disabled("Remote mirror is applying changes; retry the command".into())),
+            None => None,
+        };
+        let previous = self.remote.mirror_guard_active;
+        self.remote.mirror_guard_active = true;
+        let result = self.execute_locked(id, params);
+        remote::protect_buffers(self);
+        self.remote.mirror_guard_active = previous;
+        result
+    }
+
+    fn execute_locked(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
         // Run, debug, test and profile commands run on the target their `target` param names (M16 RT).
         if let Some(target) = target_exec::scope(self, id, params)? {
             return target_exec::with_target(self, target, |s| s.execute_scoped(id, params));
@@ -578,6 +595,14 @@ impl Session {
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
     pub fn pump(&mut self) -> bool {
+        let lock = self.remote.project.as_ref().and_then(|_| self.project_root()).map(|r| remote::mirror_lock(&r));
+        let _guard = match lock.as_ref().map(|l| l.try_lock()) {
+            Some(Ok(g)) => Some(g),
+            Some(Err(std::sync::TryLockError::Poisoned(e))) => Some(e.into_inner()),
+            Some(Err(std::sync::TryLockError::WouldBlock)) => return false,
+            None => None,
+        };
+        self.remote.mirror_guard_active = true;
         let mut changed = false;
         changed |= self.pump_lsp();
         changed |= completion::pump(self);
@@ -626,6 +651,8 @@ impl Session {
         session_store::autosave(self);
         hot_exit::autosave(self);
         self.ws.sync_views();
+        remote::protect_buffers(self);
+        self.remote.mirror_guard_active = false;
         changed
     }
 
@@ -644,6 +671,7 @@ impl Session {
             || self.inspections.busy()
             || self.docker.busy()
             || self.remote.busy()
+            || (self.remote.auto_refresh && self.remote.project.as_ref().is_some_and(|p| p.connection == remote::ConnectionState::Connected))
             || self.http.busy()
             || self.python.busy()
             || self.jupyter.busy()
@@ -695,6 +723,7 @@ impl Session {
         terminal::shutdown(self);
         vcs::shutdown(self);
         inspections::shutdown(self);
+        runs::stop_all(self);
         remote::shutdown(self);
         docker::shutdown(self);
         python::shutdown(self);
@@ -707,7 +736,6 @@ impl Session {
         cpp::shutdown(self);
         self.stop_watching();
         self.approvals.deny_all();
-        runs::stop_all(self);
         self.stop_lsp();
     }
 
@@ -796,6 +824,8 @@ impl Session {
     /// Open (or focus) a file in an editor tab; returns its editor.
     pub fn open_file(&mut self, path: &Path) -> Result<EditorId, CommandError> {
         let path = normalize_path(path);
+        if remote::fetch_external(self, &path, 0, 0)? { return Err(CommandError::Disabled("Fetching remote source; it will open when downloaded".into())); }
+        let external = remote::external_cache(self).is_some_and(|cache| path.starts_with(cache));
         let doc = match self.ws.doc_by_path(&path) {
             Some(d) => d,
             None => {
@@ -804,7 +834,7 @@ impl Session {
                 let id = self.ws.add_document(Some(path.clone()), &text);
                 if let Some(od) = self.ws.doc_mut(id) {
                     od.disk_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-                    od.read_only = std::fs::metadata(&path).map(|m| m.permissions().readonly()).unwrap_or(false);
+                    od.read_only = external || std::fs::metadata(&path).map(|m| m.permissions().readonly()).unwrap_or(false);
                     od.encoding = encoding;
                     od.bom = bom;
                     od.language = language;
@@ -835,6 +865,9 @@ impl Session {
 
     /// Open a file at (line, char column), zero-based.
     pub fn navigate_to_position(&mut self, path: &Path, line: usize, column: usize) -> Result<(), CommandError> {
+        let mapped = remote::map_output_path(self, path);
+        let path = mapped.as_path();
+        if remote::fetch_external(self, path, line, column)? { return Ok(()); }
         let editor = self.open_file(path)?;
         let offset = self
             .ws
@@ -864,6 +897,18 @@ impl Session {
 
     /// Save every modified document to disk (RustRover's Save All, Cmd+S).
     pub fn save_all(&mut self) -> Result<usize, CommandError> {
+        let mirror_lock =
+            self.remote.project.as_ref().filter(|_| !self.remote.mirror_guard_active).and_then(|_| self.project_root()).map(|root| remote::mirror_lock(&root));
+        let _mirror_guard =
+            match mirror_lock.as_ref().map(|lock| lock.try_lock()) {
+                Some(Ok(guard)) => Some(guard),
+                Some(Err(std::sync::TryLockError::Poisoned(error))) => Some(error.into_inner()),
+                Some(Err(std::sync::TryLockError::WouldBlock)) => return Err(CommandError::Disabled(
+                    "Remote transfer in progress; unsaved edits are kept in the editor. Retry Save when it finishes"
+                        .into(),
+                )),
+                None => None,
+            };
         let mut saved = 0usize;
         let mut errors = Vec::new();
         let mut saved_paths = Vec::new();

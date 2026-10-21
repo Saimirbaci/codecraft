@@ -457,3 +457,16 @@ Core = the editor/navigation/build/run/LSP surface of the current milestones. La
 
 - [x] Find Action… `Shift+Cmd+A` — `help.findAction` _(later)_
 - [x] Help — `help.help`
+
+## Remote project control commands
+
+Registered engine/CLI actions supplementing File › Remote Development (not additional observed menu items).
+
+- [x] Remote Project: Status — `remote.project.status`: {}
+- [x] Remote Project: Automatic Refresh — `remote.project.autoRefresh`: {paused?: bool} — toggle or set the persistent automatic refresh setting
+- [x] Remote Project: Resolve Conflicts — `remote.project.conflicts`: {} — list and show conflicts
+- [x] Remote Project: Resolve Conflict — `remote.project.resolve`: {path: relative path, action: compare|keepMine|takeRemote|merge}
+- [x] Remote Project: Disconnect — `remote.project.disconnect`: {} — pause automatic uploads and close this project's shared SSH connection; saved edits remain local
+- [x] Remote Project: Reconnect — `remote.project.reconnect`: {} — test/reconnect the project's SSH host and resume checked uploads; conflicts pause the queue
+- [x] Remote Project: Use Browsed Folder — `remote.project.chooseFolder`: {} — use the Remote Host browser's current folder in the Remote Development dialog
+- [x] Sync from Remote — `remote.syncFromRemote`: {server?: string} — download the project from its (default) deployment server, e.g. a Remote Development mirror
