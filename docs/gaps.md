@@ -1655,13 +1655,29 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 
 69. Remote projects retain pass 1's new-window opening, persistent marker/status, private
     ControlMaster, bounded ignore-aware rsync snapshots, conflict-preserving baseline and checked
-    save uploads. Pass 2 adds automatic detection: optional inotify over SSH, throttled to 3 s
-    focused / 15 s unfocused; a short SSH-side metadata fingerprint when inotify is absent or fails,
+    save uploads. Pass 2 adds automatic detection: bounded inotify over SSH with trailing
+    debounce; a short SSH-side metadata fingerprint when inotify is absent or fails,
     with idle backoff (3/10/30/60 seconds), slower unfocused polling and a persistent interval/disable setting.
     `remote.project.autoRefresh` persists pause/resume and is exposed in the status menu and
     File Transfer. Disconnect stops detection; Reconnect resumes it. Engine commands, pump,
     saves and repository-changing Git workers coordinate mirror writes; dirty buffers stay
     protected even when edited during download. Clean editors reload and LSP gets watcher events.
+
+    Responsiveness follow-up: each terminal now has an unshared lowdelay SSH connection,
+    while helpers inherit nice/optional ionice. A fake-SSH PTY harness with 60 ms RTT, a
+    64 KiB/s cap and competing traffic measured roughly 640–649 ms shared versus 62–65 ms
+    isolated; this models queueing, not a real network. Inotify uses a fixed list capped at
+    2,048 directories with fallback reasons, and polling has time/size/depth bounds. Events
+    use trailing debounce and 2/5/15/30 s spacing; terminal activity postpones automatic work.
+    `.claude/` and `.cache/` join project exclusions; ordinary logs remain included.
+    `remote.project.autoRefresh {helpersDisabled:true}` persists a small-host helper stop.
+    Mirror apply coordinates one file at a time; protected buffers no longer lock across
+    reconciliation. Terminal input/pumping continues during apply, empty syncs skip UI tree
+    work, and changed-file reads run on workers. Terminal snapshots/tick do not wait for the
+    parser, and output wakes are capped near 60/s. Diagnostics exposes echo medians, refresh
+    state/reasons, helper channel ages/counts and rate-limited named frame stalls, plus worker
+    RTT/load probes. Real-host load, login-shell cost, AcceptEnv, Claude redraw and WAN
+    performance remain unverified. See docs/m17-plan.md for evidence and gate results.
 
     New files/folders and refactor create/rename/delete propagate through a serialized checked
     operation queue. Destructive operations compare the accepted file/directory baseline on the

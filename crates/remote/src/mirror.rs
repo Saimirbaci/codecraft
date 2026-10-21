@@ -13,7 +13,7 @@ use crate::{RemoteError, RemoteResult};
 
 pub const MAX_FILE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_ENTRIES: usize = 100_000;
-const EXCLUDED: &[&str] = &[".codecraft", ".git", "target", "node_modules", "__pycache__"];
+const EXCLUDED: &[&str] = &[".codecraft", ".git", "target", "node_modules", "__pycache__", ".claude", ".cache"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,6 +173,20 @@ pub fn refresh_protected(
     baseline: &Path,
     protected: &BTreeSet<PathBuf>,
 ) -> RemoteResult<Refresh> {
+    refresh_coordinated(local, incoming, baseline, |_, apply| apply(protected))
+}
+
+/// One file/directory transaction, called under the owner's short-lived mirror guard.
+pub type MirrorApply<'a> = dyn FnMut(&BTreeSet<PathBuf>) -> RemoteResult<()> + 'a;
+
+/// Scan on the worker without the UI guard; coordinate each apply separately, resampling
+/// dirty buffers at every file. The caller must serialize transfers/baseline writers.
+pub fn refresh_coordinated(
+    local: &Path,
+    incoming: &Path,
+    baseline: &Path,
+    mut coordinate: impl FnMut(&Path, &mut MirrorApply<'_>) -> RemoteResult<()>,
+) -> RemoteResult<Refresh> {
     fs::create_dir_all(local).map_err(io)?;
     fs::create_dir_all(baseline).map_err(io)?;
     safe_path(local, Path::new(""))?;
@@ -183,58 +197,67 @@ pub fn refresh_protected(
     let paths: BTreeSet<_> = remote_files.union(&base_files).cloned().collect();
     let mut report = Refresh::default();
     for rel in &remote_dirs {
-        let here = match safe_path(local, rel) {
-            Ok(path) => path,
-            Err(_) => {
+        coordinate(rel, &mut |_| {
+            let here = match safe_path(local, rel) {
+                Ok(path) => path,
+                Err(_) => {
+                    report.conflicts.push(rel.clone());
+                    return Ok(());
+                }
+            };
+            if here.is_dir() || (!here.exists() && !base_dirs.contains(rel)) {
+                if !here.exists() { report.changed.push(rel.clone()); }
+                fs::create_dir_all(&here).map_err(io)?;
+                fs::create_dir_all(baseline.join(rel)).map_err(io)?;
+            } else if here.exists() {
                 report.conflicts.push(rel.clone());
-                continue;
             }
-        };
-        if here.is_dir() || (!here.exists() && !base_dirs.contains(rel)) {
-            fs::create_dir_all(&here).map_err(io)?;
-            fs::create_dir_all(baseline.join(rel)).map_err(io)?;
-        } else if here.exists() {
-            report.conflicts.push(rel.clone());
-        }
+            Ok(())
+        })?;
     }
     for rel in paths {
-        let here = match safe_path(local, &rel) {
-            Ok(p) => p,
-            Err(_) => {
-                report.conflicts.push(rel);
-                continue;
+        coordinate(&rel, &mut |protected| {
+            let here = match safe_path(local, &rel) {
+                Ok(p) => p,
+                Err(_) => {
+                    report.conflicts.push(rel.clone());
+                    return Ok(());
+                }
+            };
+            let there = incoming.join(&rel);
+            let base = baseline.join(&rel);
+            if protected.contains(&rel) {
+                if !equal(&there, &base)? {
+                    report.conflicts.push(rel.clone());
+                }
+                return Ok(());
             }
-        };
-        let there = incoming.join(&rel);
-        let base = baseline.join(&rel);
-        if protected.contains(&rel) {
-            if !equal(&there, &base)? {
-                report.conflicts.push(rel);
+            let same = equal(&here, &there).unwrap_or(false);
+            if same {
+                if !equal(&there, &base)? { replace(&there, &base)?; }
+            } else if equal(&here, &base).unwrap_or(false) {
+                replace(&there, &here)?;
+                replace(&there, &base)?;
+                report.changed.push(rel.clone());
+                if remote_files.contains(&rel) {
+                    report.updated = report.updated.saturating_add(1);
+                } else {
+                    report.deleted = report.deleted.saturating_add(1);
+                }
+            } else if !equal(&there, &base)? {
+                report.conflicts.push(rel.clone());
             }
-            continue;
-        }
-        let same = equal(&here, &there).unwrap_or(false);
-        if same {
-            replace(&there, &base)?;
-        } else if equal(&here, &base).unwrap_or(false) {
-            replace(&there, &here)?;
-            replace(&there, &base)?;
-            report.changed.push(rel.clone());
-            if remote_files.contains(&rel) {
-                report.updated = report.updated.saturating_add(1);
-            } else {
-                report.deleted = report.deleted.saturating_add(1);
-            }
-        } else if !equal(&there, &base)? {
-            report.conflicts.push(rel);
-        }
+            Ok(())
+        })?;
     }
     // Remove only empty directories, deepest first; never remove a local-only file recursively.
     for rel in base_dirs.difference(&remote_dirs).collect::<Vec<_>>().into_iter().rev() {
-        if let Ok(here) = safe_path(local, rel) {
-            let _ = fs::remove_dir(here);
-        }
-        let _ = fs::remove_dir(baseline.join(rel));
+        coordinate(rel, &mut |_| {
+            if let Ok(here) = safe_path(local, rel)
+                && fs::remove_dir(here).is_ok() { report.changed.push(rel.clone()); }
+            let _ = fs::remove_dir(baseline.join(rel));
+            Ok(())
+        })?;
     }
     Ok(report)
 }
@@ -242,6 +265,50 @@ pub fn refresh_protected(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinated_refresh_resamples_dirty_paths_between_file_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let incoming = dir.path().join("incoming");
+        let baseline = dir.path().join("baseline");
+        for root in [&local, &incoming, &baseline] { fs::create_dir_all(root).unwrap(); }
+        for name in ["a", "b"] {
+            fs::write(local.join(name), "old").unwrap();
+            fs::write(baseline.join(name), "old").unwrap();
+            fs::write(incoming.join(name), "new").unwrap();
+        }
+        let mut calls = 0;
+        let report = refresh_coordinated(&local, &incoming, &baseline, |_, apply| {
+            calls += 1;
+            let protected = if calls == 2 { BTreeSet::from([PathBuf::from("b")]) } else { BTreeSet::new() };
+            apply(&protected)
+        }).unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(fs::read_to_string(local.join("a")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(local.join("b")).unwrap(), "old");
+        assert_eq!(fs::read_to_string(baseline.join("b")).unwrap(), "old");
+        assert_eq!(report.conflicts, [PathBuf::from("b")]);
+    }
+
+    #[test]
+    fn unchanged_refresh_preserves_baseline_and_empty_directory_changes_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local");
+        let incoming = dir.path().join("incoming");
+        let baseline = dir.path().join("baseline");
+        fs::create_dir_all(&incoming).unwrap();
+        fs::write(incoming.join("a"), "same").unwrap();
+        refresh(&local, &incoming, &baseline).unwrap();
+        let before = fs::metadata(baseline.join("a")).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(refresh(&local, &incoming, &baseline).unwrap().changed.is_empty());
+        assert_eq!(fs::metadata(baseline.join("a")).unwrap().modified().unwrap(), before);
+        fs::create_dir(incoming.join("empty")).unwrap();
+        assert_eq!(refresh(&local, &incoming, &baseline).unwrap().changed, [PathBuf::from("empty")]);
+        fs::remove_dir(incoming.join("empty")).unwrap();
+        assert_eq!(refresh(&local, &incoming, &baseline).unwrap().changed, [PathBuf::from("empty")]);
+    }
 
     #[test]
     fn unsaved_buffer_paths_keep_disk_and_baseline_until_explicit_resolution() {

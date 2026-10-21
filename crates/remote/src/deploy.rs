@@ -9,7 +9,7 @@ use crate::command;
 use crate::{RemoteError, RemoteResult};
 
 /// Excluded by default from new mappings: VCS data, build output and CodeCraft's own folder.
-pub const DEFAULT_EXCLUDES: &[&str] = &[".git", "target", ".codecraft", ".idea", "node_modules", "__pycache__"];
+pub const DEFAULT_EXCLUDES: &[&str] = &[".git", "target", ".codecraft", ".idea", "node_modules", "__pycache__", ".claude", ".cache"];
 
 /// One mapping: a project folder and the remote folder it deploys to.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +45,8 @@ pub struct DeploymentConfig {
     pub auto_upload: bool,
     /// Pause automatic remote-project refresh without pausing checked saves.
     pub pause_remote_refresh: bool,
+    /// Stop CodeCraft background detection and language services for small hosts.
+    pub disable_remote_helpers: bool,
     /// Minimum fallback polling interval; zero disables polling (inotify remains available).
     pub remote_poll_interval_secs: Option<u64>,
     /// Sync deletes target items whose source is gone (Options… "Delete target items when

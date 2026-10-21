@@ -84,10 +84,16 @@ enum Action {
 }
 
 pub fn show(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
+    let started = std::time::Instant::now();
+    show_inner(ui, s, st);
+    s.record_frame_section("terminal paint", started.elapsed());
+}
+
+fn show_inner(ui: &mut Ui, s: &mut Session, st: &mut UiState) {
     let ctx = ui.ctx().clone();
     if !st.terminal.installed {
         let waker_ctx = ctx.clone();
-        s.terminal.set_waker(Arc::new(move || waker_ctx.request_repaint()));
+        s.terminal.set_waker(Arc::new(move || waker_ctx.request_repaint_after(std::time::Duration::from_millis(17))));
         s.terminal.set_palette(palette(&st.theme));
         st.terminal.installed = true;
     }

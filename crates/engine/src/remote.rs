@@ -321,7 +321,64 @@ struct Master {
     stderr: Arc<std::sync::Mutex<String>>,
 }
 
-/// Everything track S keeps in the [`Session`].
+/// Recent frame-section costs. Warnings are limited to one per section per five seconds.
+#[derive(Default, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameSection {
+    pub worst_ms: f64,
+    pub last_ms: f64,
+    pub stalls: u64,
+    #[serde(skip)]
+    window: Option<Instant>,
+    #[serde(skip)]
+    warned: Option<Instant>,
+}
+impl FrameSection {
+    fn record(&mut self, name: &str, elapsed: Duration, now: Instant) {
+        let ms = elapsed.as_secs_f64() * 1000.0;
+        if self.window.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(60)) {
+            self.window = Some(now); self.worst_ms = 0.0;
+        }
+        self.last_ms = ms;
+        self.worst_ms = self.worst_ms.max(ms);
+        if ms > 30.0 {
+            self.stalls = self.stalls.saturating_add(1);
+            if self.warned.is_none_or(|at| now.saturating_duration_since(at) >= Duration::from_secs(5)) {
+                log::warn!("frame stall section={name} duration_ms={ms:.1}");
+                self.warned = Some(now);
+            }
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct RefreshDebounce {
+    pending: bool,
+    last_event: Option<Instant>,
+    last_sync: Option<Instant>,
+    level: usize,
+    events: u64,
+    refreshes: u64,
+    reason: &'static str,
+}
+impl RefreshDebounce {
+    fn event(&mut self, now: Instant) {
+        if self.last_event.is_some_and(|at| now.saturating_duration_since(at) > Duration::from_secs(60)) { self.level = 0; }
+        self.pending = true; self.last_event = Some(now);
+        self.events = self.events.saturating_add(1);
+    }
+    fn spacing(&self) -> Duration { Duration::from_secs([2, 5, 15, 30].get(self.level).copied().unwrap_or(30)) }
+    fn due(&self, now: Instant) -> bool {
+        self.pending && self.last_event.is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(2))
+            && self.last_sync.is_none_or(|at| now.saturating_duration_since(at) >= self.spacing())
+    }
+    fn started(&mut self, now: Instant) {
+        self.pending = false; self.last_sync = Some(now);
+        self.level = self.level.saturating_add(1).min(3);
+        self.refreshes = self.refreshes.saturating_add(1);
+    }
+}
+
 pub struct RemoteState {
     /// Instead of `$CODECRAFT_HOME` (default `~/.codecraft`): `ssh.json` and the caches.
     pub home_override: Option<PathBuf>,
@@ -347,6 +404,12 @@ pub struct RemoteState {
     pub(crate) mirror_guard_active: bool,
     pub(crate) protected: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
     pub auto_refresh: bool,
+    pub helpers_disabled: bool,
+    pub frame_sections: BTreeMap<String, FrameSection>,
+    debounce: RefreshDebounce,
+    watcher_reason: Arc<std::sync::Mutex<String>>,
+    reload: Option<Receiver<ReloadFiles>>,
+    pub(crate) tree_refreshes: u64,
     pub poll_interval_secs: u64,
     poll_idle: usize,
     poll_signature: Option<String>,
@@ -371,6 +434,9 @@ pub struct RemoteState {
     control_generation: HashMap<String, u64>,
     ops: HashMap<u64, (Follow, bool)>,
     op_hosts: HashMap<u64, String>,
+    op_started: HashMap<u64, Instant>,
+    lsp_started: HashMap<codecraft_lsp::ServerKind, Instant>,
+    watcher_started: Option<Instant>,
     tx: Sender<OpDone>,
     rx: Receiver<OpDone>,
     cancel: Arc<AtomicBool>,
@@ -406,6 +472,12 @@ impl Default for RemoteState {
             mirror_guard_active: false,
             protected: Default::default(),
             auto_refresh: true,
+            helpers_disabled: false,
+            frame_sections: Default::default(),
+            debounce: Default::default(),
+            watcher_reason: Default::default(),
+            reload: None,
+            tree_refreshes: 0,
             poll_interval_secs: 3,
             poll_idle: 0,
             poll_signature: None,
@@ -428,6 +500,9 @@ impl Default for RemoteState {
             control_generation: HashMap::new(),
             ops: HashMap::new(),
             op_hosts: HashMap::new(),
+            op_started: HashMap::new(),
+            lsp_started: HashMap::new(),
+            watcher_started: None,
             tx,
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -470,6 +545,7 @@ impl RemoteState {
     /// Whether background work is in flight.
     pub fn auto_refresh_mode(&self) -> &'static str {
         if !self.auto_refresh { "paused" }
+        else if self.helpers_disabled { "helpers disabled" }
         else if self.watcher.as_ref().is_some_and(|(_, streaming, _)| streaming.load(Ordering::Acquire)) { "inotify" }
         else if self.poll_interval_secs == 0 { "polling disabled" }
         else { "polling" }
@@ -486,10 +562,14 @@ impl RemoteState {
         self.window_focused = focused;
     }
 
-    pub fn operations_pending(&self) -> bool { !self.ops.is_empty() || !self.tree_queue.is_empty() }
+    pub fn operations_pending(&self) -> bool {
+        !self.ops.is_empty() || !self.tree_queue.is_empty() || self.reload.is_some()
+            || (self.auto_refresh && !self.helpers_disabled && self.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected)
+                && (self.refresh_pending || self.debounce.pending))
+    }
 
     pub fn busy(&self) -> bool {
-        self.ops.values().any(|(follow, _)| !matches!(follow, Follow::AutoProbe | Follow::LspProbe { .. })) || !self.tree_queue.is_empty()
+        self.reload.is_some() || self.ops.values().any(|(follow, _)| !matches!(follow, Follow::AutoProbe | Follow::LspProbe { .. })) || !self.tree_queue.is_empty()
     }
 
     /// `$CODECRAFT_HOME`, else `~/.codecraft`.
@@ -799,6 +879,27 @@ fn tail(s: &str, max_lines: usize) -> String {
 }
 
 /// Run one program to completion (killed when `cancel` is set). `Ok(stdout)` on exit code 0.
+struct ActiveInvocation(u64);
+type ActiveInvocations = std::sync::Mutex<BTreeMap<u64, (String, String, Instant)>>;
+fn active_invocations() -> &'static ActiveInvocations {
+    static ACTIVE: std::sync::OnceLock<ActiveInvocations> = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(Default::default)
+}
+impl ActiveInvocation {
+    fn start(program: &str, args: &[String]) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or("process");
+        let kind = if name == "rsync" { "rsync" } else if args.last().is_some_and(|arg| arg.contains("find .")) { "find" } else { name };
+        active_invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id,
+            (INVOCATION_HOST.with(|host| host.borrow().clone()), kind.to_owned(), Instant::now()));
+        Self(id)
+    }
+}
+impl Drop for ActiveInvocation {
+    fn drop(&mut self) { active_invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&self.0); }
+}
+
 fn run_process(
     program: &str,
     args: &[String],
@@ -818,6 +919,7 @@ fn run_process(
         None => cmd.stdout(Stdio::piped()),
     };
     let mut child = cmd.spawn().map_err(|e| format!("cannot run {program}: {e}"))?;
+    let _active = ActiveInvocation::start(program, args);
     let out = child.stdout.take().map(|o| std::thread::spawn(move || read_capped(o, MAX_OUTPUT)));
     let err = child.stderr.take().map(|e| std::thread::spawn(move || read_capped(e, MAX_STDERR)));
     let status = loop {
@@ -954,11 +1056,13 @@ fn run_steps(steps: &[Step], cancel: &AtomicBool) -> Result<Vec<String>, String>
             }
             Step::RefreshMirror { local, incoming, baseline, protected } => {
                 let lock = mirror_lock(local);
-                let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                if cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
-                }
-                let report = codecraft_remote::mirror::refresh_protected(local, incoming, baseline, &protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).map_err(|e| e.to_string())?;
+                let report = codecraft_remote::mirror::refresh_coordinated(local, incoming, baseline, |rel, apply| {
+                    let _guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if cancel.load(Ordering::Relaxed) { return Err(codecraft_remote::RemoteError::Invalid("cancelled".into())); }
+                    let dirty = protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(rel);
+                    let paths = if dirty { std::collections::BTreeSet::from([rel.to_path_buf()]) } else { Default::default() };
+                    apply(&paths)
+                }).map_err(|e| e.to_string())?;
                 outputs.push(serde_json::to_string(&report).map_err(|e| e.to_string())?);
             }
             Step::Mkdir(p) => std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?,
@@ -1006,6 +1110,7 @@ pub(crate) fn start_op(
         })
         .map_err(|e| CommandError::Failed(format!("cannot start a worker thread: {e}")))?;
     r.ops.insert(id, (follow, logged));
+    r.op_started.insert(id, Instant::now());
     r.op_hosts.insert(id, server.to_owned());
     let summary = summary.into();
     if logged {
@@ -1034,6 +1139,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
         changed = true;
         let Some((follow, logged)) = s.remote.ops.remove(&done.id) else { continue };
         s.remote.op_hosts.remove(&done.id);
+        s.remote.op_started.remove(&done.id);
         if logged && let Some(e) = s.remote.log.iter_mut().find(|e| e.id == done.id) {
             match &done.result {
                 Ok(outs) => {
@@ -1113,42 +1219,92 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     if s.remote.project.as_ref().is_some_and(|project| project.connection == ConnectionState::Connected) {
         let due = s.remote.lsp_retry.iter().filter(|(_, (_, at))| *at <= Instant::now()).map(|(kind, _)| *kind).collect::<Vec<_>>();
         for kind in due {
+            if interactive_busy(s) || s.remote.helpers_disabled { continue; }
             s.remote.lsp_retry.remove(&kind);
             s.server_status.remove(&kind);
             s.ensure_server(kind);
         }
     }
+    apply_reload(s);
     maintain_watcher(s);
+    let interactive = interactive_busy(s);
+    if let Some((_, streaming, dirty)) = &s.remote.watcher
+        && streaming.load(Ordering::Acquire) && dirty.swap(false, Ordering::AcqRel) {
+        s.remote.debounce.event(Instant::now());
+        s.remote.debounce.reason = "inotify filesystem event";
+    }
+    if s.remote.debounce.due(Instant::now()) { s.remote.refresh_pending = true; }
     // A listing may have started while a probe was in flight. Retain the detected change
     // until the interactive operation finishes instead of dropping a busy refresh request.
-    if s.remote.auto_refresh && s.remote.refresh_pending && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
+    if s.remote.auto_refresh && !s.remote.helpers_disabled && !interactive && s.remote.refresh_pending && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
         && s.remote.project.as_ref().is_some_and(|project| project.connection == ConnectionState::Connected) {
+        s.remote.debounce.started(Instant::now());
         if let Err(error) = s.execute("remote.syncFromRemote", &Value::Null) {
             s.remote.refresh_pending = false;
             s.notify(NotificationLevel::Error, "Automatic remote refresh", error.to_string());
         }
         return true;
     }
-    let interval = if s.remote.auto_refresh_mode() == "inotify" { Duration::from_secs(if s.remote.window_focused { 3 } else { 15 }) } else { poll_interval(s.remote.poll_interval_secs, s.remote.poll_idle, s.remote.window_focused) };
-    if s.remote.auto_refresh && (s.remote.poll_interval_secs != 0 || s.remote.auto_refresh_mode() == "inotify") && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
-        && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected && (p.pending_uploads.is_empty() || !s.remote.conflicts.is_empty()))
-        && s.remote.last_refresh.elapsed() >= interval
-    {
+    let interval = poll_interval(s.remote.poll_interval_secs, s.remote.poll_idle, s.remote.window_focused);
+    if s.remote.auto_refresh && !s.remote.helpers_disabled && !interactive && s.remote.auto_refresh_mode() != "inotify"
+        && s.remote.poll_interval_secs != 0 && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
+        && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected)
+        && s.remote.last_refresh.elapsed() >= interval {
         s.remote.last_refresh = Instant::now();
-        let changed_on_host = s.remote.watcher.as_ref().is_none_or(|(_, streaming, changed)|
-            !streaming.load(Ordering::Acquire) || changed.swap(false, Ordering::AcqRel));
-        if !changed_on_host { return changed; }
-        let streaming = s.remote.watcher.as_ref().is_some_and(|(_, streaming, _)| streaming.load(Ordering::Acquire));
-        let refresh = if streaming { s.execute("remote.syncFromRemote", &Value::Null).map(|_| ()) } else { auto_probe(s) };
-        if let Err(error) = refresh {
-            s.notify(NotificationLevel::Warning, "Automatic remote refresh", error.to_string());
-        }
+        if let Err(error) = auto_probe(s) { s.notify(NotificationLevel::Warning, "Automatic remote refresh", error.to_string()); }
         changed = true;
     }
     changed
 }
 
+pub(crate) fn interactive_busy(s: &Session) -> bool {
+    s.terminal.tabs.iter().any(|tab| tab.remote && tab.alive() && tab.term.recently_active(Duration::from_secs(3)))
+}
+
+type ReloadFiles = Vec<(PathBuf, String, Option<std::time::SystemTime>, Vec<(codecraft_workspace::DocId, u64)>)>;
+fn start_reload(s: &mut Session, paths: Vec<PathBuf>) {
+    let paths = paths.into_iter().filter_map(|path| {
+        let versions: Vec<_> = s.ws.docs().filter(|doc| doc.path.as_ref() == Some(&path)).map(|doc| (doc.id, doc.doc.revision())).collect();
+        (!versions.is_empty()).then_some((path, versions))
+    }).collect::<Vec<_>>();
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    if std::thread::Builder::new().name("remote-reload".into()).spawn(move || {
+        for (path, versions) in paths {
+            let Ok(text) = codecraft_fs::read_text_file(&path) else { continue };
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            // One buffered file, rather than retaining every open file's text at once.
+            if tx.send(vec![(path, text, mtime, versions)]).is_err() { break; }
+        }
+    }).is_ok() { s.remote.reload = Some(rx); }
+    s.remote.tree_refreshes = s.remote.tree_refreshes.saturating_add(1);
+    s.jobs_rescan();
+}
+fn apply_reload(s: &mut Session) {
+    let Some(rx) = s.remote.reload.as_ref() else { return };
+    let files = match rx.try_recv() {
+        Ok(files) => files,
+        Err(crossbeam_channel::TryRecvError::Empty) => return,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => { s.remote.reload = None; return; }
+    };
+    for (path, text, mtime, versions) in files {
+        for (id, revision) in versions {
+            if s.ws.doc(id).is_none_or(|doc| doc.path.as_ref() != Some(&path) || doc.doc.is_modified() || doc.doc.revision() != revision) { continue; }
+            let editor = s.ws.editor_for_doc(id);
+            let sels = editor.and_then(|e| s.ws.editor(e)).map(|e| e.selections.clone()).unwrap_or_default();
+            if let Some(doc) = s.ws.doc_mut(id) {
+                if doc.doc.replace_all(&text, &sels).is_ok() { doc.doc.mark_saved(); }
+                doc.disk_mtime = mtime;
+            }
+            if let Some(editor) = editor {
+                let len = s.ws.doc(id).map_or(0, |d| d.doc.len_chars());
+                s.ws.set_selections(editor, sels.clamp(len));
+            }
+        }
+    }
+}
+
 pub(crate) fn protect_buffers(s: &Session) {
+    if s.remote.project.is_none() { return; }
     let paths = s.project_root().map(|root| s.ws.docs().filter(|d| d.doc.is_modified())
         .filter_map(|d| d.path.as_ref()?.strip_prefix(&root).ok().map(Path::to_path_buf)).collect()).unwrap_or_default();
     *s.remote.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = paths;
@@ -1161,7 +1317,10 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
             if s.remote.project.as_ref().is_none_or(|project| project.server != server) || s.remote.control_generation.get(&server).copied().unwrap_or(0) != generation { return; }
             let tool = result.ok().and_then(|out| out.last().cloned()).and_then(|out| out.lines().last().map(str::to_owned)).filter(|tool| matches!(tool.as_str(), "rust-analyzer" | "clangd" | "basedpyright-langserver" | "pyright-langserver"));
             s.remote.lsp_tools.insert((server.clone(), kind), tool.clone());
-            if tool.is_some() { s.restart_server(Some(kind)); }
+            if tool.is_some() {
+                if interactive_busy(s) { s.remote.lsp_retry.insert(kind, (0, Instant::now() + Duration::from_secs(3))); }
+                else { s.restart_server(Some(kind)); }
+            }
             else {
                 let message = format!("{} is not installed on {server}. Install: {}. Run remote.lsp.install, or remote.lsp.localFallback to analyse the local mirror without the remote toolchain.", kind.label(), remote_install_hint(kind));
                 s.set_status(kind, crate::LspStatus::Unavailable(message.clone()));
@@ -1180,9 +1339,12 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
                 let changed = s.remote.poll_signature.as_ref().is_some_and(|old| old != &signature);
                 s.remote.poll_signature = Some(signature);
                 s.remote.poll_idle = if changed { 0 } else { s.remote.poll_idle.saturating_add(1).min(3) };
-                s.remote.refresh_pending |= changed;
+                if changed { s.remote.debounce.event(Instant::now()); s.remote.debounce.reason = "metadata fingerprint changed"; }
             }
-            Err(error) => if let Some(project) = &mut s.remote.project { project.connection = ConnectionState::Failed; project.error = Some(error); },
+            Err(error) => {
+                *s.remote.watcher_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = format!("poll failed: {error}");
+                s.remote.poll_idle = 3;
+            },
         },
         Follow::ProjectUpload { local } => {
             let conflict = result.as_ref().err().is_some_and(|error| error.contains("Remote file changed"));
@@ -1363,7 +1525,7 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
                 s.remote.refresh_pending = false;
                 if let Some(report) = outputs.last().and_then(|t| serde_json::from_str::<codecraft_remote::mirror::Refresh>(t).ok()) {
                     let paths: Vec<_> = report.changed.iter().map(|p| local.join(p)).collect();
-                    s.remote_files_changed(&paths);
+                    if !paths.is_empty() { s.remote_files_changed(&paths); start_reload(s, paths); stop_watcher(&mut s.remote); }
                     s.remote.conflicts = report.conflicts.clone();
                     if !report.conflicts.is_empty() {
                     s.notify(NotificationLevel::Warning, "Remote sync conflicts", format!(
@@ -1374,8 +1536,6 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
                 }
                 if open_window {
                     crate::remote_cmds::remote_dev_ready(s, &server, &remote, &local);
-                } else {
-                    let _ = s.execute("file.synchronize", &Value::Null);
                 }
             }
             Err(error) => {
@@ -1542,12 +1702,16 @@ pub fn transfers_running(s: &Session) -> bool {
 pub(crate) fn project_opened(s: &mut Session, root: &Path) {
     stop_watcher(&mut s.remote);
     s.remote.project = None;
+    s.remote.reload = None;
+    s.remote.debounce = Default::default();
+    s.remote.watcher_reason = Default::default();
     s.remote.conflicts.clear();
     s.remote.absolute_root = None;
     s.remote.last_refresh = Instant::now();
     let Ok(cfg) = crate::deployment::load(root) else { return };
     s.remote.refresh_pending = false;
     s.remote.auto_refresh = !cfg.pause_remote_refresh;
+    s.remote.helpers_disabled = cfg.disable_remote_helpers;
     s.remote.poll_interval_secs = cfg.remote_poll_interval_secs.unwrap_or(3);
     let Some(name) = cfg.remote_development.clone() else { return };
     let Some(remote) = cfg.server(&name).and_then(|d| d.remote_for("")) else { return };
@@ -1684,6 +1848,7 @@ pub(crate) fn persist_uploads(s: &mut Session) {
 
 /// Stop remote language services without waiting for their shutdown handshakes on the UI thread.
 pub(crate) fn stop_project_servers(s: &mut Session) {
+    s.remote.lsp_started.clear();
     for server in std::mem::take(&mut s.servers).into_values() {
         std::thread::spawn(move || server.shutdown());
     }
@@ -1713,6 +1878,7 @@ pub(crate) fn lsp_transport(s: &mut Session, kind: codecraft_lsp::ServerKind, co
         _ => return Err(failed("this language has no SSH language transport yet")),
     };
     let tool = s.remote.lsp_tools.get(&(project.server.clone(), kind)).and_then(|tool| tool.as_deref()).unwrap_or(tool);
+    s.remote.lsp_started.insert(kind, Instant::now());
     let launch = format!("exec {tool}{}", if kind == codecraft_lsp::ServerKind::Python { " --stdio" } else { "" });
     let script = format!("{}{LSP_PATH}{}", codecraft_remote::target_script::prelude(&remote, &[]).map_err(failed)?, launch);
     config.command = resolve_program(&opts.program);
@@ -1829,7 +1995,7 @@ fn poll_interval(base: u64, idle: usize, focused: bool) -> Duration {
 // One remote-side fingerprint: only a fixed-size count/checksum crosses the network.
 pub(crate) fn fingerprint_script(remote: &str) -> String {
     let prune = codecraft_remote::deploy::DEFAULT_EXCLUDES.iter().map(|name| format!("-name {}", codecraft_remote::quote::sh_quote(name))).collect::<Vec<_>>().join(" -o ");
-    format!("cd {} || exit 1; find . \\( {prune} \\) -prune -o -type f -printf '%p %T@ %s\\n' | cksum", codecraft_remote::quote::quote_path(remote))
+    format!(r#"cd {} || exit 1; cc_probe=$(mktemp) || exit 44; trap 'rm -f "$cc_probe"' 0; if (ulimit -f 2048; timeout 5 find . -maxdepth 12 \( {prune} \) -prune -o -type f -printf '%p %T@ %s\n') > "$cc_probe"; then cksum < "$cc_probe"; else echo 'bounded poll exceeded time/size limit or find/timeout unavailable; use explicit refresh' >&2; exit 44; fi"#, codecraft_remote::quote::quote_path(remote))
 }
 
 fn auto_probe(s: &mut Session) -> Result<(), CommandError> {
@@ -1843,38 +2009,71 @@ fn auto_probe(s: &mut Session) -> Result<(), CommandError> {
 }
 
 fn stop_watcher(remote: &mut RemoteState) {
+    remote.watcher_started = None;
     if let Some((cancel, _, _)) = remote.watcher.take() { cancel.store(true, Ordering::Release); }
 }
 
 /// inotify is an optional optimization. A failed/missing watcher leaves the bounded,
 /// metadata fingerprint poll active; both transports reuse the project's ControlMaster.
+fn watcher_script(remote: &str) -> String {
+    format!(r#"cd {} || exit 1;
+command -v inotifywait >/dev/null 2>&1 || {{ echo 'fallback: inotifywait unavailable'; exit 42; }};
+cc_watch=$(mktemp) || exit 43; trap 'rm -f "$cc_watch" "$cc_watch.dirs"' 0;
+(timeout 5 find . \( -name .git -o -name .codecraft -o -name .idea -o -name target -o -name node_modules -o -name .claude -o -name .cache -o -name __pycache__ \) -prune -o -type d -exec sh -c '
+cc_cr=$(printf "\r");
+for cc_dir do
+  case "$cc_dir" in *"
+"*|*"$cc_cr"*) exit 45;; esac;
+  printf "%s\n" "$cc_dir";
+done' codecraft {{}} +; echo "CODECRAFT-DONE=$?") | head -n 2050 > "$cc_watch";
+[ "$(tail -n 1 "$cc_watch")" = CODECRAFT-DONE=0 ] || {{ echo 'fallback: directory preflight exceeds 2048 directories/5s, unsupported directory name, or find/timeout unavailable'; exit 43; }};
+cc_count=$(wc -l < "$cc_watch");
+[ "$cc_count" -le 2049 ] || {{ echo 'fallback: tree exceeds 2048 directories'; exit 43; }};
+cc_limit=$(cat /proc/sys/fs/inotify/max_user_watches 2>/dev/null);
+case "$cc_limit" in ''|*[!0-9]*) ;; *) [ "$cc_count" -le "$((cc_limit / 4))" ] || {{ echo 'fallback: inotify watch budget too small'; exit 43; }};; esac;
+sed '$d' "$cc_watch" > "$cc_watch.dirs";
+printf 'ready\n'; inotifywait -m -q -P --fromfile "$cc_watch.dirs" -e modify,create,delete,move,attrib --format changed --exclude '(^|/)(\.git|\.codecraft|\.idea|target|node_modules|__pycache__|\.claude|\.cache)(/|$)'"#, codecraft_remote::quote::quote_path(remote))
+}
+
 fn maintain_watcher(s: &mut Session) {
-    let connected = s.remote.auto_refresh && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected);
+    let connected = s.remote.auto_refresh && !s.remote.helpers_disabled && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected);
     if !connected { stop_watcher(&mut s.remote); return; }
-    if s.remote.watcher.is_some() { return; }
+    if s.remote.watcher.is_some() || interactive_busy(s) { return; }
     let Some(project) = s.remote.project.clone() else { return };
     let Some(server) = s.remote.server(&project.server) else { return };
     let opts = s.remote.ssh_options(&project.server);
-    let command = codecraft_remote::quote::sh_c(&format!(
-        "cd {} || exit 1; command -v inotifywait >/dev/null 2>&1 || exit 42; printf 'ready\\n'; exec inotifywait -m -r -q -P -e modify,create,delete,move,attrib --format changed --exclude '(^|/)(\\.git|\\.codecraft|target|node_modules|__pycache__)(/|$)' .",
-        codecraft_remote::quote::quote_path(&project.remote)));
+    let command = codecraft_remote::quote::sh_c(&watcher_script(&project.remote));
     let Ok(mut args) = rcmd::ssh_exec(&server, &opts, &command) else { return };
     args.insert(0, "-T".into());
     let cancel = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
     let dirty = Arc::new(AtomicBool::new(true));
     let flags = (cancel.clone(), streaming.clone(), dirty.clone());
+    let reason = Arc::new(std::sync::Mutex::new(String::new()));
+    s.remote.watcher_reason = reason.clone();
     let spawned = std::thread::Builder::new().name("remote-watch".into()).spawn(move || {
         let mut command = Command::new(resolve_program(&opts.program));
-        command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let Ok(mut child) = command.spawn() else { return };
+        if let Some(errors) = child.stderr.take() {
+            let reason = reason.clone();
+            let _ = std::thread::Builder::new().name("remote-watch-errors".into()).spawn(move || {
+                let mut text = String::new(); let _ = errors.take(4096).read_to_string(&mut text);
+                if !text.is_empty() { *reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text; }
+            });
+        }
         if let Some(mut output) = child.stdout.take() {
             let running = streaming.clone();
             let _ = std::thread::Builder::new().name("remote-watch-events".into()).spawn(move || {
                 let mut ready = [0; 6];
-                if output.read_exact(&mut ready).is_err() || &ready != b"ready\n" { return; }
+                if output.read_exact(&mut ready).is_err() || &ready != b"ready\n" {
+                    let mut text = String::from_utf8_lossy(&ready).into_owned();
+                    let _ = output.take(4096).read_to_string(&mut text);
+                    *reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+                    return;
+                }
                 running.store(true, Ordering::Release);
                 let mut bytes = [0; 4096];
                 while let Ok(n) = output.read(&mut bytes) {
@@ -1893,7 +2092,7 @@ fn maintain_watcher(s: &mut Session) {
         let _ = child.wait();
         streaming.store(false, Ordering::Release);
     });
-    if spawned.is_ok() { s.remote.watcher = Some(flags); }
+    if spawned.is_ok() { s.remote.watcher = Some(flags); s.remote.watcher_started = Some(Instant::now()); }
 }
 
 pub(crate) fn stop_project_watcher(s: &mut Session) { stop_watcher(&mut s.remote); }
@@ -2012,6 +2211,11 @@ pub(crate) fn prepare_lsp(s: &mut Session, kind: codecraft_lsp::ServerKind) -> b
         s.set_status(kind, crate::LspStatus::Unavailable("SSH transport is not implemented for this language server".into()));
         return false;
     }
+    if s.remote.helpers_disabled { return false; }
+    if interactive_busy(s) {
+        s.remote.lsp_retry.entry(kind).or_insert((0, Instant::now() + Duration::from_secs(3)));
+        return false;
+    }
     let key = (project.server.clone(), kind);
     if let Some(tool) = s.remote.lsp_tools.get(&key) { return tool.is_some(); }
     if s.remote.ops.values().any(|(follow, _)| matches!(follow, Follow::LspProbe { kind: k, .. } if *k == kind)) { return false; }
@@ -2107,7 +2311,14 @@ pub(crate) fn diagnostics(s: &mut Session, _: &Value) -> crate::commands::CmdRes
         }
     }).collect();
     let history = invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|entry| entry.host == project.server).cloned().collect::<Vec<_>>();
-    let report = serde_json::json!({"host": project.server, "masters": masters, "inFlight": s.remote.ops.iter().filter(|(id, _)| s.remote.op_hosts.get(id).is_some_and(|host| host == &project.server)).map(|(id, (follow, _))| serde_json::json!({"id": id, "kind": format!("{follow:?}").split_whitespace().next().unwrap_or("operation")})).collect::<Vec<_>>(), "invocations": history});
+    let active: Vec<_> = active_invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter()
+        .filter(|(_, (host, _, _))| host == &project.server)
+        .map(|(id, (_, kind, at))| serde_json::json!({"id": id, "kind": kind, "ageMs": at.elapsed().as_millis()})).collect();
+    let report = serde_json::json!({"host": project.server, "masters": masters, "inFlight": s.remote.ops.iter().filter(|(id, _)| s.remote.op_hosts.get(id).is_some_and(|host| host == &project.server)).map(|(id, (follow, _))| serde_json::json!({"id": id, "ageMs": s.remote.op_started.get(id).map(|at| at.elapsed().as_millis()), "kind": format!("{follow:?}").split_whitespace().next().unwrap_or("operation")})).collect::<Vec<_>>(), "invocations": history,
+        "terminals": s.terminal.tabs.iter().filter(|tab| tab.remote).map(|tab| serde_json::json!({"tab": tab.id, "echoMedianUs": tab.term.echo_latency().0, "echoSamples": tab.term.echo_latency().1, "busy": tab.term.recently_active(Duration::from_secs(3))})).collect::<Vec<_>>(),
+        "processes": {"scope": "CodeCraft-owned helper channels; excludes user shell processes and helper descendants", "active": active, "activeCount": active.len(), "languageServerCount": s.remote.lsp_started.keys().filter(|kind| s.servers.contains_key(kind) && !s.remote.local_lsp.contains(kind)).count(), "watcherCount": usize::from(s.remote.auto_refresh_mode() == "inotify"), "watcher": s.remote.watcher_started.filter(|_| s.remote.auto_refresh_mode() == "inotify").map(|at| serde_json::json!({"kind": "inotifywait", "ageMs": at.elapsed().as_millis()})), "languageServers": s.remote.lsp_started.iter().filter(|(kind, _)| s.servers.contains_key(kind) && !s.remote.local_lsp.contains(kind)).map(|(kind, at)| serde_json::json!({"kind": kind.label(), "ageMs": at.elapsed().as_millis()})).collect::<Vec<_>>()},
+        "frameSections": s.remote.frame_sections, "watcherReason": *s.remote.watcher_reason.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        "refresh": {"lastReason": s.remote.debounce.reason, "events": s.remote.debounce.events, "count": s.remote.debounce.refreshes, "pending": s.remote.debounce.pending || s.remote.refresh_pending, "spacingSecs": s.remote.debounce.spacing().as_secs(), "lastEventAgeMs": s.remote.debounce.last_event.map(|at| at.elapsed().as_millis()), "treeRefreshes": s.remote.tree_refreshes, "interactiveDeferred": interactive_busy(s)}});
     let mut check = rcmd::ssh_exit_master(&server, &opts).map_err(failed)?.unwrap_or_default();
     if let Some(index) = check.iter().position(|arg| arg == "exit") && let Some(arg) = check.get_mut(index) { *arg = "check".into(); }
     let shared = rcmd::ssh_exec(&server, &opts, "true").map_err(failed)?;
@@ -2116,7 +2327,8 @@ pub(crate) fn diagnostics(s: &mut Session, _: &Value) -> crate::commands::CmdRes
     // Timing lives in invocation history; run check last so a missing master doesn't skip RTTs.
     let mut steps = vec![Step::Output(serde_json::to_string_pretty(&report).map_err(|error| failed(error.to_string()))?),
         Step::Measure { label: "shared RTT".into(), program: opts.program.clone(), args: shared },
-        Step::Measure { label: "fresh RTT".into(), program: opts.program.clone(), args: fresh_args }];
+        Step::Measure { label: "fresh RTT".into(), program: opts.program.clone(), args: fresh_args },
+        Step::Measure { label: "host loadavg / CPUs".into(), program: opts.program.clone(), args: rcmd::ssh_exec(&server, &opts, "cat /proc/loadavg; getconf _NPROCESSORS_ONLN").map_err(failed)? }];
     if !check.is_empty() { steps.push(Step::Measure { label: "master check".into(), program: opts.program.clone(), args: check }); }
     let id = start_op(s, &project.server, "Connection diagnostics (shared RTT, fresh RTT, master check)", steps, Follow::Nothing, true)?;
     s.ws.layout.show(ToolWindowId::FileTransfer);
@@ -2126,6 +2338,121 @@ pub(crate) fn diagnostics(s: &mut Session, _: &Value) -> crate::commands::CmdRes
 #[cfg(test)]
 mod real_host_regressions {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn watcher_preflight_caps_trees_and_refuses_line_injection_before_installing_watches() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        let capture = dir.path().join("watched");
+        for (program, script) in [("timeout", "#!/bin/sh\nshift; exec \"$@\"\n"),
+            ("inotifywait", "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in --fromfile) cat \"$2\" > \"$WATCH_CAPTURE\"; shift 2;; *) shift;; esac; done\n")] {
+            let path = bin.join(program);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = || Command::new("/bin/sh").arg("-c").arg(watcher_script(&root.to_string_lossy()))
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display())).env("WATCH_CAPTURE", &capture).output().unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        assert!(run().status.success());
+        assert_eq!(std::fs::read_to_string(&capture).unwrap().lines().count(), 2);
+        std::fs::remove_file(&capture).unwrap();
+        let hostile = root.join("odd\nfolder");
+        std::fs::create_dir(&hostile).unwrap();
+        assert!(!run().status.success());
+        assert!(!capture.exists());
+        std::fs::remove_dir(hostile).unwrap();
+        for index in 0..2048 { std::fs::create_dir(root.join(format!("d{index}"))).unwrap(); }
+        let output = run();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("fallback"));
+        assert!(!capture.exists());
+    }
+    #[test]
+    fn event_storm_has_one_trailing_refresh_and_increasing_spacing() {
+        let start = Instant::now();
+        let mut debounce = RefreshDebounce::default();
+        for ms in 0..10_000 {
+            let now = start + Duration::from_millis(ms);
+            debounce.event(now);
+            assert!(!debounce.due(now));
+        }
+        let now = start + Duration::from_secs(12);
+        assert!(debounce.due(now));
+        debounce.started(now);
+        assert!(!debounce.due(now + Duration::from_secs(2)));
+        assert_eq!(debounce.refreshes, 1);
+        for seconds in [5, 15, 30, 30] {
+            debounce.event(now);
+            assert_eq!(debounce.spacing(), Duration::from_secs(seconds));
+            assert!(!debounce.due(now + Duration::from_secs(seconds - 1)));
+            assert!(debounce.due(now + Duration::from_secs(seconds)));
+            debounce.started(now);
+        }
+        debounce.event(now + Duration::from_secs(61));
+        assert_eq!(debounce.spacing(), Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stall_threshold_warning_limit_and_recent_maximum() {
+        let mut section = FrameSection::default();
+        let now = Instant::now();
+        section.record("test", Duration::from_millis(30), now);
+        assert_eq!(section.stalls, 0);
+        section.record("test", Duration::from_millis(40), now);
+        section.record("test", Duration::from_millis(80), now + Duration::from_secs(1));
+        assert_eq!(section.stalls, 2);
+        assert_eq!(section.warned, Some(now));
+        assert_eq!(section.worst_ms, 80.0);
+        section.record("test", Duration::from_millis(31), now + Duration::from_secs(6));
+        assert_eq!(section.warned, Some(now + Duration::from_secs(6)));
+        section.record("test", Duration::from_millis(1), now + Duration::from_secs(61));
+        assert_eq!(section.worst_ms, 1.0);
+    }
+
+    #[test]
+    fn unchanged_refresh_does_not_reload_or_rescan_the_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::new();
+        session.isolate_home(dir.path());
+        finish(&mut session, Follow::RemoteDev { server: "fake".into(), remote: "/project".into(), local: dir.path().to_path_buf(), open_window: false },
+            Ok(vec![serde_json::to_string(&codecraft_remote::mirror::Refresh::default()).unwrap()]));
+        assert_eq!(session.remote.tree_refreshes, 0);
+        assert!(session.remote.reload.is_none());
+        assert!(!session.jobs_running());
+    }
+
+    #[test]
+    fn delayed_reload_cannot_replace_a_newer_saved_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "old").unwrap();
+        let mut session = Session::new();
+        session.lsp_enabled = false;
+        session.isolate_home(dir.path());
+        session.open_file(&path).unwrap();
+        let id = session.ws.active().unwrap().1.id;
+        let revision = session.ws.doc(id).unwrap().doc.revision();
+        let doc = session.ws.doc_mut(id).unwrap();
+        doc.doc.replace_all("newer saved text", &codecraft_text::SelectionSet::caret(0)).unwrap();
+        doc.doc.mark_saved();
+        let saved_revision = session.ws.doc(id).unwrap().doc.revision();
+        let (tx, rx) = crossbeam_channel::bounded(2);
+        tx.send(vec![(path.clone(), "stale worker result".into(), None, vec![(id, revision)])]).unwrap();
+        tx.send(vec![(path, "fresh worker result".into(), None, vec![(id, saved_revision)])]).unwrap();
+        drop(tx);
+        session.remote.reload = Some(rx);
+        apply_reload(&mut session);
+        assert_eq!(session.ws.doc(id).unwrap().doc.text(), "newer saved text");
+        assert!(session.remote.reload.is_some());
+        apply_reload(&mut session);
+        assert_eq!(session.ws.doc(id).unwrap().doc.text(), "fresh worker result");
+        apply_reload(&mut session);
+        assert!(session.remote.reload.is_none());
+    }
     #[test]
     fn user_activity_and_focus_reset_idle_polling() {
         let mut remote = RemoteState::default();
@@ -2161,5 +2488,12 @@ fn remote_install_hint(kind: codecraft_lsp::ServerKind) -> &'static str {
         codecraft_lsp::ServerKind::Clangd => "install clangd with the host package manager (apt: clangd; dnf: clang-tools-extra)",
         codecraft_lsp::ServerKind::Python => "python3 -m pip install --user basedpyright (or npm install -g pyright)",
         _ => kind.install_hint(),
+    }
+}
+
+impl Session {
+    /// Record a named UI/pump cost; diagnostics retains the current 60-second window maximum.
+    pub fn record_frame_section(&mut self, name: &str, elapsed: Duration) {
+        self.remote.frame_sections.entry(name.to_owned()).or_default().record(name, elapsed, Instant::now());
     }
 }

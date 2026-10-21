@@ -163,17 +163,23 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Ok(json!({"project": s.remote.project, "autoRefresh": s.remote.auto_refresh, "refreshMode": s.remote.auto_refresh_mode(), "pollIntervalSecs": s.remote.poll_interval_secs, "conflicts": s.remote.conflicts}))
         }),
         spec("remote.project.autoRefresh", "Remote Project: Automatic Refresh", None,
-            "{paused?: bool, pollIntervalSecs?: u64 (0 disables fallback polling)} — toggle or set the persistent automatic refresh setting", Context::Global, has_project, |s, p| {
+            "{paused?: bool, pollIntervalSecs?: u64 (0 disables fallback polling), helpersDisabled?: bool} — toggle or set the persistent automatic refresh setting", Context::Global, has_project, |s, p| {
                 let root = deployment::project_root(s)?;
                 let mut cfg = deployment::load(&root).map_err(failed)?;
-                cfg.pause_remote_refresh = p.get("paused").and_then(Value::as_bool).unwrap_or(if p.get("pollIntervalSecs").is_some() { cfg.pause_remote_refresh } else { s.remote.auto_refresh });
+                cfg.pause_remote_refresh = p.get("paused").and_then(Value::as_bool).unwrap_or(if p.get("pollIntervalSecs").is_some() || p.get("helpersDisabled").is_some() { cfg.pause_remote_refresh } else { s.remote.auto_refresh });
                 if let Some(interval) = p.get("pollIntervalSecs").and_then(Value::as_u64) {
                     cfg.remote_poll_interval_secs = Some(interval.min(3600));
                     s.remote.poll_interval_secs = interval.min(3600);
                 }
+                if let Some(disabled) = p.get("helpersDisabled").and_then(Value::as_bool) {
+                    cfg.disable_remote_helpers = disabled;
+                    s.remote.helpers_disabled = disabled;
+                    if disabled { crate::remote::stop_project_servers(s); }
+                }
                 deployment::save(&root, &cfg).map_err(failed)?;
                 s.remote.auto_refresh = !cfg.pause_remote_refresh;
-                Ok(json!({"paused": cfg.pause_remote_refresh, "pollIntervalSecs": s.remote.poll_interval_secs}))
+                if cfg.pause_remote_refresh || cfg.disable_remote_helpers { crate::remote::stop_project_watcher(s); }
+                Ok(json!({"paused": cfg.pause_remote_refresh, "pollIntervalSecs": s.remote.poll_interval_secs, "helpersDisabled": s.remote.helpers_disabled}))
             }),
         spec("remote.project.conflicts", "Remote Project: Resolve Conflicts", None,
             "{} — list and show conflicts", Context::Global, has_project, |s, _| {
@@ -1101,7 +1107,7 @@ fn reconnect_project(s: &mut Session, _: &Value) -> CmdResult {
         let opts = s.remote.ssh_options(&server);
         s.remote.ensure_master(&host);
         let directory = s.remote.project.as_ref().map(|p| p.remote.as_str()).unwrap_or(".");
-        let script = codecraft_remote::quote::sh_c(&format!("cd {} || exit 1; printf 'CODECRAFT-ROOT=' && pwd -P && printf 'CODECRAFT-FINGERPRINT='; {}", codecraft_remote::quote::quote_path(directory), crate::remote::fingerprint_script(".")));
+        let script = codecraft_remote::quote::sh_c(&format!(r#"cd {} || exit 1; printf 'CODECRAFT-ROOT=' && pwd -P || exit 1; if cc_signature=$({}); then printf 'CODECRAFT-FINGERPRINT=%s\n' "$cc_signature"; fi"#, codecraft_remote::quote::quote_path(directory), crate::remote::fingerprint_script(".")));
         let args = rcmd::ssh_exec(&host, &opts, &script).map_err(failed)?;
         let operation = start_op(
             s,

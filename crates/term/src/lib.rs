@@ -213,13 +213,34 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Input-write to first output byte; output from an unrelated task can satisfy a sample.
+/// This is a responsiveness indicator, not a protocol-level echo acknowledgement.
+#[derive(Default)]
+struct EchoLatency {
+    pending: Option<Instant>,
+    samples: std::collections::VecDeque<u64>,
+    last_input: Option<Instant>,
+    last_output: Option<Instant>,
+}
+impl EchoLatency {
+    fn output(&mut self, now: Instant) {
+        self.last_output = Some(now);
+        if let Some(start) = self.pending.take() {
+            if self.samples.len() >= 31 { self.samples.pop_front(); }
+            self.samples.push_back(now.saturating_duration_since(start).as_micros().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+}
+
 /// State shared between the terminal, its threads and the emulator's event listener.
 struct Shared {
     events: Sender<TermEvent>,
-    input: Sender<Vec<u8>>,
+    input: Sender<(Vec<u8>, bool)>,
     palette: SharedPalette,
     waker: SharedWaker,
     dirty: AtomicBool,
+    wake_at: Mutex<Option<Instant>>,
+    echo: Mutex<EchoLatency>,
     exited: AtomicBool,
     /// cols, rows, cell width, cell height (px) for size reports.
     size: [AtomicU32; 4],
@@ -227,10 +248,13 @@ struct Shared {
 
 impl Shared {
     fn wake(&self) {
-        let waker = lock(&self.waker).clone();
-        if let Some(w) = waker {
-            w();
-        }
+        let Some(waker) = lock(&self.waker).clone() else { return };
+        let now = Instant::now();
+        let mut at = lock(&self.wake_at);
+        if at.is_some_and(|last| now.duration_since(last) < Duration::from_millis(17)) { return; }
+        *at = Some(now);
+        drop(at);
+        waker();
     }
 
     fn window_size(&self) -> WindowSize {
@@ -259,7 +283,7 @@ impl EventListener for Listener {
         let s = &self.0;
         match event {
             AlacrittyEvent::PtyWrite(text) => {
-                let _ = s.input.send(text.into_bytes());
+                let _ = s.input.send((text.into_bytes(), false));
             }
             AlacrittyEvent::Title(t) => {
                 let _ = s.events.send(TermEvent::Title(t));
@@ -274,10 +298,10 @@ impl EventListener for Listener {
                 let _ = s.events.send(TermEvent::Clipboard(text));
             }
             AlacrittyEvent::ColorRequest(index, format) => {
-                let _ = s.input.send(format(s.color(index)).into_bytes());
+                let _ = s.input.send((format(s.color(index)).into_bytes(), false));
             }
             AlacrittyEvent::TextAreaSizeRequest(format) => {
-                let _ = s.input.send(format(s.window_size()).into_bytes());
+                let _ = s.input.send((format(s.window_size()).into_bytes(), false));
             }
             // Clipboard reads (OSC 52 paste) are refused: a program must not read the clipboard.
             _ => {}
@@ -375,13 +399,15 @@ impl Terminal {
         let writer = master.take_writer().map_err(|e| TermError::Pty(e.to_string()))?;
 
         let (events_tx, events) = unbounded();
-        let (input_tx, input_rx) = unbounded::<Vec<u8>>();
+        let (input_tx, input_rx) = unbounded::<(Vec<u8>, bool)>();
         let shared = Arc::new(Shared {
             events: events_tx,
             input: input_tx,
             palette,
             waker,
             dirty: AtomicBool::new(true),
+            wake_at: Mutex::new(None),
+            echo: Mutex::new(EchoLatency::default()),
             exited: AtomicBool::new(false),
             size: [
                 AtomicU32::new(u32::from(cols)),
@@ -415,7 +441,8 @@ impl Terminal {
             rows,
         };
         // From here on, dropping `terminal` on an error kills the child.
-        std::thread::Builder::new().name("term-writer".into()).spawn(move || writer_loop(writer, input_rx))?;
+        let writer_shared = shared.clone();
+        std::thread::Builder::new().name("term-writer".into()).spawn(move || writer_loop(writer, input_rx, writer_shared))?;
         let reader_shared = shared.clone();
         std::thread::Builder::new()
             .name("term-reader".into())
@@ -463,7 +490,7 @@ impl Terminal {
     /// Raw bytes to the PTY (queued; never blocks).
     pub fn write(&self, bytes: Vec<u8>) {
         if !bytes.is_empty() {
-            let _ = self.shared.input.send(bytes);
+            let _ = self.shared.input.send((bytes, true));
         }
     }
 
@@ -574,6 +601,29 @@ impl Terminal {
             }
         }
         self.mark_dirty();
+    }
+
+    /// Median of the last 31 input/first-output samples, in microseconds, and sample count.
+    pub fn echo_latency(&self) -> (Option<u64>, usize) {
+        let echo = lock(&self.shared.echo);
+        let mut samples: Vec<_> = echo.samples.iter().copied().collect();
+        samples.sort_unstable();
+        (samples.get(samples.len() / 2).copied(), samples.len())
+    }
+
+    /// Recent input/output means a remote interactive channel needs priority.
+    pub fn recently_active(&self, quiet: Duration) -> bool {
+        let echo = lock(&self.shared.echo);
+        echo.pending.is_some() || [echo.last_input, echo.last_output].into_iter().flatten().any(|at| at.elapsed() < quiet)
+    }
+
+    /// Nonblocking snapshot: retain the previous frame if a parser chunk is in flight.
+    pub fn try_screen(&self) -> Option<Screen> {
+        match self.emu.try_lock() {
+            Ok(emu) => Some(screen::snapshot(&emu.term)),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(screen::snapshot(&e.into_inner().term)),
+            Err(std::sync::TryLockError::WouldBlock) => { self.mark_dirty(); None }
+        }
     }
 
     /// A copy of the visible screen.
@@ -700,7 +750,7 @@ impl Terminal {
 
     /// Flush a synchronized update (DEC mode 2026) whose timeout passed while no output arrived.
     pub fn tick(&self) {
-        let mut emu = self.emu();
+        let Ok(mut emu) = self.emu.try_lock() else { return };
         let expired = emu.parser.sync_timeout().sync_timeout().is_some_and(|t| t <= Instant::now());
         if expired {
             let Emu { term, parser } = &mut *emu;
@@ -755,8 +805,14 @@ impl Drop for Terminal {
     }
 }
 
-fn writer_loop(mut writer: Box<dyn Write + Send>, input: Receiver<Vec<u8>>) {
-    for bytes in input {
+fn writer_loop(mut writer: Box<dyn Write + Send>, input: Receiver<(Vec<u8>, bool)>, shared: Arc<Shared>) {
+    for (bytes, measure) in input {
+        if measure {
+            let mut echo = lock(&shared.echo);
+            let now = Instant::now();
+            echo.pending.get_or_insert(now);
+            echo.last_input = Some(now);
+        }
         if writer.write_all(&bytes).and_then(|()| writer.flush()).is_err() {
             break;
         }
@@ -764,11 +820,12 @@ fn writer_loop(mut writer: Box<dyn Write + Send>, input: Receiver<Vec<u8>>) {
 }
 
 fn reader_loop(mut reader: Box<dyn Read + Send>, emu: Arc<Mutex<Emu>>, shared: Arc<Shared>) {
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 4096];
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
+                lock(&shared.echo).output(Instant::now());
                 let Some(bytes) = buf.get(..n) else { break };
                 {
                     let mut guard = lock(&emu);
@@ -874,6 +931,39 @@ fn percent_decode(s: &str) -> Option<String> {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_waker_does_not_consume_the_next_repaint_and_requests_are_coalesced() {
+        let (events, _) = unbounded();
+        let (input, _) = unbounded();
+        let shared = Shared { events, input, palette: Default::default(), waker: Default::default(),
+            dirty: AtomicBool::new(true), wake_at: Mutex::new(None), echo: Default::default(),
+            exited: AtomicBool::new(false), size: std::array::from_fn(|_| AtomicU32::new(0)) };
+        shared.wake();
+        assert!(lock(&shared.wake_at).is_none());
+        let count = Arc::new(AtomicU32::new(0));
+        let notified = count.clone();
+        *lock(&shared.waker) = Some(Arc::new(move || { notified.fetch_add(1, Ordering::Relaxed); }));
+        shared.wake();
+        shared.wake();
+        assert_eq!(count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn echo_samples_are_rolling_and_use_first_output_after_writer_timestamp() {
+        let mut echo = EchoLatency::default();
+        let now = Instant::now();
+        echo.output(now);
+        assert!(echo.samples.is_empty());
+        for i in 0..40 {
+            echo.pending = Some(now);
+            echo.output(now + Duration::from_millis(i));
+            echo.output(now + Duration::from_secs(1));
+        }
+        assert_eq!(echo.samples.len(), 31);
+        assert_eq!(echo.samples.front(), Some(&9_000));
+        assert_eq!(echo.samples.back(), Some(&39_000));
+    }
 
     #[test]
     fn osc7() {

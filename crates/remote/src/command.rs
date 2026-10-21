@@ -62,14 +62,26 @@ pub fn ssh_exec(server: &SshServer, opts: &SshOptions, remote_cmd: &str) -> Remo
     out.extend(server.connect_options());
     out.push("--".into());
     out.push(server.destination()?);
-    out.push(remote_cmd.to_string());
+    out.push(background_command(remote_cmd));
     Ok(out)
+}
+
+/// Lower the scheduling priority of CodeCraft helpers and all their descendants.
+/// ionice is optional (Linux); nice is available on supported Unix hosts.
+pub fn background_command(command: &str) -> String {
+    format!("nice -n 19 sh -c {} codecraft {}", quote::sh_quote("if command -v ionice >/dev/null 2>&1; then exec ionice -c3 sh -c \"$1\"; else exec sh -c \"$1\"; fi"), quote::sh_quote(command))
 }
 
 /// An interactive session (Tools › Start SSH Session…): no BatchMode, so ssh may ask for a
 /// passphrase or to confirm a host key in the terminal.
 pub fn ssh_interactive(server: &SshServer, opts: &SshOptions) -> RemoteResult<Vec<String>> {
-    let mut out = opts.base(false, true);
+    let mut out = opts.base(false, false);
+    out.extend(opt("ControlMaster=no"));
+    out.extend(opt("IPQoS=lowdelay"));
+    out.extend(opt("Compression=no"));
+    out.extend(opt("ServerAliveInterval=15"));
+    out.extend(opt("ServerAliveCountMax=3"));
+    out.extend(opt("SendEnv=LANG LC_*"));
     out.extend(server.connect_options());
     out.push("--".into());
     out.push(server.destination()?);
@@ -249,6 +261,7 @@ pub fn rsync_args(server: &SshServer, opts: &SshOptions, spec: &RsyncSpec<'_>) -
         e.push(rsync_word(w)?);
     }
     let mut out = vec!["-rlptz".to_string(), "--itemize-changes".into(), "-e".into(), e.join(" ")];
+    out.push(r#"--rsync-path=nice -n 19 sh -c 'if command -v ionice >/dev/null 2>&1; then exec ionice -c3 rsync "$@"; else exec rsync "$@"; fi' codecraft"#.into());
     if spec.dry_run {
         out.push("--dry-run".into());
     }
@@ -533,12 +546,24 @@ mod tests {
                 "IdentitiesOnly=yes",
                 "--",
                 "h.example",
-                "sh -c 'ls'"
+                &background_command("sh -c 'ls'")
             ]
         );
         let i = ssh_interactive(&alias(), &SshOptions::default()).unwrap();
         assert!(!i.iter().any(|w| w.contains("BatchMode")));
         assert_eq!(i.last().map(String::as_str), Some("web"));
+    }
+
+    #[test]
+    fn terminal_has_an_interactive_connection_of_its_own_and_helpers_are_niced() {
+        let args = ssh_interactive(&alias(), &shared()).unwrap();
+        for option in ["ControlPath=none", "ControlMaster=no", "IPQoS=lowdelay", "Compression=no", "ServerAliveInterval=15", "ServerAliveCountMax=3", "SendEnv=LANG LC_*"] {
+            assert!(args.iter().any(|arg| arg == option), "{args:?}");
+        }
+        assert!(!args.iter().any(|arg| arg.contains("/tmp/cc-s") || arg.contains("BatchMode")));
+        let helper = ssh_exec(&alias(), &shared(), "find .").unwrap();
+        assert!(helper.last().unwrap().starts_with("nice -n 19"));
+        assert!(helper.last().unwrap().contains("ionice -c3"));
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub(crate) fn fake() -> (Fake, Session) {
     for d in [&remote, &project, &home, &bin] {
         std::fs::create_dir_all(d).unwrap();
     }
+    script(&bin.join("timeout"), "#!/bin/sh\nshift; exec \"$@\"\n", &root, &remote, &log);
     script(&bin.join("ssh"), SSH, &root, &remote, &log);
     script(&bin.join("rsync"), RSYNC, &root, &remote, &log);
     script(&bin.join("scp"), SCP, &root, &remote, &log);
@@ -1113,10 +1114,124 @@ fn failed_master_reports_stderr_and_bulk_socket_is_distinct() {
     pump_until(&mut s, |s| s.remote.project.as_ref().and_then(|p| p.error.as_ref()).is_some_and(|error| error.contains("multiplexing unavailable") && error.contains("Host key verification failed")));
     let report = run(&mut s, "remote.diagnostics", json!({}));
     assert_eq!(report["report"]["masters"].as_array().unwrap().len(), 2);
+    assert!(report["report"]["processes"]["activeCount"].is_number());
+    assert!(report["report"]["frameSections"].is_object());
+    assert!(report["report"]["refresh"]["lastReason"].is_string());
     settle(&mut s);
     assert!(s.remote.log.last().unwrap().output.contains("shared RTT"));
     assert!(s.remote.log.last().unwrap().output.contains("fresh RTT"));
     assert!(!f.argv().contains("-- web:bulk"));
+}
+
+#[test]
+fn helper_stop_setting_persists_and_prevents_automatic_probes() {
+    let (f, mut s) = fake();
+    let root = open_mirror(&f, &mut s);
+    let status = run(&mut s, "remote.project.autoRefresh", json!({"helpersDisabled":true}));
+    assert_eq!(status["helpersDisabled"], true);
+    assert!(crate::deployment::load(&root).unwrap().disable_remote_helpers);
+    assert_eq!(s.remote.auto_refresh_mode(), "helpers disabled");
+    // Let a watcher that was already stopping finish before counting new invocations.
+    std::thread::sleep(Duration::from_millis(100));
+    let calls = f.argv();
+    s.remote.last_refresh = Instant::now() - Duration::from_secs(600);
+    s.pump();
+    assert_eq!(f.argv(), calls);
+    run(&mut s, "remote.project.autoRefresh", json!({"helpersDisabled":false}));
+    assert!(!crate::deployment::load(&root).unwrap().disable_remote_helpers);
+}
+
+#[test]
+fn unavailable_bounded_poll_tools_do_not_fail_reconnect() {
+    let (f, mut s) = fake();
+    let _root = open_mirror(&f, &mut s);
+    std::fs::write(f.dir.path().join("bin/timeout"), "#!/bin/sh\nexit 44\n").unwrap();
+    run(&mut s, "remote.project.reconnect", json!({}));
+    settle(&mut s);
+    assert_eq!(s.remote.project.as_ref().unwrap().connection, crate::remote::ConnectionState::Connected);
+}
+
+#[test]
+fn latency_harness_measures_pty_echo_with_busy_bandwidth_limited_channel() {
+    let Some(python) = codecraft_lsp::which("python3") else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("ssh.py");
+    std::fs::write(&script, include_str!("../../../tools/remote-latency/fake_ssh.py")).unwrap();
+    for isolated in [false, true] {
+        let link = dir.path().join(format!("link-{isolated}"));
+        let ready = dir.path().join(format!("busy-{isolated}"));
+        let env = vec![("FAKE_LINK".into(), link.display().to_string()), ("FAKE_BUSY_READY".into(), ready.display().to_string()), ("FAKE_RTT_MS".into(), "60".into()), ("FAKE_BYTES_PER_SEC".into(), "65536".into())];
+        let mut args = vec![script.display().to_string()];
+        if isolated {
+            let (_fixture, mut session) = fake();
+            let server = session.remote.server("web").unwrap();
+            let options = codecraft_remote::command::SshOptions { control_path: Some("fixture-master".into()), ..Default::default() };
+            args.extend(codecraft_remote::command::ssh_interactive(&server, &options).unwrap());
+        }
+        let mut term = codecraft_term::Terminal::spawn(codecraft_term::TermConfig { program: Some(python.display().to_string()), args, env: env.clone(), ..Default::default() }, Default::default(), Default::default()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !term.screen().text().contains("READY") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut busy = std::process::Command::new(&python).arg(&script).arg("--busy").envs(env).spawn().unwrap();
+        while !ready.exists() { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(2)); }
+        term.send_text("x");
+        while term.echo_latency().1 == 0 { assert!(Instant::now() < deadline); std::thread::sleep(Duration::from_millis(2)); }
+        let micros = term.echo_latency().0.unwrap();
+        eprintln!("fake SSH isolated={isolated}, RTT=60ms, cap=64KiB/s, busy=32KiB: echo={:.1}ms", micros as f64 / 1000.0);
+        assert!(micros >= 50_000);
+        if isolated { assert!(micros < 400_000); } else { assert!(micros >= 450_000); }
+        busy.wait().unwrap();
+        term.terminate();
+    }
+}
+
+#[test]
+fn redraw_bursts_keep_screen_snapshots_nonblocking_and_wakes_bounded() {
+    let Some(python) = codecraft_lsp::which("python3") else { return };
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("ssh.py");
+    std::fs::write(&script, include_str!("../../../tools/remote-latency/fake_ssh.py")).unwrap();
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wakes = count.clone();
+    let waker: codecraft_term::SharedWaker = Default::default();
+    *waker.lock().unwrap() = Some(std::sync::Arc::new(move || { wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }));
+    let mut term = codecraft_term::Terminal::spawn(codecraft_term::TermConfig {
+        program: Some(python.display().to_string()), args: vec![script.display().to_string(), "ControlPath=none".into(), "--burst".into()],
+        env: vec![("FAKE_LINK".into(), dir.path().join("link").display().to_string()), ("FAKE_BYTES_PER_SEC".into(), "1048576".into())], ..Default::default()
+    }, waker, Default::default()).unwrap();
+    let started = Instant::now();
+    let mut worst = Duration::ZERO;
+    loop {
+        let tick = Instant::now();
+        term.tick();
+        let screen = term.try_screen();
+        worst = worst.max(tick.elapsed());
+        if screen.is_some_and(|screen| screen.text().contains("BURST-DONE")) { break; }
+        assert!(started.elapsed() < Duration::from_secs(5));
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    eprintln!("fake SSH TUI burst: worst snapshot={worst:?}, wakes={}", count.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(worst < Duration::from_millis(30));
+    assert!(count.load(std::sync::atomic::Ordering::Relaxed) <= (started.elapsed().as_millis() / 17) as usize + 2);
+    term.terminate();
+}
+
+#[test]
+fn mirror_application_does_not_disable_remote_terminal_input_or_pumping() {
+    let (f, mut s) = fake();
+    let root = open_mirror(&f, &mut s);
+    run(&mut s, "terminal.newRemote", json!({}));
+    let lock = crate::remote::mirror_lock(&root);
+    let _guard = lock.lock().unwrap();
+    let started = Instant::now();
+    run(&mut s, "terminal.sendText", json!({"text":"printf 'still responsive\\n'\n"}));
+    s.pump();
+    assert!(started.elapsed() < Duration::from_millis(100));
+    let argv = f.argv();
+    // Remote terminals do not install/source local shell integrations.
+    assert!(!argv.contains("codecraft-terminal.zsh"));
 }
 
 #[test]

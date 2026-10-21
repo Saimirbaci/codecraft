@@ -98,7 +98,7 @@ impl TerminalTab {
 
     /// Re-read the screen from the emulator now (after scrolling or selecting).
     pub fn refresh(&mut self) {
-        self.screen = self.term.screen();
+        if let Some(screen) = self.term.try_screen() { self.screen = screen; }
     }
 
     pub(crate) fn info(&self, active: bool) -> Value {
@@ -179,7 +179,9 @@ impl Default for TerminalState {
 impl TerminalState {
     /// Called from background threads when a terminal's screen changed (the UI repaints).
     pub fn set_waker(&self, waker: codecraft_term::Waker) {
-        *self.waker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker);
+        *self.waker.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(waker.clone());
+        // Output may have arrived before the panel installed its first callback.
+        waker();
     }
 
     /// The theme's colours, for programs that query them (OSC 4/10/11).
@@ -298,12 +300,12 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
     }
     let cwd = new.cwd.clone().unwrap_or_else(|| default_cwd(s));
     let remote_shell = !new.local_shell && new.command.is_none() && s.remote.project.is_some();
-    if !cwd.is_dir() && !remote_shell {
+    if !remote_shell && !cwd.is_dir() {
         return Err(CommandError::Failed(format!("not a directory: {}", cwd.display())));
     }
     let shell = shell(s);
     let key = new.key.clone().filter(|k| shell_int::valid_id(k)).unwrap_or_else(shell_int::new_key);
-    let integration = if new.command.is_none() || new.claude.is_some() { shell_int::install(s) } else { None };
+    let integration = if !remote_shell && (new.command.is_none() || new.claude.is_some()) { shell_int::install(s) } else { None };
     let mut extra_env = Vec::new();
     let mut shell_program = None;
     if let Some(integration) = &integration {
@@ -336,7 +338,6 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         let project = s.remote.project.clone().ok_or_else(|| CommandError::Failed("remote project closed".into()))?;
         let server = crate::deployment::server(s, &project.server)?;
         let opts = s.remote.ssh_options(&project.server);
-        s.remote.ensure_master(&server);
         args = codecraft_remote::command::ssh_interactive(&server, &opts).map_err(crate::remote::failed)?;
         args.insert(0, "-tt".into());
         let rel = s.project_root().and_then(|root| codecraft_remote::deploy::rel_path(&root, &cwd)).unwrap_or_default();
@@ -475,7 +476,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
                 TermEvent::Clipboard(text) => effects.push(Effect::CopyToClipboard(text)),
                 TermEvent::Cwd(dir) => {
                     let dir = if tab.remote { mapping.as_ref().and_then(|m| m.map_path(&dir.to_string_lossy(), codecraft_lsp::path_mapper::Direction::ToClient)).map(PathBuf::from).unwrap_or(dir) } else { dir };
-                    if dir.is_dir() || tab.remote {
+                    if tab.remote || dir.is_dir() {
                         tab.cwd = dir;
                     }
                 }

@@ -473,7 +473,8 @@ impl Session {
         if self.remote.project.is_some() && (id.starts_with("editor.") || matches!(id, "terminal.sendText" | "terminal.sendKey" | "terminal.paste" | "file.open")) {
             self.remote.note_activity();
         }
-        let lock = (!self.remote.mirror_guard_active && self.remote.project.is_some())
+        let independent = id.starts_with("terminal.") || id == "remote.diagnostics" || id.starts_with("remote.host.");
+        let lock = (!independent && !self.remote.mirror_guard_active && self.remote.project.is_some())
             .then(|| self.project_root().map(|r| remote::mirror_lock(&r))).flatten();
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),
@@ -484,7 +485,7 @@ impl Session {
         let previous = self.remote.mirror_guard_active;
         self.remote.mirror_guard_active = true;
         let result = self.execute_locked(id, params);
-        remote::protect_buffers(self);
+        if !independent { remote::protect_buffers(self); }
         self.remote.mirror_guard_active = previous;
         result
     }
@@ -598,26 +599,44 @@ impl Session {
 
     /// Drain background services. Returns true if anything changed (the UI should repaint).
     pub fn pump(&mut self) -> bool {
+        let started = std::time::Instant::now();
+        let changed = self.pump_frame();
+        self.record_frame_section("Session::pump", started.elapsed());
+        changed
+    }
+
+    fn pump_frame(&mut self) -> bool {
         let lock = self.remote.project.as_ref().and_then(|_| self.project_root()).map(|r| remote::mirror_lock(&r));
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),
             Some(Err(std::sync::TryLockError::Poisoned(e))) => Some(e.into_inner()),
-            Some(Err(std::sync::TryLockError::WouldBlock)) => return false,
+            Some(Err(std::sync::TryLockError::WouldBlock)) => {
+                let started = std::time::Instant::now();
+                let changed = terminal::pump(self);
+                self.record_frame_section("terminal::pump", started.elapsed());
+                return changed;
+            },
             None => None,
         };
         self.remote.mirror_guard_active = true;
         let mut changed = false;
+        let section_started = std::time::Instant::now();
         changed |= self.pump_lsp();
+        self.record_frame_section("LSP pump", section_started.elapsed());
         changed |= completion::pump(self);
         changed |= runs::pump(self);
+        let section_started = std::time::Instant::now();
         changed |= jobs::pump(self);
+        self.record_frame_section("tree refresh", section_started.elapsed());
         changed |= self.approvals.pump();
         changed |= debug::pump(self);
         changed |= database::pump(self);
         changed |= agents::pump(self);
         changed |= ide_server::pump(self);
         changed |= agent_tools::pump(self);
+        let section_started = std::time::Instant::now();
         changed |= terminal::pump(self);
+        self.record_frame_section("terminal::pump", section_started.elapsed());
         changed |= vcs::pump(self);
         changed |= watch::pump(self);
         changed |= testing::pump(self);
@@ -631,7 +650,9 @@ impl Session {
         changed |= misc::pump(self);
         changed |= appearance::pump(self);
         changed |= docker::pump(self);
+        let section_started = std::time::Instant::now();
         changed |= remote::pump(self);
+        self.record_frame_section("remote::pump", section_started.elapsed());
         changed |= http_client::pump(self);
         changed |= python::pump(self);
         changed |= jupyter::pump(self);

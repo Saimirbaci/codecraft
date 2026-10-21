@@ -389,7 +389,13 @@ fn file_badge(name: &str, is_dir: bool, theme: &crate::theme::Theme) -> (&'stati
 }
 
 fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
-    let Some(project) = s.ws.project.clone() else {
+    let started = std::time::Instant::now();
+    project_view_inner(ui, s, st);
+    s.record_frame_section("tree paint", started.elapsed());
+}
+
+fn project_view_inner(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let Some(project) = s.ws.project.as_ref() else {
         ui.label(RichText::new("No project open").color(st.theme.text_muted));
         return;
     };
@@ -557,6 +563,7 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             });
         }
     });
+    let truncated = project.tree.truncated();
     if let Some(p) = &mut s.ws.project {
         if let Some(sel) = select {
             p.selected = Some(sel);
@@ -576,7 +583,7 @@ fn project_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     if let Some((c, params)) = cmd {
         run_command(s, st, c, &params);
     }
-    if project.tree.truncated() {
+    if truncated {
         ui.label(RichText::new("The project tree was truncated (too many files).").color(theme.warning).size(11.0));
     }
 }
@@ -992,6 +999,47 @@ fn notifications_view(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 #[cfg(test)]
 mod tests {
     use super::{find_location, window_panel_id};
+
+    #[test]
+    fn project_paint_preserves_tree_state_and_records_cost() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let mut session = codecraft_engine::Session::new();
+        session.isolate_home(dir.path());
+        let mut project = codecraft_workspace::Project::new(dir.path().to_path_buf());
+        project.tree = codecraft_fs::scan(dir.path(), &Default::default()).unwrap();
+        project.selected = Some(dir.path().join("main.rs"));
+        // A collapsed large mirror still used to clone every hidden node on each paint.
+        let mut nodes = vec![codecraft_fs::Node {
+            name: "project".into(), path: dir.path().to_path_buf(), is_dir: true,
+            parent: None, children: (1..50_001).map(codecraft_fs::NodeId).collect(), depth: 0,
+        }];
+        for index in 1..50_001 {
+            let name = format!("file-{index}.rs");
+            nodes.push(codecraft_fs::Node { path: dir.path().join(&name), name, is_dir: false,
+                parent: Some(codecraft_fs::NodeId(0)), children: Vec::new(), depth: 1 });
+        }
+        project.tree = codecraft_fs::FileTree::from_nodes(nodes, false);
+        project.expanded.clear();
+        let mut cloning = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            std::hint::black_box(project.clone());
+            cloning.push(started.elapsed());
+        }
+        cloning.sort_unstable();
+        session.ws.project = Some(project);
+        let mut state = crate::UiState::new();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(Default::default(), |ui| super::project_view(ui, &mut session, &mut state));
+            output.textures_delta.clear();
+        }
+        assert_eq!(session.ws.project.as_ref().unwrap().selected, Some(dir.path().join("main.rs")));
+        assert!(session.remote.frame_sections.contains_key("tree paint"));
+        eprintln!("50k collapsed project: old clone median={:?}, new tree paint worst={:.3}ms",
+            cloning.get(3), session.remote.frame_sections.get("tree paint").unwrap().worst_ms);
+    }
 
     #[test]
     fn console_locations() {
