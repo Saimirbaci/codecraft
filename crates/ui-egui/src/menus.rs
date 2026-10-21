@@ -61,8 +61,10 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
 
 pub(crate) fn visible(item: &CatalogItem) -> bool {
     // CLion's Valgrind import is implemented (track CL) although the observed install lists it
-    // as a third-party plugin item.
-    !matches!(item.scope, Scope::Out | Scope::Os) || item.id == "run.importValgrindXmlResults"
+    // as a third-party plugin item. File › Remote Development… is implemented (M11 track S, M17)
+    // although the observed install lists it as a plugin item.
+    !matches!(item.scope, Scope::Out | Scope::Os)
+        || matches!(item.id, "run.importValgrindXmlResults" | "file.remoteDevelopment")
 }
 
 fn children<'a>(path: &'a [&'a str]) -> impl Iterator<Item = &'static CatalogItem> + 'a {
@@ -193,6 +195,13 @@ pub fn menu_bar_contents(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_menu_offers_remote_development() {
+        let file = children(&["File"]).any(|c| c.id == "file.remoteDevelopment");
+        assert!(file, "File › Remote Development… is hidden because the catalog scopes it out");
+        assert!(registry().all().iter().any(|s| s.id == "file.remoteDevelopment"));
+    }
 
     #[test]
     fn extra_entries_are_registered_ids_the_catalog_does_not_show_there() {
