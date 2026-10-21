@@ -733,7 +733,7 @@ fn remote_development(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
                 ui.add(TextEdit::singleline(&mut d.path).hint_text("~/projects/app").desired_width(320.0));
                 ui.end_row();
             });
-            if ui.add_enabled(!d.server.is_empty() && !s.remote.busy(), egui::Button::new("Browse Folders…")).clicked()
+            if ui.add_enabled(!d.server.is_empty(), egui::Button::new("Browse Folders…")).clicked()
             {
                 cmds.push(("tools.deployment.browseRemoteHost", json!({"server": d.server, "path": d.path})));
             }
@@ -820,6 +820,21 @@ pub(crate) fn status_widget(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState
             if !s.remote.conflicts.is_empty() && ui.button(format!("Resolve {} Conflict(s)…", s.remote.conflicts.len())).clicked() {
                 run_command(s, st, "remote.project.conflicts", &Value::Null);
                 s.ws.layout.show(codecraft_workspace::ToolWindowId::FileTransfer);
+            }
+            for (kind, language) in [(codecraft_lsp::ServerKind::RustAnalyzer, "rust"), (codecraft_lsp::ServerKind::Clangd, "cpp"), (codecraft_lsp::ServerKind::Python, "python")] {
+                if matches!(s.server_status(kind), codecraft_engine::LspStatus::Unavailable(_)) {
+                    ui.menu_button(format!("{} unavailable", kind.label()), |ui| {
+                        if ui.button("Install on remote host").clicked() {
+                            run_command(s, st, "remote.lsp.install", &json!({"language": language}));
+                        }
+                        if ui.button("Use local server (mirror only)").clicked() {
+                            run_command(s, st, "remote.lsp.localFallback", &json!({"language": language}));
+                        }
+                    });
+                }
+            }
+            if ui.button("Connection diagnostics").clicked() {
+                run_command(s, st, "remote.diagnostics", &Value::Null);
             }
             let connected = project.connection == codecraft_engine::remote::ConnectionState::Connected;
             if ui

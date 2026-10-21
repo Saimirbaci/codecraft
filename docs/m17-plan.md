@@ -11,7 +11,7 @@ worker-thread transfer log. There is no workspace-wide virtual filesystem.
 ## Pass 1 foundation
 
 Opening creates a new project window, remembers the mirror and its deployment marker, exposes
-connection state, and shares a private persistent ControlMaster. Bounded, incremental rsync
+connection state, and maintains private persistent interactive and bulk ControlMasters. Bounded, incremental rsync
 snapshots honor deployment defaults and per-directory `.gitignore` filters. A three-way baseline
 preserves local edits and deletions; checked saves compare the host before advancing the baseline.
 
@@ -21,10 +21,14 @@ preserves local edits and deletions; checked saves compare the host before advan
 
 - Optional `inotifywait -m -r` runs over the shared SSH connection. Events are coalesced to a
   three-second focused / fifteen-second unfocused refresh interval. Missing or failed inotify
-  falls back to one batched rsync metadata probe per interval; a download happens on differences.
-  This intentionally uses rsync rather than a separate find/stat implementation so polling has
-  the download's exact filters, deletion handling and size exclusions. Metadata polling cannot
-  detect an edit preserving both size and timestamp; an explicit refresh still uses checksums.
+  falls back to one SSH-side metadata fingerprint (`find` with default directory pruning and
+  `cksum`), transferring only a fixed-size result. Idle intervals grow 3 → 10 → 30 → 60 seconds,
+  five times slower unfocused; changes, focus regain and editor/terminal/transfer activity reset
+  the backoff. A detected change stays queued while an interactive operation finishes.
+  Polls start only with no operations in flight. `remote.project.autoRefresh` accepts
+  `pollIntervalSecs` (persistent minimum, 0 disables fallback polling). Per-directory gitignore
+  and size limits remain enforced by the download; ignored metadata can trigger extra refreshes.
+  Same-size/same-timestamp changes require inotify or explicit checksum refresh.
 - `remote.project.autoRefresh {paused?}` persists the pause setting in deployment.json. The
   status menu and File Transfer expose it. Disconnect stops detection; Reconnect resumes it.
 - Commands, pump-applied edits, saves, baseline updates and repository-changing Git workers
@@ -54,8 +58,14 @@ External toolchain/registry sources map into a separate read-only source cache a
 on demand with a 50 MiB cap. Single-definition navigation converts UTF-16 columns after fetching.
 Refactoring refuses writes to this cache. Unsaved buffers continue to use didChange; checked
 upload completion repeats didSave so server checks see the new remote disk contents. Rust-analyzer
-runs its configured cargo check/clippy on the host. Missing servers report their remote install
-hint; no installation is performed automatically.
+runs its configured cargo check/clippy on the host. Servers are version-probed on workers with
+cargo/local/usr-local bins on PATH inside the remote project (honoring rust-toolchain.toml). Results are
+cached per host/language until reconnect; a rustup proxy without its component is unavailable.
+Missing servers notify once with install hints and `remote.lsp.install {language}` (explicit,
+logged installation), or `remote.lsp.localFallback {language}` (local mirror, no remote toolchain).
+Clangd installation uses noninteractive host package managers; `command` can override the install
+command for a particular distribution. Unexpected exits back off 2/4/8 seconds, then stop after
+three retries with visible status; reconnect clears the budget.
 
 ### C. Remote terminals and runs
 
@@ -72,15 +82,27 @@ through SSH on Stop, Disconnect, project close and quit. Stop is idempotent so r
 signals do not interrupt its cleanup trap. Console/diagnostic paths map into the mirror; outside
 paths navigate through the read-only source cache.
 
+### First real-host follow-up
+
+Bulk uploads and rsync/scp use a second private ControlMaster socket; PTYs, listings and LSP
+retain the primary socket. Listings and file opens can proceed during background/transfer work.
+Master stderr is retained and surfaced as `multiplexing unavailable: …` in project status.
+Socket paths remain hashed/short; oversized override paths are refused with a reason.
+`remote.diagnostics` and the status menu's Connection diagnostics show both masters, uptime,
+sockets, in-flight work and a bounded invocation history. Worker measurements compare shared
+and fresh RTTs and run `ssh -O check`; results appear in File Transfer. Debug invocation logs
+contain program/duration/result, never command arguments. Socket presence records a sharing
+request, not proof that an individual OpenSSH client attached; the explicit check verifies the
+master at measurement time. QoS remains controlled by the user's SSH configuration.
+
 ## Remaining before calling M17 complete
 
 - Real-host authentication, network loss, ControlPersist, host-side inotify, actual remote language
   servers/cargo and terminal job control need manual verification. All new SSH transport tests use
   executables in temporary fixture directories, never a real host or user SSH/config directory.
 - Remote project root transfer paths retain the existing safe-character restriction.
-- Polling uses rsync metadata, not find-newer/stat; inotify filters default excluded directories,
-  while per-directory `.gitignore` filtering is enforced by the actual download. Ignored events
-  can cause an unnecessary probe/refresh. This is not a remote synchronization daemon.
+- Polling requires Linux/GNU `find -printf` and prunes default excluded directories; per-directory
+  `.gitignore` filtering is enforced by the download. Ignored events can cause extra refreshes.
 - Generic recursive copies and generated populated subtrees (Cargo New/Python-package creation)
   are not fully published by the new empty-folder operation. File/directory type conflicts
   require manual reconciliation; file conflict actions explicitly refuse them without changes. Directory rename/delete conservatively
@@ -101,6 +123,33 @@ paths navigate through the read-only source cache.
 
 All checks use `CARGO_TARGET_DIR=target-m17 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=3`; no cargo
 update, commits, real hosts, user SSH directories or user CodeCraft directories in the fixtures.
+
+### First real-host follow-up gate
+
+- `cargo test -p codecraft-engine --lib remote`: **46 passed**. Includes missing rustup
+  components, project-directory version probes, install output and local fallback, retry limits,
+  no-rsync idle polling, interval/activity/focus backoff, browsing during a slow bulk worker,
+  retained refresh intent during interactive work, distinct sockets, master stderr and shutdown.
+- Remote UI: **7 passed**, including the Connection diagnostics status-menu action.
+- Remote crate: **52 passed, 2 failed** in existing relay/listener tests with Operation not
+  permitted. The new persistent polling setting round-trips and legacy settings keep the default.
+- All-target clippy with `-D warnings` passes for engine, remote and UI. Layers pass. Parity is
+  regenerated and kept (407/407 observed actions); auxiliary install/fallback/diagnostics commands
+  remain engine actions rather than additional observed RustRover menu items.
+- The broad touched-crate run reached **852 passing / 10 failing engine unit tests**. Failures
+  cover denied loopback sockets/process inspection, notebook/font caches and filesystem watching.
+  Agent/debugger integration failures followed; the agent bridge test stalled and the broad run
+  was interrupted after over 360 seconds of test runtime. This is not a green global gate.
+- The full UI run completed **111 passing / 3 failing tests** before interruption after over
+  360 seconds of test runtime in `qa_gallery_m15_ui::gallery_m15` (three other gallery cases
+  passed before the stall). Failures: `debug_sessions_ui`'s exited debugpy adapter,
+  `feedback_ui`'s missing GPU adapter and `http_ui`'s denied loopback socket. The focused remote
+  UI target separately passes all seven tests.
+- All SSH is fake. No real-host authentication, actual socket reuse, aarch64 installation,
+  terminal latency, WAN RTT or throughput measurement was attempted. Socket presence in history
+  is explicitly distinct from a successful `ssh -O check`.
+
+### Previous pass 2 baseline
 
 - Focused remote engine suite: 30/30; LSP: 108/108 (including fake SSH round trip and rejected
   URI traversal); remote UI: 6/6; remote-mirror agent permissions: 2/2. The engine mock-server

@@ -31,7 +31,9 @@ done
 dest="$1"; shift
 [ "$dest" = "unreachable" ] && { echo "ssh: connect to host unreachable port 22: Connection refused" >&2; exit 255; }
 cd "$REMOTE" || exit 1
-HOME="$REMOTE" exec /bin/sh -c "$*"
+# /usr/local/bin belongs to the emulated host, not the test runner. Keep fixture binaries first.
+remote_command=$(printf '%s' "$*" | /usr/bin/sed 's@:/usr/local/bin:@:@g')
+HOME="$REMOTE" exec /bin/sh -c "$remote_command"
 "#;
 
 /// Copies like rsync (no exclusions); dry runs print a canned itemize file.
@@ -97,6 +99,12 @@ pub(crate) fn fake() -> (Fake, Session) {
         "Host web web2\n  HostName web.example\n  User deploy\nHost *.internal\n  User ops\n",
     )
     .unwrap();
+    // Emulate GNU find's Linux metadata format on the macOS test host.
+    if let Some(python) = codecraft_lsp::which("python3") {
+        let find = bin.join("find");
+        std::fs::write(&find, format!("#!{}\nimport os,sys\nif '-printf' not in sys.argv: os.execv('/usr/bin/find',['find']+sys.argv[1:])\nfor root,dirs,files in os.walk('.'):\n dirs[:]=sorted(d for d in dirs if d not in ['.git','target','.codecraft','.idea','node_modules','__pycache__'])\n for name in sorted(files):\n  p=os.path.join(root,name);s=os.stat(p);print(p,s.st_mtime_ns,s.st_size)\n", python.display())).unwrap();
+        std::fs::set_permissions(find, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
     let mut s = Session::new();
     s.lsp_enabled = false;
     s.isolate_home(&home);
@@ -135,7 +143,7 @@ pub(crate) fn pump_until(s: &mut Session, done: impl Fn(&Session) -> bool) {
 }
 
 fn settle(s: &mut Session) {
-    pump_until(s, |s| !s.remote.busy());
+    pump_until(s, |s| !s.remote.operations_pending());
 }
 
 fn run(s: &mut Session, id: &str, p: Value) -> Value {
@@ -900,6 +908,9 @@ fn remote_language_servers_initialize_on_the_host_and_all_restart_on_reconnect()
     let (f, mut s) = fake();
     let mock = r#"
 import sys,json,os
+if '--version' in sys.argv:
+ if sys.argv[0].endswith('clangd') and os.path.exists(os.path.join(os.environ['HOME'],'missing-clangd')): sys.exit(127)
+ print('fixture 1.0');sys.exit(0)
 with open(os.path.join(os.environ['HOME'],'server-starts'),'a') as f: f.write(sys.argv[0]+'\n')
 if sys.argv[0].endswith('clangd') and os.path.exists(os.path.join(os.environ['HOME'],'missing-clangd')):
  print('Install clangd on the remote host',file=sys.stderr);sys.exit(127)
@@ -957,7 +968,7 @@ while True:
     run(&mut s, "remote.project.disconnect", json!({}));
     run(&mut s, "remote.project.reconnect", json!({}));
     pump_until(&mut s, |s| matches!(s.server_status(ServerKind::Python), crate::LspStatus::Ready)
-        && matches!(s.server_status(ServerKind::Clangd), crate::LspStatus::Stopped(message) if message.contains("Install clangd")));
+        && matches!(s.server_status(ServerKind::Clangd), crate::LspStatus::Unavailable(message) if message.contains("clangd")));
     assert!(std::fs::read_to_string(f.remote.join("server-starts")).unwrap().lines().any(|line| line.ends_with("/pyright-langserver")));
     s.shutdown();
 }
@@ -1005,4 +1016,157 @@ fn remote_cargo_check_clippy_and_rebuild_run_in_the_host_directory() {
     for command in ["check", "clippy", "clean", "build"] {
         assert!(commands.lines().any(|line| line.starts_with(&format!("{}|{command}", f.remote.join("proj").display()))), "{commands}");
     }
+}
+
+#[test]
+fn rustup_proxy_is_not_a_remote_server_and_probe_is_cached_until_reconnect() {
+    use codecraft_lsp::ServerKind;
+    let (f, mut s) = fake();
+    let proxy = f.dir.path().join("bin/rust-analyzer");
+    std::fs::write(&proxy, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho \"error: Unknown binary 'rust-analyzer' in official toolchain '1.98.1-aarch64-unknown-linux-gnu'.\" >&2\nexit 1\n", f.remote.join("proxy-calls").display())).unwrap();
+    std::fs::set_permissions(&proxy, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = open_mirror(&f, &mut s);
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+    s.open_file(&root.join("main.rs")).unwrap();
+    s.lsp_enabled = true;
+    s.ensure_server(ServerKind::RustAnalyzer);
+    pump_until(&mut s, |s| matches!(s.server_status(ServerKind::RustAnalyzer), crate::LspStatus::Unavailable(_)));
+    for _ in 0..20 { s.ensure_server(ServerKind::RustAnalyzer); s.pump(); }
+    assert!(!s.servers.contains_key(&ServerKind::RustAnalyzer));
+    assert!(matches!(s.lsp_status, crate::LspStatus::Unavailable(_)));
+    assert_eq!(std::fs::read_to_string(f.remote.join("proxy-calls")).unwrap(), "--version\n");
+    assert!(f.argv().lines().any(|line| line.contains("--version") && line.contains(f.remote.join("proj").to_str().unwrap())));
+    assert!(matches!(s.server_status(ServerKind::RustAnalyzer), crate::LspStatus::Unavailable(message) if message.contains("rustup component add rust-analyzer") && message.contains("remote.lsp.localFallback")));
+    run(&mut s, "remote.project.disconnect", json!({}));
+    run(&mut s, "remote.project.reconnect", json!({}));
+    pump_until(&mut s, |s| matches!(s.server_status(ServerKind::RustAnalyzer), crate::LspStatus::Unavailable(_)) && !s.remote.operations_pending());
+    assert_eq!(std::fs::read_to_string(f.remote.join("proxy-calls")).unwrap().lines().count(), 2);
+    let rustup = f.dir.path().join("bin/rustup");
+    std::fs::write(&rustup, "#!/bin/sh\nprintf 'fixture installed %s\\n' \"$*\"\n").unwrap();
+    std::fs::set_permissions(rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+    run(&mut s, "remote.lsp.install", json!({"language":"rust"}));
+    settle(&mut s);
+    assert!(s.remote.log.last().unwrap().output.contains("fixture installed component add rust-analyzer"));
+    assert_eq!(std::fs::read_to_string(f.remote.join("proxy-calls")).unwrap().lines().count(), 3);
+    // Explicit fallback uses the configured local binary, with no additional SSH launch.
+    s.ws.settings.rust_analyzer_path = Some(proxy);
+    let ssh_calls = f.argv().lines().filter(|line| line.starts_with("ssh ")).count();
+    run(&mut s, "remote.lsp.localFallback", json!({"language":"rust"}));
+    assert!(s.remote.local_lsp.contains(&ServerKind::RustAnalyzer));
+    assert_eq!(f.argv().lines().filter(|line| line.starts_with("ssh ")).count(), ssh_calls);
+    s.shutdown();
+}
+
+#[test]
+fn missing_inotify_uses_short_ssh_fingerprint_and_idle_backoff_without_rsync() {
+    let (f, mut s) = fake();
+    let _root = open_mirror(&f, &mut s);
+    let transfers = f.argv().lines().filter(|line| line.starts_with("rsync ")).count();
+    for interval in [3, 10, 30, 60, 60] {
+        s.remote.last_refresh = Instant::now() - Duration::from_secs(interval);
+        s.pump(); settle(&mut s);
+    }
+    assert_eq!(transfers, f.argv().lines().filter(|line| line.starts_with("rsync ")).count());
+    assert!(f.argv().contains("cksum"));
+    let calls = f.argv().lines().filter(|line| line.contains("cksum")).count();
+    s.remote.last_refresh = Instant::now() - Duration::from_secs(4);
+    s.pump(); settle(&mut s);
+    assert_eq!(calls, f.argv().lines().filter(|line| line.contains("cksum")).count());
+    run(&mut s, "remote.project.autoRefresh", json!({"paused":false, "pollIntervalSecs":0}));
+    s.remote.last_refresh = Instant::now() - Duration::from_secs(600);
+    s.pump(); settle(&mut s);
+    assert_eq!(calls, f.argv().lines().filter(|line| line.contains("cksum")).count());
+}
+
+#[test]
+fn remote_listing_completes_while_bulk_worker_is_running() {
+    let (f, mut s) = fake();
+    let _root = open_mirror(&f, &mut s);
+    let rsync = f.dir.path().join("bin/rsync");
+    let original = std::fs::read_to_string(&rsync).unwrap();
+    std::fs::write(&rsync, original.replace("dry=0; from=\"\"", "[ \"$1\" = --slow ] && { touch \"$REMOTE/bulk-started\"; sleep 2; exit 0; }\ndry=0; from=\"\"")).unwrap();
+    crate::remote::start_op(&mut s, "web", "Slow bulk transfer", vec![crate::remote::Step::run(rsync.to_str().unwrap(), vec!["--slow".into()])], crate::remote::Follow::Nothing, false).unwrap();
+    pump_until(&mut s, |_| f.remote.join("bulk-started").exists());
+    let started = Instant::now();
+    run(&mut s, "remote.host.browse", json!({"server":"web", "path": f.remote.join("proj")}));
+    pump_until(&mut s, |s| !s.remote.browser.loading);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(s.remote.busy());
+    assert!(!s.remote.browser.entries.is_empty());
+    settle(&mut s);
+}
+
+#[test]
+fn failed_master_reports_stderr_and_bulk_socket_is_distinct() {
+    let (f, mut s) = fake();
+    let _root = open_mirror(&f, &mut s);
+    let ssh = f.dir.path().join("bin/ssh");
+    let old = std::fs::read_to_string(&ssh).unwrap();
+    std::fs::write(&ssh, old.replace("while [ $# -gt 0 ]; do", "case \" $* \" in *' -N '*) echo 'Host key verification failed.' >&2; exit 255;; esac\nwhile [ $# -gt 0 ]; do")).unwrap();
+    s.remote.share_connections = true;
+    let sockets = tempfile::Builder::new().prefix("m17-").tempdir_in("/tmp").unwrap();
+    s.remote.control_dir_override = Some(sockets.path().to_path_buf());
+    let server = s.remote.server("web").unwrap();
+    assert_ne!(s.remote.ssh_options("web").control_path, s.remote.bulk_options("web").control_path);
+    s.remote.ensure_master(&server);
+    s.remote.ensure_bulk_master(&server);
+    pump_until(&mut s, |s| s.remote.project.as_ref().and_then(|p| p.error.as_ref()).is_some_and(|error| error.contains("multiplexing unavailable") && error.contains("Host key verification failed")));
+    let report = run(&mut s, "remote.diagnostics", json!({}));
+    assert_eq!(report["report"]["masters"].as_array().unwrap().len(), 2);
+    settle(&mut s);
+    assert!(s.remote.log.last().unwrap().output.contains("shared RTT"));
+    assert!(s.remote.log.last().unwrap().output.contains("fresh RTT"));
+    assert!(!f.argv().contains("-- web:bulk"));
+}
+
+#[test]
+fn crashing_remote_server_backs_off_and_stops_after_three_retries() {
+    use codecraft_lsp::ServerKind;
+    let (f, mut s) = fake();
+    let binary = f.dir.path().join("bin/rust-analyzer");
+    std::fs::write(&binary, "#!/bin/sh\n[ \"$1\" = --version ] && { echo fixture; exit 0; }\necho crashed >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let root = open_mirror(&f, &mut s);
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+    s.open_file(&root.join("main.rs")).unwrap();
+    s.lsp_enabled = true;
+    s.ensure_server(ServerKind::RustAnalyzer);
+    for attempt in 1..=4 {
+        pump_until(&mut s, |s| s.remote.lsp_failures.get(&ServerKind::RustAnalyzer) == Some(&attempt));
+        if attempt <= 3 {
+            let (_, due) = s.remote.lsp_retry.get_mut(&ServerKind::RustAnalyzer).unwrap();
+            assert!(*due > Instant::now());
+            *due = Instant::now();
+        }
+    }
+    assert!(s.remote.lsp_retry.is_empty());
+    assert!(matches!(s.server_status(ServerKind::RustAnalyzer), crate::LspStatus::Stopped(message) if message.contains("Retry limit reached")));
+}
+
+#[test]
+fn shutting_down_slow_fake_master_does_not_wait_on_ui_thread() {
+    let (f, mut s) = fake();
+    let ssh = f.dir.path().join("bin/ssh");
+    let old = std::fs::read_to_string(&ssh).unwrap();
+    std::fs::write(&ssh, old.replace("while [ $# -gt 0 ]; do", "case \" $* \" in *' -O exit '*) sleep 2; exit 0;; *' -N '*) sleep 5; exit 0;; esac\nwhile [ $# -gt 0 ]; do")).unwrap();
+    let sockets = tempfile::Builder::new().prefix("m17-").tempdir_in("/tmp").unwrap();
+    s.remote.control_dir_override = Some(sockets.path().to_path_buf());
+    s.remote.share_connections = true;
+    let server = s.remote.server("web").unwrap();
+    s.remote.ensure_master(&server);
+    let started = Instant::now();
+    crate::remote::shutdown(&mut s);
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
+#[test]
+fn detected_change_is_retained_when_interactive_work_starts_during_probe() {
+    let (f, mut s) = fake();
+    let root = open_mirror(&f, &mut s);
+    std::fs::write(f.remote.join("proj/a.txt"), "changed while browsing").unwrap();
+    s.remote.last_refresh = Instant::now() - Duration::from_secs(4);
+    s.pump();
+    crate::remote::start_op(&mut s, "web", "Interactive operation", vec![crate::remote::Step::run("sh", vec!["-c".into(), "sleep 0.4".into()])], crate::remote::Follow::Nothing, false).unwrap();
+    settle(&mut s);
+    assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "changed while browsing");
 }

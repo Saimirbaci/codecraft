@@ -25,6 +25,9 @@ use crate::{CommandError, Session};
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
+        spec("remote.lsp.install", "Install Remote Language Server", None, "{language?: rust|cpp|python, command?: explicit host install command}", Context::Global, has_project, |s, p| crate::remote::lsp_action(s, p, false)),
+        spec("remote.lsp.localFallback", "Use Local Language Server", None, "{language?: rust|cpp|python} — analyse the mirror without the remote toolchain", Context::Global, has_project, |s, p| crate::remote::lsp_action(s, p, true)),
+        simple("remote.diagnostics", "Connection diagnostics", has_project, crate::remote::diagnostics),
         // ------------------------------------------------ Tools › Deployment
         spec(
             "tools.deployment.uploadToDefaultServer",
@@ -157,16 +160,20 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             remote_development,
         ),
         simple("remote.project.status", "Remote Project: Status", has_project, |s, _| {
-            Ok(json!({"project": s.remote.project, "autoRefresh": s.remote.auto_refresh, "refreshMode": s.remote.auto_refresh_mode(), "conflicts": s.remote.conflicts}))
+            Ok(json!({"project": s.remote.project, "autoRefresh": s.remote.auto_refresh, "refreshMode": s.remote.auto_refresh_mode(), "pollIntervalSecs": s.remote.poll_interval_secs, "conflicts": s.remote.conflicts}))
         }),
         spec("remote.project.autoRefresh", "Remote Project: Automatic Refresh", None,
-            "{paused?: bool} — toggle or set the persistent automatic refresh setting", Context::Global, has_project, |s, p| {
+            "{paused?: bool, pollIntervalSecs?: u64 (0 disables fallback polling)} — toggle or set the persistent automatic refresh setting", Context::Global, has_project, |s, p| {
                 let root = deployment::project_root(s)?;
                 let mut cfg = deployment::load(&root).map_err(failed)?;
-                cfg.pause_remote_refresh = p.get("paused").and_then(Value::as_bool).unwrap_or(s.remote.auto_refresh);
+                cfg.pause_remote_refresh = p.get("paused").and_then(Value::as_bool).unwrap_or(if p.get("pollIntervalSecs").is_some() { cfg.pause_remote_refresh } else { s.remote.auto_refresh });
+                if let Some(interval) = p.get("pollIntervalSecs").and_then(Value::as_u64) {
+                    cfg.remote_poll_interval_secs = Some(interval.min(3600));
+                    s.remote.poll_interval_secs = interval.min(3600);
+                }
                 deployment::save(&root, &cfg).map_err(failed)?;
                 s.remote.auto_refresh = !cfg.pause_remote_refresh;
-                Ok(json!({"paused": cfg.pause_remote_refresh}))
+                Ok(json!({"paused": cfg.pause_remote_refresh, "pollIntervalSecs": s.remote.poll_interval_secs}))
             }),
         spec("remote.project.conflicts", "Remote Project: Resolve Conflicts", None,
             "{} — list and show conflicts", Context::Global, has_project, |s, _| {
@@ -1056,9 +1063,9 @@ fn project_refresh_steps(
         return Err(CommandError::Failed("Remote projects require rsync locally and on the server for bounded, incremental sync; install rsync and retry".into()));
     }
     let (incoming, baseline) = crate::remote::mirror_paths(local)?;
-    let opts = s.remote.ssh_options(&server.name);
+    let opts = s.remote.bulk_options(&server.name);
     let args = rcmd::project_download_args(server, &opts, &incoming, remote).map_err(failed)?;
-    s.remote.ensure_master(server);
+    s.remote.ensure_bulk_master(server);
     Ok(vec![
         Step::Mkdir(incoming.clone()),
         Step::run(&s.remote.programs.rsync, args),
@@ -1083,6 +1090,8 @@ fn disconnect_project(s: &mut Session, _: &Value) -> CmdResult {
 }
 
 fn reconnect_project(s: &mut Session, _: &Value) -> CmdResult {
+    let host = s.remote.project.as_ref().ok_or_else(|| failed("no remote project"))?.server.clone();
+    crate::remote::disconnect_master(s, &host);
     let project =
         s.remote.project.as_mut().ok_or_else(|| CommandError::Failed("this is not a remote project".into()))?;
     project.connection = crate::remote::ConnectionState::Connecting;
@@ -1092,7 +1101,7 @@ fn reconnect_project(s: &mut Session, _: &Value) -> CmdResult {
         let opts = s.remote.ssh_options(&server);
         s.remote.ensure_master(&host);
         let directory = s.remote.project.as_ref().map(|p| p.remote.as_str()).unwrap_or(".");
-        let script = codecraft_remote::quote::sh_c(&format!("cd {} && printf 'CODECRAFT-ROOT=' && pwd -P", codecraft_remote::quote::quote_path(directory)));
+        let script = codecraft_remote::quote::sh_c(&format!("cd {} || exit 1; printf 'CODECRAFT-ROOT=' && pwd -P && printf 'CODECRAFT-FINGERPRINT='; {}", codecraft_remote::quote::quote_path(directory), crate::remote::fingerprint_script(".")));
         let args = rcmd::ssh_exec(&host, &opts, &script).map_err(failed)?;
         let operation = start_op(
             s,

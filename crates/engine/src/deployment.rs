@@ -93,8 +93,8 @@ pub(crate) fn upload_file_op(
     verb: &str,
 ) -> Result<u64, CommandError> {
     let server = server(s, server_name)?;
-    let opts = s.remote.ssh_options(server_name);
-    s.remote.ensure_master(&server);
+    let opts = s.remote.bulk_options(server_name);
+    s.remote.ensure_bulk_master(&server);
     if s.remote.project.is_some() {
         if s.remote.busy() {
             return Err(failed("wait for the current remote operation before uploading"));
@@ -163,8 +163,8 @@ pub(crate) fn folder_steps(
     remote: &str,
     excludes: &[String],
 ) -> Result<Vec<Step>, CommandError> {
-    let opts = s.remote.ssh_options(&server.name);
-    s.remote.ensure_master(server);
+    let opts = s.remote.bulk_options(&server.name);
+    s.remote.ensure_bulk_master(server);
     let mut steps = Vec::new();
     match direction {
         Direction::Upload => {
@@ -216,8 +216,8 @@ pub(crate) fn upload(s: &mut Session, server_name: &str, local: &Path) -> Result
 pub(crate) fn upload_files(s: &mut Session, server_name: &str, files: &[PathBuf]) -> Result<u64, CommandError> {
     let (root, dep) = deployment_of(s, server_name)?;
     let server = server(s, server_name)?;
-    let opts = s.remote.ssh_options(server_name);
-    s.remote.ensure_master(&server);
+    let opts = s.remote.bulk_options(server_name);
+    s.remote.ensure_bulk_master(&server);
     let mut steps = Vec::new();
     for f in files {
         let Ok((remote, _)) = mapped(&root, &dep, f) else { continue };
@@ -294,8 +294,8 @@ pub(crate) fn sync_preview(s: &mut Session, server_name: &str, local: &Path) -> 
             true,
         );
     }
-    let opts = s.remote.ssh_options(server_name);
-    s.remote.ensure_master(&server);
+    let opts = s.remote.bulk_options(server_name);
+    s.remote.ensure_bulk_master(&server);
     let mk = rcmd::ssh_exec(&server, &opts, &rcmd::mkdir_command(&remote)).map_err(failed)?;
     let mut steps = vec![Step::run(&opts.program, mk)];
     for (direction, delete) in [(Direction::Upload, cfg.delete_target_items), (Direction::Download, false)] {
@@ -325,8 +325,8 @@ pub(crate) fn sync_preview(s: &mut Session, server_name: &str, local: &Path) -> 
 pub(crate) fn apply_sync(s: &mut Session) -> Result<u64, CommandError> {
     let preview = s.remote.sync_preview.clone().ok_or_else(|| CommandError::Failed("no sync preview".into()))?;
     let server = server(s, &preview.server)?;
-    let opts = s.remote.ssh_options(&preview.server);
-    s.remote.ensure_master(&server);
+    let opts = s.remote.bulk_options(&preview.server);
+    s.remote.ensure_bulk_master(&server);
     let cache = s
         .remote
         .cache_dir()

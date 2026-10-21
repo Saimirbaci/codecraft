@@ -45,6 +45,8 @@ pub struct DeploymentConfig {
     pub auto_upload: bool,
     /// Pause automatic remote-project refresh without pausing checked saves.
     pub pause_remote_refresh: bool,
+    /// Minimum fallback polling interval; zero disables polling (inotify remains available).
+    pub remote_poll_interval_secs: Option<u64>,
     /// Sync deletes target items whose source is gone (Options… "Delete target items when
     /// source ones do not exist").
     pub delete_target_items: bool,
@@ -283,5 +285,20 @@ mod tests {
         assert_eq!(rel_path(Path::new("/p"), Path::new("/p/a/b.rs")).as_deref(), Some("a/b.rs"));
         assert_eq!(rel_path(Path::new("/p"), Path::new("/p")).as_deref(), Some(""));
         assert_eq!(rel_path(Path::new("/p"), Path::new("/q/a")), None);
+    }
+}
+
+#[cfg(test)]
+mod polling_settings_tests {
+    use super::*;
+
+    #[test]
+    fn old_deployments_keep_default_polling_and_zero_round_trips_as_disabled() {
+        let mut cfg = DeploymentConfig::parse("{}").unwrap();
+        assert_eq!(cfg.remote_poll_interval_secs, None);
+        cfg.remote_poll_interval_secs = Some(0);
+        assert_eq!(DeploymentConfig::parse(&cfg.to_json().unwrap()).unwrap().remote_poll_interval_secs, Some(0));
+        cfg.remote_poll_interval_secs = Some(30);
+        assert_eq!(DeploymentConfig::parse(&cfg.to_json().unwrap()).unwrap().remote_poll_interval_secs, Some(30));
     }
 }

@@ -470,6 +470,9 @@ impl Session {
 
     /// Run a command by id. Never panics: a panic inside a command is caught and reported.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value, CommandError> {
+        if self.remote.project.is_some() && (id.starts_with("editor.") || matches!(id, "terminal.sendText" | "terminal.sendKey" | "terminal.paste" | "file.open")) {
+            self.remote.note_activity();
+        }
         let lock = (!self.remote.mirror_guard_active && self.remote.project.is_some())
             .then(|| self.project_root().map(|r| remote::mirror_lock(&r))).flatten();
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {

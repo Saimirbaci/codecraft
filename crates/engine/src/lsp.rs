@@ -224,7 +224,7 @@ impl Session {
         self.servers.get(&kind).map(|l| l.name.as_str())
     }
 
-    fn set_status(&mut self, kind: ServerKind, status: LspStatus) {
+    pub(crate) fn set_status(&mut self, kind: ServerKind, status: LspStatus) {
         if kind == ServerKind::RustAnalyzer {
             self.lsp_status = status.clone();
         }
@@ -265,13 +265,15 @@ impl Session {
 
     fn start_server(&mut self, kind: ServerKind, root: &Path) {
         if let Some(old) = self.servers.remove(&kind) {
-            old.shutdown();
+            std::thread::spawn(move || old.shutdown());
         }
         if !self.lsp_enabled {
             return;
         }
         if self.remote.project.is_some() && self.remote.absolute_root.is_none() { return; }
-        let command = if self.remote.project.is_some() {
+        if self.remote.project.is_some() && !crate::remote::prepare_lsp(self, kind) { return; }
+        let remote_lsp = self.remote.project.is_some() && !self.remote.local_lsp.contains(&kind);
+        let command = if remote_lsp {
             Some(codecraft_lsp::ServerCommand { program: PathBuf::from(kind.label()), args: Vec::new(), name: format!("{} (SSH)", kind.label()) })
         } else if kind == ServerKind::RustAnalyzer {
             self.ws
@@ -336,7 +338,7 @@ impl Session {
             _ => {}
         }
         let name = command.name.clone();
-        let spawned = if self.remote.project.is_some() {
+        let spawned = if remote_lsp {
             match crate::remote::lsp_transport(self, kind, &mut config) {
                 Ok(mapper) => LspClient::spawn_mapped(config, mapper),
                 Err(error) => { self.set_status(kind, LspStatus::Unavailable(error.to_string())); return; }
@@ -406,6 +408,8 @@ impl Session {
             None => self.servers.keys().copied().collect(),
         };
         for k in kinds {
+            self.remote.lsp_retry.remove(&k);
+            self.remote.lsp_failures.remove(&k);
             self.server_status.remove(&k);
             for od in self.ws.docs_mut() {
                 if server_kind(od.language) == Some(k) {
@@ -826,6 +830,15 @@ impl Session {
             ServerEvent::Exited { code } => {
                 let detail = self.servers.get(&kind).map(|server| server.client.stderr_tail().join("\n")).unwrap_or_default();
                 let msg = format!("{name} stopped (exit code {}): {detail}", code.map_or("unknown".into(), |c| c.to_string()));
+                let msg = if self.remote.project.is_some() {
+                    let failures = self.remote.lsp_failures.entry(kind).or_default();
+                    *failures = failures.saturating_add(1);
+                    if *failures <= 3 {
+                        let delay = 2_u64.saturating_pow(*failures);
+                        self.remote.lsp_retry.insert(kind, (*failures, std::time::Instant::now() + std::time::Duration::from_secs(delay)));
+                        format!("{msg}. Retry {failures}/3 in {delay}s")
+                    } else { format!("{msg}. Retry limit reached; Reconnect or restart the server manually") }
+                } else { msg };
                 self.servers.remove(&kind);
                 self.server_memory_mb.remove(&kind);
                 self.set_status(kind, LspStatus::Stopped(msg.clone()));

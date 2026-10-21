@@ -3,8 +3,8 @@
 //!
 //! Everything that talks to a server runs the system `ssh`/`rsync`/`scp` on a worker thread as an
 //! *operation* (a list of [`Step`]s); [`pump`] applies the result (log entry, listing, opening a
-//! downloaded file, a sync preview…). Each server gets one ControlMaster connection (`ssh -M -N`)
-//! that the other invocations share; masters are closed on [`shutdown`].
+//! downloaded file, a sync preview…). Each server has separate interactive and bulk ControlMaster
+//! connections (`ssh -N`); masters are closed on [`shutdown`].
 //!
 //! Test seams: [`RemoteState::home_override`] (instead of `$CODECRAFT_HOME`),
 //! [`RemoteState::ssh_config_override`] (instead of `~/.ssh/config`) and [`Programs`] (fake
@@ -193,6 +193,8 @@ pub enum TestStatus {
 #[derive(Clone, Debug)]
 pub(crate) enum Step {
     /// Run a program; stdin from a file, stdout to a file (else captured).
+    Output(String),
+    Measure { label: String, program: String, args: Vec<String> },
     Run {
         program: String,
         args: Vec<String>,
@@ -247,6 +249,8 @@ pub(crate) enum Follow {
     /// Reload open documents that changed on disk.
     Reload,
     AutoProbe,
+    LspProbe { server: String, generation: u64, kind: codecraft_lsp::ServerKind },
+    LspInstall { kind: codecraft_lsp::ServerKind },
     Listing {
         server: String,
         path: String,
@@ -314,6 +318,7 @@ struct Master {
     started: Instant,
     server: SshServer,
     options: SshOptions,
+    stderr: Arc<std::sync::Mutex<String>>,
 }
 
 /// Everything track S keeps in the [`Session`].
@@ -323,7 +328,7 @@ pub struct RemoteState {
     /// Instead of `~/.ssh/config`.
     pub ssh_config_override: Option<PathBuf>,
     pub programs: Programs,
-    /// Share one connection per server (ControlMaster); tests turn it off.
+    /// Separate interactive and bulk shared connections per server; fixtures can turn sharing off.
     pub share_connections: bool,
     /// Directory for control sockets (default: a short path under `/tmp`, macOS limits socket
     /// paths to 104 bytes).
@@ -342,6 +347,14 @@ pub struct RemoteState {
     pub(crate) mirror_guard_active: bool,
     pub(crate) protected: Arc<std::sync::Mutex<std::collections::BTreeSet<PathBuf>>>,
     pub auto_refresh: bool,
+    pub poll_interval_secs: u64,
+    poll_idle: usize,
+    poll_signature: Option<String>,
+    refresh_pending: bool,
+    pub(crate) lsp_tools: HashMap<(String, codecraft_lsp::ServerKind), Option<String>>,
+    pub(crate) lsp_retry: HashMap<codecraft_lsp::ServerKind, (u32, Instant)>,
+    pub(crate) lsp_failures: HashMap<codecraft_lsp::ServerKind, u32>,
+    pub(crate) local_lsp: std::collections::HashSet<codecraft_lsp::ServerKind>,
     pub(crate) absolute_root: Option<String>,
     pub window_focused: bool,
     pub(crate) last_refresh: Instant,
@@ -357,6 +370,7 @@ pub struct RemoteState {
     masters: HashMap<String, Master>,
     control_generation: HashMap<String, u64>,
     ops: HashMap<u64, (Follow, bool)>,
+    op_hosts: HashMap<u64, String>,
     tx: Sender<OpDone>,
     rx: Receiver<OpDone>,
     cancel: Arc<AtomicBool>,
@@ -392,6 +406,14 @@ impl Default for RemoteState {
             mirror_guard_active: false,
             protected: Default::default(),
             auto_refresh: true,
+            poll_interval_secs: 3,
+            poll_idle: 0,
+            poll_signature: None,
+            refresh_pending: false,
+            lsp_tools: HashMap::new(),
+            local_lsp: Default::default(),
+            lsp_retry: Default::default(),
+            lsp_failures: Default::default(),
             absolute_root: None,
             window_focused: true,
             last_refresh: Instant::now(),
@@ -405,6 +427,7 @@ impl Default for RemoteState {
             masters: HashMap::new(),
             control_generation: HashMap::new(),
             ops: HashMap::new(),
+            op_hosts: HashMap::new(),
             tx,
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
@@ -448,11 +471,25 @@ impl RemoteState {
     pub fn auto_refresh_mode(&self) -> &'static str {
         if !self.auto_refresh { "paused" }
         else if self.watcher.as_ref().is_some_and(|(_, streaming, _)| streaming.load(Ordering::Acquire)) { "inotify" }
+        else if self.poll_interval_secs == 0 { "polling disabled" }
         else { "polling" }
     }
 
+    /// Postpone background polling while the user is interacting with the project.
+    pub fn note_activity(&mut self) {
+        self.poll_idle = 0;
+        self.last_refresh = Instant::now();
+    }
+
+    pub fn set_window_focused(&mut self, focused: bool) {
+        if focused && !self.window_focused { self.note_activity(); }
+        self.window_focused = focused;
+    }
+
+    pub fn operations_pending(&self) -> bool { !self.ops.is_empty() || !self.tree_queue.is_empty() }
+
     pub fn busy(&self) -> bool {
-        !self.ops.is_empty() || !self.tree_queue.is_empty()
+        self.ops.values().any(|(follow, _)| !matches!(follow, Follow::AutoProbe | Follow::LspProbe { .. })) || !self.tree_queue.is_empty()
     }
 
     /// `$CODECRAFT_HOME`, else `~/.codecraft`.
@@ -577,21 +614,38 @@ impl RemoteState {
         SshOptions { program: self.programs.ssh.clone(), control_path, connect_timeout: Some(15) }
     }
 
+    pub(crate) fn bulk_options(&self, server: &str) -> SshOptions {
+        self.ssh_options(&format!("{server}\0bulk"))
+    }
+
+    pub(crate) fn ensure_bulk_master(&mut self, server: &SshServer) {
+        self.ensure_master_role(server, true);
+    }
+
     /// Start the server's control master if it is not running (non-blocking).
     pub(crate) fn ensure_master(&mut self, server: &SshServer) {
+        self.ensure_master_role(server, false);
+    }
+
+    fn ensure_master_role(&mut self, server: &SshServer, bulk: bool) {
+        let key = if bulk { format!("{}\0bulk", server.name) } else { server.name.clone() };
         if !self.share_connections {
             return;
         }
-        if let Some(m) = self.masters.get_mut(&server.name) {
+        if let Some(m) = self.masters.get_mut(&key) {
             let alive = m.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
             let persistent = m.options.control_path.as_ref().is_some_and(|p| Path::new(p).exists());
             if alive || persistent || m.started.elapsed() < MASTER_RETRY {
                 return;
             }
         }
-        let opts = self.ssh_options(&server.name);
+        let opts = self.ssh_options(&key);
         let Some(dir) = self.control_dir() else { return };
-        if create_private_dir(&dir).is_err() {
+        let setup = if opts.control_path.as_ref().is_some_and(|path| path.len() >= 100) {
+            Err("control socket path exceeds the macOS socket limit; use a shorter control directory".to_owned())
+        } else { create_private_dir(&dir).map_err(|error| error.to_string()) };
+        if let Err(reason) = setup {
+            self.masters.insert(key, Master { child: None, started: Instant::now(), server: server.clone(), options: opts, stderr: Arc::new(std::sync::Mutex::new(reason)) });
             return;
         }
         if let Some(p) = &opts.control_path {
@@ -599,17 +653,27 @@ impl RemoteState {
             let _ = std::fs::remove_file(p);
         }
         let Ok(Some(args)) = rcmd::ssh_master(server, &opts) else { return };
-        let child = Command::new(resolve_program(&self.programs.ssh))
+        let stderr = Arc::new(std::sync::Mutex::new(String::new()));
+        let mut child = Command::new(resolve_program(&self.programs.ssh))
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| log::warn!("ssh master for {}: {e}", server.name))
+            .map_err(|e| {
+                *stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = e.to_string();
+                log::warn!("ssh master for {}: {e}", server.name);
+            })
             .ok();
+        if let Some(pipe) = child.as_mut().and_then(|child| child.stderr.take()) {
+            let output = stderr.clone();
+            std::thread::spawn(move || {
+                *output.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = String::from_utf8_lossy(&read_capped(pipe, MAX_STDERR)).into_owned();
+            });
+        }
         self.masters.insert(
-            server.name.clone(),
-            Master { child, started: Instant::now(), server: server.clone(), options: opts },
+            key,
+            Master { child, started: Instant::now(), server: server.clone(), options: opts, stderr },
         );
     }
 
@@ -742,6 +806,7 @@ fn run_process(
     stdout_to: Option<&Path>,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
+    let started = Instant::now();
     let mut cmd = Command::new(resolve_program(program));
     cmd.args(args).stderr(Stdio::piped());
     match stdin {
@@ -771,6 +836,16 @@ fn run_process(
     let stdout = out.and_then(|h| h.join().ok()).unwrap_or_default();
     let stderr = err.and_then(|h| h.join().ok()).unwrap_or_default();
     let stdout = String::from_utf8_lossy(&stdout).into_owned();
+    let control_path = args.iter().find_map(|arg| arg.strip_prefix("ControlPath=").map(str::to_owned)).or_else(|| {
+        args.iter().find_map(|arg| arg.split_whitespace().find_map(|word| word.strip_prefix("ControlPath=").map(|word| word.trim_matches('\'').to_owned())))
+    });
+    let name = Path::new(program).file_name().and_then(|name| name.to_str()).unwrap_or("process");
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    log::debug!(target: "codecraft_engine::remote", "{name}: {duration_ms} ms; control socket configured={}; success={}", control_path.is_some(), status.success());
+    let mut history = invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    history.push_back(Invocation { host: INVOCATION_HOST.with(|host| host.borrow().clone()), program: name.into(), duration_ms, socket_present: control_path.as_ref().is_some_and(|path| Path::new(path).exists()), control_path, success: status.success() });
+    while history.len() > 100 { history.pop_front(); }
+    drop(history);
     if status.success() {
         return Ok(stdout);
     }
@@ -795,6 +870,12 @@ fn run_steps(steps: &[Step], cancel: &AtomicBool) -> Result<Vec<String>, String>
             return Err("cancelled".into());
         }
         match step {
+            Step::Output(text) => outputs.push(text.clone()),
+            Step::Measure { label, program, args } => {
+                let started = Instant::now();
+                let result = run_process(program, args, None, None, cancel);
+                outputs.push(format!("{label}: {} ms; {}", started.elapsed().as_millis(), match result { Ok(output) => format!("ok {output}"), Err(error) => error }));
+            }
             Step::Run { program, args, stdin, stdout_to } => {
                 outputs.push(run_process(program, args, stdin.as_deref(), stdout_to.as_deref(), cancel)?);
             }
@@ -908,17 +989,24 @@ pub(crate) fn start_op(
     logged: bool,
 ) -> Result<u64, CommandError> {
     let r = &mut s.remote;
+    if logged || matches!(follow, Follow::Listing { .. } | Follow::OpenRemote { .. }) {
+        r.poll_idle = 0;
+        r.last_refresh = Instant::now();
+    }
     let id = r.next();
     let tx = r.tx.clone();
     let cancel = r.cancel.clone();
+    let host = server.to_owned();
     std::thread::Builder::new()
         .name(format!("remote-{id}"))
         .spawn(move || {
+            INVOCATION_HOST.with(|current| *current.borrow_mut() = host);
             let result = run_steps(&steps, &cancel);
             let _ = tx.send(OpDone { id, result });
         })
         .map_err(|e| CommandError::Failed(format!("cannot start a worker thread: {e}")))?;
     r.ops.insert(id, (follow, logged));
+    r.op_hosts.insert(id, server.to_owned());
     let summary = summary.into();
     if logged {
         r.push_log(TransferEntry {
@@ -945,6 +1033,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     while let Ok(done) = s.remote.rx.try_recv() {
         changed = true;
         let Some((follow, logged)) = s.remote.ops.remove(&done.id) else { continue };
+        s.remote.op_hosts.remove(&done.id);
         if logged && let Some(e) = s.remote.log.iter_mut().find(|e| e.id == done.id) {
             match &done.result {
                 Ok(outs) => {
@@ -1011,9 +1100,37 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             changed = true;
         }
     }
+    for key in s.remote.masters.keys().cloned().collect::<Vec<_>>() {
+        if let Some(master) = s.remote.masters.get_mut(&key)
+            && master.child.as_mut().is_none_or(|child| matches!(child.try_wait(), Ok(Some(_)))) {
+                let reason = master.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                if !reason.is_empty() && let Some(project) = &mut s.remote.project {
+                    let warning = format!("multiplexing unavailable: {}", tail(&reason, 3));
+                    if project.error.as_ref() != Some(&warning) { project.error = Some(warning); changed = true; }
+                }
+        }
+    }
+    if s.remote.project.as_ref().is_some_and(|project| project.connection == ConnectionState::Connected) {
+        let due = s.remote.lsp_retry.iter().filter(|(_, (_, at))| *at <= Instant::now()).map(|(kind, _)| *kind).collect::<Vec<_>>();
+        for kind in due {
+            s.remote.lsp_retry.remove(&kind);
+            s.server_status.remove(&kind);
+            s.ensure_server(kind);
+        }
+    }
     maintain_watcher(s);
-    let interval = Duration::from_secs(if s.remote.window_focused { 3 } else { 15 });
-    if s.remote.auto_refresh && !s.remote.busy()
+    // A listing may have started while a probe was in flight. Retain the detected change
+    // until the interactive operation finishes instead of dropping a busy refresh request.
+    if s.remote.auto_refresh && s.remote.refresh_pending && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
+        && s.remote.project.as_ref().is_some_and(|project| project.connection == ConnectionState::Connected) {
+        if let Err(error) = s.execute("remote.syncFromRemote", &Value::Null) {
+            s.remote.refresh_pending = false;
+            s.notify(NotificationLevel::Error, "Automatic remote refresh", error.to_string());
+        }
+        return true;
+    }
+    let interval = if s.remote.auto_refresh_mode() == "inotify" { Duration::from_secs(if s.remote.window_focused { 3 } else { 15 }) } else { poll_interval(s.remote.poll_interval_secs, s.remote.poll_idle, s.remote.window_focused) };
+    if s.remote.auto_refresh && (s.remote.poll_interval_secs != 0 || s.remote.auto_refresh_mode() == "inotify") && s.remote.ops.is_empty() && s.remote.tree_queue.is_empty()
         && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected && (p.pending_uploads.is_empty() || !s.remote.conflicts.is_empty()))
         && s.remote.last_refresh.elapsed() >= interval
     {
@@ -1040,14 +1157,32 @@ pub(crate) fn protect_buffers(s: &Session) {
 fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) {
     match follow {
         Follow::Nothing => {}
+        Follow::LspProbe { server, generation, kind } => {
+            if s.remote.project.as_ref().is_none_or(|project| project.server != server) || s.remote.control_generation.get(&server).copied().unwrap_or(0) != generation { return; }
+            let tool = result.ok().and_then(|out| out.last().cloned()).and_then(|out| out.lines().last().map(str::to_owned)).filter(|tool| matches!(tool.as_str(), "rust-analyzer" | "clangd" | "basedpyright-langserver" | "pyright-langserver"));
+            s.remote.lsp_tools.insert((server.clone(), kind), tool.clone());
+            if tool.is_some() { s.restart_server(Some(kind)); }
+            else {
+                let message = format!("{} is not installed on {server}. Install: {}. Run remote.lsp.install, or remote.lsp.localFallback to analyse the local mirror without the remote toolchain.", kind.label(), remote_install_hint(kind));
+                s.set_status(kind, crate::LspStatus::Unavailable(message.clone()));
+                s.notify(NotificationLevel::Warning, &format!("{} is not installed on {server}", kind.label()), message);
+            }
+        }
+        Follow::LspInstall { kind } => {
+            if result.is_ok() {
+                if let Some(project) = &s.remote.project { s.remote.lsp_tools.remove(&(project.server.clone(), kind)); }
+                s.restart_server(Some(kind));
+            }
+        }
         Follow::AutoProbe => match result {
-            Ok(output) if output.iter().any(|s| !s.trim().is_empty()) => {
-                if let Err(error) = s.execute("remote.syncFromRemote", &Value::Null) {
-                    s.notify(NotificationLevel::Error, "Automatic remote refresh", error.to_string());
-                }
+            Ok(output) => {
+                let signature = output.join("\n").trim().to_owned();
+                let changed = s.remote.poll_signature.as_ref().is_some_and(|old| old != &signature);
+                s.remote.poll_signature = Some(signature);
+                s.remote.poll_idle = if changed { 0 } else { s.remote.poll_idle.saturating_add(1).min(3) };
+                s.remote.refresh_pending |= changed;
             }
             Err(error) => if let Some(project) = &mut s.remote.project { project.connection = ConnectionState::Failed; project.error = Some(error); },
-            _ => {}
         },
         Follow::ProjectUpload { local } => {
             let conflict = result.as_ref().err().is_some_and(|error| error.contains("Remote file changed"));
@@ -1183,6 +1318,11 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
         Follow::Test { server } => {
             let absolute = result.as_ref().ok().and_then(|outputs| outputs.iter().flat_map(|s| s.lines())
                 .find_map(|line| line.strip_prefix("CODECRAFT-ROOT=").filter(|p| p.starts_with('/')).map(str::to_owned)));
+            if let Some(signature) = result.as_ref().ok().and_then(|outputs| outputs.iter().flat_map(|out| out.lines()).find_map(|line| line.strip_prefix("CODECRAFT-FINGERPRINT="))) {
+                s.remote.poll_signature = Some(signature.to_owned());
+                s.remote.poll_idle = 0;
+                s.remote.last_refresh = Instant::now();
+            }
             let restart = absolute.is_some() && s.remote.project.as_ref().is_some_and(|p| p.server == server);
             if restart { s.remote.absolute_root = absolute; }
             let status = match result {
@@ -1220,6 +1360,7 @@ fn finish(s: &mut Session, follow: Follow, result: Result<Vec<String>, String>) 
         }
         Follow::RemoteDev { server, remote, local, open_window } => match result {
             Ok(outputs) => {
+                s.remote.refresh_pending = false;
                 if let Some(report) = outputs.last().and_then(|t| serde_json::from_str::<codecraft_remote::mirror::Refresh>(t).ok()) {
                     let paths: Vec<_> = report.changed.iter().map(|p| local.join(p)).collect();
                     s.remote_files_changed(&paths);
@@ -1351,29 +1492,31 @@ pub(crate) fn shutdown(s: &mut Session) {
     s.remote.cancel.store(true, Ordering::Relaxed);
     let masters: Vec<Master> = s.remote.masters.drain().map(|(_, m)| m).collect();
     for mut m in masters {
-        // Ask the master to exit (removes its socket), then make sure it is gone.
-        if let Ok(Some(args)) = rcmd::ssh_exit_master(&m.server, &m.options)
-            && let Ok(mut c) = Command::new(resolve_program(&m.options.program))
-                .args(&args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-        {
-            let deadline = Instant::now() + Duration::from_millis(500);
-            while Instant::now() < deadline && matches!(c.try_wait(), Ok(None)) {
-                std::thread::sleep(Duration::from_millis(10));
+        std::thread::spawn(move || {
+            // Ask the master to exit (removes its socket), then make sure it is gone.
+            if let Ok(Some(args)) = rcmd::ssh_exit_master(&m.server, &m.options)
+                && let Ok(mut c) = Command::new(resolve_program(&m.options.program))
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+            {
+                let deadline = Instant::now() + Duration::from_millis(500);
+                while Instant::now() < deadline && matches!(c.try_wait(), Ok(None)) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let _ = c.kill();
+                let _ = c.wait();
             }
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        if let Some(c) = &mut m.child {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-        if let Some(p) = &m.options.control_path {
-            let _ = std::fs::remove_file(p);
-        }
+            if let Some(c) = &mut m.child {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+            if let Some(p) = &m.options.control_path {
+                let _ = std::fs::remove_file(p);
+            }
+        });
     }
 }
 
@@ -1403,7 +1546,9 @@ pub(crate) fn project_opened(s: &mut Session, root: &Path) {
     s.remote.absolute_root = None;
     s.remote.last_refresh = Instant::now();
     let Ok(cfg) = crate::deployment::load(root) else { return };
+    s.remote.refresh_pending = false;
     s.remote.auto_refresh = !cfg.pause_remote_refresh;
+    s.remote.poll_interval_secs = cfg.remote_poll_interval_secs.unwrap_or(3);
     let Some(name) = cfg.remote_development.clone() else { return };
     let Some(remote) = cfg.server(&name).and_then(|d| d.remote_for("")) else { return };
     let destination = s
@@ -1438,7 +1583,13 @@ pub(crate) fn project_opened(s: &mut Session, root: &Path) {
 
 /// Close this host's master off the UI thread. Other hosts remain usable.
 pub(crate) fn disconnect_master(s: &mut Session, server: &str) {
+    s.remote.lsp_tools.retain(|(host, _), _| host != server);
+    s.remote.local_lsp.clear();
+    s.remote.lsp_retry.clear();
+    s.remote.lsp_failures.clear();
+    s.remote.poll_idle = 0;
     stop_watcher(&mut s.remote);
+    if !server.ends_with("\0bulk") { disconnect_master(s, &format!("{server}\0bulk")); }
     let generation = s.remote.control_generation.entry(server.into()).or_default();
     *generation = generation.saturating_add(1);
     if let Some(mut master) = s.remote.masters.remove(server) {
@@ -1561,12 +1712,9 @@ pub(crate) fn lsp_transport(s: &mut Session, kind: codecraft_lsp::ServerKind, co
         codecraft_lsp::ServerKind::Python => "basedpyright-langserver",
         _ => return Err(failed("this language has no SSH language transport yet")),
     };
-    let launch = if kind == codecraft_lsp::ServerKind::Python {
-        "if command -v basedpyright-langserver >/dev/null 2>&1; then exec basedpyright-langserver --stdio; elif command -v pyright-langserver >/dev/null 2>&1; then exec pyright-langserver --stdio; else echo 'Install basedpyright or pyright on the remote host' >&2; exit 127; fi".to_owned()
-    } else {
-        format!("command -v {tool} >/dev/null 2>&1 || {{ echo {} >&2; exit 127; }}; exec {tool}", codecraft_remote::quote::sh_quote(&format!("Missing {tool} on the remote host: {}", kind.install_hint())))
-    };
-    let script = format!("{}{}", codecraft_remote::target_script::prelude(&remote, &[]).map_err(failed)?, launch);
+    let tool = s.remote.lsp_tools.get(&(project.server.clone(), kind)).and_then(|tool| tool.as_deref()).unwrap_or(tool);
+    let launch = format!("exec {tool}{}", if kind == codecraft_lsp::ServerKind::Python { " --stdio" } else { "" });
+    let script = format!("{}{LSP_PATH}{}", codecraft_remote::target_script::prelude(&remote, &[]).map_err(failed)?, launch);
     config.command = resolve_program(&opts.program);
     config.args = rcmd::ssh_exec(&server, &opts, &codecraft_remote::quote::sh_c(&script)).map_err(failed)?;
     config.args.insert(0, "-T".into());
@@ -1673,18 +1821,24 @@ pub(crate) fn map_output_line(s: &Session, line: &str) -> String {
     }
 }
 
-// rsync's metadata probe is one batched SSH command and honors exactly the download's
-// per-directory .gitignore rules, size cap and exclusions (unlike a bare find/stat walk).
+fn poll_interval(base: u64, idle: usize, focused: bool) -> Duration {
+    let seconds = [3_u64, 10, 30, 60].get(idle).copied().unwrap_or(60).max(base);
+    Duration::from_secs(if focused { seconds } else { seconds.saturating_mul(5) })
+}
+
+// One remote-side fingerprint: only a fixed-size count/checksum crosses the network.
+pub(crate) fn fingerprint_script(remote: &str) -> String {
+    let prune = codecraft_remote::deploy::DEFAULT_EXCLUDES.iter().map(|name| format!("-name {}", codecraft_remote::quote::sh_quote(name))).collect::<Vec<_>>().join(" -o ");
+    format!("cd {} || exit 1; find . \\( {prune} \\) -prune -o -type f -printf '%p %T@ %s\\n' | cksum", codecraft_remote::quote::quote_path(remote))
+}
+
 fn auto_probe(s: &mut Session) -> Result<(), CommandError> {
     let project = s.remote.project.clone().ok_or_else(|| failed("project closed"))?;
-    let root = s.project_root().ok_or_else(|| failed("project closed"))?;
     let server = crate::deployment::server(s, &project.server)?;
     let options = s.remote.ssh_options(&project.server);
-    let (incoming, _) = mirror_paths(&root)?;
-    let mut args = rcmd::project_download_args(&server, &options, &incoming, &project.remote).map_err(failed)?;
-    args.retain(|a| a != "--checksum");
-    args.insert(0, "--dry-run".into());
-    start_op(s, &project.server, "Probe remote project changes", vec![Step::run(&s.remote.programs.rsync.clone(), args)], Follow::AutoProbe, false)?;
+    let script = fingerprint_script(&project.remote);
+    let args = rcmd::ssh_exec(&server, &options, &codecraft_remote::quote::sh_c(&script)).map_err(failed)?;
+    start_op(s, &project.server, "Probe remote project changes", vec![Step::run(&options.program, args)], Follow::AutoProbe, false)?;
     Ok(())
 }
 
@@ -1693,7 +1847,7 @@ fn stop_watcher(remote: &mut RemoteState) {
 }
 
 /// inotify is an optional optimization. A failed/missing watcher leaves the bounded,
-/// ignore-aware rsync poll active; both transports reuse the project's ControlMaster.
+/// metadata fingerprint poll active; both transports reuse the project's ControlMaster.
 fn maintain_watcher(s: &mut Session) {
     let connected = s.remote.auto_refresh && s.remote.project.as_ref().is_some_and(|p| p.connection == ConnectionState::Connected);
     if !connected { stop_watcher(&mut s.remote); return; }
@@ -1845,5 +1999,167 @@ mod pending_upload_tests {
         assert!(load_uploads(dir.path()).unwrap_err().contains("outside"));
         std::fs::write(dir.path().join(PENDING_UPLOADS), r#"["src/a.rs"]"#).unwrap();
         assert!(load_uploads(dir.path()).unwrap().contains(&dir.path().join("src/a.rs")));
+    }
+}
+
+const LSP_PATH: &str = "export PATH=\"$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH\"; ";
+
+/// Returns true only after a successful version probe, cached until reconnect.
+pub(crate) fn prepare_lsp(s: &mut Session, kind: codecraft_lsp::ServerKind) -> bool {
+    let Some(project) = s.remote.project.clone() else { return true };
+    if s.remote.local_lsp.contains(&kind) { return true; }
+    if !matches!(kind, codecraft_lsp::ServerKind::RustAnalyzer | codecraft_lsp::ServerKind::Clangd | codecraft_lsp::ServerKind::Python) {
+        s.set_status(kind, crate::LspStatus::Unavailable("SSH transport is not implemented for this language server".into()));
+        return false;
+    }
+    let key = (project.server.clone(), kind);
+    if let Some(tool) = s.remote.lsp_tools.get(&key) { return tool.is_some(); }
+    if s.remote.ops.values().any(|(follow, _)| matches!(follow, Follow::LspProbe { kind: k, .. } if *k == kind)) { return false; }
+    let Some(server) = s.remote.server(&project.server) else { return false };
+    let opts = s.remote.ssh_options(&project.server);
+    let script = if kind == codecraft_lsp::ServerKind::Python {
+        format!("{LSP_PATH}if basedpyright-langserver --version >/dev/null 2>&1; then echo basedpyright-langserver; elif pyright-langserver --version >/dev/null 2>&1; then echo pyright-langserver; else exit 127; fi")
+    } else {
+        format!("{LSP_PATH}{} --version >/dev/null 2>&1 && echo {}", kind.label(), kind.label())
+    };
+    let root = s.remote.absolute_root.as_deref().unwrap_or(&project.remote);
+    let prefix = match codecraft_remote::target_script::prelude(root, &[]) {
+        Ok(prefix) => prefix,
+        Err(error) => { s.set_status(kind, crate::LspStatus::Unavailable(error.to_string())); return false; }
+    };
+    let script = format!("{prefix}{script}");
+    let Ok(args) = rcmd::ssh_exec(&server, &opts, &codecraft_remote::quote::sh_c(&script)) else { return false };
+    let generation = s.remote.control_generation.get(&project.server).copied().unwrap_or(0);
+    s.set_status(kind, crate::LspStatus::Starting);
+    if let Err(error) = start_op(s, &project.server, "Probe remote language server", vec![Step::run(&opts.program, args)], Follow::LspProbe { server: project.server.clone(), generation, kind }, false) {
+        s.set_status(kind, crate::LspStatus::Stopped(error.to_string()));
+        s.notify(NotificationLevel::Error, "Remote language server probe", error.to_string());
+    }
+    false
+}
+
+pub(crate) fn lsp_action(s: &mut Session, params: &Value, local: bool) -> crate::commands::CmdResult {
+    let kind = match params.get("language").and_then(Value::as_str).unwrap_or("rust") {
+        "rust" => codecraft_lsp::ServerKind::RustAnalyzer,
+        "cpp" | "clangd" => codecraft_lsp::ServerKind::Clangd,
+        "python" => codecraft_lsp::ServerKind::Python,
+        _ => return Err(failed("language must be rust, cpp or python")),
+    };
+    let project = s.remote.project.clone().ok_or_else(|| failed("no remote project"))?;
+    if local {
+        s.remote.local_lsp.insert(kind);
+        s.notify(NotificationLevel::Warning, "Local language server fallback", "Analysing the local mirror without the remote toolchain.");
+        s.restart_server(Some(kind));
+        return Ok(Value::Null);
+    }
+    s.remote.local_lsp.remove(&kind);
+    let server = crate::deployment::server(s, &project.server)?;
+    let opts = s.remote.ssh_options(&project.server);
+    let install = match kind {
+        codecraft_lsp::ServerKind::RustAnalyzer => "rustup component add rust-analyzer",
+        codecraft_lsp::ServerKind::Clangd => "if command -v apt-get >/dev/null; then sudo -n apt-get install -y clangd; elif command -v dnf >/dev/null; then sudo -n dnf install -y clang-tools-extra; elif command -v pacman >/dev/null; then sudo -n pacman -S --noconfirm clang; else echo 'Install clangd with the host package manager' >&2; exit 1; fi",
+        _ => "python3 -m pip install --user basedpyright",
+    };
+    let install = params.get("command").and_then(Value::as_str).unwrap_or(install);
+    let root = s.remote.absolute_root.as_deref().unwrap_or(&project.remote);
+    let prefix = codecraft_remote::target_script::prelude(root, &[]).map_err(failed)?;
+    let args = rcmd::ssh_exec(&server, &opts, &codecraft_remote::quote::sh_c(&format!("{prefix}{LSP_PATH}{install}"))).map_err(failed)?;
+    let id = start_op(s, &project.server, "Install remote language server", vec![Step::run(&opts.program, args)], Follow::LspInstall { kind }, true)?;
+    s.ws.layout.show(ToolWindowId::FileTransfer);
+    Ok(serde_json::json!({"operation": id}))
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Invocation {
+    host: String,
+    program: String,
+    duration_ms: u64,
+    control_path: Option<String>,
+    socket_present: bool,
+    success: bool,
+}
+
+thread_local! {
+    static INVOCATION_HOST: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn invocations() -> &'static std::sync::Mutex<std::collections::VecDeque<Invocation>> {
+    static HISTORY: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Invocation>>> = std::sync::OnceLock::new();
+    HISTORY.get_or_init(Default::default)
+}
+
+pub(crate) fn diagnostics(s: &mut Session, _: &Value) -> crate::commands::CmdResult {
+    let project = s.remote.project.clone().ok_or_else(|| failed("no remote project"))?;
+    let server = crate::deployment::server(s, &project.server)?;
+    let opts = s.remote.ssh_options(&project.server);
+    let masters: Vec<_> = [project.server.clone(), format!("{}\0bulk", project.server)].iter().map(|key| {
+        match s.remote.masters.get_mut(key) {
+            Some(master) => {
+                let alive = master.child.as_mut().is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+                let reason = master.stderr.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                serde_json::json!({"host": project.server, "bulk": key.ends_with("\0bulk"), "running": alive,
+                    "uptimeMs": master.started.elapsed().as_millis(), "socket": master.options.control_path,
+                    "socketPresent": master.options.control_path.as_ref().is_some_and(|path| Path::new(path).exists()),
+                    "error": if reason.is_empty() { None } else { Some(format!("multiplexing unavailable: {reason}")) }})
+            }
+            None => serde_json::json!({"bulk": key.ends_with("\0bulk"), "running": false}),
+        }
+    }).collect();
+    let history = invocations().lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().filter(|entry| entry.host == project.server).cloned().collect::<Vec<_>>();
+    let report = serde_json::json!({"host": project.server, "masters": masters, "inFlight": s.remote.ops.iter().filter(|(id, _)| s.remote.op_hosts.get(id).is_some_and(|host| host == &project.server)).map(|(id, (follow, _))| serde_json::json!({"id": id, "kind": format!("{follow:?}").split_whitespace().next().unwrap_or("operation")})).collect::<Vec<_>>(), "invocations": history});
+    let mut check = rcmd::ssh_exit_master(&server, &opts).map_err(failed)?.unwrap_or_default();
+    if let Some(index) = check.iter().position(|arg| arg == "exit") && let Some(arg) = check.get_mut(index) { *arg = "check".into(); }
+    let shared = rcmd::ssh_exec(&server, &opts, "true").map_err(failed)?;
+    let mut fresh = opts.clone(); fresh.control_path = None;
+    let fresh_args = rcmd::ssh_exec(&server, &fresh, "true").map_err(failed)?;
+    // Timing lives in invocation history; run check last so a missing master doesn't skip RTTs.
+    let mut steps = vec![Step::Output(serde_json::to_string_pretty(&report).map_err(|error| failed(error.to_string()))?),
+        Step::Measure { label: "shared RTT".into(), program: opts.program.clone(), args: shared },
+        Step::Measure { label: "fresh RTT".into(), program: opts.program.clone(), args: fresh_args }];
+    if !check.is_empty() { steps.push(Step::Measure { label: "master check".into(), program: opts.program.clone(), args: check }); }
+    let id = start_op(s, &project.server, "Connection diagnostics (shared RTT, fresh RTT, master check)", steps, Follow::Nothing, true)?;
+    s.ws.layout.show(ToolWindowId::FileTransfer);
+    Ok(serde_json::json!({"operation": id, "report": report}))
+}
+
+#[cfg(test)]
+mod real_host_regressions {
+    use super::*;
+    #[test]
+    fn user_activity_and_focus_reset_idle_polling() {
+        let mut remote = RemoteState::default();
+        remote.set_window_focused(false);
+        remote.poll_idle = 3;
+        remote.set_window_focused(true);
+        assert_eq!(remote.poll_idle, 0);
+        remote.poll_idle = 3;
+        remote.note_activity();
+        assert_eq!(remote.poll_idle, 0);
+        assert!(remote.last_refresh.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bulk_socket_cannot_alias_another_servers_primary_socket() {
+        let remote = RemoteState::default();
+        assert_ne!(remote.bulk_options("web").control_path, remote.ssh_options("web:bulk").control_path);
+    }
+
+    #[test]
+    fn idle_intervals_are_bounded_and_unfocused_polling_is_slower() {
+        for (idle, seconds) in [(0, 3), (1, 10), (2, 30), (3, 60), (100, 60)] {
+            assert_eq!(poll_interval(3, idle, true), Duration::from_secs(seconds));
+            assert_eq!(poll_interval(3, idle, false), Duration::from_secs(seconds * 5));
+        }
+        assert_eq!(poll_interval(120, 0, true), Duration::from_secs(120));
+    }
+}
+
+fn remote_install_hint(kind: codecraft_lsp::ServerKind) -> &'static str {
+    match kind {
+        codecraft_lsp::ServerKind::RustAnalyzer => "rustup component add rust-analyzer",
+        codecraft_lsp::ServerKind::Clangd => "install clangd with the host package manager (apt: clangd; dnf: clang-tools-extra)",
+        codecraft_lsp::ServerKind::Python => "python3 -m pip install --user basedpyright (or npm install -g pyright)",
+        _ => kind.install_hint(),
     }
 }

@@ -259,3 +259,23 @@ fn remote_conflict_controls_compare_and_take_incoming_and_pause_refresh() {
     h.get_by_label("Pause Auto-refresh").click(); h.run_steps(2);
     assert!(!h.state().session.remote.auto_refresh);
 }
+
+#[test]
+fn remote_status_menu_opens_connection_diagnostics_with_fake_ssh() {
+    let f = fake();
+    let mut h = harness(&f);
+    h.state_mut().session.remote.project = Some(codecraft_engine::remote::RemoteProject {
+        server: "web".into(), destination: "web".into(), remote: "~/project".into(),
+        connection: codecraft_engine::remote::ConnectionState::Cached, error: None,
+        pending_uploads: Default::default(),
+    });
+    h.run_steps(3);
+    h.get_by_label("SSH web · cached").click();
+    h.run_steps(2);
+    h.get_by_label("Connection diagnostics").click();
+    settle(&mut h, "diagnostics", |app| !app.session.remote.operations_pending());
+    assert!(h.state().session.ws.layout.is_visible(ToolWindowId::FileTransfer));
+    let entry = h.state().session.remote.log.last().unwrap();
+    assert!(entry.output.contains("shared RTT"));
+    assert!(entry.output.contains("fresh RTT"));
+}

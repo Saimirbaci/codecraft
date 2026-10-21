@@ -1656,7 +1656,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
 69. Remote projects retain pass 1's new-window opening, persistent marker/status, private
     ControlMaster, bounded ignore-aware rsync snapshots, conflict-preserving baseline and checked
     save uploads. Pass 2 adds automatic detection: optional inotify over SSH, throttled to 3 s
-    focused / 15 s unfocused; a batched rsync metadata probe when inotify is absent or fails.
+    focused / 15 s unfocused; a short SSH-side metadata fingerprint when inotify is absent or fails,
+    with idle backoff (3/10/30/60 seconds), slower unfocused polling and a persistent interval/disable setting.
     `remote.project.autoRefresh` persists pause/resume and is exposed in the status menu and
     File Transfer. Disconnect stops detection; Reconnect resumes it. Engine commands, pump,
     saves and repository-changing Git workers coordinate mirror writes; dirty buffers stay
@@ -1676,7 +1677,12 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     text left intact. Canonical roots resolve on reconnect; open-buffer server kinds restart.
     External sources fetch into a bounded read-only cache; refactoring refuses cache writes.
     Checked save completion sends didSave after upload; rust-analyzer's check/clippy runs remotely.
-    Missing tools provide the host install hint.
+    Version probes reject broken proxies, cache per host/language until reconnect and extend PATH.
+    Missing tools notify once with install/fallback commands. Explicit installs log output; local
+    fallback clearly analyses the mirror without the remote toolchain. Crashes retry at 2/4/8 s,
+    then stop after three retries. Bulk traffic uses its own master/socket; browsing stays concurrent.
+    Master failures expose stderr. `remote.diagnostics` reports masters, sockets, work and bounded
+    invocation timings, compares shared/fresh RTTs and checks the master with `ssh -O check`.
 
     New/restored shell terminals use SSH with a tty in the remote directory; session identity,
     titles/output and mapped OSC-7 cwd are retained. `terminal.newRemote` is explicit; ordinary
@@ -1687,8 +1693,8 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Disconnect, close and quit. Stop is idempotent so repeat signals cannot cut off cleanup.
     Console/compiler paths map back to the mirror or the external source cache.
 
-    Remaining (M17 is **not complete**): fallback polling uses rsync metadata rather than
-    find-newer/stat to share download filters; same-size/same-timestamp edits require inotify
+    Remaining (M17 is **not complete**): fallback polling uses GNU find metadata with default
+    directory pruning; same-size/same-timestamp edits require inotify
     or an explicit checksum refresh. Per-directory .gitignore is enforced by rsync rather than
     the inotify event filter, so ignored events can trigger extra work. Generic recursive copy
     and generated populated subtrees still need full publication; directory operations refuse
@@ -1706,19 +1712,16 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     Remote Debug/Profile target defaults do not replace track 5 debugger/profiler validation.
     Track 6 still owns ssh -G / Match, askpass, automatic reconnect and robust retained queues.
 
-    Verification: 30 focused engine, 108 LSP, 6 remote UI and 2 remote-mirror permission checks
-    pass; all-target clippy, layers and regenerated parity pass. Focused engine/fake-SSH
-    regressions cover automatic detection and dirty/clean
-    editors, pause/reconnect, tree checks and refusals, conflict actions, source fetching, default
-    targets, terminal restore and remote child cleanup. The LSP transport round trip uses a fake
-    ssh/mock server with initialize, didOpen, diagnostics, definition and rename; pure cases
-    include encoded/non-ASCII paths and Windows separators. No real SSH host, credentials,
-    ~/.ssh or ~/.codecraft is used by these fixtures. Full touched-crate testing is attempted,
-    but existing socket/process-inspection, watcher/font-cache and notebook failures prevent a
-    green global gate here; agent-service integration tests time out because the sandbox refuses
-    loopback listeners. The full UI run timed out in debug_sessions_ui under a 360-second limit.
-    The new local Claude shell-resume regression passes; the existing combined terminal history/
-    Claude test cannot identify its running child through process inspection here. Remote has
-    50 passes and two blocked loopback tests; xtask has 34 passes and its existing iconutil failure.
-    Actual authentication, ControlPersist, remote inotify/LSP/cargo, tty job control, forwarding
-    and debugger breakpoint/stop remain unverified on a real host. See docs/m17-plan.md.
+    Follow-up verification: 46 focused remote engine and 7 remote UI tests pass, including proxy
+    rejection, toolchain-aware probing, installation/fallback, bounded retries, adaptive polling,
+    concurrent browsing, retained refresh intent, socket separation and master stderr/shutdown.
+    All-target clippy for engine/remote/UI, layers and regenerated parity pass. Remote has 52
+    passes and two existing loopback tests blocked with Operation not permitted. The broad engine
+    run has 852 passing and 10 failing unit tests (socket/process permissions, watcher and notebook
+    caches); later agent/debugger integrations fail or stall, so it was interrupted after over
+    360 seconds of test runtime. Full UI completed 111 passes and 3 failures (debug adapter,
+    GPU adapter, loopback socket), then was interrupted after over 360 seconds in the QA gallery.
+    The full gate remains non-green. All SSH fixtures are fake;
+    real-host authentication, actual socket reuse, aarch64 installation and WAN latency/throughput
+    require a host rerun. Earlier LSP mapping, local Claude restore and mirror-permission checks
+    remain recorded in docs/m17-plan.md.
