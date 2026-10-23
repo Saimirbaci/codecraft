@@ -56,10 +56,11 @@ command (build, codesign, hdiutil, notarytool, …) without running anything. Ou
 Cargo target directory (`CARGO_TARGET_DIR` when set). Developer ID signing, notarization, the
 entitlements and the CI/release workflows are described in [release.md](release.md).
 
-- **macOS bundle.** `Contents/MacOS/codecraft`, `Contents/Info.plist` (bundle id
+- **macOS bundle.** `Contents/MacOS/codecraft-launcher` (background stable entry point),
+  `Contents/Resources/factory/CodeCraft.app` (full foreground app), `Contents/Info.plist` (bundle id
   `dev.codecraft.CodeCraft`, version from the workspace, `LSMinimumSystemVersion` 11.0,
   `NSHighResolutionCapable`), `Contents/Resources/CodeCraft.icns` and `PkgInfo`. The icon is our
-  own, drawn by `xtask/src/icon.rs` at every icon-set size and converted with `iconutil`. The
+  own, drawn by `xtask/src/icon.rs` at every icon-set size and encoded as native ICNS in Rust. The
   bundle is signed inside-out with the hardened runtime and
   `apps/codecraft/macos/CodeCraft.entitlements`, ad hoc by default (`--timestamp=none`), or with
   `--sign <identity>` / `CODECRAFT_SIGN_IDENTITY` (a Developer ID, with a secure timestamp), then
@@ -103,3 +104,15 @@ cargo xtask catalog
 
 Read `docs/clean-room.md` first. Remove anything personal from the capture (open project
 names appear in the Window menu).
+
+### Version payload development
+
+`cargo xtask bundle --version-payload /tmp/codecraft-payload --layout-only` inspects a payload
+layout; omit `--layout-only` to build and sign it ad hoc. The payload has no launcher and can be
+passed to `codecraft_selfupdate::Store::stage` with version/source provenance. Never stage over
+an existing version; promotion changes pointers atomically. Use an isolated `CODECRAFT_HOME`
+and `CODECRAFT_FACTORY_DIR` for launcher development. `CODECRAFT_BOOT_TIMEOUT` and
+`CODECRAFT_HEALTHY_AFTER` configure seconds (45 and 20 by default). App health is reported
+from main-window UI progress, with the file write on a worker. Help › Versions & Rollback…
+exposes commands whose disk work runs on engine workers. Rollback restores bounded configuration
+snapshots; versions are selected for the next launch. See [m18-plan.md](m18-plan.md).

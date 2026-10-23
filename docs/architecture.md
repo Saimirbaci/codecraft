@@ -9,10 +9,12 @@
 | L0 | `codecraft-fs` | Ignore-aware `FileTree` scan, IntelliJ-style `fuzzy_match`/`rank`, `find_in_files`, safe text I/O (binary detection, size caps, atomic writes). |
 | L0 | `codecraft-lsp` | Thread-based LSP client: framing, request/response correlation, handshake + queueing, auto-answers to common server requests, rust-analyzer discovery, `file://` URIs. |
 | L0 | `codecraft-cargo` | `cargo metadata` model, `CargoInvocation` builder, process runner streaming `RunEvent`s (lines, compiler messages, libtest results, exit), rustfmt. |
+| L0 | `codecraft-selfupdate` | Standalone version store, atomic pointers, configuration snapshots, health handshake and rollback selection (std + serde only). |
 | L1 | `codecraft-workspace` | Pure data: `Workspace` (project, documents, editors/tabs, problems, run tabs, find results, navigation history, layout, notifications, settings). |
 | L2 | `codecraft-engine` | `Session` (workspace + popups + services), the command `registry`, the observed menu `catalog`. |
 | L3 | `codecraft-ui-egui` | The egui shell: menu bar from the catalog, editor widget, tool windows, popups, keymap. |
 | app | `codecraft` | Desktop binary (eframe). |
+| app | `codecraft-launcher` | Stable, background boot supervisor; release entry point with an independent factory payload. |
 | app | `codecraft-cli` | Headless binary over the same engine. |
 
 `cargo xtask layers` fails if a crate depends on its own layer or a higher one, or if anything

@@ -29,11 +29,11 @@ cargo xtask notarize --profile <keychain-profile> [--dmg <path> | --app <path>] 
 
 ### What `bundle` does
 
-1. `cargo build -p codecraft [--release]`, then lays out `CodeCraft.app` (see
+1. `cargo build -p codecraft -p codecraft-launcher [--release]`, then lays out `CodeCraft.app` (see
    docs/development.md › Packaging).
 2. Signs nested code inside-out: every nested bundle (`.framework`, `.app`, `.xpc`, `.appex`,
-   `.bundle`, `.plugin`) and Mach-O file other than the main executable, deepest first. Today there
-   are none (CodeCraft is one binary); the walk keeps signing correct when helpers are added.
+   `.bundle`, `.plugin`) and Mach-O file other than the main executable, deepest first. The full factory app is
+   signed before the outer stable launcher bundle.
    `--deep` is never used for signing (Apple recommends signing each piece explicitly).
 3. Signs the bundle with the hardened runtime and the entitlements:
    `codesign --force --sign <identity> --timestamp --options runtime --entitlements apps/codecraft/macos/CodeCraft.entitlements CodeCraft.app`
@@ -292,3 +292,20 @@ AARCH64_UNKNOWN_LINUX_MUSL_OPENSSL_DIR=$(brew --prefix openssl@3) \
 The script must be named `clang`: the `cc` crate guesses the compiler family from the name and
 otherwise may take the stand-in for MSVC. The result says nothing about linking or running;
 CI's Linux job does that. (2026-10-16: the whole workspace, all targets, checks clean this way.)
+
+## Self-update payloads (M18 pass 1)
+
+Release bundles use `Contents/MacOS/codecraft-launcher` as `CFBundleExecutable` with
+`LSUIElement=true`; the foreground factory app lives in
+`Contents/Resources/factory/CodeCraft.app`. The launcher starts its executable directly and
+supervises health without adding a foreground Dock icon. Self-update never rebuilds the
+installed launcher. `cargo xtask bundle --version-payload <dir> [--release]` creates only an
+ad-hoc signed foreground payload for staging (use no `--sign` for local self-updates).
+`--layout-only` works for both modes. Developer `cargo run -p codecraft` stays direct.
+
+Linux packages install the launcher as `bin/codecraft` and the factory as
+`bin/factory/codecraft`; Windows packages use `codecraft.exe` and `factory/codecraft.exe`.
+The stable entry point accepts `--factory`, `--version-id <id>`, `--status`, and `--rollback`.
+`--factory` ignores version pointers and metadata; on macOS run
+`/Applications/CodeCraft.app/Contents/MacOS/codecraft-launcher --factory`.
+See [m18-plan.md](m18-plan.md) for health deadlines, rollback, tests and manual GUI checks.

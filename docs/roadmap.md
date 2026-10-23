@@ -24,6 +24,7 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 | M16 Remote targets, live analysis, safer SQL, shippable builds | Run, debug, test and profile on SSH and Docker targets; analysis while typing in every language; bind parameters and editable console results; Developer ID signing, notarization and CI workflows. Plan: `docs/m16-plan.md` | ✅ (2026-10-16) |
 
 | M17 SSH remote projects | Pass 2: automatic detection/conflict UI, checked tree operations, SSH language services/path mapping/read-only sources, remote terminal/run defaults and process-group Stop. Plan: `docs/m17-plan.md`; remaining limits: gaps item 69 | Partial — fake-transport regressions; global test gate has sandbox failures; tracks 5–6 and documented sync/terminal limits remain |
+| M18 self-update | Pass 1: versions, stable launcher/factory, health supervision and rollback; pass 2: managed source/build/Accept flow. Plan: `docs/m18-plan.md` | Partial — safety core implemented; GUI identity/signing verification and pass 2 remain |
 
 ## Current focus
 

@@ -1741,3 +1741,15 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     real-host authentication, actual socket reuse, aarch64 installation and WAN latency/throughput
     require a host rerun. Earlier LSP mapping, local Claude restore and mirror-permission checks
     remain recorded in docs/m17-plan.md.
+
+
+## M18 — self-update safety (pass 1, partial)
+
+70. The standalone version store, stable release launcher/factory payload, atomic pointers,
+    health supervision, automatic fallback, bounded configuration snapshots, running-version
+    GC protection, logging and Help › Versions & Rollback… are implemented in pass 1.
+    Managed source acquisition, toolchain preflight, background builds and Accept/restart/session
+    handoff remain for pass 2. Native Dock/menu identity, Gatekeeper/TCC and ad-hoc rebuilt app
+    behavior require manual macOS verification. Shift-launch detection is omitted; use
+    `codecraft-launcher --factory` independently of corrupt pointer/metadata files.
+    Design and exact validation: [m18-plan.md](m18-plan.md).
