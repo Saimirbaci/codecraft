@@ -217,7 +217,8 @@ fn no_command_panics_with_popups_open() {
         "navigate.lineColumn",
         "edit.find.find",
     ] {
-        // The previous round may have closed every tab.
+        // The previous round may have closed every tab or saved hostile text over the file.
+        std::fs::write(&file, "struct A;\nimpl A { fn f(&self) {} }\n").unwrap();
         s.execute("file.open", &json!({ "path": file })).unwrap();
         s.execute(opener, &Value::Null).unwrap();
         check_all(&mut s, tmp.path(), opener);

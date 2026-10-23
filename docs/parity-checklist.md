@@ -463,7 +463,7 @@ Core = the editor/navigation/build/run/LSP surface of the current milestones. La
 Registered engine/CLI actions supplementing File › Remote Development (not additional observed menu items).
 
 - [x] Remote Project: Status — `remote.project.status`: {}
-- [x] Remote Project: Automatic Refresh — `remote.project.autoRefresh`: {paused?: bool, pollIntervalSecs?: u64 (0 disables fallback polling)} — toggle or set the persistent automatic refresh setting
+- [x] Remote Project: Automatic Refresh — `remote.project.autoRefresh`: {paused?: bool, pollIntervalSecs?: u64 (0 disables fallback polling), helpersDisabled?: bool} — toggle or set the persistent automatic refresh setting
 - [x] Remote Project: Resolve Conflicts — `remote.project.conflicts`: {} — list and show conflicts
 - [x] Remote Project: Resolve Conflict — `remote.project.resolve`: {path: relative path, action: compare|keepMine|takeRemote|merge}
 - [x] Remote Project: Disconnect — `remote.project.disconnect`: {} — pause automatic uploads and close this project's shared SSH connection; saved edits remain local
