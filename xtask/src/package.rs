@@ -37,6 +37,7 @@ pub fn version() -> &'static str {
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub release: bool,
+    pub version_payload: Option<PathBuf>,
     /// Lay out the package without building or signing (CI dry runs, tests).
     pub layout_only: bool,
     /// Print the build, signing and packaging commands without running them or writing files.
@@ -61,6 +62,7 @@ impl Options {
                 inline.clone().or_else(|| it.next().cloned()).ok_or_else(|| format!("{name} needs a value"))
             };
             match flag {
+                "--version-payload" => o.version_payload = Some(PathBuf::from(value("--version-payload")?)),
                 "--release" => o.release = true,
                 "--layout-only" => o.layout_only = true,
                 "--dry-run" => o.dry_run = true,
@@ -223,7 +225,7 @@ impl AppLayout {
 }
 
 /// Lay out `CodeCraft.app` in `bundle_dir` from a built binary (`None`: lay out without one) and
-/// an `.icns` file (`None`: generate the icon set and convert it with `iconutil` when present).
+/// an `.icns` file (`None`: generate a native ICNS container directly in Rust).
 /// Replaces an existing bundle.
 pub fn write_app_bundle(bundle_dir: &Path, binary: Option<&Path>, icns: Option<&Path>) -> Result<AppLayout, String> {
     let layout = AppLayout::new(bundle_dir);
@@ -241,19 +243,9 @@ pub fn write_app_bundle(bundle_dir: &Path, binary: Option<&Path>, icns: Option<&
     }
     match icns {
         Some(src) => copy(src, &layout.icns)?,
-        None => {
-            let iconset = bundle_dir.join(format!("{APP_NAME}.iconset"));
-            remove_dir(&iconset)?;
-            icon::write_iconset(&iconset)?;
-            if Path::new("/usr/bin/iconutil").exists() {
-                run(Command::new("/usr/bin/iconutil").arg("-c").arg("icns").arg(&iconset).arg("-o").arg(&layout.icns))?;
-                remove_dir(&iconset)?;
-            } else {
-                // No iconutil (not macOS): keep the PNGs so the layout is still inspectable.
-                eprintln!("iconutil not found; left {} unconverted", iconset.display());
-            }
-        }
+        None => icon::write_icns(&layout.icns)?,
     }
+
     Ok(layout)
 }
 
@@ -267,39 +259,61 @@ pub fn sign_bundle(root: &Path, opts: &Options, layout: &AppLayout) -> Result<()
     for (key, why) in sign::ENTITLEMENT_KEYS {
         eprintln!("entitlement {key}: {why}");
     }
-    sign::sign_app(&opts.runner(), &signer, &layout.app, &layout.executable, &entitlements)
+    if layout.executable.file_name().is_some_and(|n| n == "codecraft-launcher") {
+        sign::sign_prepared_app(&opts.runner(), &signer, &layout.app, &entitlements)
+    } else {
+        sign::sign_app(&opts.runner(), &signer, &layout.app, &layout.executable, &entitlements)
+    }
 }
 
-/// `cargo xtask bundle`: build, lay out, sign. Returns the bundle path.
+/// Stable release layout: background launcher outside, full foreground factory app inside.
+pub fn write_launcher_bundle(bundle_dir: &Path, app_binary: Option<&Path>, launcher: Option<&Path>, icns: Option<&Path>) -> Result<AppLayout, String> {
+    let mut layout = write_app_bundle(bundle_dir, None, icns)?;
+    let factory_dir = layout.app.join("Contents/Resources/factory");
+    write_app_bundle(&factory_dir, app_binary, Some(layout.icns.as_path()).filter(|p| p.is_file()))?;
+    layout.executable = layout.app.join("Contents/MacOS/codecraft-launcher");
+    if let Some(binary) = launcher { copy(binary, &layout.executable)?; make_executable(&layout.executable)?; }
+    let plist = info_plist(version()).replace("<string>codecraft</string>", "<string>codecraft-launcher</string>")
+        .replace("</dict>", "<key>LSUIElement</key><true/>\n</dict>");
+    write(&layout.info_plist, plist)?;
+    Ok(layout)
+}
+
+/// Build a stable release or a standalone version payload (`--version-payload <directory>`).
 pub fn bundle(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     let target = target_dir(root);
     let binary = target.join(opts.profile()).join(EXECUTABLE);
-    let bundle_dir = target.join("bundle");
+    let launcher = target.join(opts.profile()).join("codecraft-launcher");
+    let bundle_dir = opts.version_payload.clone().unwrap_or_else(|| target.join("bundle"));
+    let packages = if opts.version_payload.is_some() { vec!["codecraft"] } else { vec!["codecraft", "codecraft-launcher"] };
+    if !opts.layout_only { cargo_build(root, opts, &packages)?; }
+    let payload_layout = AppLayout::new(&bundle_dir);
     if opts.dry_run {
-        let layout = AppLayout::new(&bundle_dir);
+        println!("# lay out {} (factory payload + stable launcher unless --version-payload)", payload_layout.app.display());
         if !opts.layout_only {
-            cargo_build(root, opts, &["codecraft"])?;
+            if opts.version_payload.is_none() {
+                let factory = AppLayout::new(&payload_layout.app.join("Contents/Resources/factory"));
+                sign_bundle(root, opts, &factory)?;
+                let mut stable = AppLayout::new(&bundle_dir);
+                stable.executable = stable.app.join("Contents/MacOS/codecraft-launcher");
+                sign_bundle(root, opts, &stable)?;
+            } else { sign_bundle(root, opts, &payload_layout)?; }
         }
-        println!("# lay out {}", layout.app.display());
-        if !opts.layout_only {
-            sign_bundle(root, opts, &layout)?;
-        }
-        return Ok(layout.app);
-    }
-    if !opts.layout_only {
-        cargo_build(root, opts, &["codecraft"])?;
+        return Ok(payload_layout.app);
     }
     let bin = (!opts.layout_only).then_some(binary.as_path());
-    let layout = write_app_bundle(&bundle_dir, bin, None)?;
-    if !opts.layout_only {
-        if cfg!(target_os = "macos") {
-            sign_bundle(root, opts, &layout)?;
-        } else {
-            eprintln!("not on macOS: the bundle is not signed");
+    let layout = if opts.version_payload.is_some() {
+        write_app_bundle(&bundle_dir, bin, None)?
+    } else {
+        write_launcher_bundle(&bundle_dir, bin, (!opts.layout_only).then_some(launcher.as_path()), None)?
+    };
+    if !opts.layout_only && cfg!(target_os = "macos") {
+        if opts.version_payload.is_none() {
+            sign_bundle(root, opts, &AppLayout::new(&layout.app.join("Contents/Resources/factory")))?;
         }
+        sign_bundle(root, opts, &layout)?;
     }
-    println!("{}", layout.app.display());
-    Ok(layout.app)
+    println!("{}", layout.app.display()); Ok(layout.app)
 }
 
 /// The disk image `dmg` writes: `<target>/bundle/CodeCraft-<version>.dmg`.
@@ -417,11 +431,14 @@ fn write_unix_tree(prefix: &Path, bin_dir: Option<&Path>) -> Result<(), String> 
         create_dir(&icons)?;
         icon::write_png(&icons.join(format!("{BUNDLE_ID}.png")), size)?;
     }
+    create_dir(&bin.join("factory"))?;
     if let Some(src) = bin_dir {
-        for exe in ["codecraft", "codecraft-cli"] {
-            copy(&src.join(exe), &bin.join(exe))?;
-            make_executable(&bin.join(exe))?;
-        }
+        copy(&src.join("codecraft"), &bin.join("factory/codecraft"))?;
+        make_executable(&bin.join("factory/codecraft"))?;
+        copy(&src.join("codecraft-launcher"), &bin.join("codecraft"))?;
+        make_executable(&bin.join("codecraft"))?;
+        copy(&src.join("codecraft-cli"), &bin.join("codecraft-cli"))?;
+        make_executable(&bin.join("codecraft-cli"))?;
     }
     Ok(())
 }
@@ -445,7 +462,7 @@ pub fn package_linux(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     let dir = out.join(&name);
     let build = cfg!(target_os = "linux") && !opts.layout_only;
     if build {
-        cargo_build(root, opts, &["codecraft", "codecraft-cli"])?;
+        cargo_build(root, opts, &["codecraft", "codecraft-cli", "codecraft-launcher"])?;
     } else {
         eprintln!("layout only (binaries are built on Linux)");
     }
@@ -585,7 +602,7 @@ pub fn package_deb(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     let dir = out.join("deb").join(&name);
     let build = cfg!(target_os = "linux") && !opts.layout_only;
     if build {
-        cargo_build(root, opts, &["codecraft", "codecraft-cli"])?;
+        cargo_build(root, opts, &["codecraft", "codecraft-cli", "codecraft-launcher"])?;
     } else {
         eprintln!("layout only (binaries are built on Linux)");
     }
@@ -616,10 +633,11 @@ pub fn package_deb(root: &Path, opts: &Options) -> Result<PathBuf, String> {
 pub fn write_windows_layout(dir: &Path, root: &Path, bin_dir: Option<&Path>) -> Result<(), String> {
     remove_dir(dir)?;
     create_dir(dir)?;
+    create_dir(&dir.join("factory"))?;
     if let Some(src) = bin_dir {
-        for exe in ["codecraft.exe", "codecraft-cli.exe"] {
-            copy(&src.join(exe), &dir.join(exe))?;
-        }
+        copy(&src.join("codecraft.exe"), &dir.join("factory/codecraft.exe"))?;
+        copy(&src.join("codecraft-launcher.exe"), &dir.join("codecraft.exe"))?;
+        copy(&src.join("codecraft-cli.exe"), &dir.join("codecraft-cli.exe"))?;
     }
     icon::write_png(&dir.join("codecraft.png"), 256)?;
     icon::write_ico(&dir.join("codecraft.ico"))?;
@@ -636,7 +654,7 @@ pub fn package_windows(root: &Path, opts: &Options) -> Result<PathBuf, String> {
     let dir = out.join(&name);
     let build = cfg!(windows) && !opts.layout_only;
     if build {
-        cargo_build(root, opts, &["codecraft", "codecraft-cli"])?;
+        cargo_build(root, opts, &["codecraft", "codecraft-cli", "codecraft-launcher"])?;
     } else {
         eprintln!("layout only (binaries are built on Windows)");
     }
@@ -855,6 +873,38 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stable_factory_signatures_keep_entitlements_and_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = write_launcher_bundle(dir.path(), Some(Path::new("/usr/bin/true")), Some(Path::new("/usr/bin/true")), None).unwrap();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let opts = Options { sign: Some("-".into()), ..Default::default() };
+        let factory = AppLayout::new(&layout.app.join("Contents/Resources/factory"));
+        sign_bundle(root, &opts, &factory).unwrap();
+        sign_bundle(root, &opts, &layout).unwrap();
+        let output = Command::new("codesign").args(["--display", "--entitlements", "-", "--xml"]).arg(&factory.app).output().unwrap();
+        assert!(output.status.success());
+        let entitlements = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        assert!(entitlements.contains("com.apple.security.automation.apple-events"));
+    }
+
+    #[test]
+    fn stable_launcher_and_payload_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let icon = dir.path().join("icon.icns"); std::fs::write(&icon, "icns").unwrap();
+        let bin = dir.path().join("app"); std::fs::write(&bin, "app").unwrap();
+        let launcher = dir.path().join("launcher"); std::fs::write(&launcher, "launcher").unwrap();
+        let layout = write_launcher_bundle(&dir.path().join("stable"), Some(&bin), Some(&launcher), Some(&icon)).unwrap();
+        assert_eq!(std::fs::read_to_string(&layout.executable).unwrap(), "launcher");
+        assert_eq!(std::fs::read_to_string(layout.app.join("Contents/Resources/factory/CodeCraft.app/Contents/MacOS/codecraft")).unwrap(), "app");
+        let plist = std::fs::read_to_string(layout.info_plist).unwrap();
+        assert!(plist.contains("<string>codecraft-launcher</string>")); assert!(plist.contains("<key>LSUIElement</key><true/>"));
+        let payload = write_app_bundle(&dir.path().join("payload"), Some(&bin), Some(&icon)).unwrap();
+        assert!(!payload.app.join("Contents/Resources/factory").exists());
+        assert!(Options::parse(&["--version-payload".into(), "payload".into()]).unwrap().version_payload.is_some());
+    }
+
     #[test]
     fn app_bundle_layout() {
         let dir = tempfile::tempdir().unwrap();
@@ -901,7 +951,7 @@ mod tests {
         std::fs::write(root.join("README.md"), "# hi").unwrap();
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
-        for b in ["codecraft", "codecraft-cli"] {
+        for b in ["codecraft", "codecraft-cli", "codecraft-launcher"] {
             std::fs::write(bins.join(b), "bin").unwrap();
         }
         let out = dir.path().join("pkg");
@@ -926,7 +976,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
-        for b in ["codecraft.exe", "codecraft-cli.exe"] {
+        for b in ["codecraft.exe", "codecraft-cli.exe", "codecraft-launcher.exe"] {
             std::fs::write(bins.join(b), "exe").unwrap();
         }
         let out = dir.path().join("win");
@@ -979,7 +1029,7 @@ mod tests {
         std::fs::write(root.join("LICENSE"), "MIT License\n\nCopyright (c) 2026 X\n\nPermission is hereby granted.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\".\n").unwrap();
         let bins = dir.path().join("bins");
         std::fs::create_dir_all(&bins).unwrap();
-        for b in ["codecraft", "codecraft-cli"] {
+        for b in ["codecraft", "codecraft-cli", "codecraft-launcher"] {
             std::fs::write(bins.join(b), vec![0u8; 4000]).unwrap();
         }
         let out = dir.path().join("deb");

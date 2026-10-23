@@ -224,8 +224,8 @@ pub fn has_hardened_runtime(display_output: &str) -> bool {
 
 /// Code inside `CodeCraft.app` that must be signed before the bundle: nested bundles
 /// (`.framework`, `.app`, `.xpc`, `.appex`, `.bundle`, `.plugin`) and Mach-O files, except the
-/// bundle's main executable (signed with the bundle). Symbolic links are skipped. Empty today
-/// (CodeCraft is one binary); this keeps signing correct when helpers or dylibs are added.
+/// bundle's main executable (signed with the bundle). Symbolic links are skipped. The factory
+/// app is signed independently before the outer stable launcher is sealed.
 pub fn nested_code(app: &Path, main_executable: &Path) -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
     let contents = app.join("Contents");
@@ -279,7 +279,17 @@ pub fn sign_app(runner: &Runner, signer: &Signer, app: &Path, main_executable: &
         return Err(format!("{}: entitlements file missing", entitlements.display()));
     }
     let nested = if app.is_dir() { nested_code(app, main_executable)? } else { Vec::new() };
-    let cmds = signer.app_commands(app, &nested, entitlements);
+    finish_app_signing(runner, signer, app, &nested, entitlements)
+}
+
+/// Seal an outer launcher after its complete factory app was signed separately.
+/// Avoid re-signing the factory's executable without its app entitlements.
+pub fn sign_prepared_app(runner: &Runner, signer: &Signer, app: &Path, entitlements: &Path) -> Result<(), String> {
+    finish_app_signing(runner, signer, app, &[], entitlements)
+}
+
+fn finish_app_signing(runner: &Runner, signer: &Signer, app: &Path, nested: &[PathBuf], entitlements: &Path) -> Result<(), String> {
+    let cmds = signer.app_commands(app, nested, entitlements);
     let Some((show, rest)) = cmds.split_last() else { return Ok(()) };
     for c in rest {
         runner.run(c)?;

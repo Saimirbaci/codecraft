@@ -199,7 +199,8 @@ mod tests {
         let (_, v) = workspace_version(&manifest).unwrap();
         let lock = std::fs::read_to_string(root.join("Cargo.lock")).unwrap();
         let (_, n) = bump_lock(&lock, &v, "99.0.0");
-        let crates = std::fs::read_dir(root.join("crates")).unwrap().count() + 2 /* apps */ + 1 /* xtask */;
+        let crates = std::fs::read_dir(root.join("crates")).unwrap().count()
+            + std::fs::read_dir(root.join("apps")).unwrap().count() + 1 /* xtask */;
         assert_eq!(n, crates, "every workspace crate's lock entry follows the version");
     }
 }

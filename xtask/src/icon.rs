@@ -122,6 +122,21 @@ pub fn write_png(path: &Path, size: u32) -> Result<(), String> {
     std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Native ICNS container of PNG representations. No platform service or iconutil needed.
+pub fn write_icns(path: &Path) -> Result<(), String> {
+    let mut body = Vec::new();
+    for (kind, size) in [(b"icp4", 16), (b"icp5", 32), (b"icp6", 64), (b"ic07", 128),
+        (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024), (b"ic11", 32), (b"ic12", 64),
+        (b"ic13", 256), (b"ic14", 512)] {
+        let png = encode_png(size, &render(size))?;
+        let length = u32::try_from(png.len()).ok().and_then(|n| n.checked_add(8)).ok_or("ICNS chunk too large")?;
+        body.extend_from_slice(kind); body.extend_from_slice(&length.to_be_bytes()); body.extend_from_slice(&png);
+    }
+    let length = u32::try_from(body.len()).ok().and_then(|n| n.checked_add(8)).ok_or("ICNS too large")?;
+    let mut bytes = b"icns".to_vec(); bytes.extend_from_slice(&length.to_be_bytes()); bytes.extend_from_slice(&body);
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// A Windows `.ico` holding PNG images (Vista and later read PNG entries) at `sizes` (each 1..=256).
 pub fn encode_ico(sizes: &[u32]) -> Result<Vec<u8>, String> {
     let images: Vec<(u32, Vec<u8>)> =
@@ -158,6 +173,7 @@ pub fn write_ico(path: &Path) -> Result<(), String> {
 }
 
 /// The files of a macOS `.iconset` directory: (file name, pixel size).
+#[cfg(test)]
 pub const ICONSET: &[(&str, u32)] = &[
     ("icon_16x16.png", 16),
     ("icon_16x16@2x.png", 32),
@@ -172,6 +188,7 @@ pub const ICONSET: &[(&str, u32)] = &[
 ];
 
 /// Write every `.iconset` file into `dir` (created if needed).
+#[cfg(test)]
 pub fn write_iconset(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for (name, size) in ICONSET {
@@ -187,6 +204,22 @@ mod tests {
     fn pixel(rgba: &[u8], size: u32, x: u32, y: u32) -> [u8; 4] {
         let i = ((y * size + x) * 4) as usize;
         [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    #[test]
+    fn icns_chunks_are_bounded_valid_png_representations() {
+        let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("icon.icns");
+        write_icns(&path).unwrap(); let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[..4], b"icns"); assert_eq!(u32::from_be_bytes(bytes[4..8].try_into().unwrap()) as usize, bytes.len());
+        let mut rest = &bytes[8..]; let mut count = 0;
+        while !rest.is_empty() {
+            let len = u32::from_be_bytes(rest[4..8].try_into().unwrap()) as usize;
+            assert!(len >= 8 && len <= rest.len());
+            let reader = png::Decoder::new(std::io::Cursor::new(&rest[8..len])).read_info().unwrap();
+            assert_eq!(reader.info().width, reader.info().height);
+            rest = &rest[len..]; count += 1;
+        }
+        assert_eq!(count, 11);
     }
 
     #[test]
