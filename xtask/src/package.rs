@@ -37,6 +37,7 @@ pub fn version() -> &'static str {
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub release: bool,
+    pub build_profile: Option<String>,
     pub version_payload: Option<PathBuf>,
     /// Lay out the package without building or signing (CI dry runs, tests).
     pub layout_only: bool,
@@ -64,6 +65,13 @@ impl Options {
             match flag {
                 "--version-payload" => o.version_payload = Some(PathBuf::from(value("--version-payload")?)),
                 "--release" => o.release = true,
+                "--profile" => {
+                    let p = value("--profile")?;
+                    if p.is_empty() || !p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                        return Err("invalid build profile".into());
+                    }
+                    o.build_profile = Some(p);
+                }
                 "--layout-only" => o.layout_only = true,
                 "--dry-run" => o.dry_run = true,
                 "--sign" => o.sign = Some(value("--sign")?),
@@ -78,7 +86,10 @@ impl Options {
         Ok(o)
     }
 
-    fn profile(&self) -> &'static str {
+    fn profile(&self) -> &str {
+        if let Some(p) = &self.build_profile {
+            return match p.as_str() { "dev"|"test"=>"debug", "bench"=>"release", _=>p };
+        }
         if self.release { "release" } else { "debug" }
     }
 
@@ -112,7 +123,13 @@ pub fn cargo_build_cmd(opts: &Options, packages: &[&str]) -> Cmd {
     for p in packages {
         cmd = cmd.args(["-p", p]);
     }
-    if opts.release {
+    if opts.version_payload.is_some() { cmd = cmd.arg("--locked"); }
+    if let Some(p) = &opts.build_profile {
+        cmd = cmd.args(["--profile", p]);
+        if opts.version_payload.is_some() {
+            cmd = cmd.arg("--message-format=json-render-diagnostics");
+        }
+    } else if opts.release {
         cmd = cmd.arg("--release");
     }
     cmd
@@ -267,7 +284,12 @@ pub fn sign_bundle(root: &Path, opts: &Options, layout: &AppLayout) -> Result<()
 }
 
 /// Stable release layout: background launcher outside, full foreground factory app inside.
-pub fn write_launcher_bundle(bundle_dir: &Path, app_binary: Option<&Path>, launcher: Option<&Path>, icns: Option<&Path>) -> Result<AppLayout, String> {
+pub fn write_launcher_bundle(
+    bundle_dir: &Path,
+    app_binary: Option<&Path>,
+    launcher: Option<&Path>,
+    icns: Option<&Path>,
+) -> Result<AppLayout, String> {
     let mut layout = write_app_bundle(bundle_dir, None, icns)?;
     let factory_dir = layout.app.join("Contents/Resources/factory");
     write_app_bundle(&factory_dir, app_binary, Some(layout.icns.as_path()).filter(|p| p.is_file()))?;
@@ -783,6 +805,14 @@ pub fn package_windows_installer(root: &Path, opts: &Options) -> Result<PathBuf,
 mod tests {
     use super::*;
 
+    #[test]
+    fn payload_profiles_use_cargo_output_directories() {
+        let dev=Options::parse(&["--profile".into(),"dev".into(),"--version-payload".into(),"payload".into()]).unwrap();
+        assert_eq!(dev.profile(),"debug");
+        assert!(cargo_build_cmd(&dev,&["codecraft"]).args.windows(2).any(|w|w==["--profile","dev"]));
+        let local=Options::parse(&["--profile".into(),"selfupdate".into()]).unwrap();assert_eq!(local.profile(),"selfupdate");
+        assert!(Options::parse(&["--profile".into(),"../escape".into()]).is_err());
+    }
     #[test]
     fn info_plist_has_the_required_keys() {
         let p = info_plist("1.2.3");

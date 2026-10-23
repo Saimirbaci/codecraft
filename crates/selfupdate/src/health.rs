@@ -51,3 +51,42 @@ pub fn window_progress() {
         }
     }
 }
+
+static CURRENT_PAYLOAD: OnceLock<bool> = OnceLock::new();
+/// Launcher variables inherited by cargo/agent children do not identify those executables.
+/// Validate the actual running payload before using its launcher or health context.
+pub fn is_current_payload() -> bool {
+    *CURRENT_PAYLOAD.get_or_init(|| {
+        let Ok(id) = std::env::var("CODECRAFT_VERSION_ID") else { return false };
+        let Ok(base) = crate::default_base() else { return false };
+        let Ok(exe) = std::env::current_exe() else { return false };
+        let factory = std::env::var_os("CODECRAFT_FACTORY_DIR").map(PathBuf::from).unwrap_or_default();
+        matches_payload(&crate::Store::new(base, factory), &id, &exe)
+    })
+}
+fn matches_payload(store: &crate::Store, id: &str, exe: &std::path::Path) -> bool {
+    store
+        .executable(id)
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .zip(exe.canonicalize().ok())
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn developer_and_test_executables_cannot_claim_another_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let factory = dir.path().join("factory");
+        std::fs::create_dir(&factory).unwrap();
+        let payload = factory.join(if cfg!(windows) { "codecraft.exe" } else { "codecraft" });
+        std::fs::write(&payload, "payload").unwrap();
+        let developer = dir.path().join("developer executable");
+        std::fs::write(&developer, "developer").unwrap();
+        let store = crate::Store::new(dir.path().into(), factory);
+        assert!(matches_payload(&store, crate::FACTORY, &payload));
+        assert!(!matches_payload(&store, crate::FACTORY, &developer));
+        assert!(!matches_payload(&store, "../invalid", &payload));
+    }
+}

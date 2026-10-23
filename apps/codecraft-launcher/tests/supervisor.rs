@@ -166,3 +166,20 @@ fn forced_factory_does_not_read_or_rewrite_pointer_files() {
     assert!(bounded(f.cmd().arg("--factory").spawn().unwrap()).status.success());
     assert_eq!(fs::read_to_string(state.join("sentinel")).unwrap(), "untouched");
 }
+
+#[test]
+fn wait_pid_rejects_invalid_and_waits_for_a_real_local_child() {
+    let f = Fixture::new();
+    for pid in ["0", "4294967295"] {
+        let invalid = bounded(f.cmd().args(["--wait-pid", pid]).spawn().unwrap());
+        assert!(!invalid.status.success());
+    }
+    let mut old = Command::new("sleep").arg("1").spawn().unwrap();
+    let pid = old.id();
+    let reap = std::thread::spawn(move || old.wait());
+    let start = Instant::now();
+    let result = bounded(f.cmd().args(["--factory", "--wait-pid", &pid.to_string()]).spawn().unwrap());
+    let _ = reap.join();
+    assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
+    assert!(start.elapsed() >= Duration::from_secs(2));
+}

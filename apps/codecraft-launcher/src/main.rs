@@ -15,6 +15,7 @@ struct Options {
     status: bool,
     rollback: bool,
     wait: bool,
+    wait_pid: Option<u32>,
     args: Vec<OsString>,
 }
 fn parse(args: impl Iterator<Item = OsString>) -> io::Result<Options> {
@@ -23,6 +24,14 @@ fn parse(args: impl Iterator<Item = OsString>) -> io::Result<Options> {
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--wait-lock") => o.wait = true,
+            Some("--wait-pid") => {
+                o.wait_pid = Some(
+                    args.next()
+                        .and_then(|v| v.to_str().and_then(|s| s.parse::<u32>().ok()))
+                        .filter(|p| i32::try_from(*p).is_ok_and(|p| p > 0) && *p != std::process::id())
+                        .ok_or_else(|| io::Error::other("--wait-pid requires another positive PID"))?,
+                );
+            }
             Some("--factory") => o.factory = true,
             Some("--status") => o.status = true,
             Some("--rollback") => o.rollback = true,
@@ -64,6 +73,18 @@ fn run() -> io::Result<()> {
         // Print through a library serialization helper, keeping the executable std-only.
         writeln!(io::stdout().lock(), "{}", store.status_json()?)?;
         return Ok(());
+    }
+    if let Some(pid) = opts.wait_pid {
+        let deadline = Instant::now() + Duration::from_secs(300);
+        while process_alive(pid).inspect_err(|e| {
+            let _ = store.log(&format!("handoff wait failed: {e}"));
+        })? {
+            if Instant::now() >= deadline {
+                let _ = store.log("handoff cancelled: previous app has not exited");
+                return Err(io::Error::other("previous app has not exited; restart cancelled"));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     let lock_start = Instant::now();
     let _launcher = loop {
@@ -245,5 +266,28 @@ impl Drop for OwnedChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
+    }
+}
+
+fn process_alive(pid: u32) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        let output = Command::new("/bin/kill").env("LC_ALL", "C").args(["-0", "--", &pid.to_string()]).output()?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        let message = String::from_utf8_lossy(&output.stderr);
+        if message.contains("No such process") {
+            return Ok(false);
+        }
+        Err(io::Error::other(format!("cannot check previous process: {message}")))
+    }
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other("could not inspect previous app"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\"")))
     }
 }

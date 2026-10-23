@@ -70,3 +70,11 @@ debug = "line-tables-only"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Fast local feedback builds trade peak optimization for shorter rebuilds.
+[profile.selfupdate]
+inherits = "release"
+lto = false
+codegen-units = 256
+incremental = true
+debug = false

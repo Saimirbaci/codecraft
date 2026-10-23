@@ -1,8 +1,11 @@
 //! Standalone version store. Contract stable: public types and operations are additive.
 #![forbid(unsafe_code)]
 
+pub mod build;
 pub mod health;
+pub mod preflight;
 mod snapshot;
+pub mod source;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -102,6 +105,16 @@ pub struct Meta {
     pub status: Status,
     pub reason: Option<String>,
     pub size: u64,
+    #[serde(default)]
+    pub feedback_summary: String,
+    #[serde(default)]
+    pub feedback_job: Option<u64>,
+    #[serde(default)]
+    pub feedback_session: Option<String>,
+    #[serde(default)]
+    pub dirty_hash: Option<String>,
+    #[serde(default)]
+    pub user_commit: Option<String>,
     #[serde(default)]
     pub failures: u32,
     #[serde(default)]
@@ -331,6 +344,11 @@ impl Store {
                 status: Status::Staged,
                 reason: None,
                 size,
+                feedback_summary: String::new(),
+                feedback_job: None,
+                feedback_session: None,
+                dirty_hash: None,
+                user_commit: None,
                 failures: 0,
                 last_failure: 0,
             };
@@ -345,6 +363,31 @@ impl Store {
         result?;
         self.log(&format!("staged {id}"))?;
         Ok(id)
+    }
+    pub fn provenance(
+        &self,
+        id: &str,
+        summary: &str,
+        job: Option<u64>,
+        dirty: Option<String>,
+        user_commit: Option<String>,
+    ) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut meta = self.meta(id).ok_or_else(|| invalid("missing version"))?;
+        meta.feedback_summary = summary.chars().take(4096).collect();
+        meta.feedback_job = job;
+        meta.dirty_hash = dirty.map(|s| s.chars().take(128).collect());
+        meta.user_commit = user_commit.filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+        write_json(&self.version_dir(id)?.join("meta.json"), &meta)
+    }
+    pub fn feedback_session(&self, id: &str, session: Option<&str>) -> Result<()> {
+        let _lock = self.lock()?;
+        let mut meta = self.meta(id).ok_or_else(|| invalid("missing version"))?;
+        meta.feedback_session = session.map(|s| s.chars().take(512).collect());
+        write_json(&self.version_dir(id)?.join("meta.json"), &meta)
+    }
+    pub fn promote_pending(&self, id: &str) -> Result<()> {
+        self.promote(id)
     }
     pub fn promote(&self, id: &str) -> Result<()> {
         self.use_version(id)

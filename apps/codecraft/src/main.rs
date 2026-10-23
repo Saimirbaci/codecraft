@@ -30,8 +30,19 @@ fn main() -> eframe::Result {
         println!("{} {}", info.name, info.version_line());
         return Ok(());
     }
+    // Explicit headless protocol diagnostic; never opens projects, agents or user stores.
+    if args.first().map(String::as_str) == Some("--selfupdate-health-check") {
+        codecraft_selfupdate::health::report_started();
+        std::thread::sleep(codecraft_selfupdate::health::healthy_after());
+        codecraft_selfupdate::health::report_healthy().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        println!("CodeCraft headless health protocol OK");
+        return Ok(());
+    }
     // Hold a shared running lease even if the background supervisor is interrupted.
-    let _version_lease = if let Ok(id) = std::env::var("CODECRAFT_VERSION_ID") {
+    let _version_lease = if codecraft_selfupdate::health::is_current_payload()
+        && let Ok(id) = std::env::var("CODECRAFT_VERSION_ID")
+    {
         let base = codecraft_selfupdate::default_base().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
         Some(
             codecraft_selfupdate::Store::new(base, PathBuf::new())
