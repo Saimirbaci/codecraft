@@ -1649,7 +1649,7 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     aren't Authenticode-signed (SmartScreen warns) and `codecraft.exe` has no embedded icon; no
     AppImage/Flatpak, Homebrew cask or winget manifest; no in-app update check; file names keep
     `CodeCraft` (`CodeCraft.app`, `CodeCraft-<version>.dmg`); feedback on "CodeCraft itself"
-    needs `CODECRAFT_SOURCE_DIR` in packaged builds (the build folder isn't on users' machines).
+    now prepares a managed source clone in packaged builds; `CODECRAFT_SOURCE_DIR` remains an optional developer override.
 
 ## M17 — SSH projects (pass 2, partial, 2026-10-20)
 
@@ -1743,13 +1743,18 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     remain recorded in docs/m17-plan.md.
 
 
-## M18 — self-update safety (pass 1, partial)
+## M18 — self-update safety and feedback builds
 
 70. The standalone version store, stable release launcher/factory payload, atomic pointers,
     health supervision, automatic fallback, bounded configuration snapshots, running-version
     GC protection, logging and Help › Versions & Rollback… are implemented in pass 1.
-    Managed source acquisition, toolchain preflight, background builds and Accept/restart/session
-    handoff remain for pass 2. Native Dock/menu identity, Gatekeeper/TCC and ad-hoc rebuilt app
+    Pass 2 adds managed source, preflight, background builds and confirmed Accept/restart/session
+    handoff. Native Dock/menu identity, Gatekeeper/TCC and ad-hoc rebuilt app
     behavior require manual macOS verification. Shift-launch detection is omitted; use
     `codecraft-launcher --factory` independently of corrupt pointer/metadata files.
     Design and exact validation: [m18-plan.md](m18-plan.md).
+
+M18 pass 2 adds managed source, preflight, background payload builds, confirmed Accept/build/restart,
+PID handoff, sensitive agent policy and a real offline rollback smoke. Native Dock/menu identity,
+Gatekeeper/TCC, live GUI session restoration and real-agent acceptance still require manual checks;
+see `docs/m18-plan.md` for validation and platform limits.

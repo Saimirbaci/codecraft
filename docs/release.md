@@ -309,3 +309,15 @@ The stable entry point accepts `--factory`, `--version-id <id>`, `--status`, and
 `--factory` ignores version pointers and metadata; on macOS run
 `/Applications/CodeCraft.app/Contents/MacOS/codecraft-launcher --factory`.
 See [m18-plan.md](m18-plan.md) for health deadlines, rollback, tests and manual GUI checks.
+
+Self-update payload builds use `cargo xtask bundle --profile selfupdate --version-payload <dir>`.
+The stable launcher additionally accepts `--wait-pid <pid> --version-id <id> --wait-lock` for
+handoff: wait for the prior app, acquire supervision, then boot the requested version. The wait
+is bounded to five minutes. Release packaging still uses the release profile; local feedback
+builds favor turnaround over peak optimization. Managed source lives under `CODECRAFT_HOME/source`
+on `codecraft-user`; no credentials are stored and no changes are pushed.
+
+`tools/selfupdate-smoke.sh` is an offline real-binary smoke using a local bare repository and
+temporary home/store. `codecraft --selfupdate-health-check` tests the launcher's health protocol
+without opening a GUI or reading project/agent state. This diagnostic does not replace native
+Dock/menu identity, Gatekeeper/TCC, GUI health or session-restoration release checks.

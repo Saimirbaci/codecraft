@@ -1,0 +1,494 @@
+Offline self-update smoke; Cargo compiler-artifact/build-script JSON omitted.
+Cloning into bare repository '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/remote.git'...
+done.
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on build directory
+   Compiling codecraft-selfupdate v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 4m 39s
+    Blocking waiting for file lock on build directory
+   Compiling codecraft-selfupdate v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
+   Compiling codecraft-launcher v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/apps/codecraft-launcher)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 11m 56s
+Setting up CodeCraft's source: cloning repository…
+Setting up CodeCraft's source: checking out user branch…
+   Compiling proc-macro2 v1.0.107
+   Compiling simd-adler32 v0.3.10
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling adler2 v2.0.1
+   Compiling crc32fast v1.5.2
+   Compiling zmij v1.0.23
+   Compiling cfg-if v1.0.5
+   Compiling syn v3.0.9
+   Compiling miniz_oxide v0.9.1
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.154
+   Compiling flate2 v1.1.10
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling bitflags v2.13.2
+   Compiling memchr v2.8.3
+   Compiling itoa v1.0.18
+   Compiling png v0.18.1
+   Compiling serde_derive v1.0.229
+   Compiling xtask v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/xtask)
+    Finished `dev` profile [optimized + debuginfo] target(s) in 18.65s
+     Running `/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/build-target/debug/xtask bundle --profile selfupdate --version-payload '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0'`
+$ /Users/saimirbaci/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.24
+   Compiling serde_core v1.0.229
+   Compiling libc v0.2.190
+   Compiling syn v3.0.9
+   Compiling cfg-if v1.0.5
+   Compiling log v0.4.34
+   Compiling memchr v2.8.3
+   Compiling bitflags v2.13.2
+   Compiling thiserror v2.0.21
+   Compiling smallvec v1.16.3
+   Compiling objc2-encode v4.1.0
+   Compiling syn v2.0.119
+   Compiling libm v0.2.16
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling once_cell v1.21.4
+   Compiling thiserror-impl v2.0.21
+   Compiling objc2 v0.6.5
+   Compiling bytemuck_derive v1.12.1
+   Compiling synstructure v0.14.0
+   Compiling bytemuck v1.25.2
+   Compiling typenum v1.20.1
+   Compiling serde v1.0.229
+   Compiling zerofrom-derive v0.1.8
+   Compiling objc2-core-foundation v0.3.2
+   Compiling serde_derive v1.0.229
+   Compiling zerofrom v0.1.8
+   Compiling yoke-derive v0.8.4
+   Compiling stable_deref_trait v1.2.1
+   Compiling zerovec-derive v0.11.6
+   Compiling yoke v0.8.3
+   Compiling itoa v1.0.18
+   Compiling core-foundation-sys v0.8.7
+   Compiling zmij v1.0.23
+   Compiling arrayvec v0.7.8
+   Compiling cfg_aliases v0.2.2
+   Compiling zerovec v0.11.8
+   Compiling displaydoc v0.2.7
+   Compiling crossbeam-utils v0.8.23
+   Compiling version_check v0.9.5
+   Compiling serde_json v1.0.154
+   Compiling scopeguard v1.2.0
+   Compiling foldhash v0.2.0
+   Compiling rand_core v0.10.1
+   Compiling getrandom v0.4.3
+   Compiling parking_lot_core v0.9.12
+   Compiling pin-project-lite v0.2.17
+   Compiling simd-adler32 v0.3.10
+   Compiling zerocopy v0.8.62
+   Compiling lock_api v0.4.14
+   Compiling tinystr v0.8.4
+   Compiling block2 v0.6.2
+   Compiling zerocopy-derive v0.8.62
+   Compiling errno v0.3.14
+   Compiling writeable v0.6.4
+   Compiling crc32fast v1.5.2
+   Compiling bytes v1.12.1
+   Compiling litemap v0.8.3
+   Compiling adler2 v2.0.1
+   Compiling icu_locale_core v2.3.0
+   Compiling parking_lot v0.12.5
+   Compiling potential_utf v0.1.6
+   Compiling zerotrie v0.2.5
+   Compiling hybrid-array v0.4.15
+   Compiling icu_properties_data v2.3.0
+   Compiling rustix v1.1.5
+   Compiling utf8_iter v1.0.4
+   Compiling icu_normalizer_data v2.3.0
+   Compiling icu_collections v2.3.0
+   Compiling icu_provider v2.3.1
+   Compiling miniz_oxide v0.9.1
+   Compiling objc2-foundation v0.3.2
+   Compiling hashbrown v0.17.1
+   Compiling aho-corasick v1.1.5
+   Compiling regex-syntax v0.8.11
+   Compiling cmov v0.5.4
+   Compiling percent-encoding v2.3.2
+   Compiling ctutils v0.4.3
+   Compiling regex-automata v0.4.18
+   Compiling flate2 v1.1.10
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.12.1
+   Compiling objc2-core-graphics v0.3.2
+   Compiling const-oid v0.10.2
+   Compiling digest v0.11.3
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling uuid v1.28.0
+   Compiling base64 v0.22.1
+   Compiling idna_adapter v1.2.2
+   Compiling half v2.7.1
+   Compiling crossbeam-channel v0.5.17
+   Compiling objc-sys v0.3.5
+   Compiling unicode-width v0.2.2
+   Compiling raw-window-handle v0.6.2
+   Compiling idna v1.1.0
+   Compiling form_urlencoded v1.2.2
+   Compiling generic-array v0.14.7
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling cpufeatures v0.3.1
+   Compiling futures-core v0.3.34
+   Compiling futures-sink v0.3.34
+   Compiling bitflags v1.3.2
+   Compiling equivalent v1.0.2
+   Compiling unicode-properties v0.1.4
+   Compiling indexmap v2.14.2
+   Compiling security-framework v3.7.0
+   Compiling url v2.5.8
+   Compiling regex v1.13.1
+   Compiling chacha20 v0.10.2
+   Compiling rustc-hash v1.1.0
+   Compiling rustversion v1.0.23
+   Compiling futures-io v0.3.34
+   Compiling byteorder v1.5.0
+   Compiling native-tls v0.2.18
+   Compiling fastrand v2.5.0
+   Compiling tempfile v3.27.0
+   Compiling naga-types v30.0.1
+   Compiling rand v0.10.3
+   Compiling objc2 v0.5.3
+   Compiling naga v30.0.1
+   Compiling polycool v0.4.0
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-macro v0.3.34
+   Compiling tracing-core v0.1.36
+   Compiling socket2 v0.6.5
+   Compiling cursor-icon v1.2.0
+   Compiling tinyvec v1.13.3
+   Compiling bit-vec v0.9.1
+   Compiling slab v0.4.12
+   Compiling futures-task v0.3.34
+   Compiling profiling v1.0.18
+   Compiling bit-set v0.10.0
+   Compiling futures-util v0.3.34
+   Compiling unicode-normalization v0.1.25
+   Compiling tracing v0.1.44
+   Compiling kurbo v0.13.1
+   Compiling block2 v0.5.1
+   Compiling codespan-reporting v0.13.1
+   Compiling objc2-metal v0.3.2
+   Compiling font-types v0.12.6
+   Compiling color v0.3.3
+   Compiling euclid v0.22.14
+   Compiling mio v1.2.4
+   Compiling static_assertions v1.1.0
+   Compiling dispatch v0.2.0
+   Compiling linebender_resource_handle v0.1.1
+   Compiling unicode-bidi v0.3.18
+   Compiling peniko v0.6.1
+   Compiling stringprep v0.1.5
+   Compiling objc2-foundation v0.2.2
+   Compiling objc2-quartz-core v0.3.2
+   Compiling wgpu-types v30.0.1
+   Compiling tokio v1.53.2
+   Compiling guillotiere v0.7.0
+   Compiling read-fonts v0.41.0
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling sha2 v0.11.1
+   Compiling accesskit v0.24.1
+   Compiling hmac v0.13.0
+   Compiling md-5 v0.11.0
+   Compiling ahash v0.8.12
+   Compiling wgpu-hal v30.0.1
+   Compiling core-foundation v0.9.4
+   Compiling foreign-types-macros v0.2.4
+   Compiling unicode-segmentation v1.13.3
+   Compiling fallible-iterator v0.2.0
+   Compiling fearless_simd v0.4.1
+   Compiling siphasher v1.0.4
+   Compiling shlex v2.0.1
+   Compiling getrandom v0.3.4
+   Compiling foreign-types-shared v0.3.1
+   Compiling crossbeam-epoch v0.9.21
+   Compiling unicode-general-category v1.1.0
+   Compiling find-msvc-tools v0.1.14
+   Compiling cc v1.8.0
+   Compiling foreign-types v0.5.0
+   Compiling phf_shared v0.13.1
+   Compiling vello_common v0.1.0
+   Compiling postgres-protocol v0.6.12
+   Compiling core-graphics-types v0.1.3
+   Compiling wgpu-naga-bridge v30.0.1
+   Compiling digest v0.10.7
+   Compiling objc2-app-kit v0.2.2
+   Compiling raw-window-metal v1.1.0
+   Compiling objc2-app-kit v0.3.2
+   Compiling miniz_oxide v0.8.9
+   Compiling fdeflate v0.3.7
+   Compiling winit v0.30.13
+   Compiling objc2-system-configuration v0.3.2
+   Compiling emath v0.36.2
+   Compiling async-trait v0.1.92
+   Compiling libloading v0.8.9
+   Compiling cpufeatures v0.2.17
+   Compiling pkg-config v0.3.34
+   Compiling dpi v0.1.2
+   Compiling crossbeam-deque v0.8.8
+   Compiling thiserror v1.0.69
+   Compiling same-file v1.0.6
+   Compiling cfg_aliases v0.1.1
+   Compiling zune-core v0.5.3
+   Compiling vcpkg v0.2.15
+   Compiling zune-jpeg v0.5.15
+   Compiling libsqlite3-sys v0.38.2
+   Compiling nix v0.28.0
+   Compiling walkdir v2.5.0
+   Compiling ecolor v0.36.2
+   Compiling whoami v2.1.3
+   Compiling png v0.18.1
+   Compiling core-graphics v0.23.2
+   Compiling postgres-types v0.2.14
+   Compiling vello_cpu v0.1.0
+   Compiling phf v0.13.1
+   Compiling harfrust v0.12.0
+   Compiling skrifa v0.44.0
+   Compiling tokio-util v0.7.20
+   Compiling encoding_rs v0.8.42
+   Compiling futures-channel v0.3.34
+   Compiling hashbrown v0.16.1
+   Compiling wgpu-core v30.0.1
+   Compiling num-integer v0.1.47
+   Compiling thiserror-impl v1.0.69
+   Compiling bstr v1.13.1
+   Compiling zeroize v1.9.1
+   Compiling pxfm v0.1.30
+   Compiling self_cell v1.3.0
+   Compiling quick-error v2.0.1
+   Compiling anyhow v1.0.104
+   Compiling epaint_default_fonts v0.36.2
+   Compiling signal-hook v0.4.5
+   Compiling mysql_common v0.37.3
+   Compiling either v1.19.0
+   Compiling litrs v1.0.1
+   Compiling httparse v1.10.1
+   Compiling nohash-hasher v0.2.0
+   Compiling weezl v0.1.12
+   Compiling fax v0.2.7
+   Compiling smol_str v0.2.2
+   Compiling tiff v0.11.3
+   Compiling epaint v0.36.2
+   Compiling document-features v0.2.12
+   Compiling itertools v0.15.0
+   Compiling moxcms v0.8.1
+   Compiling globset v0.4.20
+   Compiling num-bigint v0.4.8
+   Compiling accesskit_consumer v0.38.0
+   Compiling tokio-postgres v0.7.18
+   Compiling wgpu-core-deps-apple v30.0.1
+   Compiling sha2 v0.10.9
+   Compiling sha1 v0.10.7
+   Compiling signal-hook-registry v1.4.8
+   Compiling wgpu v30.0.1
+   Compiling btoi v0.5.0
+   Compiling enumflags2_derive v0.7.12
+   Compiling derive_utils v0.16.0
+   Compiling notify-types v2.1.0
+   Compiling fsevent-sys v4.1.0
+   Compiling mysql v28.0.3
+   Compiling base64 v0.23.1
+   Compiling multiversion_no_op v1.0.0
+   Compiling byteorder-lite v0.1.0
+   Compiling saturating v0.1.0
+   Compiling simdutf8 v0.1.5
+   Compiling str_indices v0.4.4
+   Compiling ropey v1.6.1
+   Compiling image v0.25.10
+   Compiling pem v4.0.0
+   Compiling notify v8.2.0
+   Compiling io-enum v1.3.0
+   Compiling enumflags2 v0.7.12
+   Compiling ignore v0.4.33
+   Compiling accesskit_macos v0.26.3
+   Compiling filedescriptor v0.8.3
+   Compiling egui v0.36.2
+   Compiling rustls-pki-types v1.15.1
+   Compiling secrecy v0.10.3
+   Compiling tokio-native-tls v0.3.1
+   Compiling async-native-tls v0.6.0
+   Compiling asynchronous-codec v0.7.0
+   Compiling ureq v2.12.1
+   Compiling arc-swap v1.9.2
+   Compiling vte v0.15.0
+   Compiling ra-ap-rustc_lexer v0.177.0
+   Compiling fluent-uri v0.1.4
+   Compiling sha1 v0.11.0
+   Compiling polling v3.11.0
+   Compiling rustix-openpty v0.2.0
+   Compiling http v1.5.0
+   Compiling crossbeam-queue v0.3.14
+   Compiling tiberius-macros v0.1.0
+   Compiling serde_repr v0.1.21
+   Compiling serial2 v0.2.38
+   Compiling bufstream v0.1.4
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling home v0.5.12
+   Compiling data-encoding v2.11.1
+   Compiling similar v2.7.0
+   Compiling connection-string v0.2.0
+   Compiling downcast-rs v1.2.1
+   Compiling futures-timer v3.0.4
+   Compiling twox-hash v2.1.5
+   Compiling lru v0.18.5
+   Compiling rustc-hash v2.1.3
+   Compiling web-time v1.1.0
+   Compiling pretty-hex v0.4.2
+   Compiling fallible-iterator v0.3.0
+   Compiling shell-words v1.1.1
+   Compiling portable-pty v0.9.0
+   Compiling rusqlite v0.40.2
+   Compiling tiberius v0.13.0
+   Compiling type-map v0.5.1
+   Compiling tungstenite v0.30.0
+   Compiling alacritty_terminal v0.26.0
+   Compiling lsp-types v0.97.0
+   Compiling codecraft-syntax v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/syntax)
+   Compiling postgres-native-tls v0.5.3
+   Compiling accesskit_winit v0.32.2
+   Compiling codecraft-fs v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/fs)
+   Compiling arboard v3.6.1
+   Compiling codecraft-text v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/text)
+   Compiling postgres v0.19.14
+   Compiling webbrowser v1.2.4
+   Compiling keyring v3.6.3
+   Compiling codecraft-cargo v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/cargo)
+   Compiling utf8parse v0.2.2
+   Compiling strict-num v0.1.1
+   Compiling rfd v0.17.2
+   Compiling arrayref v0.3.9
+   Compiling ttf-parser v0.25.1
+   Compiling owned_ttf_parser v0.25.1
+   Compiling tiny-skia-path v0.11.4
+   Compiling codecraft-workspace v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/workspace)
+   Compiling anstyle-parse v1.0.0
+   Compiling codecraft-db v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/db)
+   Compiling egui-winit v0.36.2
+   Compiling codecraft-lsp v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/lsp)
+   Compiling egui-wgpu v0.36.2
+   Compiling codecraft-term v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/term)
+   Compiling codecraft-mcp v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/mcp)
+   Compiling codecraft-agent v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/agent)
+   Compiling codecraft-vcs v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/vcs)
+   Compiling codecraft-http v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/http)
+   Compiling keyboard-types v0.7.0
+   Compiling codecraft-dap v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/dap)
+   Compiling codecraft-profile v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/profile)
+   Compiling dispatch2 v0.3.1
+   Compiling codecraft-remote v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/remote)
+   Compiling codecraft-selfupdate v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/selfupdate)
+   Compiling anstyle v1.0.14
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling ab_glyph_rasterizer v0.1.10
+   Compiling pollster v1.0.1
+   Compiling jiff-core v0.1.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstream v1.0.0
+   Compiling jiff v0.2.38
+   Compiling eframe v0.36.2
+   Compiling ab_glyph v0.2.32
+   Compiling codecraft-engine v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/engine)
+   Compiling muda v0.19.3
+   Compiling tiny-skia v0.11.4
+   Compiling env_filter v2.0.0
+   Compiling env_logger v0.11.11
+   Compiling codecraft-ui-egui v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/ui-egui)
+   Compiling codecraft v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/apps/codecraft)
+    Finished `selfupdate` profile [optimized] target(s) in 9m 57s
+signing ad hoc (runs on this Mac only; pass --sign <identity> to distribute)
+entitlement com.apple.security.automation.apple-events: programs run from the Terminal tool window and run configurations are attributed to CodeCraft by macOS; without it the hardened runtime denies their Apple Events (osascript, open -a … scripting) without asking
+$ codesign --force --sign - --timestamp=none --options runtime --entitlements '/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/apps/codecraft/macos/CodeCraft.entitlements' '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app'
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app: replacing existing signature
+$ codesign --verify --deep --strict --verbose=2 '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app'
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app: valid on disk
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app: satisfies its Designated Requirement
+$ codesign --display --verbose=2 '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app'
+Executable=/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app/Contents/MacOS/codecraft
+Identifier=dev.codecraft.CodeCraft
+Format=app bundle with Mach-O thin (arm64)
+CodeDirectory v=20500 size=492216 flags=0x10002(adhoc,runtime) hashes=15371+7 location=embedded
+Signature=adhoc
+Info.plist entries=17
+TeamIdentifier=not set
+Runtime Version=15.2.0
+Sealed Resources version=2 rules=13 files=1
+Internal requirements count=0 size=12
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0/CodeCraft.app
+COLD_BUILD_SECONDS=617.18
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.28s
+     Running `/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/build-target/debug/xtask bundle --profile selfupdate --version-payload '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1'`
+$ /Users/saimirbaci/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
+   Compiling codecraft-engine v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/engine)
+   Compiling codecraft-ui-egui v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/ui-egui)
+   Compiling codecraft v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/apps/codecraft)
+    Finished `selfupdate` profile [optimized] target(s) in 33.93s
+signing ad hoc (runs on this Mac only; pass --sign <identity> to distribute)
+entitlement com.apple.security.automation.apple-events: programs run from the Terminal tool window and run configurations are attributed to CodeCraft by macOS; without it the hardened runtime denies their Apple Events (osascript, open -a … scripting) without asking
+$ codesign --force --sign - --timestamp=none --options runtime --entitlements '/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/apps/codecraft/macos/CodeCraft.entitlements' '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app'
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app: replacing existing signature
+$ codesign --verify --deep --strict --verbose=2 '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app'
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app: valid on disk
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app: satisfies its Designated Requirement
+$ codesign --display --verbose=2 '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app'
+Executable=/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app/Contents/MacOS/codecraft
+Identifier=dev.codecraft.CodeCraft
+Format=app bundle with Mach-O thin (arm64)
+/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1/CodeCraft.app
+CodeDirectory v=20500 size=492216 flags=0x10002(adhoc,runtime) hashes=15371+7 location=embedded
+Signature=adhoc
+Info.plist entries=17
+TeamIdentifier=not set
+Runtime Version=15.2.0
+Sealed Resources version=2 rules=13 files=1
+Internal requirements count=0 size=12
+WARM_BUILD_SECONDS=35.91
+PAYLOAD_VERSION=Code Craft 0.3.0 (build dd8ab8fcbd)
+{
+  "choice": {
+    "id": "0.3.0-dd8ab8fcbd5d-1",
+    "why": "current"
+  },
+  "factory": "/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0",
+  "state": {
+    "boot": null,
+    "current": "0.3.0-dd8ab8fcbd5d-1",
+    "last_good": null,
+    "pending_health": false,
+    "previous": null,
+    "schema": 1
+  },
+  "versions": [
+    {
+      "built_at": 1792778123,
+      "commit": "dd8ab8fcbd5dbdf251b605cf6b37af6375b055fd",
+      "dirty_hash": null,
+      "failures": 0,
+      "feedback_job": null,
+      "feedback_session": null,
+      "feedback_summary": "",
+      "id": "0.3.0-dd8ab8fcbd5d-1",
+      "last_failure": 0,
+      "parent": null,
+      "reason": null,
+      "semver": "0.3.0",
+      "size": 63629092,
+      "source_branch": "codecraft-user",
+      "status": "installed",
+      "user_commit": null
+    }
+  ]
+}
+SMOKE_OK real payload healthy; broken payload rolled back to 0.3.0-dd8ab8fcbd5d-1

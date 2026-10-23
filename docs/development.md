@@ -116,3 +116,33 @@ and `CODECRAFT_FACTORY_DIR` for launcher development. `CODECRAFT_BOOT_TIMEOUT` a
 from main-window UI progress, with the file write on a worker. Help › Versions & Rollback…
 exposes commands whose disk work runs on engine workers. Rollback restores bounded configuration
 snapshots; versions are selected for the next launch. See [m18-plan.md](m18-plan.md).
+
+### Building CodeCraft from feedback (M18)
+
+Review jobs targeting CodeCraft show **Accept, Build & Restart** and **Accept only**. Confirm
+Build & Restart or Build only before files are accepted and built. Accepted editor buffers are
+saved before the worker starts Cargo. Build progress and errors appear in Build and Problems;
+closing the Build tab leaves the worker running. Cancel is available in the status bar. Build
+only leaves a Restart now action. Modified buffers and active debug sessions postpone handoff.
+
+Source resolution is explicit settings/test override, `CODECRAFT_SOURCE_DIR`, existing build
+tree, then an on-demand partial clone at `<CODECRAFT_HOME>/source`. Managed changes are committed
+on `codecraft-user`; developer checkouts are never committed or rebased automatically. Configure
+repository URL, source, retention, thresholds and profile in Settings › Tools › Self-update.
+`CODECRAFT_REPO_URL` overrides the configured URL. Git's own config/credential agent handles
+private repositories with terminal prompts disabled. Update CodeCraft from upstream requires
+a clean managed tree and aborts conflicting rebases. It never pushes or hard-resets user work.
+
+The `selfupdate` Cargo profile uses persistent `<base>/build-target`, incremental release code,
+256 codegen units, no LTO and no debug info. These settings reduce rebuild time at some cost to
+runtime optimization and cache size. `selfupdate.*` commands have documented params in the
+registry and are an always-asked sensitive agent capability. No toolchain auto-install occurs.
+Developer `cargo run` lacks the stable launcher: a successful build offers its payload for opening
+and keeps the running developer app alive. `selfupdate.build`'s optional `rev` verifies current
+HEAD; it never checks out another revision over developer changes.
+
+Run `./tools/selfupdate-smoke.sh` for an offline local-bare-repo → managed commit → real payload
+build → stage/promote → real launcher health and broken-payload rollback smoke. It uses an isolated
+HOME and existing explicit Cargo/rustup caches. See `docs/m18-plan.md` for measured times and the
+validation record. Keep GUI checks for Dock/menu name, ad-hoc signing/TCC/Gatekeeper, session
+restoration, and the real-agent Review flow.
