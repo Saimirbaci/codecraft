@@ -57,6 +57,7 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("File › New", "file.newFromTemplate"),
     // CodeCraft's own: the feedback overlay (also on the toolbar).
     ("Tools", "feedback.toggle"),
+    ("Help", "version.list"),
 ];
 
 pub(crate) fn visible(item: &CatalogItem) -> bool {

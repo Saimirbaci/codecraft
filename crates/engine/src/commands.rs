@@ -149,6 +149,7 @@ pub fn registry() -> &'static Registry {
         let mut specs = Vec::new();
         specs.extend(crate::file_cmds::specs());
         specs.extend(crate::app_cmds::specs());
+        specs.extend(crate::version_cmds::specs());
         specs.extend(crate::edit_cmds::specs());
         specs.extend(crate::editor_cmds::specs());
         specs.extend(crate::view_cmds::specs());

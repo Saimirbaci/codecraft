@@ -27,6 +27,7 @@ mod bookmark_cmds;
 pub mod bookmarks;
 pub mod agents;
 pub mod app_cmds;
+pub mod version_cmds;
 pub mod approvals;
 pub mod catalog;
 pub mod before_launch;
@@ -239,6 +240,7 @@ pub enum LspStatus {
 
 /// One IDE window's worth of state and services.
 pub struct Session {
+    pub versions: version_cmds::Versions,
     pub ws: Workspace,
     pub popup: Option<Popup>,
     pub find_bar: Option<FindBar>,
@@ -388,6 +390,7 @@ impl Default for Session {
 impl Session {
     pub fn new() -> Self {
         Self {
+            versions: version_cmds::Versions::default(),
             ws: Workspace::new(),
             popup: None,
             find_bar: None,
@@ -582,6 +585,8 @@ impl Session {
         // IDE inspection profiles and managed analyzers (M14 CA).
         self.analysis.set_home(dir.to_path_buf());
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
+        self.versions.base = Some(dir.to_path_buf());
+        self.versions.factory = Some(dir.join("factory"));
         self.cpp.isolated = true;
         // zig and tsc too (M13 track RC).
         self.zig.isolated = true;
@@ -606,6 +611,7 @@ impl Session {
     }
 
     fn pump_frame(&mut self) -> bool {
+        version_cmds::pump(self);
         let lock = self.remote.project.as_ref().and_then(|_| self.project_root()).map(|r| remote::mirror_lock(&r));
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),

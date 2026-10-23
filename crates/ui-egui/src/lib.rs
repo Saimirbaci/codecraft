@@ -33,6 +33,7 @@ mod ed_ui;
 mod editor;
 mod er_diagram;
 mod feedback;
+mod versions;
 mod fonts;
 mod history_ui;
 mod hot_exit_ui;
@@ -692,6 +693,7 @@ impl App {
         redis_ui::windows(ui, s, st);
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
+        versions::show(ui.ctx(), s, st);
         windows::capture(ui.ctx(), st);
         if st.focus_editor
             && let Some(id) = s.ws.active_editor()
@@ -783,6 +785,14 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        if std::env::var_os("CODECRAFT_LAUNCHER").is_some() {
+            codecraft_selfupdate::health::window_progress();
+            if !self.session.versions.startup_checked && codecraft_selfupdate::health::is_reported() {
+                self.session.versions.startup_checked = true;
+                let _ = self.session.execute("version.status", &serde_json::Value::Null);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
         let menu_bar = !self.native_menu.active();
         Self::paint(ui, &mut self.session, &mut self.ui, &self.persisted, menu_bar);
         // Project windows, then what any window's effects asked of the app.

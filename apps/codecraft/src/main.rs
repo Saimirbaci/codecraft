@@ -21,7 +21,7 @@ fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     // `codecraft --mcp-bridge --port N …`: the stdio MCP server built-in agent jobs are given; it
     // forwards to the running IDE's server (no window).
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args_os().skip(1).map(|v| v.to_string_lossy().into_owned()).collect();
     if args.first().map(String::as_str) == Some(codecraft_engine::agent_mcp::BRIDGE_FLAG) {
         std::process::exit(codecraft_engine::agent_mcp::bridge_main(&args));
     }
@@ -30,6 +30,17 @@ fn main() -> eframe::Result {
         println!("{} {}", info.name, info.version_line());
         return Ok(());
     }
+    // Hold a shared running lease even if the background supervisor is interrupted.
+    let _version_lease = if let Ok(id) = std::env::var("CODECRAFT_VERSION_ID") {
+        let base = codecraft_selfupdate::default_base().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
+        Some(
+            codecraft_selfupdate::Store::new(base, PathBuf::new())
+                .app_lease(&id)
+                .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?,
+        )
+    } else {
+        None
+    };
     codecraft_ui_egui::launch(parse(std::env::args_os().skip(1)))
 }
 
@@ -53,6 +64,14 @@ mod tests {
 
     fn args(a: &[&str]) -> Launch {
         parse(a.iter().map(OsString::from))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn developer_path_preserves_non_utf8_without_a_launcher() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = OsString::from_vec(b"/tmp/project-\xff".to_vec());
+        assert_eq!(parse([path.clone()].into_iter()).open, Some(PathBuf::from(path)));
     }
 
     #[test]
