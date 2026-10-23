@@ -543,6 +543,7 @@ pub struct FeedbackState {
     pub dir: Option<PathBuf>,
     /// CodeCraft source override (tests); else `CODECRAFT_SOURCE_DIR`, else the build tree.
     pub source_dir: Option<PathBuf>,
+    pub managed_source_dir: Option<PathBuf>,
     pub launcher: Option<Launcher>,
 }
 
@@ -618,10 +619,34 @@ impl FeedbackState {
         if let Some(d) = &self.source_dir {
             return Ok(d.clone());
         }
-        resolve_source_dir(
+        resolve_source_with_managed(
             std::env::var_os("CODECRAFT_SOURCE_DIR").map(PathBuf::from),
             Path::new(env!("CARGO_MANIFEST_DIR")),
+            self.managed_source_dir.as_deref(),
         )
+    }
+}
+
+/// Resolve developer source first; only then use a prepared managed clone.
+pub fn resolve_source_with_managed(
+    env: Option<PathBuf>,
+    manifest: &Path,
+    managed: Option<&Path>,
+) -> Result<PathBuf, CommandError> {
+    let env = env.filter(|p| !p.as_os_str().is_empty());
+    let resolved = resolve_source_dir(env.clone(), manifest);
+    if resolved.is_ok() || env.is_some() {
+        return resolved;
+    }
+    let managed = managed
+        .map(Path::to_path_buf)
+        .map(Ok)
+        .unwrap_or_else(|| codecraft_selfupdate::default_base().map(|p| p.join("source")))
+        .map_err(|e| CommandError::Failed(e.to_string()))?;
+    if managed.join(".git").is_dir() {
+        Ok(managed)
+    } else {
+        Err(CommandError::Failed("Setting up CodeCraft's source is required; use selfupdate.prepareSource".into()))
     }
 }
 
@@ -1044,6 +1069,18 @@ mod tests {
         assert_eq!(resolve_source_dir(Some(tmp.path().to_path_buf()), &manifest).unwrap(), tmp.path());
         let err = resolve_source_dir(Some(tmp.path().join("missing")), &manifest).unwrap_err();
         assert!(err.to_string().contains("CODECRAFT_SOURCE_DIR"));
+        let managed = tmp.path().join("managed source");
+        std::fs::create_dir_all(managed.join(".git")).unwrap();
+        let absent = tmp.path().join("nowhere/a/b");
+        assert_eq!(resolve_source_with_managed(None, &absent, Some(&managed)).unwrap(), managed);
+        assert_eq!(resolve_source_with_managed(None, &manifest, Some(&managed)).unwrap(), ws);
+        assert!(resolve_source_with_managed(Some(tmp.path().join("missing")), &absent, Some(&managed)).is_err());
+        assert!(
+            resolve_source_with_managed(None, &absent, Some(&tmp.path().join("not prepared")))
+                .unwrap_err()
+                .to_string()
+                .contains("prepareSource")
+        );
         let err = resolve_source_dir(None, &tmp.path().join("nowhere/a/b")).unwrap_err();
         assert!(err.to_string().contains("CODECRAFT_SOURCE_DIR"), "{err}");
     }

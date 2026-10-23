@@ -20,41 +20,42 @@ pub mod agent_mcp;
 pub mod agent_tools;
 mod agent_tools_cmds;
 // M15 track AI: Review jobs' tool calls in their worktree.
-mod agent_worktree;
 pub mod agent_sessions;
+mod agent_worktree;
+pub mod agents;
+pub mod analysis;
+pub mod app_cmds;
 pub mod appearance;
+pub mod approvals;
+pub mod asm;
+pub mod before_launch;
 mod bookmark_cmds;
 pub mod bookmarks;
-pub mod agents;
-pub mod app_cmds;
-pub mod version_cmds;
-pub mod approvals;
-pub mod catalog;
-pub mod before_launch;
-pub mod command_completion;
-pub mod modify_code;
-pub mod typescript_tool;
-pub mod zig_tool;
 pub mod cargo_audit;
 pub mod cargo_deps;
+pub mod catalog;
 mod code_cmds;
+pub mod command_completion;
 pub mod commands;
-pub mod completion;
 pub mod commit_ai;
+pub mod completion;
 mod convert;
+pub mod copyright;
 pub mod cpp;
+pub mod data_flow;
 pub mod database;
 mod database_cmds;
+pub mod dataframe;
 pub mod debug;
-mod debug_cmds;
 mod debug_agent_cmds;
+mod debug_cmds;
 pub mod debug_views;
-pub mod asm;
 mod decorations;
 pub mod deployment;
 pub mod docker;
 mod docker_cmds;
 pub mod docker_target;
+pub mod duplicates;
 mod edit_cmds;
 pub mod editing;
 mod editing_cmds;
@@ -62,38 +63,40 @@ mod editor_cmds;
 pub mod feedback;
 mod feedback_cmds;
 mod file_cmds;
+pub mod file_templates;
 pub mod github_prs;
-mod ide_cmds;
-pub mod ide_server;
+pub mod hot_exit;
 pub mod http_client;
 mod http_cmds;
+mod ide_cmds;
+pub mod ide_server;
+pub mod inline_completion;
+pub mod inline_rename;
 mod inspection_cmds;
 pub mod inspections;
-pub mod inline_rename;
 mod jobs;
 pub mod jupyter;
 pub mod keymaps;
 mod lang_cmds;
+pub mod layouts;
 pub mod local_history;
-pub mod macro_expand;
 mod local_history_cmds;
 mod lsp;
+pub mod macro_expand;
+pub mod macros;
+pub mod markdown_export;
 pub mod misc;
 mod misc_cmds;
+pub mod modify_code;
 mod navigate_cmds;
 pub mod notebook;
 mod notebook_cmds;
 pub mod notebook_kernel;
-pub mod dataframe;
 mod params;
-pub mod refactor;
-mod refactor_cmds;
-pub mod remote;
-mod remote_cmds;
-pub mod run_targets;
-mod render_cmds;
-mod reformat;
+pub mod paste;
 pub mod popup;
+pub mod prefs_cmds;
+pub mod presentation;
 pub mod profiler;
 mod profiler_agent_cmds;
 mod profiler_cmds;
@@ -105,67 +108,65 @@ mod python_cmds;
 pub mod python_console;
 pub mod python_env;
 pub mod python_format;
-pub mod python_output;
 mod python_lint;
+pub mod python_output;
 pub mod python_project;
+pub mod refactor;
+mod refactor_cmds;
+mod reformat;
+pub mod remote;
+mod remote_cmds;
+mod render_cmds;
 mod run_cmds;
-pub mod run_config_gen;
 mod run_config_cmds;
+pub mod run_config_gen;
 pub mod run_config_store;
 pub mod run_configs;
+pub mod run_targets;
 mod runs;
 mod rust_cmds;
 pub mod rust_repl;
 pub mod rust_tools;
 pub mod scratch;
+pub mod selfupdate;
 pub mod services;
 pub mod session_store;
 pub mod settings;
 mod settings_cmds;
-pub mod prefs_cmds;
 pub mod snippet;
-pub mod paste;
 mod split_cmds;
 pub mod sql_lang;
 mod sql_lang_cmds;
-pub mod analysis;
-pub mod copyright;
-pub mod data_flow;
-pub mod duplicates;
-pub mod file_templates;
-pub mod hot_exit;
-pub mod inline_completion;
-pub mod layouts;
-pub mod macros;
-pub mod markdown_export;
-pub mod tasks_contexts;
-pub mod presentation;
+pub mod ssh_target;
 pub mod ssr;
 pub mod ssr_cmds;
+pub mod tasks_contexts;
+pub mod typescript_tool;
 pub mod user_store;
-pub mod ssh_target;
+pub mod version_cmds;
+pub mod zig_tool;
 // M16 track RT: run, debug, test and profile on SSH hosts and Docker containers.
-pub mod target_exec;
-mod target_cmds;
-pub mod target_python;
+mod folding;
 pub mod ssh_tunnel;
 pub mod structure;
+mod target_cmds;
+pub mod target_exec;
+pub mod target_python;
 pub mod templates;
 pub mod templates_django;
-pub mod todo;
 pub mod terminal;
-pub mod terminal_shell;
 mod terminal_cmds;
+pub mod terminal_shell;
+pub mod test_file;
 pub mod testing;
 mod testing_cmds;
-pub mod test_file;
+pub mod todo;
+mod tool_window_cmds;
+pub mod usages;
 pub mod vcs;
 mod vcs_cmds;
 mod vcs_ext_cmds;
 pub mod vcs_merge;
-pub mod usages;
-mod folding;
-mod tool_window_cmds;
 mod view_cmds;
 mod watch;
 mod window_cmds;
@@ -220,7 +221,14 @@ pub enum Effect {
     SetFullScreen(bool),
     /// Ask for a file to open (or, with `save`, a file to write), then run `command` with the
     /// chosen path as param `param`. `extensions` filter the dialog (`["json"]`).
-    PickFile { title: String, command: String, param: String, save: bool, extensions: Vec<String>, default_name: Option<String> },
+    PickFile {
+        title: String,
+        command: String,
+        param: String,
+        save: bool,
+        extensions: Vec<String>,
+        default_name: Option<String>,
+    },
     /// Ask for a folder, then run `command` with the chosen path as param `param`.
     PickFolder { title: String, command: String, param: String },
 }
@@ -241,6 +249,7 @@ pub enum LspStatus {
 /// One IDE window's worth of state and services.
 pub struct Session {
     pub versions: version_cmds::Versions,
+    pub selfupdate: selfupdate::State,
     pub ws: Workspace,
     pub popup: Option<Popup>,
     pub find_bar: Option<FindBar>,
@@ -391,6 +400,7 @@ impl Session {
     pub fn new() -> Self {
         Self {
             versions: version_cmds::Versions::default(),
+            selfupdate: selfupdate::State::default(),
             ws: Workspace::new(),
             popup: None,
             find_bar: None,
@@ -482,7 +492,9 @@ impl Session {
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),
             Some(Err(std::sync::TryLockError::Poisoned(e))) => Some(e.into_inner()),
-            Some(Err(std::sync::TryLockError::WouldBlock)) => return Err(CommandError::Disabled("Remote mirror is applying changes; retry the command".into())),
+            Some(Err(std::sync::TryLockError::WouldBlock)) => {
+                return Err(CommandError::Disabled("Remote mirror is applying changes; retry the command".into()));
+            }
             None => None,
         };
         let previous = self.remote.mirror_guard_active;
@@ -585,6 +597,8 @@ impl Session {
         // IDE inspection profiles and managed analyzers (M14 CA).
         self.analysis.set_home(dir.to_path_buf());
         // C/C++ tools (cmake, valgrind, conan, …) only from explicit overrides.
+        self.selfupdate.isolated=true;
+        self.feedback.managed_source_dir=Some(dir.join("source"));
         self.versions.base = Some(dir.to_path_buf());
         self.versions.factory = Some(dir.join("factory"));
         self.cpp.isolated = true;
@@ -612,6 +626,7 @@ impl Session {
 
     fn pump_frame(&mut self) -> bool {
         version_cmds::pump(self);
+        selfupdate::pump(self);
         let lock = self.remote.project.as_ref().and_then(|_| self.project_root()).map(|r| remote::mirror_lock(&r));
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),
@@ -621,7 +636,7 @@ impl Session {
                 let changed = terminal::pump(self);
                 self.record_frame_section("terminal::pump", started.elapsed());
                 return changed;
-            },
+            }
             None => None,
         };
         self.remote.mirror_guard_active = true;
@@ -689,6 +704,7 @@ impl Session {
     /// Whether background work is in flight (the UI keeps repainting to poll).
     pub fn busy(&self) -> bool {
         !self.servers.is_empty()
+            || self.selfupdate.busy
             || self.runs.any_running()
             || self.jobs.any_running()
             || self.agents.any_active()

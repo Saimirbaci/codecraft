@@ -97,11 +97,28 @@ fn start(s: &mut Session, p: &Value, op: &'static str) -> crate::commands::CmdRe
             io.map_err(|e| e.to_string())?;
             let status =
                 serde_json::from_str(&store.status_json().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-            let notice = if codecraft_selfupdate::health::is_reported() {
+            let mut notice = if codecraft_selfupdate::health::is_reported() {
                 store.take_notice().map_err(|e| e.to_string())?
             } else {
                 None
             };
+            if let Some(text) = &mut notice {
+                use std::io::Read;
+                let log_path = text
+                    .split_whitespace()
+                    .nth(2)
+                    .map(|id| id.trim_end_matches(':'))
+                    .and_then(|id| store.version_dir(id).ok())
+                    .map(|dir| dir.join("build.log"))
+                    .filter(|p| p.is_file())
+                    .unwrap_or_else(|| store.base.join("selfupdate-build.log"));
+                if let Ok(file) = std::fs::File::open(log_path) {
+                    let mut log = String::new();
+                    let _ = file.take(1024 * 1024).read_to_string(&mut log);
+                    text.push_str("\nBuild log:\n");
+                    text.push_str(&log);
+                }
+            }
             Ok((store.list(), status, notice))
         })();
         let _ = tx.send(Reply { result, quit: op == "factory" });
@@ -122,10 +139,32 @@ pub(crate) fn pump(s: &mut Session) {
             s.versions.busy = false;
             match reply.result {
                 Ok((entries, status, notice)) => {
+                    if !s.selfupdate.updated_seen
+                        && let Ok(id) = std::env::var("CODECRAFT_VERSION_ID")
+                        && let Some(meta) = entries.iter().find(|m| m.id == id && !m.feedback_summary.is_empty())
+                    {
+                        s.selfupdate.updated_seen = true;
+                        s.selfupdate.updated_notice =
+                            Some(format!("Updated to {} from your feedback: {}", meta.id, meta.feedback_summary));
+                        s.notify(
+                            crate::workspace::NotificationLevel::Info,
+                            "CodeCraft updated",
+                            format!(
+                                "Updated to {} from your feedback: {}. Roll Back is available in Versions & Rollback.",
+                                meta.id, meta.feedback_summary
+                            ),
+                        );
+                    }
                     s.versions.entries = entries;
                     s.versions.status = status;
                     if let Some(notice) = notice {
-                        s.notify(crate::workspace::NotificationLevel::Warning, "Version rollback", notice);
+                        s.selfupdate.rollback_notice = Some(notice.clone());
+                        let display = format!(
+                            "{}\n{}",
+                            notice.lines().next().unwrap_or_default(),
+                            crate::selfupdate::log_tail(crate::selfupdate::crash_log(&notice), 8192)
+                        );
+                        s.notify(crate::workspace::NotificationLevel::Warning, "Version rollback", display);
                     }
                     if reply.quit {
                         s.effects.push(Effect::Quit);

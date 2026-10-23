@@ -160,6 +160,7 @@ fn toggle(s: &mut Session, p: &Value) -> CmdResult {
 }
 
 fn cancel(s: &mut Session, _: &Value) -> CmdResult {
+    s.selfupdate.pending_submit=None;
     s.feedback.reset_draft();
     s.feedback.active = false;
     ok()
@@ -290,12 +291,28 @@ fn submit(s: &mut Session, p: &Value) -> CmdResult {
     if p.get("confirm").and_then(Value::as_bool) != Some(true) {
         return Err(CommandError::BadParams("pass {\"confirm\": true}: submitting starts an agent run".into()));
     }
+    crate::selfupdate::load(s)?;
     set(s, p)?;
     let mut draft = s.feedback.draft.clone();
     if draft.text.trim().is_empty() {
         return Err(CommandError::BadParams("describe the change first".into()));
     }
-    let cwd = target_cwd(s, draft.target)?;
+    let cwd = match target_cwd(s, draft.target) {
+        Ok(cwd) => cwd,
+        Err(e)
+            if draft.target == Target::CodeCraft
+                && std::env::var_os("CODECRAFT_SOURCE_DIR").filter(|v|!v.is_empty()).is_none()
+                && s.feedback.source_dir.is_none() =>
+        {
+            if s.selfupdate.busy {
+                return Err(e);
+            }
+            s.execute("selfupdate.prepareSource", &Value::Null)?;
+            s.selfupdate.pending_submit = Some(p.clone());
+            return Ok(json!({"settingUpSource":true}));
+        }
+        Err(e) => return Err(e),
+    };
     // A follow-up: the thread's agent session when it still exists, else a new run.
     let mut resume_job = None;
     let mut fallback_note = None;

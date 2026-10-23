@@ -52,10 +52,11 @@ pub enum Capability {
     /// this is always asked, once per call: it can be Off or Ask, never Allow, "Always for this
     /// session" doesn't apply, Auto jobs are asked too, and headless servers refuse it.
     Remote,
+    SelfUpdate,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 7] = [
+    pub const ALL: [Capability; 8] = [
         Capability::Read,
         Capability::Run,
         Capability::Debug,
@@ -63,6 +64,7 @@ impl Capability {
         Capability::Write,
         Capability::DbWrite,
         Capability::Remote,
+        Capability::SelfUpdate,
     ];
 
     pub fn id(self) -> &'static str {
@@ -74,6 +76,7 @@ impl Capability {
             Self::Write => "write",
             Self::DbWrite => "db-write",
             Self::Remote => "remote",
+            Self::SelfUpdate => "self-update",
         }
     }
 
@@ -86,6 +89,7 @@ impl Capability {
             Self::Write => "Edit files",
             Self::DbWrite => "Modify databases",
             Self::Remote => "Act on SSH hosts and Docker containers",
+            Self::SelfUpdate => "Rebuild or restart CodeCraft",
         }
     }
 
@@ -99,6 +103,7 @@ impl Capability {
             Self::Profile => "Record CPU profiles of run configurations",
             Self::Write => "Change files and run commands that edit the project",
             Self::DbWrite => "INSERT/UPDATE/DELETE/DDL on data sources (read-only queries only need Read)",
+            Self::SelfUpdate => "Prepare, update, build or restart CodeCraft. Always asked for every call.",
             Self::Remote => {
                 "Run, debug, test or profile on an SSH host or Docker container, deployment, remote hosts, and \
                  data sources behind an SSH tunnel. Always asked, every time (never Allow)"
@@ -196,7 +201,7 @@ impl AgentAccess {
     /// denied (nobody can approve). Not saved.
     pub fn headless(allowed: &[Capability]) -> Self {
         let mut levels = default_levels();
-        for c in allowed.iter().filter(|c| **c != Capability::Remote) {
+        for c in allowed.iter().filter(|c| !matches!(**c, Capability::Remote | Capability::SelfUpdate)) {
             levels.insert(*c, Level::Allow);
         }
         Self { levels, interactive: false, ephemeral: true, loaded: true, ..Self::default() }
@@ -208,12 +213,16 @@ impl AgentAccess {
 
     pub fn level(&self, cap: Capability) -> Level {
         let level = self.levels.get(&cap).copied().unwrap_or(Level::Ask);
-        if cap == Capability::Remote && level == Level::Allow { Level::Ask } else { level }
+        if matches!(cap, Capability::Remote | Capability::SelfUpdate) && level == Level::Allow {
+            Level::Ask
+        } else {
+            level
+        }
     }
 
     /// Change one capability (saved unless ephemeral).
     pub fn set_level(&mut self, cap: Capability, level: Level) -> Result<(), String> {
-        if cap == Capability::Remote && level == Level::Allow {
+        if matches!(cap, Capability::Remote | Capability::SelfUpdate) && level == Level::Allow {
             return Err("SSH hosts and Docker containers are always asked for now: `remote` can be off or ask".into());
         }
         self.ensure_loaded();
@@ -253,7 +262,7 @@ impl AgentAccess {
                 cap.id()
             ));
         }
-        if cap == Capability::Remote {
+        if matches!(cap, Capability::Remote | Capability::SelfUpdate) {
             // Always asked, once per call: no Allow level, no session approval, no Auto bypass.
             if !self.interactive {
                 return Verdict::Deny(

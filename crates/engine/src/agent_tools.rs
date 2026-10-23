@@ -73,9 +73,8 @@ impl Caller {
         let job = info.get(CLIENT_INFO_JOB).and_then(Value::as_u64).map(JobId).filter(|j| s.agents.job(*j).is_some());
         let key = info.get(CLIENT_INFO_JOB_KEY).and_then(Value::as_str).unwrap_or_default();
         if let Some(job) = job.filter(|j| !key.is_empty() && key == job_key(s, *j)).and_then(|j| s.agents.job(j)) {
-            let root = (job.mode == crate::approvals::AgentMode::Review).then(|| {
-                job.worktree.as_ref().map(|wt| crate::normalize_path(&wt.cwd())).unwrap_or_default()
-            });
+            let root = (job.mode == crate::approvals::AgentMode::Review)
+                .then(|| job.worktree.as_ref().map(|wt| crate::normalize_path(&wt.cwd())).unwrap_or_default());
             return Self { name: format!("{} (job {})", job.backend.label(), job.id.0), job: Some(job.id), root };
         }
         let name = info.get("name").and_then(Value::as_str).filter(|n| !n.trim().is_empty()).unwrap_or(fallback);
@@ -164,7 +163,9 @@ impl Default for AgentToolsState {
             instance: {
                 use std::hash::{BuildHasher, Hasher};
                 let mut h = std::hash::RandomState::new().build_hasher();
-                h.write_u128(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()));
+                h.write_u128(
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()),
+                );
                 h.finish()
             },
             worktrees: Vec::new(),
@@ -477,6 +478,9 @@ const OUTWARD_PREFIXES: &[&str] = &[
 /// that publish or change things outside this machine).
 pub fn command_capability(id: &str) -> Option<Capability> {
     let id = crate::registry().canonical(id);
+    if id.starts_with("selfupdate.") {
+        return Some(Capability::SelfUpdate);
+    }
     if READ_COMMANDS.contains(&id) {
         return Some(Capability::Read);
     }
@@ -619,13 +623,20 @@ fn remote_reason(s: &mut Session, name: &str, args: &Value) -> Option<String> {
             && args.get("target").is_none_or(Value::is_null);
         let command = (name == t::EXECUTE).then(|| args.get("id").and_then(Value::as_str)).flatten();
         let params = args.get("params").unwrap_or(&Value::Null);
-        let command_default = command.is_some_and(|id| crate::target_exec::TARGET_COMMANDS.contains(&id)
-            && params.get("target").is_none_or(Value::is_null));
-        let terminal = command.is_some_and(|id| id == "terminal.newRemote"
-            || (id == "terminal.new" && params.get("command").is_none_or(Value::is_null))
-            || (matches!(id, "terminal.sendText" | "terminal.sendKey" | "terminal.paste" | "terminal.close")
-                && params.get("tab").and_then(Value::as_u64).and_then(|id| s.terminal.tabs.iter().find(|t| t.id == id))
-                    .or_else(|| s.terminal.tabs.get(s.terminal.active)).is_some_and(|t| t.remote)));
+        let command_default = command.is_some_and(|id| {
+            crate::target_exec::TARGET_COMMANDS.contains(&id) && params.get("target").is_none_or(Value::is_null)
+        });
+        let terminal = command.is_some_and(|id| {
+            id == "terminal.newRemote"
+                || (id == "terminal.new" && params.get("command").is_none_or(Value::is_null))
+                || (matches!(id, "terminal.sendText" | "terminal.sendKey" | "terminal.paste" | "terminal.close")
+                    && params
+                        .get("tab")
+                        .and_then(Value::as_u64)
+                        .and_then(|id| s.terminal.tabs.iter().find(|t| t.id == id))
+                        .or_else(|| s.terminal.tabs.get(s.terminal.active))
+                        .is_some_and(|t| t.remote))
+        });
         if target_default || command_default || terminal {
             return Some(format!("remote project {} (default SSH execution)", project.server));
         }
@@ -662,17 +673,21 @@ fn remote_reason(s: &mut Session, name: &str, args: &Value) -> Option<String> {
         ssh.then(|| format!("data source {} (through an SSH tunnel)", d.config.name))
     }
     match name {
-        t::DEBUG_START | t::PROFILE_START | t::TEST_RUN | t::RUN_START => match args.get("target").filter(|v| !v.is_null()) {
-            Some(v) => label(s, v),
-            None if args.get("config").is_some_and(|c| !c.is_null()) => config(s, args.get("config"), true),
-            // A file, test or program: the configuration picked for it may be remote, so a
-            // project with remote configurations asks unless the call says `target: "local"`.
-            None => s
-                .run_configs
-                .iter()
-                .find(|c| !c.target.is_local())
-                .map(|c| format!("a remote configuration, maybe ({}: {}); pass target \"local\" to stay here", c.name, c.target.label())),
-        },
+        t::DEBUG_START | t::PROFILE_START | t::TEST_RUN | t::RUN_START => {
+            match args.get("target").filter(|v| !v.is_null()) {
+                Some(v) => label(s, v),
+                None if args.get("config").is_some_and(|c| !c.is_null()) => config(s, args.get("config"), true),
+                // A file, test or program: the configuration picked for it may be remote, so a
+                // project with remote configurations asks unless the call says `target: "local"`.
+                None => s.run_configs.iter().find(|c| !c.target.is_local()).map(|c| {
+                    format!(
+                        "a remote configuration, maybe ({}: {}); pass target \"local\" to stay here",
+                        c.name,
+                        c.target.label()
+                    )
+                }),
+            }
+        }
         t::DB_QUERY => tunnel(s, args.get("dataSource")),
         t::EXECUTE => {
             let id = crate::registry().canonical(args.get("id").and_then(Value::as_str)?);
@@ -1007,7 +1022,11 @@ pub fn submit_call(s: &mut Session, caller: Caller, key: Option<CallKey>, name: 
                 None => {
                     let source = crate::agent_access::approval_source(&caller.name, cap);
                     let title = format!("{} wants to use {name} ({})", caller.name, cap.label().to_lowercase());
-                    (cap, s.approvals.sink().ask(source, title, kind))
+                    if cap == Capability::SelfUpdate {
+                        (cap, s.approvals.sink().ask_once(source, title, kind))
+                    } else {
+                        (cap, s.approvals.sink().ask(source, title, kind))
+                    }
                 }
             };
             s.status = format!("{} asks to use {name}", caller.name);
@@ -1650,7 +1669,9 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
             o.remove("session");
         }
         return match crate::debug::with_session(s, id, |s| run_tool(s, caller, name, &inner)) {
-            Step::Wait(Wait::DebugStop { frames, .. }, t) => Step::Wait(Wait::DebugStop { frames, session: Some(id) }, t),
+            Step::Wait(Wait::DebugStop { frames, .. }, t) => {
+                Step::Wait(Wait::DebugStop { frames, session: Some(id) }, t)
+            }
             Step::Wait(w, t) => Step::Wait(Wait::InSession { session: id, inner: Box::new(w) }, t),
             done => done,
         };
@@ -2475,7 +2496,14 @@ fn agent_params_ok(params: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn db_outcome(s: &mut Session, source: &str, before: &[u64], output_before: usize, limit: usize, added: Option<Value>) -> Step {
+fn db_outcome(
+    s: &mut Session,
+    source: &str,
+    before: &[u64],
+    output_before: usize,
+    limit: usize,
+    added: Option<Value>,
+) -> Step {
     let owner = format!("query:{source}");
     let new_ids: Vec<u64> =
         s.db.results.iter().filter(|r| r.owner == owner && !before.contains(&r.id)).map(|r| r.id).collect();

@@ -125,6 +125,7 @@ pub const PAGE_SQL: &str = "Languages & Frameworks › SQL";
 pub const PAGE_VCS: &str = "Version Control › Commit Message Generation";
 pub const PAGE_TOOLS: &str = "Tools › AI Agents";
 /// What agents connected over MCP may do (M14 track AX; `agentAccess.*` commands).
+pub const PAGE_SELFUPDATE: &str = "Tools › Self-update";
 pub const PAGE_AGENT_ACCESS: &str = "Tools › Agent Access";
 pub const PAGE_OTHER: &str = "Other";
 
@@ -153,6 +154,7 @@ pub const PAGES: &[&str] = &[
     PAGE_VCS,
     PAGE_TOOLS,
     PAGE_AGENT_ACCESS,
+    PAGE_SELFUPDATE,
 ];
 
 pub const THEMES: [&str; 3] = ["Dark", "Light", "High Contrast"];
@@ -935,9 +937,9 @@ pub fn matching_pages(query: &str) -> Vec<&'static str> {
             q.is_empty()
                 || p.to_lowercase().contains(&q)
                 || SETTINGS.iter().any(|d| d.page == *p && matches(d, &q))
-                || page_options(p).iter().any(|o| {
-                    [o.key, o.label, o.description].iter().any(|t| t.to_lowercase().contains(&q))
-                })
+                || page_options(p)
+                    .iter()
+                    .any(|o| [o.key, o.label, o.description].iter().any(|t| t.to_lowercase().contains(&q)))
         })
         .collect();
     if !out.contains(&PAGE_KEYMAP) && crate::registry().all().iter().any(|c| c.label.to_lowercase().contains(&q)) {
@@ -1080,7 +1082,9 @@ pub mod analysis_levels {
         };
         map.into_iter()
             .take(10_000)
-            .filter(|(rel, _)| !rel.is_empty() && !Path::new(rel).is_absolute() && !rel.split(['/', '\\']).any(|c| c == ".."))
+            .filter(|(rel, _)| {
+                !rel.is_empty() && !Path::new(rel).is_absolute() && !rel.split(['/', '\\']).any(|c| c == "..")
+            })
             .map(|(rel, l)| (root.join(rel), l))
             .collect()
     }
@@ -1094,7 +1098,9 @@ pub mod analysis_levels {
         let path = file(root);
         if rel.is_empty() {
             return match std::fs::remove_file(&path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("cannot remove {}: {e}", path.display())),
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("cannot remove {}: {e}", path.display()))
+                }
                 _ => Ok(()),
             };
         }
