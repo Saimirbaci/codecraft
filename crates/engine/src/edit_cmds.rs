@@ -86,6 +86,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
         editor("edit.extendSelection", "Extend Selection", extend_selection),
         editor("edit.shrinkSelection", "Shrink Selection", shrink_selection),
         editor("edit.toggleCase", "Toggle Case", |s, _| run_op(s, |d, sel, _| ops::toggle_case(d, sel))),
+        editor("edit.convertCase.camelCase", "camelCase", |s, _| run_op(s, |d, sel, _| ops::to_camel_case(d, sel))),
         editor("edit.joinLines", "Join Lines", |s, _| run_op(s, |d, sel, _| ops::join_lines(d, sel))),
         editor("edit.duplicateSelection", "Duplicate Line or Selection", |s, _| {
             run_op(s, |d, sel, _| ops::duplicate(d, sel))
