@@ -181,6 +181,14 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let chrome = appearance::chrome(s);
     egui::Panel::bottom("status-bar").exact_size(height).frame(bar_frame(st)).show(ui, |ui| {
         ui.horizontal_centered(|ui| {
+            if s.selfupdate.busy {
+                ui.spinner(); ui.label(&s.selfupdate.phase);
+                if ui.small_button("Cancel build").clicked() { run_command(s, st, "selfupdate.cancel", &serde_json::Value::Null); }
+            } else if let Some(id) = s.selfupdate.ready.clone()
+                && ui.small_button("Restart now").clicked()
+            {
+                run_command(s, st, "selfupdate.restartInto", &serde_json::json!({"id":id}));
+            }
             let muted = st.theme.text_muted;
             // Left: a pending two-stroke shortcut, the status message (Status Text widget), else
             // the navigation path.
@@ -640,8 +648,14 @@ fn tabs(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, g: GroupId, focuse
                         .as_deref()
                         .is_some_and(|p| s.ws.problems_for(p).iter().any(|p| p.severity == Severity::Error));
                     let mut title = d.title();
-                    let remote_conflict = d.path.as_ref().is_some_and(|path| s.project_root().is_some_and(|root| path.strip_prefix(root).ok().is_some_and(|rel| s.remote.conflicts.iter().any(|p| p == rel))));
-                    if remote_conflict { title = format!("⚠ {title}"); }
+                    let remote_conflict = d.path.as_ref().is_some_and(|path| {
+                        s.project_root().is_some_and(|root| {
+                            path.strip_prefix(root).ok().is_some_and(|rel| s.remote.conflicts.iter().any(|p| p == rel))
+                        })
+                    });
+                    if remote_conflict {
+                        title = format!("⚠ {title}");
+                    }
                     if e.pinned {
                         title = format!("📌 {title}");
                     }

@@ -33,7 +33,6 @@ mod ed_ui;
 mod editor;
 mod er_diagram;
 mod feedback;
-mod versions;
 mod fonts;
 mod history_ui;
 mod hot_exit_ui;
@@ -55,23 +54,25 @@ mod project_windows;
 mod pull_requests_ui;
 mod python_settings_ui;
 mod python_ui;
-mod remote_python_ui;
 mod rc_ui;
 mod redis_ui;
 mod refactor_ui;
+mod remote_python_ui;
 mod remote_ui;
 mod rust_ui;
+mod selfupdate_ui;
 mod services_panel;
 mod settings_pages;
 mod settings_ui;
 mod state;
 mod terminal_panel;
 mod testing_panel;
-mod valgrind_ui;
 pub mod theme;
+mod valgrind_ui;
 mod vcs_changes_ui;
 mod vcs_merge_ui;
 mod vcs_panels;
+mod versions;
 mod windows;
 
 use std::path::PathBuf;
@@ -116,6 +117,8 @@ pub struct UiState {
     pub last_autosave: Instant,
     /// Feedback overlay view state (tool, ink, gesture, capture).
     pub feedback: feedback::FeedbackUi,
+    pub selfupdate_settings: Option<codecraft_engine::selfupdate::Settings>,
+    pub selfupdate_preflight_job: Option<u64>,
     /// Agent tool window and approval cards view state.
     pub agent: agent_panel::AgentUi,
     /// Database tool window, result grids and data source dialog view state.
@@ -165,6 +168,8 @@ impl UiState {
             error: None,
             last_autosave: Instant::now(),
             feedback: feedback::FeedbackUi::default(),
+            selfupdate_settings: None,
+            selfupdate_preflight_job: None,
             agent: agent_panel::AgentUi::default(),
             db: database_panel::DbUi::default(),
             debug: debug_panel::DebugUi::default(),
@@ -471,8 +476,12 @@ impl App {
             {
                 let inline = match key {
                     Key::Tab if modifiers.is_none() => Some("code.codeCompletion.insertInlineProposal"),
-                    Key::ArrowRight if modifiers.alt && !modifiers.shift => Some("code.codeCompletion.insertInlineProposalsWord"),
-                    Key::ArrowRight if modifiers.command && !modifiers.shift => Some("code.codeCompletion.insertInlineProposalsLine"),
+                    Key::ArrowRight if modifiers.alt && !modifiers.shift => {
+                        Some("code.codeCompletion.insertInlineProposalsWord")
+                    }
+                    Key::ArrowRight if modifiers.command && !modifiers.shift => {
+                        Some("code.codeCompletion.insertInlineProposalsLine")
+                    }
                     Key::Escape => Some("editor.inlineCompletion.dismiss"),
                     _ => None,
                 };
@@ -694,6 +703,7 @@ impl App {
         refactor_ui::overlays(ui, s, st);
         feedback::overlay(ui, s, st);
         versions::show(ui.ctx(), s, st);
+        selfupdate_ui::show(ui.ctx(), s, st);
         windows::capture(ui.ctx(), st);
         if st.focus_editor
             && let Some(id) = s.ws.active_editor()
@@ -785,7 +795,7 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if std::env::var_os("CODECRAFT_LAUNCHER").is_some() {
+        if self.persist && std::env::var_os("CODECRAFT_LAUNCHER").is_some() && codecraft_selfupdate::health::is_current_payload() {
             codecraft_selfupdate::health::window_progress();
             if !self.session.versions.startup_checked && codecraft_selfupdate::health::is_reported() {
                 self.session.versions.startup_checked = true;

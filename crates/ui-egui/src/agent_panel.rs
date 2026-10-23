@@ -207,7 +207,9 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
             }
             if ui
                 .add(egui::Button::new(RichText::new("⇄").color(theme.text_muted)).frame(false))
-                .on_hover_text("Connect an external agent (Claude Code, Codex, Gemini, Cursor, Grok) to CodeCraft's tools")
+                .on_hover_text(
+                    "Connect an external agent (Claude Code, Codex, Gemini, Cursor, Grok) to CodeCraft's tools",
+                )
                 .clicked()
             {
                 open_connect(s, st);
@@ -452,8 +454,7 @@ pub(crate) fn connect_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiStat
                                 .selectable(true)
                                 .wrap(),
                         );
-                    },
-                );
+                    });
                 ui.add_space(6.0);
             };
             if let Some(text) = current.get("ide").and_then(Value::as_str) {
@@ -473,7 +474,9 @@ pub(crate) fn connect_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiStat
                     text,
                 ),
                 None => {
-                    ui.label(RichText::new("Headless: not available here (see below).").small().color(theme.text_muted));
+                    ui.label(
+                        RichText::new("Headless: not available here (see below).").small().color(theme.text_muted),
+                    );
                 }
             }
             for n in info.get("notes").and_then(Value::as_array).into_iter().flatten() {
@@ -876,6 +879,10 @@ fn change_badge(theme: &Theme, c: ChangeKind) -> (&'static str, egui::Color32) {
 }
 
 fn review(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, id: JobId) {
+    if codecraft_engine::selfupdate::is_codecraft(s,id.0) && st.selfupdate_preflight_job!=Some(id.0) && !s.selfupdate.busy {
+        st.selfupdate_preflight_job=Some(id.0);
+        if let Some(source)=s.agents.job(id).map(|j|j.project.clone()) {run_command(s,st,"selfupdate.preflight",&json!({"source":source}));}
+    }
     let Some(job) = s.agents.job(id) else { return };
     let files: Vec<ReviewFile> = job.review.clone();
     let pending = job.pending_review();
@@ -888,6 +895,14 @@ fn review(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, i
         return;
     }
     let mut cmd: Option<(&str, Value)> = None;
+    if codecraft_engine::selfupdate::is_codecraft(s,id.0) && let Some(report)=&s.selfupdate.report && !report.ready() {
+        ui.label("Build requirements need attention");
+        for check in report.checks.iter().filter(|c|c.level==codecraft_selfupdate::preflight::Level::Fail) {
+            ui.label(&check.message);ui.small(&check.fix);
+        }
+        if report.checks.iter().any(|c|matches!(c.name.as_str(),"cargo"|"rustc")&&c.level==codecraft_selfupdate::preflight::Level::Fail) && ui.small_button("Open rustup.rs").clicked() {cmd=Some(("selfupdate.openRustup",Value::Null));}
+        if ui.add_enabled(!s.selfupdate.busy,egui::Button::new("Check requirements again")).clicked() {cmd=Some(("selfupdate.preflight",json!({"source":job.project})));}
+    }
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Changes · {pending}/{}", files.len())).strong())
             .on_hover_text(format!("{pending} of {} files still to review", files.len()));
@@ -896,8 +911,30 @@ fn review(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, i
                 if ui.small_button("Reject All").clicked() {
                     cmd = Some(("agent.review.rejectAll", json!({ "job": id.0 })));
                 }
-                if ui.small_button("Accept All").clicked() {
+                let own_source = codecraft_engine::selfupdate::is_codecraft(s, id.0);
+                let label = if own_source { "Accept only" } else { "Accept All" };
+                if ui.small_button(label).clicked() {
                     cmd = Some(("agent.review.acceptAll", json!({ "job": id.0 })));
+                }
+                if own_source {
+                    let reason = s.selfupdate.report.as_ref().filter(|r| !r.ready()).map(|r| {
+                        r.checks
+                            .iter()
+                            .filter(|c| c.level == codecraft_selfupdate::preflight::Level::Fail)
+                            .map(|c| c.message.clone())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    });
+                    if ui
+                        .add_enabled(
+                            !s.selfupdate.busy && reason.is_none(),
+                            egui::Button::new("Accept, Build & Restart"),
+                        )
+                        .on_disabled_hover_text(reason.as_deref().unwrap_or("Self-update is busy"))
+                        .clicked()
+                    {
+                        cmd = Some(("feedback.acceptAndBuild", json!({"job":id.0})));
+                    }
                 }
             }
             ui.toggle_value(&mut st.agent.side_by_side, RichText::new("Split").small())

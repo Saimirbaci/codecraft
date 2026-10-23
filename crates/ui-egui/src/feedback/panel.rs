@@ -254,7 +254,11 @@ fn body(ui: &mut Ui, s: &mut Session, st: &mut UiState, theme: &Theme) {
     ui.separator();
 
     ui.horizontal(|ui| {
-        let ready = !s.feedback.draft.text.trim().is_empty();
+        if s.selfupdate.busy && s.selfupdate.pending_submit.is_some() {
+            ui.spinner();
+            ui.label("Setting up CodeCraft's source…");
+        }
+        let ready = !s.feedback.draft.text.trim().is_empty() && s.selfupdate.pending_submit.is_none();
         let label = if s.feedback.draft.session.is_some() { "Send follow-up" } else { "Send to agent" };
         let send = egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(theme.accent);
         if ui.add_enabled(ready, send).on_disabled_hover_text("Describe the change first").clicked() {

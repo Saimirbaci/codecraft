@@ -463,6 +463,7 @@ fn page(
         settings::PAGE_COLOR_SCHEME => color_scheme_page(ui, st, draft, query, cmds),
         settings::PAGE_LIVE_TEMPLATES => pages::templates_page(ui, s, st, cmds),
         settings::PAGE_TOOLS => tools_page(ui, s, st, cmds),
+        settings::PAGE_SELFUPDATE => crate::selfupdate_ui::settings(ui, s, st, cmds),
         settings::PAGE_AGENT_ACCESS => crate::agent_access_ui::page(ui, s, st, cmds),
         settings::PAGE_SQL => crate::database_settings_ui::page(ui, s, st, cmds),
         settings::PAGE_FONT => pages::font_page(ui, s, st, draft, cmds),
@@ -493,12 +494,18 @@ pub(crate) fn setting_grid_keys(ui: &mut egui::Ui, st: &UiState, draft: &Setting
                 }
                 ui.end_row();
             }
-        },
-    );
+        });
 }
 
 /// The page's settings as a two-column grid (only those matching a search, when some do).
-pub(crate) fn setting_grid(ui: &mut egui::Ui, st: &UiState, page: &str, draft: &Settings, query: &str, cmds: &mut Cmds) {
+pub(crate) fn setting_grid(
+    ui: &mut egui::Ui,
+    st: &UiState,
+    page: &str,
+    draft: &Settings,
+    query: &str,
+    cmds: &mut Cmds,
+) {
     let defs: Vec<&SettingDef> = settings::SETTINGS
         .iter()
         .filter(|d| d.page == page && !d.kind.has_own_editor() && d.kind != Kind::FontFamily)
@@ -670,7 +677,9 @@ fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut
         }
     });
     if let Some(parent) = keymaps::parent_of(draft, &active) {
-        ui.label(RichText::new(format!("Based on {parent}; changes here override it.")).color(theme.text_muted).size(11.5));
+        ui.label(
+            RichText::new(format!("Based on {parent}; changes here override it.")).color(theme.text_muted).size(11.5),
+        );
     }
     if let Some(mut name) = st.prefs.keymap_rename.clone() {
         ui.horizontal(|ui| {
@@ -718,7 +727,9 @@ fn keymap_page(ui: &mut egui::Ui, st: &mut UiState, draft: &Settings, cmds: &mut
         let label = registry().get(id).map(|c| c.label).unwrap_or(id);
         let text = match &st.prefs.recorded_first {
             Some(first) => format!("{}, … press the second key for “{label}” (Escape cancels)", keymap::display(first)),
-            None if st.prefs.record_chord => format!("Press the first key of the chord for “{label}” (Escape cancels)…"),
+            None if st.prefs.record_chord => {
+                format!("Press the first key of the chord for “{label}” (Escape cancels)…")
+            }
             None => format!("Press the shortcut for “{label}” (Escape cancels)…"),
         };
         ui.label(RichText::new(text).color(theme.accent));
@@ -1199,12 +1210,7 @@ fn run_configs_window(ctx: &egui::Context, s: &mut Session, st: &mut UiState) {
 
 /// Edit Configurations › Generate: the proposed configurations, grouped by ecosystem, with a
 /// tick box each.
-fn generate_view(
-    ui: &mut egui::Ui,
-    theme: &Theme,
-    view: &codecraft_engine::run_config_gen::GenView,
-    cmds: &mut Cmds,
-) {
+fn generate_view(ui: &mut egui::Ui, theme: &Theme, view: &codecraft_engine::run_config_gen::GenView, cmds: &mut Cmds) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("Generated configurations").strong().size(15.0));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1225,7 +1231,10 @@ fn generate_view(
             ui.add(egui::Spinner::new().size(12.0));
             ui.label(RichText::new(busy).color(theme.text_muted));
             if let Some(job) = view.agent_job {
-                ui.label(RichText::new(format!("(agent job {job}; its progress is in the Agents tool window)")).color(theme.text_disabled));
+                ui.label(
+                    RichText::new(format!("(agent job {job}; its progress is in the Agents tool window)"))
+                        .color(theme.text_disabled),
+                );
             }
         });
     }
@@ -1272,7 +1281,11 @@ fn generate_view(
                 } else {
                     format!("   in {}", p.config.working_dir)
                 };
-                ui.label(RichText::new(format!("{}: {}{dir}", p.config.kind.label(), p.config.command)).monospace().size(12.0));
+                ui.label(
+                    RichText::new(format!("{}: {}{dir}", p.config.kind.label(), p.config.command))
+                        .monospace()
+                        .size(12.0),
+                );
                 if !p.reason.is_empty() {
                     ui.label(RichText::new(&p.reason).color(theme.text_muted).size(12.0));
                 }
