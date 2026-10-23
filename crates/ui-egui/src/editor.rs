@@ -1469,6 +1469,23 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
         st.drag_anchor_active = false;
     }
 
+    // Right-click menu: clipboard actions and Convert Case.
+    response.context_menu(|ui| {
+        for (label, cmd) in [("Cut", "edit.cut"), ("Copy", "edit.copy"), ("Paste", "edit.paste.paste")] {
+            if ui.button(label).clicked() {
+                commands.push((cmd, serde_json::json!({})));
+                ui.close();
+            }
+            ui.separator();
+        }
+        ui.menu_button("Convert Case", |ui| {
+            if ui.button("camelCase").clicked() {
+                commands.push(("edit.convertCase.camelCase", serde_json::json!({})));
+                ui.close();
+            }
+        });
+    });
+
     // Inlay hint tooltip; Cmd shows which hints navigate.
     let mut response = response;
     let inlay_hover = response
