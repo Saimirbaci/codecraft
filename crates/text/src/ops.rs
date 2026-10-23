@@ -824,6 +824,66 @@ pub fn toggle_case(doc: &Document, sels: &SelectionSet) -> Edit {
     b.finish(doc, sels.primary_index(), &sels)
 }
 
+/// Convert an identifier-like string to camelCase: `my_variable_name`, `MyVariable`,
+/// `my-variable` and `my variable` all become `myVariableName`-style. Other chars are kept.
+pub fn camel_case(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut upper_next = false;
+    let mut started = false;
+    let mut prev_lower = false;
+    for c in text.chars() {
+        if c == '_' || c == '-' || c == ' ' {
+            upper_next = started;
+            prev_lower = false;
+        } else if c.is_alphanumeric() {
+            if !started {
+                out.extend(c.to_lowercase());
+                started = true;
+            } else if upper_next {
+                out.extend(c.to_uppercase());
+            } else if c.is_uppercase() && !prev_lower && !c.is_numeric() {
+                // Part of an acronym or leading capital run: fold to lowercase.
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+            upper_next = false;
+            prev_lower = c.is_lowercase();
+        } else {
+            out.push(c);
+            upper_next = false;
+            prev_lower = false;
+        }
+    }
+    out
+}
+
+/// Convert the selection (or the word at the caret) to camelCase.
+pub fn to_camel_case(doc: &Document, sels: &SelectionSet) -> Edit {
+    let sels = sels.clamp(doc.len_chars());
+    let mut b = EditBuilder::new(sels.len());
+    for s in sels.ranges() {
+        let range = if s.is_empty() { word_range_at(doc, s.head) } else { s.range() };
+        if range.is_empty() || !b.fits(range.start) {
+            b.keep(s);
+            continue;
+        }
+        let text = doc.slice(range.clone());
+        let converted = camel_case(&text);
+        if converted == text {
+            b.keep(s);
+            continue;
+        }
+        let n = converted.chars().count();
+        match b.replace(range.start, range.end, converted) {
+            Some(at) if s.is_empty() => b.caret(at + (s.head - range.start).min(n)),
+            Some(at) => b.push(directed(s, at, at + n)),
+            None => b.keep(s),
+        }
+    }
+    b.finish(doc, sels.primary_index(), &sels)
+}
+
 /// Swap the chars on either side of each caret.
 ///
 /// The caret moves past the swapped pair; at a line end the two chars before it are swapped

@@ -535,3 +535,14 @@ fn unicode_line_separator_lines() {
     d.apply(&edit, &sels, EditGroup::Standalone).unwrap();
     assert_eq!(d.text(), "c");
 }
+
+#[test]
+fn camel_case_cases() {
+    assert_eq!(run("«my_variable_name»", to_camel_case), "«myVariableName»");
+    assert_eq!(run("«MyVariable»", to_camel_case), "«myVariable»");
+    assert_eq!(run("«my-var name»", to_camel_case), "«myVarName»");
+    assert_eq!(run("my_va|r", to_camel_case), "myVar|");
+    assert_eq!(run("«myVar»", to_camel_case), "«myVar»");
+    assert_eq!(run(" | ", to_camel_case), " | ");
+    assert_eq!(camel_case("__init_x"), "initX");
+}
