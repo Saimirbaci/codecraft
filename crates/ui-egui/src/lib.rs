@@ -31,6 +31,7 @@ mod diff_view;
 mod docker_ui;
 mod ed_ui;
 mod editor;
+mod editor_menu_ui;
 mod er_diagram;
 mod feedback;
 mod fonts;

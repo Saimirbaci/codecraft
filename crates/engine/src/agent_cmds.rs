@@ -26,6 +26,25 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             always,
             start,
         ),
+        spec(
+            "agent.sendToChat",
+            "Send to Chat",
+            None,
+            "{text?: string} — queue the editor's selection (or `text`) as a code snippet in the Agent prompt and \
+             show the Agent tool window → {queued}",
+            Context::Editor,
+            has_chat_text,
+            |s, p| {
+                let snippet = match opt_str(p, "text").filter(|t| !t.trim().is_empty()) {
+                    Some(t) => format!("```\n{}\n```\n", t.trim_end_matches('\n')),
+                    None => agents::selection_snippet(s)
+                        .ok_or_else(|| CommandError::Failed("select some text to send to the chat".into()))?,
+                };
+                s.agents.chat_inbox.push(snippet);
+                s.ws.layout.show(codecraft_workspace::ToolWindowId::Agent);
+                Ok(json!({ "queued": s.agents.chat_inbox.len() }))
+            },
+        ),
         spec("agent.stop", "Stop Agent Job", None, "{job: int}", Context::Global, always, |s, p| {
             agents::stop(s, job(p)?)?;
             Ok(Value::Null)
@@ -162,6 +181,11 @@ fn job(p: &Value) -> Result<JobId, CommandError> {
     Ok(JobId(u64::try_from(n).unwrap_or(u64::MAX)))
 }
 
+fn has_chat_text(s: &Session) -> Result<(), String> {
+    let (e, _) = s.ws.active().ok_or("no editor is open")?;
+    if e.selections.primary().is_empty() { Err("select some text first".into()) } else { Ok(()) }
+}
+
 fn backend(p: &Value) -> Result<Backend, CommandError> {
     let id = req_str(p, "backend")?;
     Backend::from_id(id)
@@ -293,4 +317,45 @@ fn settings(s: &mut Session, p: &Value) -> CmdResult {
         s.agents.refresh_backends();
     }
     serde_json::to_value(&s.agents.settings).map_err(|e| CommandError::Failed(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session_with_file(body: &str) -> (Session, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, body).unwrap();
+        let mut s = Session::new();
+        s.open_file(&file).unwrap();
+        (s, dir)
+    }
+
+    #[test]
+    fn send_to_chat_needs_a_selection() {
+        let (mut s, _dir) = session_with_file("fn main() {}\n");
+        assert!(s.enabled("agent.sendToChat").is_err());
+        assert!(s.execute("agent.sendToChat", &json!({})).is_err());
+        assert!(s.agents.chat_inbox.is_empty());
+    }
+
+    #[test]
+    fn send_to_chat_queues_the_selection_and_shows_the_agent() {
+        let (mut s, _dir) = session_with_file("fn main() {}\n");
+        s.execute("edit.selectAll", &json!({})).unwrap();
+        s.execute("agent.sendToChat", &json!({})).unwrap();
+        let snippet = s.agents.chat_inbox.first().cloned().unwrap_or_default();
+        assert!(snippet.contains("a.rs:1"), "{snippet}");
+        assert!(snippet.contains("fn main() {}"), "{snippet}");
+        assert!(s.ws.layout.is_visible(codecraft_workspace::ToolWindowId::Agent));
+    }
+
+    #[test]
+    fn send_to_chat_accepts_explicit_text() {
+        let (mut s, _dir) = session_with_file("x\n");
+        s.execute("edit.selectAll", &json!({})).unwrap();
+        s.execute("agent.sendToChat", &json!({ "text": "SELECT 1;" })).unwrap();
+        assert_eq!(s.agents.chat_inbox, vec!["```\nSELECT 1;\n```\n".to_string()]);
+    }
 }

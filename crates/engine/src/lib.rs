@@ -38,6 +38,7 @@ mod code_cmds;
 pub mod command_completion;
 pub mod commands;
 pub mod commit_ai;
+pub mod editor_menu;
 pub mod completion;
 mod convert;
 pub mod copyright;

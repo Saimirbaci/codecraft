@@ -365,6 +365,19 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             },
         ),
         spec(
+            "git.currentFile.showDiff",
+            "Show Diff",
+            None,
+            "Compare the active file with its last committed version (HEAD)",
+            g,
+            file_in_repo,
+            |s, _| {
+                let rel = active_rel(s)?;
+                vcs::compare_with(s, &rel, "HEAD");
+                ok()
+            },
+        ),
+        spec(
             "git.currentFile.compareWithRevision",
             "Compare with Revision…",
             None,

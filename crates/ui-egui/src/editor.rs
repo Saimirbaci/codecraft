@@ -764,6 +764,7 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
     let ghost = if preedit.is_none() { codecraft_engine::inline_completion::ghost_text(s, eid) } else { None };
     let crumbs_shown = s.ws.doc(editor.doc).is_some_and(|d| crate::navbar::has_breadcrumbs(d.language));
     codecraft_engine::sql_lang::refresh(s, editor.doc);
+    crate::editor_menu_ui::sample(ui, s, editor_id(eid));
     let Some(od) = s.ws.doc_mut(editor.doc) else { return };
     od.refresh_caches();
     let od = &*od;
@@ -1484,6 +1485,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, eid: EditorId)
                 ui.close();
             }
         });
+        ui.separator();
+        crate::editor_menu_ui::contents(ui, &theme, editor_id(eid), &mut commands);
     });
 
     // Inlay hint tooltip; Cmd shows which hints navigate.

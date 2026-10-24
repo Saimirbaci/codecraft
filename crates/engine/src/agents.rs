@@ -360,6 +360,9 @@ pub struct AgentsState {
     /// What `agent.connectExternal` returned, for the UI to show in the Connect an External
     /// Agent window (so Find Action and the menus open it too, not only the ⇄ button).
     pub connect_shown: Option<serde_json::Value>,
+    /// Snippets queued by `agent.sendToChat` (editor › Send to Chat); the Agent panel appends them
+    /// to its prompt draft and clears the queue.
+    pub chat_inbox: Vec<String>,
 }
 
 impl Default for AgentsState {
@@ -375,6 +378,7 @@ impl Default for AgentsState {
             cleanups: 0,
             sessions: crate::agent_sessions::SessionsState::default(),
             connect_shown: None,
+            chat_inbox: Vec::new(),
         }
     }
 }
@@ -486,10 +490,38 @@ fn compose_prompt(s: &Session, req: &StartRequest, project: &Path, agent_root: &
         }
     }
     if !req.attachments.is_empty() {
-        let list: Vec<String> = req.attachments.iter().map(|p| rel(p)).collect();
-        ctx.push(format!("- Attached files: {}", list.join(", ")));
+        // Folders get a trailing slash so the agent knows to list them.
+        let list: Vec<String> =
+            req.attachments.iter().map(|p| if p.is_dir() { format!("{}/", rel(p)) } else { rel(p) }).collect();
+        ctx.push(format!("- Attached files and folders: {}", list.join(", ")));
     }
     format!("{}\n\n---\nContext from the IDE (CodeCraft):\n{}", req.prompt.trim_end(), ctx.join("\n"))
+}
+
+/// The active editor's selection as a fenced Markdown snippet headed by `file:lines`, for the chat.
+pub(crate) fn selection_snippet(s: &Session) -> Option<String> {
+    let (editor, doc) = s.ws.active()?;
+    let sel = editor.selections.primary();
+    let (from, to) = (sel.anchor.min(sel.head), sel.anchor.max(sel.head));
+    if from >= to {
+        return None;
+    }
+    let text = doc.doc.slice(from..to);
+    let (l1, l2) = (doc.doc.char_to_line(from) + 1, doc.doc.char_to_line(to) + 1);
+    let name = doc.path.as_deref().map(|p| match s.project_root() {
+        Some(root) => p.strip_prefix(&root).unwrap_or(p).display().to_string(),
+        None => p.display().to_string(),
+    });
+    let head = match name {
+        Some(n) if l1 == l2 => format!("{n}:{l1}"),
+        Some(n) => format!("{n}:{l1}-{l2}"),
+        None => "Selection".to_string(),
+    };
+    Some(format!(
+        "{head}\n```{}\n{}\n```\n",
+        doc.language.lsp_id(),
+        truncate(text.trim_end_matches('\n'), MAX_SELECTION_CHARS)
+    ))
 }
 
 fn default_title(prompt: &str) -> String {

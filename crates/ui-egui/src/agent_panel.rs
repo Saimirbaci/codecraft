@@ -27,6 +27,8 @@ pub struct AgentUi {
     pub prompt: String,
     pub attach_file: bool,
     pub attach_selection: bool,
+    /// Files and folders the user added with `+`; sent as the job's attachments.
+    pub context: Vec<PathBuf>,
     pub selected: Option<JobId>,
     pub follow_up: String,
     /// The review file whose diff is shown (relative path).
@@ -62,6 +64,7 @@ impl Default for AgentUi {
             prompt: String::new(),
             attach_file: true,
             attach_selection: true,
+            context: Vec::new(),
             selected: None,
             follow_up: String::new(),
             review_file: None,
@@ -127,6 +130,13 @@ fn seconds(ms: u64) -> String {
 
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let theme = st.theme.clone();
+    // Snippets from the editor's Send to Chat.
+    for snippet in std::mem::take(&mut s.agents.chat_inbox) {
+        if !st.agent.prompt.is_empty() && !st.agent.prompt.ends_with('\n') {
+            st.agent.prompt.push('\n');
+        }
+        st.agent.prompt.push_str(&snippet);
+    }
     let backends: Vec<BackendInfo> = s.agents.backends().to_vec();
     new_job(ui, s, st, &theme, &backends);
     ui.add_space(4.0);
@@ -239,7 +249,9 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
             .desired_rows(3)
             .desired_width(f32::INFINITY),
     );
+    context_chips(ui, s, st, theme);
     ui.horizontal(|ui| {
+        add_context_button(ui, s, st);
         ui.checkbox(&mut st.agent.attach_file, "Current file").on_hover_text("Tell the agent which file is open");
         ui.checkbox(&mut st.agent.attach_selection, "Selection").on_hover_text("Include the selected text");
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -257,15 +269,76 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
             "prompt": st.agent.prompt,
             "includeActiveFile": st.agent.attach_file,
             "includeSelection": st.agent.attach_selection,
+            "attachments": st.agent.context,
         });
         match s.execute("agent.start", &params) {
             Ok(v) => {
                 st.agent.prompt.clear();
+                st.agent.context.clear();
                 st.agent.selected = v.get("job").and_then(Value::as_u64).map(JobId);
                 st.agent.review_file = None;
             }
             Err(e) => s.status = e.to_string(),
         }
+    }
+}
+
+/// `+`: add files or folders the agent should look at.
+fn add_context_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    let start = s.project_root();
+    let dialog = || {
+        let d = rfd::FileDialog::new();
+        match &start {
+            Some(root) => d.set_directory(root),
+            None => d,
+        }
+    };
+    ui.menu_button("+", |ui| {
+        if ui.button("Add Files…").clicked() {
+            ui.close();
+            for p in dialog().set_title("Add Files to Agent Context").pick_files().unwrap_or_default() {
+                add_context(st, p);
+            }
+        }
+        if ui.button("Add Folder…").clicked() {
+            ui.close();
+            for p in dialog().set_title("Add Folders to Agent Context").pick_folders().unwrap_or_default() {
+                add_context(st, p);
+            }
+        }
+    })
+    .response
+    .on_hover_text("Add files or folders to the agent's context");
+}
+
+fn add_context(st: &mut UiState, path: PathBuf) {
+    if !st.agent.context.contains(&path) {
+        st.agent.context.push(path);
+    }
+}
+
+/// The added paths as removable chips.
+fn context_chips(ui: &mut egui::Ui, s: &Session, st: &mut UiState, theme: &Theme) {
+    if st.agent.context.is_empty() {
+        return;
+    }
+    let root = s.project_root();
+    let roots: Vec<&Path> = root.iter().map(PathBuf::as_path).collect();
+    let mut remove = None;
+    ui.horizontal_wrapped(|ui| {
+        for (i, p) in st.agent.context.iter().enumerate() {
+            let icon = if p.is_dir() { "📁" } else { "📄" };
+            let name = rel_display(p, &roots);
+            let resp = ui
+                .add(egui::Button::new(RichText::new(format!("{icon} {name}  ×")).small().color(theme.text)))
+                .on_hover_text(format!("{}\nClick to remove", p.display()));
+            if resp.clicked() {
+                remove = Some(i);
+            }
+        }
+    });
+    if let Some(i) = remove {
+        st.agent.context.remove(i);
     }
 }
 
