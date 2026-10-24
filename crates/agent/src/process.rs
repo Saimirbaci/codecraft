@@ -190,11 +190,7 @@ pub(crate) fn read_lines(r: impl Read, mut f: impl FnMut(String) -> bool) {
 
 /// Run an agent CLI headless: stdout lines go through the backend's parser.
 pub fn spawn_cli(req: &CliRequest, events: Sender<AgentEvent>) -> Result<AgentProcess> {
-    let mut cmd = build_command(req);
-    // MCP servers a CLI reads from a settings file (Gemini): written to the run's own directory.
-    for (k, v) in crate::cli::mcp_settings(req)? {
-        cmd.env(k, v);
-    }
+    let cmd = build_command(req);
     let sp = spawn(cmd, false, events.clone())?;
     let mut parser = StreamParser::new(req.backend, &req.cwd);
     let done = sp.done_tx;
@@ -374,7 +370,6 @@ mod tests {
             scrub_api_keys: true,
             mcp_servers: Vec::new(),
             env: Vec::new(),
-            settings_dir: None,
         }
     }
 

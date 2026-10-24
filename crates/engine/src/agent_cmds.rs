@@ -36,7 +36,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "agent.start",
             "Start Agent Job",
             None,
-            "{backend: \"claude\"|\"codex\"|\"grok\"|\"gemini\", mode: \"auto\"|\"ask\"|\"review\", prompt: string, \
+            "{backend: \"claude\"|\"codex\"|\"grok\"|\"antigravity\", mode: \"auto\"|\"ask\"|\"review\", prompt: string, \
              attachments?: [path], cwd?: path, title?: string, includeActiveFile?: bool (default true), \
              includeSelection?: bool (default true)} → {job, session} (`session`: the saved session's id, \
              see agent.sessions.*)",
@@ -221,7 +221,7 @@ fn has_chat_text(s: &Session) -> Result<(), String> {
 fn backend(p: &Value) -> Result<Backend, CommandError> {
     let id = req_str(p, "backend")?;
     Backend::from_id(id)
-        .ok_or_else(|| CommandError::BadParams(format!("unknown backend `{id}` (claude, codex, grok, gemini)")))
+        .ok_or_else(|| CommandError::BadParams(format!("unknown backend `{id}` (claude, codex, grok, antigravity)")))
 }
 
 fn start(s: &mut Session, p: &Value) -> CmdResult {

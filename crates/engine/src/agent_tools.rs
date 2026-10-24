@@ -142,8 +142,6 @@ pub struct AgentToolsState {
     /// Calls the client cancelled or abandoned by disconnecting.
     pub cancelled: u64,
     pub(crate) job_secret: JobSecret,
-    /// Tells this session's per-job files from other sessions' in the same process.
-    pub(crate) instance: u64,
     /// Sessions on Review jobs' worktrees.
     pub(crate) worktrees: Vec<crate::agent_worktree::WorktreeSession>,
     next_forward: u64,
@@ -160,14 +158,6 @@ impl Default for AgentToolsState {
             approval_timeout: APPROVAL_TIMEOUT,
             cancelled: 0,
             job_secret: JobSecret::default(),
-            instance: {
-                use std::hash::{BuildHasher, Hasher};
-                let mut h = std::hash::RandomState::new().build_hasher();
-                h.write_u128(
-                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos()),
-                );
-                h.finish()
-            },
             worktrees: Vec::new(),
             next_forward: 0,
         }

@@ -24,12 +24,15 @@ from the IDE's event loop; tools that wait (a debugger stop, test results) never
   CLI documents, never by editing the user's own settings:
   - Claude Code: `--mcp-config` with a `codecraft` stdio server;
   - Codex: `-c mcp_servers.codecraft.command=… -c mcp_servers.codecraft.args=[…]`;
-  - Gemini CLI (Auto/Review): a per-job settings file, `$TMPDIR/codecraft-agent-…-job<N>/gemini-system-defaults.json`,
-    named by `GEMINI_CLI_SYSTEM_DEFAULTS_PATH` (Gemini's documented "system defaults" layer, the
-    lowest one). It holds the machine's own system defaults, if any, plus `mcpServers.codecraft`;
-    Gemini merges `mcpServers` by name across its layers, so the servers in `~/.gemini/settings.json`
-    stay (one the user also named `codecraft` wins). The directory is removed when the turn ends;
-    CodeCraft never reads or writes `~/.gemini`;
+  - Antigravity (`agy`, Auto/Review): `agy -p <prompt> --output-format stream-json`; resume is
+    `--conversation <id>`, auto-approve is `--dangerously-skip-permissions`. It has no per-run MCP
+    flag (`agy mcp add` writes its own config), so, like Grok, it gets none and CodeCraft never
+    edits that config. Add CodeCraft once:
+    ```sh
+    agy mcp add codecraft-ide -- /path/to/codecraft-cli mcp --ide
+    ```
+    Jobs carry the same `CODECRAFT_*` environment as Grok's. `agy` has no ACP mode, so there is no
+    Ask mode for it;
   - Grok (Auto/Review): Grok's headless mode reads MCP servers only from its config files
     (`~/.grok/config.toml`, `.grok/config.toml`), and its `GROK_CONFIG`/`GROK_CONFIG_PATH`
     overlay is documented not to add servers, so CodeCraft gives it none and never edits those
@@ -41,7 +44,7 @@ from the IDE's event loop; tools that wait (a debugger stop, test results) never
     `CODECRAFT_JOB` and `CODECRAFT_JOB_KEY` in its environment, so that server reaches this IDE as
     the job (if Grok passes its environment to MCP servers; not verified against a real `grok`).
     The job's feed says this when it starts;
-  - Ask mode (ACP: Claude, Codex, Gemini, Grok): `mcpServers` in `session/new`/`session/load`.
+  - Ask mode (ACP: Claude, Codex, Grok): `mcpServers` in `session/new`/`session/load`.
 
   The server is the IDE executable itself, `codecraft --mcp-bridge --port <port> --lock-dir <dir>
   --job <id>` with `CODECRAFT_JOB_KEY` in its environment: a stdio bridge to the IDE's server that
@@ -664,12 +667,12 @@ review as they are.
   `crates/engine/src/agent_tools_cmds.rs`; the policy: `crates/engine/src/agent_access.rs`; the
   stdio server, the bridge and the job's server entry: `crates/engine/src/agent_mcp.rs`.
 - Review jobs' worktree sessions: `crates/engine/src/agent_worktree.rs`; per-CLI MCP delivery
-  (Gemini's settings file, Grok's environment): `crates/agent/src/cli.rs`; client configuration
+  (Grok's and Antigravity's environment): `crates/agent/src/cli.rs`; client configuration
   and `--ide` discovery: `crates/engine/src/agent_mcp.rs`; cancellation:
   `agent_tools::{cancel, client_gone}` and the transports' `Inflight` (`crates/mcp/src/lib.rs`).
 - Tests: `crates/engine/tests/agent_tools.rs` (tools on temp projects, policy, IDE server and
   bridge, real debugpy/lldb-dap/rust-analyzer sessions when installed, a fake profiler),
-  `crates/engine/tests/agent_everywhere.rs` (fake Gemini and Grok jobs, job keys, cancellation and
+  `crates/engine/tests/agent_everywhere.rs` (fake Antigravity and Grok jobs, job keys, cancellation and
   disconnects over WebSocket and stdio, a Review job's calls on its worktree),
   `crates/engine/tests/agent_results_camel_case.rs` (every tool's result keys),
   `apps/codecraft-cli/tests/agent_cli.rs` and `agent_connect.rs` (the built binary over stdio,

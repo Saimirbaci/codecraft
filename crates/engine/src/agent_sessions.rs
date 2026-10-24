@@ -17,7 +17,7 @@
 //! Loading: when a project opens its sessions are read in the background into
 //! [`SessionsState::saved`] (newest first; corrupt or oversized files are skipped with a
 //! warning). `agent.sessions.open` turns one back into a job; a follow-up resumes it: Claude Code
-//! `--resume <id>` (Codex `exec resume`, Gemini/Grok `--resume`) in the same directory, ACP
+//! `--resume <id>` (Codex `exec resume`, Grok `--resume`, Antigravity `--conversation`) in the same directory, ACP
 //! agents `session/load` when they offer it, otherwise a new session whose first prompt carries a
 //! transcript of the old one. A review whose worktree is gone recreates it at the same path.
 //!

@@ -67,7 +67,7 @@ fn fake_acp_agent_roundtrip() {
     std::fs::write(dir.join("hello.txt"), "hello\n").unwrap();
     let (etx, erx) = unbounded();
     let (htx, hrx) = unbounded();
-    let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &[script.display().to_string()], &dir, true);
+    let cmd = cli::acp_command(Backend::Antigravity, Path::new("python3"), &[script.display().to_string()], &dir, true);
     let client = acp::start(cmd, &dir, "shout".into(), etx, htx).unwrap();
     let mut written = Vec::new();
 
@@ -119,7 +119,7 @@ fn agent_that_is_not_acp_fails_cleanly() {
     let (etx, erx) = unbounded();
     let (htx, _hrx) = unbounded();
     let cmd = cli::acp_command(
-        Backend::Gemini,
+        Backend::Antigravity,
         Path::new("sh"),
         &["-c".into(), "echo not-json; exit 3".into()],
         tmp.path(),
@@ -172,7 +172,7 @@ fn resume_loads_the_session_when_offered() {
     let (etx, erx) = unbounded();
     let (htx, _hrx) = unbounded();
     let args = [script.display().to_string(), "--load".into(), "--log".into(), log.display().to_string()];
-    let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
+    let cmd = cli::acp_command(Backend::Antigravity, Path::new("python3"), &args, &dir, true);
     let resume = acp::Resume {
         session_id: Some("old-1".into()),
         fallback_preamble: Some("TRANSCRIPT\n".into()),
@@ -204,7 +204,7 @@ fn resume_falls_back_to_a_transcript() {
     let (etx, erx) = unbounded();
     let (htx, _hrx) = unbounded();
     let args = [script.display().to_string(), "--log".into(), log.display().to_string()];
-    let cmd = cli::acp_command(Backend::Gemini, Path::new("python3"), &args, &dir, true);
+    let cmd = cli::acp_command(Backend::Antigravity, Path::new("python3"), &args, &dir, true);
     let resume = acp::Resume {
         session_id: Some("old-1".into()),
         fallback_preamble: Some("TRANSCRIPT\n".into()),

@@ -1,6 +1,6 @@
 [package]
 name = "codecraft-agent"
-description = "CodeCraft Coding-agent backends: headless CLIs (Claude Code, Codex, Grok, Gemini), ACP, git worktrees, diffs"
+description = "CodeCraft Coding-agent backends: headless CLIs (Claude Code, Codex, Grok, Antigravity), ACP, git worktrees, diffs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

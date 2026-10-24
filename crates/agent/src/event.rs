@@ -124,13 +124,13 @@ pub fn command_text(v: Option<&Value>) -> Option<String> {
     }
 }
 
-/// A one-line description of a tool call. Knows Claude Code's, Gemini CLI's and common
+/// A one-line description of a tool call. Knows Claude Code's, Antigravity's and common
 /// Messages-API tool names; anything else is "Using <tool>".
 pub fn describe_tool(tool: &str, input: &Value, cwd: &Path) -> String {
     let path = || display_path(s(input, &["file_path", "path", "absolute_path", "filePath", "notebook_path"]), cwd);
     let lower = tool.to_ascii_lowercase();
     match lower.as_str() {
-        "read" | "notebookread" | "read_file" | "view" | "read_many_files" => {
+        "read" | "notebookread" | "read_file" | "view" | "view_file" | "read_many_files" => {
             let p = path();
             if p.is_empty() { "Reading files".into() } else { format!("Reading {p}") }
         }
@@ -142,16 +142,18 @@ pub fn describe_tool(tool: &str, input: &Value, cwd: &Path) -> String {
         | "str_replace"
         | "str_replace_editor"
         | "str_replace_based_edit_tool"
-        | "search_replace" => format!("Editing {}", path()),
-        "write" | "write_file" | "create" | "create_file" => format!("Writing {}", path()),
-        "bash" | "run_shell_command" | "shell" | "run_terminal_cmd" | "execute" | "exec" | "terminal" => {
-            let cmd = command_text(input.get("command").or_else(|| input.get("cmd"))).unwrap_or_default();
+        | "search_replace"
+        | "replace_file_content"
+        | "multi_replace_file_content" => format!("Editing {}", path()),
+        "write" | "write_file" | "write_to_file" | "create" | "create_file" => format!("Writing {}", path()),
+        "bash" | "run_shell_command" | "run_command" | "shell" | "run_terminal_cmd" | "execute" | "exec" | "terminal" => {
+            let cmd = command_text(input.get("command").or_else(|| input.get("cmd")).or_else(|| input.get("commandline"))).unwrap_or_default();
             format!("Running `{}`", clean_command(&cmd))
         }
         "grep" | "search_file_content" | "search" | "grep_search" => {
             format!("Searching for “{}”", truncate(s(input, &["pattern", "query", "regex"]), 80))
         }
-        "glob" | "list_directory" | "ls" | "list_dir" | "find_files" => {
+        "glob" | "list_directory" | "ls" | "list_dir" | "find_files" | "find_by_name" => {
             let what = s(input, &["pattern", "path", "dir_path"]);
             if what.is_empty() {
                 "Listing files".into()
@@ -187,6 +189,9 @@ pub fn is_edit_tool(tool: &str) -> bool {
             | "str_replace_editor"
             | "str_replace_based_edit_tool"
             | "search_replace"
+            | "write_to_file"
+            | "replace_file_content"
+            | "multi_replace_file_content"
     )
 }
 

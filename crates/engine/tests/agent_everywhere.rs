@@ -1,9 +1,9 @@
-//! M15 track AI, "AI agents everywhere": Gemini and Grok jobs get CodeCraft's tools the way their
-//! CLIs document (a per-job Gemini settings file, the job's environment for a bridge the user
-//! registered with Grok), a job's bridge must prove it is the job (its key), Review jobs' calls
+//! M15 track AI, "AI agents everywhere": Antigravity and Grok jobs get CodeCraft's tools the way their
+//! CLIs document (the job's environment for a bridge the user registered with `agy mcp add` or
+//! `grok mcp add`), a job's bridge must prove it is the job (its key), Review jobs' calls
 //! run on their worktree, and `notifications/cancelled` / disconnects cancel waiting calls and
 //! withdraw their approval cards. Fake agent CLIs only (shell scripts); never the real ones, the
-//! user's ~/.gemini, ~/.grok, ~/.claude or ~/.codecraft.
+//! user's ~/.gemini/antigravity-cli, ~/.grok, ~/.claude or ~/.codecraft.
 #![cfg(unix)]
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
@@ -191,57 +191,36 @@ fn tag(job: u64, key: &str) -> serde_json::Map<String, Value> {
     t
 }
 
-// ---------------------------------------------------------------- Gemini and Grok
+// ---------------------------------------------------------------- Antigravity and Grok
 
 #[test]
-fn gemini_jobs_get_the_tools_from_a_private_settings_file() {
+fn antigravity_jobs_carry_the_job_and_take_no_mcp_flag() {
     let (_t, root) = tmpdir();
     let dir = project(&root);
     let (mut s, port, _) = ide_session(&root, &dir);
-    let log = root.join("gemini.log");
+    let log = root.join("agy.log");
     let fake = script(
         &root,
-        "gemini",
+        "agy",
         &format!(
-            "f=\"$GEMINI_CLI_SYSTEM_DEFAULTS_PATH\"\n\
-             echo \"SETTINGS=$f\" >> '{log}'\n\
-             echo \"CODECRAFT_JOB=$CODECRAFT_JOB\" >> '{log}'\n\
+            "echo \"CODECRAFT_JOB=$CODECRAFT_JOB\" >> '{log}'\n\
              echo \"CODECRAFT_IDE_PORT=$CODECRAFT_IDE_PORT\" >> '{log}'\n\
-             cp \"$f\" '{copy}'\n\
              printf '%s\\n' \"$@\" > '{args}'\n\
-             echo '{{\"type\":\"init\",\"session_id\":\"gm-1\"}}'\n\
-             echo '{{\"type\":\"result\",\"status\":\"success\",\"stats\":{{\"duration_ms\":3}}}}'\n",
+             echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\"}}'\n\
+             echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"duration_seconds\":0.1}}}}'\n",
             log = log.display(),
-            copy = root.join("settings.copy.json").display(),
-            args = root.join("gemini.args").display(),
+            args = root.join("agy.args").display(),
         ),
     );
-    let job = start_job(&mut s, "gemini", "auto", &fake);
-    pump_until(&mut s, "the fake Gemini job", |s| !s.agents.job(JobId(job)).unwrap().is_running());
+    let job = start_job(&mut s, "antigravity", "auto", &fake);
+    pump_until(&mut s, "the fake Antigravity job", |s| !s.agents.job(JobId(job)).unwrap().is_running());
     let env = logged_env(&std::fs::read_to_string(&log).unwrap());
-    let settings = PathBuf::from(&env["SETTINGS"]);
-    assert!(settings.ends_with("gemini-system-defaults.json"), "{settings:?}");
-    assert!(
-        settings.starts_with(std::env::temp_dir().canonicalize().unwrap())
-            || settings.starts_with(std::env::temp_dir())
-    );
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    assert!(!settings.starts_with(home.join(".gemini")), "never the user's Gemini settings");
-    assert!(!settings.exists(), "the per-job settings are removed when the turn ends");
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(root.join("settings.copy.json")).unwrap()).unwrap();
-    let server = &v["mcpServers"]["codecraft"];
-    let args: Vec<String> =
-        server["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect();
-    assert_eq!(args[0], "--mcp-bridge");
-    assert!(args.windows(2).any(|w| w[0] == "--port" && w[1] == port.to_string()), "{args:?}");
-    assert!(args.windows(2).any(|w| w[0] == "--job" && w[1] == job.to_string()), "{args:?}");
-    assert_eq!(server["env"]["CODECRAFT_JOB_KEY"], agent_tools::job_key(&s, JobId(job)));
     assert_eq!(env["CODECRAFT_JOB"], job.to_string());
     assert_eq!(env["CODECRAFT_IDE_PORT"], port.to_string());
-    // Gemini's command line has no MCP flag (it reads the settings file).
-    let cli_args = std::fs::read_to_string(root.join("gemini.args")).unwrap();
-    assert!(!cli_args.contains("mcp"), "{cli_args}");
-    assert_eq!(s.agents.job(JobId(job)).unwrap().session_id.as_deref(), Some("gm-1"));
+    // agy has no per-run MCP flag: it reads servers from `agy mcp add`.
+    let cli_args = std::fs::read_to_string(root.join("agy.args")).unwrap();
+    assert!(cli_args.contains("--output-format") && !cli_args.contains("mcp"), "{cli_args}");
+    assert_eq!(s.agents.job(JobId(job)).unwrap().session_id.as_deref(), Some("c-1"));
     s.shutdown();
 }
 

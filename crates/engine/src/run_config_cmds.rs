@@ -87,7 +87,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "runConfig.generate",
             "Generate Run Configurations",
             None,
-            "{agent?: \"claude\"|\"codex\"|\"grok\"|\"gemini\", mode?: \"ask\"|\"auto\" (default ask)} — open Edit \
+            "{agent?: \"claude\"|\"codex\"|\"grok\"|\"antigravity\", mode?: \"ask\"|\"auto\" (default ask)} — open Edit \
              Configurations and propose configurations for the project's entry points (Cargo binaries, \
              Django/FastAPI/Flask/Streamlit apps, `__main__` packages, CMake/Meson/Zig executables, sources with \
              main(), npm scripts, tests). With `agent`, that coding agent reviews the detected list and the \
@@ -197,7 +197,7 @@ fn generate(s: &mut Session, p: &Value) -> CmdResult {
         None => None,
         Some(id) => {
             let backend = codecraft_agent::Backend::from_id(id).ok_or_else(|| {
-                CommandError::BadParams(format!("unknown agent `{id}` (claude, codex, grok, gemini)"))
+                CommandError::BadParams(format!("unknown agent `{id}` (claude, codex, grok, antigravity)"))
             })?;
             let mode = match opt_str(p, "mode").unwrap_or("ask") {
                 "ask" => crate::approvals::AgentMode::Ask,

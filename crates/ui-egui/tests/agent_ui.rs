@@ -169,10 +169,10 @@ fn approval_cards_answer_ask_mode_requests() {
         .build_eframe(move |_| App::ephemeral(Some(open)));
     h.run_steps(2);
     let s = &mut h.state_mut().session;
-    s.execute("agent.settings", &json!({ "acp": { "gemini": ["python3", fake] } })).unwrap();
+    s.execute("agent.settings", &json!({ "acp": { "antigravity": ["python3", fake] } })).unwrap();
     s.execute("file.open", &json!({ "path": proj })).ok();
     let id = s
-        .execute("agent.start", &json!({ "backend": "gemini", "mode": "ask", "prompt": "shout", "cwd": proj }))
+        .execute("agent.start", &json!({ "backend": "antigravity", "mode": "ask", "prompt": "shout", "cwd": proj }))
         .unwrap()["job"]
         .as_u64()
         .unwrap();

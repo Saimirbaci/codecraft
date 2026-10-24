@@ -16,11 +16,11 @@ pub enum Backend {
     Claude,
     Codex,
     Grok,
-    Gemini,
+    Antigravity,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 4] = [Backend::Claude, Backend::Codex, Backend::Grok, Backend::Gemini];
+    pub const ALL: [Backend; 4] = [Backend::Claude, Backend::Codex, Backend::Grok, Backend::Antigravity];
 
     /// Machine id used in commands (`"claude"`, `"codex"`, …).
     pub fn id(self) -> &'static str {
@@ -28,7 +28,7 @@ impl Backend {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Grok => "grok",
-            Self::Gemini => "gemini",
+            Self::Antigravity => "antigravity",
         }
     }
 
@@ -41,13 +41,16 @@ impl Backend {
             Self::Claude => "Claude Code",
             Self::Codex => "Codex",
             Self::Grok => "Grok",
-            Self::Gemini => "Gemini",
+            Self::Antigravity => "Antigravity",
         }
     }
 
     /// The headless CLI's executable name.
     pub fn binary(self) -> &'static str {
-        self.id()
+        match self {
+            Self::Antigravity => "agy",
+            _ => self.id(),
+        }
     }
 
     pub fn install_hint(self) -> &'static str {
@@ -55,7 +58,7 @@ impl Backend {
             Self::Claude => "Install Claude Code: curl -fsSL https://claude.ai/install.sh | bash",
             Self::Codex => "Install Codex: npm install -g @openai/codex",
             Self::Grok => "Install Grok Build: see https://x.ai/cli",
-            Self::Gemini => "Install Gemini CLI: npm install -g @google/gemini-cli",
+            Self::Antigravity => "Install the Antigravity CLI (agy) from Google, then run `agy install`",
         }
     }
 
@@ -64,17 +67,16 @@ impl Backend {
         match self {
             Self::Claude => &["claude-code-acp", "claude-agent-acp"],
             Self::Codex => &["codex-acp"],
-            Self::Grok | Self::Gemini => &[],
+            Self::Grok | Self::Antigravity => &[],
         }
     }
 
     /// Arguments that make the CLI itself speak ACP on stdio (verified against `--help`:
-    /// `gemini --acp`; `grok agent stdio`, whose initialize answers with ACP protocol version 1).
+    /// `grok agent stdio`, whose initialize answers with ACP protocol version 1).
     pub fn native_acp_args(self) -> Option<&'static [&'static str]> {
         match self {
-            Self::Gemini => Some(&["--acp"]),
             Self::Grok => Some(&["agent", "--no-leader", "stdio"]),
-            Self::Claude | Self::Codex => None,
+            Self::Claude | Self::Codex | Self::Antigravity => None,
         }
     }
 
@@ -87,7 +89,7 @@ impl Backend {
             }
             Self::Codex => "Ask mode needs the ACP adapter: npm install -g @zed-industries/codex-acp (codex-acp)",
             Self::Grok => "Ask mode needs a Grok Build version with `grok agent stdio`",
-            Self::Gemini => "Ask mode needs a Gemini CLI version with `--acp`",
+            Self::Antigravity => "Antigravity (agy) has no ACP mode yet, so it runs in Auto and Review only",
         }
     }
 }
@@ -305,7 +307,8 @@ mod tests {
     fn ask_hint_when_no_adapter() {
         let info = BackendInfo { backend: Backend::Codex, path: Some("/x/codex".into()), acp: None };
         assert!(info.ask_unavailable().is_some_and(|h| h.contains("codex-acp")));
-        let gem = BackendInfo { backend: Backend::Gemini, path: None, acp: None };
-        assert!(gem.ask_unavailable().is_some_and(|h| h.contains("gemini-cli")));
+        let agy = BackendInfo { backend: Backend::Antigravity, path: None, acp: None };
+        assert!(agy.ask_unavailable().is_some_and(|h| h.contains("no ACP mode")));
+        assert_eq!(Backend::Antigravity.binary(), "agy");
     }
 }

@@ -464,8 +464,9 @@ pub fn connect_snippets(s: &Session) -> Value {
         "The IDE entry reaches the CodeCraft window whose project holds the agent's working directory; this IDE's \
          Agent Access policy and approval prompts apply."
             .to_string(),
-        "Built-in Claude Code, Codex and Gemini jobs get CodeCraft's tools without this. Grok's headless mode reads \
-         MCP servers only from its own config: add the Grok entry once and its jobs use it (tagged with the job)."
+        "Built-in Claude Code and Codex jobs get CodeCraft's tools without this. Grok's and Antigravity's headless \
+         modes read MCP servers only from their own config (`grok mcp add`, `agy mcp add`): add the entry once and \
+         their jobs use it (tagged with the job)."
             .to_string(),
     ];
     if headless.is_none() {

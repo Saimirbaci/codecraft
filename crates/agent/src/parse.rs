@@ -8,13 +8,13 @@
 //! - Codex `exec --json`: `thread.started`, `item.started|updated|completed` (command_execution,
 //!   file_change, agent_message, mcp_tool_call, web_search, todo_list, error), `turn.completed`,
 //!   `turn.failed`, `error`.
-//! - Gemini `--output-format stream-json`: `init`, `message` (assistant deltas), `tool_use`,
-//!   `tool_result`, `error`, `result`.
+//! - Antigravity (`agy -p … --output-format stream-json`): `init` (conversation id), `step_update`
+//!   (`agent_response` text deltas; `tool` steps going ACTIVE then DONE), `result`.
 //!
 //! Every parser tolerates unknown lines: non-JSON becomes [`AgentEvent::Log`], unknown JSON is
 //! ignored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -34,11 +34,13 @@ pub struct StreamParser {
     /// Tool call id → the file it edits (reported as a change once the call succeeds).
     pending_edits: HashMap<String, PathBuf>,
     session_seen: bool,
+    /// Antigravity tool steps already reported as started (a step is updated more than once).
+    open_steps: HashSet<u64>,
 }
 
 impl StreamParser {
     pub fn new(backend: Backend, cwd: &Path) -> Self {
-        Self { backend, cwd: cwd.to_path_buf(), pending_edits: HashMap::new(), session_seen: false }
+        Self { backend, cwd: cwd.to_path_buf(), pending_edits: HashMap::new(), session_seen: false, open_steps: HashSet::new() }
     }
 
     /// Parse one line of output.
@@ -57,7 +59,7 @@ impl StreamParser {
         match self.backend {
             Backend::Claude | Backend::Grok => self.anthropic(&v, &mut out),
             Backend::Codex => self.codex(&v, &mut out),
-            Backend::Gemini => self.gemini(&v, &mut out),
+            Backend::Antigravity => self.antigravity(&v, &mut out),
         }
         out
     }
@@ -331,64 +333,69 @@ impl StreamParser {
         }
     }
 
-    // ------------------------------------------------------------------ Gemini
+    // ------------------------------------------------------------------ Antigravity
 
-    fn gemini(&mut self, v: &Value, out: &mut Vec<AgentEvent>) {
-        match v.get("type").and_then(Value::as_str).unwrap_or("") {
-            "init" => self.session(v.get("session_id").and_then(Value::as_str), out),
-            "message" => {
-                if v.get("role").and_then(Value::as_str) != Some("assistant") {
-                    return;
+    fn antigravity(&mut self, v: &Value, out: &mut Vec<AgentEvent>) {
+        match v.get("event").and_then(Value::as_str).unwrap_or("") {
+            "init" => self.session(v.get("conversation_id").and_then(Value::as_str), out),
+            "step_update" => {
+                let Some(step) = v.get("step_update") else { return };
+                match step.get("step_type").and_then(Value::as_str).unwrap_or("") {
+                    "agent_response" => {
+                        let text = step.get("text_delta").and_then(Value::as_str).unwrap_or("");
+                        if !text.is_empty() {
+                            out.push(AgentEvent::TextDelta { text: text.to_string() });
+                        }
+                    }
+                    "tool" => self.antigravity_tool(step, out),
+                    _ => {}
                 }
-                let text = v.get("content").and_then(Value::as_str).unwrap_or("");
-                if text.is_empty() {
-                    return;
-                }
-                if v.get("delta").and_then(Value::as_bool).unwrap_or(false) {
-                    out.push(AgentEvent::TextDelta { text: text.to_string() });
-                } else {
-                    out.push(AgentEvent::Text { text: text.to_string() });
-                }
-            }
-            "tool_use" => {
-                let id = v.get("tool_id").and_then(Value::as_str).unwrap_or("");
-                let name = v.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
-                let input = v.get("parameters").cloned().unwrap_or(Value::Null);
-                self.tool_use(id, name, &input, out);
-            }
-            "tool_result" => {
-                let id = v.get("tool_id").and_then(Value::as_str).unwrap_or("");
-                let ok = v.get("status").and_then(Value::as_str) == Some("success");
-                let output = if ok {
-                    output_text(v.get("output"))
-                } else {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(|m| truncate(m, crate::event::MAX_OUTPUT_CHARS))
-                        .unwrap_or_else(|| output_text(v.get("output")))
-                };
-                self.tool_result(id, ok, output, out);
             }
             "error" => {
                 let msg = v.get("message").and_then(Value::as_str).unwrap_or("unknown error");
-                if v.get("severity").and_then(Value::as_str) == Some("warning") {
-                    out.push(AgentEvent::Log { line: format!("warning: {msg}") });
-                } else {
-                    out.push(AgentEvent::Error { message: msg.to_string() });
-                }
+                out.push(AgentEvent::Error { message: msg.to_string() });
             }
             "result" => {
-                let is_error = v.get("status").and_then(Value::as_str) != Some("success");
-                let text = v.pointer("/error/message").and_then(Value::as_str).map(str::to_string);
+                let r = v.get("result").unwrap_or(v);
+                let is_error = r.get("status").and_then(Value::as_str) != Some("SUCCESS");
+                // The reply was already streamed; only a failure carries text of its own.
+                let text = if is_error { r.get("response").and_then(Value::as_str).map(str::to_string) } else { None };
                 out.push(AgentEvent::Result {
                     is_error,
                     cost_usd: None,
-                    duration_ms: v.pointer("/stats/duration_ms").and_then(Value::as_u64),
+                    duration_ms: r.get("duration_seconds").and_then(Value::as_f64).map(|s| (s * 1000.0) as u64),
                     text,
                 });
             }
             _ => {}
         }
+    }
+
+    fn antigravity_tool(&mut self, step: &Value, out: &mut Vec<AgentEvent>) {
+        let Some(index) = step.get("step_index").and_then(Value::as_u64) else { return };
+        let id = format!("step-{index}");
+        let name = step.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+        // agy capitalises its parameter names (`Path`); the shared helpers look for lowercase ones.
+        let input = match step.pointer("/tool_info/parameters") {
+            Some(Value::Object(m)) => {
+                Value::Object(m.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.clone())).collect())
+            }
+            _ => Value::Null,
+        };
+        let state = step.get("state").and_then(Value::as_str).unwrap_or("");
+        if state != "DONE" && !matches!(state, "ERROR" | "FAILED" | "CANCELED" | "CANCELLED") {
+            if self.open_steps.insert(index) {
+                self.tool_use(&id, name, &input, out);
+            }
+            return;
+        }
+        if self.open_steps.insert(index) {
+            self.tool_use(&id, name, &input, out);
+        }
+        self.open_steps.remove(&index);
+        let ok = state == "DONE";
+        let output = if ok { String::new() } else { format!("tool {state}") };
+        self.tool_result(&id, ok, output, out);
     }
 }
 
@@ -486,26 +493,31 @@ not json at all
     }
 
     #[test]
-    fn gemini_stream() {
-        let lines = r#"{"type":"init","timestamp":"t","session_id":"gm-1","model":"gemini-2.5-pro"}
-{"type":"message","timestamp":"t","role":"user","content":"fix it"}
-{"type":"message","timestamp":"t","role":"assistant","content":"Sure","delta":true}
-{"type":"tool_use","timestamp":"t","tool_name":"replace","tool_id":"r1","parameters":{"file_path":"/proj/a.py","old_string":"x","new_string":"y"}}
-{"type":"tool_result","timestamp":"t","tool_id":"r1","status":"success","output":"ok"}
-{"type":"tool_use","timestamp":"t","tool_name":"run_shell_command","tool_id":"r2","parameters":{"command":"pytest"}}
-{"type":"tool_result","timestamp":"t","tool_id":"r2","status":"error","output":"","error":{"type":"X","message":"boom"}}
-{"type":"error","timestamp":"t","severity":"warning","message":"slow"}
-{"type":"result","timestamp":"t","status":"success","stats":{"total_tokens":5,"duration_ms":1234,"tool_calls":2}}"#;
-        let ev = parse_all(Backend::Gemini, lines);
-        assert_eq!(ev.first(), Some(&AgentEvent::Session { id: "gm-1".into() }));
+    fn antigravity_stream() {
+        let lines = r#"{"event":"init","conversation_id":"c-1","init":{"cwd":"/proj","tools":[]}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":0,"state":"DONE","step_type":"user_input"}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"Sure"}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"write_file","tool_info":{"name":"write_file","parameters":{"Path":"/proj/a.py"}}}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":2,"state":"DONE","step_type":"tool","tool_name":"write_file","tool_info":{"name":"write_file","parameters":{"Path":"/proj/a.py"}}}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"pytest"}}}}
+{"event":"step_update","step_update":{"conversation_id":"c-1","step_index":4,"state":"ERROR","step_type":"tool","tool_name":"view_file","tool_info":{"name":"view_file","parameters":{}}}}
+{"event":"result","result":{"conversation_id":"c-1","status":"SUCCESS","response":"done","duration_seconds":1.5,"num_turns":1}}"#;
+        let ev = parse_all(Backend::Antigravity, lines);
+        assert_eq!(ev.first(), Some(&AgentEvent::Session { id: "c-1".into() }));
         assert!(ev.contains(&AgentEvent::TextDelta { text: "Sure".into() }));
+        assert_eq!(ev.iter().filter(|e| matches!(e, AgentEvent::ToolUse { id, .. } if id == "step-2")).count(), 1);
         assert!(ev.contains(&AgentEvent::FileChanged { path: "/proj/a.py".into(), kind: ChangeKind::Modified }));
-        assert!(ev.contains(&AgentEvent::ToolResult { id: "r2".into(), ok: false, output: "boom".into() }));
         assert!(ev.iter().any(|e| matches!(e, AgentEvent::ToolUse { summary, .. } if summary == "Running `pytest`")));
+        assert!(ev.contains(&AgentEvent::ToolResult { id: "step-4".into(), ok: false, output: "tool ERROR".into() }));
         assert_eq!(
             ev.last(),
-            Some(&AgentEvent::Result { is_error: false, cost_usd: None, duration_ms: Some(1234), text: None })
+            Some(&AgentEvent::Result { is_error: false, cost_usd: None, duration_ms: Some(1500), text: None })
         );
+        let failed = parse_all(
+            Backend::Antigravity,
+            r#"{"event":"result","result":{"status":"FAILED","response":"quota"}}"#,
+        );
+        assert!(matches!(failed.last(), Some(AgentEvent::Result { is_error: true, text: Some(t), .. }) if t == "quota"));
     }
 
     #[test]

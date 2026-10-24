@@ -1,6 +1,6 @@
 //! CodeCraft coding-agent backends (L0, no workspace deps).
 //!
-//! - [`backend`]: which agent CLIs exist (Claude Code, Codex, Grok, Gemini), found on an enriched
+//! - [`backend`]: which agent CLIs exist (Claude Code, Codex, Grok, Antigravity), found on an enriched
 //!   `PATH` because GUI apps start with a minimal one.
 //! - [`cli`] + [`parse`] + [`process`]: run a CLI headless and turn its JSON stream into the
 //!   common [`AgentEvent`] model.

@@ -450,9 +450,9 @@ fn an_agent_refines_the_generated_configurations() {
     let tmp = tempfile::tempdir().unwrap();
     let root = polyglot(tmp.path());
     let mut s = open(&root);
-    s.execute("agent.settings", &json!({ "acp": { "gemini": ["python3", fake] } })).unwrap();
+    s.execute("agent.settings", &json!({ "acp": { "antigravity": ["python3", fake] } })).unwrap();
 
-    s.execute("runConfig.generate", &json!({ "agent": "gemini" })).unwrap();
+    s.execute("runConfig.generate", &json!({ "agent": "antigravity" })).unwrap();
     let start = Instant::now();
     loop {
         s.pump();

@@ -21,7 +21,7 @@ pub const TOGGLE_SHORTCUT: &str = "Alt+Shift+Cmd+F";
 pub const DEFAULT_COLOR: &str = "#ef4444";
 
 /// Backends offered when track D's `agent.backends` is not available.
-pub const FALLBACK_BACKENDS: [&str; 4] = ["claude", "codex", "grok", "gemini"];
+pub const FALLBACK_BACKENDS: [&str; 4] = ["claude", "codex", "grok", "antigravity"];
 
 pub const MODES: [&str; 3] = ["auto", "ask", "review"];
 
@@ -973,7 +973,7 @@ fn backend_label(id: &str) -> String {
         "claude" => "Claude Code".into(),
         "codex" => "Codex".into(),
         "grok" => "Grok".into(),
-        "gemini" => "Gemini".into(),
+        "antigravity" => "Antigravity".into(),
         other => other.to_string(),
     }
 }

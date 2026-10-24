@@ -126,13 +126,13 @@ fn auto_mode_edits_the_project_and_reloads_open_files() {
 #[test]
 fn failing_and_stopped_jobs() {
     let tmp = tempfile::tempdir().unwrap();
-    let fail = script(tmp.path(), "gemini", "echo '{\"type\":\"init\",\"session_id\":\"g\"}'\necho boom >&2\nexit 2\n");
+    let fail = script(tmp.path(), "antigravity", "echo '{\"event\":\"init\",\"conversation_id\":\"g\"}'\necho boom >&2\nexit 2\n");
     let slow = script(tmp.path(), "codex", "echo '{\"type\":\"thread.started\",\"thread_id\":\"t\"}'\nexec sleep 30\n");
     let mut s = session();
-    s.execute("agent.settings", &json!({ "binaries": { "gemini": fail, "codex": slow } })).unwrap();
+    s.execute("agent.settings", &json!({ "binaries": { "antigravity": fail, "codex": slow } })).unwrap();
     let cwd = tmp.path().to_path_buf();
 
-    let id = start(&mut s, json!({ "backend": "gemini", "mode": "auto", "prompt": "x", "cwd": cwd }));
+    let id = start(&mut s, json!({ "backend": "antigravity", "mode": "auto", "prompt": "x", "cwd": cwd }));
     wait(&mut s, "failure", |s| status(s, id) == JobStatus::Failed);
     let job = s.agents.job(JobId(id)).unwrap();
     assert!(job.error.as_deref().is_some_and(|e| e.contains("code 2")), "{:?}", job.error);
@@ -315,15 +315,15 @@ fn ask_mode_routes_permissions_and_writes_through_the_engine() {
     s.execute("file.open", &json!({ "path": proj.join("hello.txt") })).unwrap();
     // The open document has unsaved edits: the agent must read those, not the disk.
     s.execute("editor.type", &json!({ "text": "well, " })).unwrap();
-    s.execute("agent.settings", &json!({ "acp": { "gemini": ["python3", fake] } })).unwrap();
+    s.execute("agent.settings", &json!({ "acp": { "antigravity": ["python3", fake] } })).unwrap();
     let backends = s.execute("agent.backends", &Value::Null).unwrap();
-    let gem = backends.as_array().unwrap().iter().find(|b| b["id"] == "gemini").unwrap();
+    let gem = backends.as_array().unwrap().iter().find(|b| b["id"] == "antigravity").unwrap();
     assert!(gem["modes"].as_array().unwrap().contains(&json!("ask")));
 
-    let id = start(&mut s, json!({ "backend": "gemini", "mode": "ask", "prompt": "shout" }));
+    let id = start(&mut s, json!({ "backend": "antigravity", "mode": "ask", "prompt": "shout" }));
     wait(&mut s, "an approval", |s| !s.approvals.is_empty());
     let req = s.approvals.pending().next().cloned().unwrap();
-    assert_eq!(req.source, format!("Gemini (job {id})"));
+    assert_eq!(req.source, format!("Antigravity (job {id})"));
     match &req.kind {
         ApprovalKind::FileEdit { path, original, proposed } => {
             assert_eq!(path, &proj.join("hello.txt"));

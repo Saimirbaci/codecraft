@@ -270,11 +270,11 @@ fn ask_sessions_resume_over_acp() {
         if load {
             cmd.push(json!("--load"));
         }
-        let settings = json!({ "acp": { "gemini": cmd } });
+        let settings = json!({ "acp": { "antigravity": cmd } });
 
         let mut s = session(&home, &proj);
         s.execute("agent.settings", &settings).unwrap();
-        let (id, key) = start(&mut s, json!({ "backend": "gemini", "mode": "ask", "prompt": "chat hello" }));
+        let (id, key) = start(&mut s, json!({ "backend": "antigravity", "mode": "ask", "prompt": "chat hello" }));
         wait(&mut s, "the turn", |s| status(s, id) == JobStatus::Finished);
         s.shutdown();
         drop(s);
