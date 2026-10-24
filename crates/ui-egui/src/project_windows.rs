@@ -192,7 +192,8 @@ impl ProjectWindows {
             let mut builder = ViewportBuilder::default()
                 .with_title(crate::App::window_title(&w.session))
                 .with_inner_size(w.open_size)
-                .with_min_inner_size([640.0, 400.0]);
+                .with_min_inner_size([640.0, 400.0])
+                .with_resizable(true);
             if let Some(pos) = w.open_pos {
                 builder = builder.with_position(pos);
             }

@@ -54,6 +54,19 @@ pub struct AgentUi {
     pub connect: Option<Value>,
     /// The client shown in that window (its id).
     pub connect_client: String,
+    mention_cache: Option<MentionCache>,
+    mention_index: usize,
+    mention_scroll: bool,
+    mention_dismissed: Option<String>,
+}
+
+struct MentionCache {
+    follow_up: bool,
+    query: String,
+    root: Option<PathBuf>,
+    count: usize,
+    result: Value,
+    loaded: std::time::Instant,
 }
 
 impl Default for AgentUi {
@@ -81,6 +94,10 @@ impl Default for AgentUi {
             cleanup_worktrees_only: false,
             connect: None,
             connect_client: "claude".into(),
+            mention_cache: None,
+            mention_index: 0,
+            mention_scroll: false,
+            mention_dismissed: None,
         }
     }
 }
@@ -141,19 +158,11 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     new_job(ui, s, st, &theme, &backends);
     ui.add_space(4.0);
     ui.separator();
-    let has_history = !agent_sessions::history(s).is_empty() || s.agents.sessions.loading;
+    history(ui, s, st, &theme);
     if s.agents.jobs.is_empty() {
-        if has_history {
-            history(ui, s, st, &theme);
-        } else {
-            ui.label(RichText::new("No agent jobs yet.").color(theme.text_muted));
-        }
         return;
     }
     job_list(ui, s, st, &theme);
-    if has_history {
-        history(ui, s, st, &theme);
-    }
     let selected =
         st.agent.selected.filter(|id| s.agents.job(*id).is_some()).or_else(|| s.agents.jobs.last().map(|j| j.id));
     st.agent.selected = selected;
@@ -242,13 +251,35 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
     let prompt_id = Id::new("agent-prompt");
     let mut send =
         ui.memory(|m| m.has_focus(prompt_id)) && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
-    ui.add(
-        TextEdit::multiline(&mut st.agent.prompt)
-            .id(prompt_id)
-            .hint_text("Describe the task… (⌘↩ to send)")
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
+    let accept_mention = mention_keys(ui, st, prompt_id, false);
+    let height = s.ws.layout.pane_size("agent.composer", 82.0);
+    let (pane, pane_height) = egui::Resize::default()
+        .id_salt("agent-composer-size")
+        .default_size([ui.available_width(), height])
+        .min_size([80.0, 58.0])
+        .max_size([ui.available_width().max(80.0), (ui.available_height() * 0.6).max(58.0)])
+        .resizable([false, true])
+        .show(ui, |ui| {
+            let size = ui.available_size();
+            let output = ScrollArea::vertical()
+                .id_salt("agent-composer-scroll")
+                .auto_shrink([false, false])
+                .max_height(size.y)
+                .show(ui, |ui| {
+                    TextEdit::multiline(&mut st.agent.prompt)
+                        .id(prompt_id)
+                        .hint_text("Describe the task… (@ to attach, ⌘↩ to send)")
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .min_size(egui::vec2(0.0, (size.y - 8.0).max(1.0)))
+                        .show(ui)
+                })
+                .inner;
+            (output, size.y)
+        });
+    s.ws.layout.remember_pane("agent.composer", pane_height);
+    let cursor = if pane.response.has_focus() || pane.response.lost_focus() { pane.cursor_range } else { None };
+    attachment_mentions(ui, s, st, theme, cursor, accept_mention, false);
     context_chips(ui, s, st, theme);
     ui.horizontal(|ui| {
         add_context_button(ui, s, st);
@@ -263,13 +294,17 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
         });
     });
     if send && support.is_ok() && !st.agent.prompt.trim().is_empty() {
+        let Some(attachments) = attachment_paths(&st.agent.context) else {
+            s.status = "An attachment path is not UTF-8. Rename it or remove it before sending.".into();
+            return;
+        };
         let params = json!({
             "backend": st.agent.backend.id(),
             "mode": mode_id(st.agent.mode),
             "prompt": st.agent.prompt,
             "includeActiveFile": st.agent.attach_file,
             "includeSelection": st.agent.attach_selection,
-            "attachments": st.agent.context,
+            "attachments": attachments,
         });
         match s.execute("agent.start", &params) {
             Ok(v) => {
@@ -277,6 +312,156 @@ fn new_job(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, 
                 st.agent.context.clear();
                 st.agent.selected = v.get("job").and_then(Value::as_u64).map(JobId);
                 st.agent.review_file = None;
+            }
+            Err(e) => s.status = e.to_string(),
+        }
+    }
+}
+
+/// JSON paths are strings; validate native picker paths before calling json!.
+fn attachment_paths(paths: &[PathBuf]) -> Option<Vec<&str>> {
+    paths.iter().map(|path| path.to_str()).collect()
+}
+
+/// Byte range of the @ token immediately before a char-based text caret.
+/// Whitespace before @ prevents email addresses from opening the picker.
+fn mention_range(text: &str, caret: usize) -> Option<std::ops::Range<usize>> {
+    let end = text.char_indices().nth(caret).map_or(text.len(), |(i, _)| i);
+    let before = text.get(..end)?;
+    let start = before.rfind('@')?;
+    if before.get(..start)?.chars().next_back().is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let query = before.get(start.saturating_add(1)..)?;
+    if query.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(start..end)
+}
+
+fn mention_keys(ui: &egui::Ui, st: &mut UiState, prompt_id: Id, follow_up: bool) -> bool {
+    let mut accept_mention = false;
+    if ui.memory(|m| m.has_focus(prompt_id))
+        && st.agent.mention_cache.as_ref().is_some_and(|cache| cache.follow_up == follow_up)
+    {
+        ui.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                st.agent.mention_index = st.agent.mention_index.saturating_add(1);
+                st.agent.mention_scroll = true;
+            }
+            if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                st.agent.mention_index = st.agent.mention_index.saturating_sub(1);
+                st.agent.mention_scroll = true;
+            }
+            accept_mention = i.consume_key(Modifiers::NONE, Key::Enter) || i.consume_key(Modifiers::NONE, Key::Tab);
+            if i.consume_key(Modifiers::NONE, Key::Escape) {
+                st.agent.mention_dismissed =
+                    Some(if follow_up { st.agent.follow_up.clone() } else { st.agent.prompt.clone() });
+            }
+        });
+    }
+    accept_mention
+}
+
+fn attachment_mentions(
+    ui: &mut egui::Ui,
+    s: &mut Session,
+    st: &mut UiState,
+    theme: &Theme,
+    cursor: Option<egui::text::CCursorRange>,
+    accept: bool,
+    follow_up: bool,
+) {
+    let text = if follow_up { st.agent.follow_up.clone() } else { st.agent.prompt.clone() };
+    let Some(cursor) = cursor else { return };
+    let range = cursor.is_empty().then(|| mention_range(&text, cursor.primary.index.into())).flatten();
+    let Some(range) = range else {
+        st.agent.mention_cache = None;
+        st.agent.mention_dismissed = None;
+        return;
+    };
+    if st.agent.mention_dismissed.as_ref() == Some(&text) {
+        st.agent.mention_cache = None;
+        return;
+    }
+    let query = text.get(range.start.saturating_add(1)..range.end).unwrap_or("").to_string();
+    let root = s.project_root();
+    let count = s.ws.project.as_ref().map_or(0, |p| p.tree.len());
+    if !st.agent.mention_cache.as_ref().is_some_and(|cache| {
+        cache.follow_up == follow_up
+            && cache.query == query
+            && cache.root == root
+            && cache.count == count
+            && cache.loaded.elapsed() < std::time::Duration::from_millis(500)
+    }) {
+        match s.execute("agent.context.search", &json!({"query": query})) {
+            Ok(v) => {
+                let changed = st
+                    .agent
+                    .mention_cache
+                    .as_ref()
+                    .is_none_or(|c| c.follow_up != follow_up || c.query != query || c.root != root);
+                st.agent.mention_cache =
+                    Some(MentionCache { follow_up, query, root, count, result: v, loaded: std::time::Instant::now() });
+                if changed {
+                    st.agent.mention_index = 0;
+                }
+            }
+            Err(e) => {
+                s.status = e.to_string();
+                return;
+            }
+        }
+    }
+    let result = st.agent.mention_cache.as_ref().map(|cache| cache.result.clone()).unwrap_or_default();
+    let prompt_id = Id::new(if follow_up { "agent-follow-up" } else { "agent-prompt" });
+    let mut selected = None;
+    Frame::new().stroke(egui::Stroke::new(1.0, theme.separator)).inner_margin(4).show(ui, |ui| {
+        ui.label(RichText::new("Attach a file or folder").small().color(theme.text_muted));
+        let items = result.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
+        if items.is_empty() {
+            ui.label(if result.get("loading").and_then(Value::as_bool) == Some(true) {
+                "Loading project files…"
+            } else {
+                "No matching files or folders"
+            });
+        }
+        st.agent.mention_index = st.agent.mention_index.min(items.len().saturating_sub(1));
+        ScrollArea::vertical().id_salt("agent-mentions").max_height(150.0).show(ui, |ui| {
+            for (index, item) in items.into_iter().enumerate() {
+                let label = item.get("label").and_then(Value::as_str).unwrap_or("");
+                let directory = item.get("directory").and_then(Value::as_bool).unwrap_or(false);
+                let highlighted = index == st.agent.mention_index;
+                let response =
+                    ui.selectable_label(highlighted, format!("{} {label}", if directory { "Folder" } else { "File" }));
+                if highlighted && st.agent.mention_scroll {
+                    response.scroll_to_me(Some(Align::Center));
+                }
+                if response.clicked() || (highlighted && accept) {
+                    selected = item.get("path").and_then(Value::as_str).map(PathBuf::from);
+                }
+            }
+        });
+    });
+    st.agent.mention_scroll = false;
+    if let Some(path) = selected {
+        match s.execute("agent.context.attach", &json!({"path": path})) {
+            Ok(_) => {
+                add_context(st, path);
+                st.agent.mention_cache = None;
+                let mut text = text;
+                text.replace_range(range.clone(), "");
+                let caret = text.get(..range.start).unwrap_or("").chars().count();
+                if follow_up {
+                    st.agent.follow_up = text;
+                } else {
+                    st.agent.prompt = text;
+                }
+                if let Some(mut state) = egui::TextEdit::load_state(ui.ctx(), prompt_id) {
+                    state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(caret))));
+                    state.store(ui.ctx(), prompt_id);
+                }
+                ui.memory_mut(|m| m.request_focus(prompt_id));
             }
             Err(e) => s.status = e.to_string(),
         }
@@ -407,7 +592,7 @@ fn filter_params(st: &UiState) -> Value {
 
 /// Search, status and backend filters, Export and Clean Up.
 fn history_tools(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, cmd: &mut Option<(&'static str, Value)>) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.add(
             TextEdit::singleline(&mut st.agent.history_query)
                 .id(Id::new("agent-history-search"))
@@ -638,6 +823,9 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
     let mut cmd: Option<(&'static str, Value)> = None;
     let mut select_session: Option<String> = None;
     ui.horizontal(|ui| {
+        if ui.small_button("⟳").on_hover_text("Reload saved conversations").clicked() {
+            cmd = Some(("agent.sessions.reload", Value::Null));
+        }
         let arrow = if st.agent.history_open { "▼" } else { "▶" };
         let count = if filter.is_empty() { rows.len().to_string() } else { format!("{} of {total}", rows.len()) };
         let header = RichText::new(format!("{arrow} History · {count}")).small().strong().color(theme.text_muted);
@@ -681,7 +869,17 @@ fn history(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme) 
         });
     });
     if !st.agent.history_open {
+        if let Some((c, p)) = cmd {
+            run_command(s, st, c, &p);
+        }
         return;
+    }
+    if total == 0 && !loading && s.agents.jobs.is_empty() {
+        ui.label(
+            RichText::new("No saved conversations yet. Chats appear here after you start work.")
+                .small()
+                .color(theme.text_muted),
+        );
     }
     if total > 0 {
         history_tools(ui, s, st, &mut cmd);
@@ -917,11 +1115,22 @@ fn follow_up_bar(
         return;
     }
     let mut send = false;
+    let prompt_id = Id::new("agent-follow-up");
+    let accept = mention_keys(ui, st, prompt_id, true);
+    let mut cursor = None;
     ui.horizontal(|ui| {
         let w = ui.available_width() - if resume { 74.0 } else { 60.0 };
         let hint = if resume { "Resume this session…" } else { "Follow up…" };
-        let resp = ui.add(TextEdit::singleline(&mut st.agent.follow_up).hint_text(hint).desired_width(w.max(80.0)));
-        if resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+        let output = TextEdit::singleline(&mut st.agent.follow_up)
+            .id(prompt_id)
+            .hint_text(hint)
+            .desired_width(w.max(80.0))
+            .show(ui);
+        let resp = output.response;
+        if resp.has_focus() || resp.lost_focus() {
+            cursor = output.cursor_range;
+        }
+        if !accept && resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
             send = true;
         }
         let (label, tip) = if resume {
@@ -934,10 +1143,23 @@ fn follow_up_bar(
             send = true;
         }
     });
+    attachment_mentions(ui, s, st, theme, cursor, accept, true);
     if send && !st.agent.follow_up.trim().is_empty() {
-        let prompt = std::mem::take(&mut st.agent.follow_up);
-        run_command(s, st, "agent.followUp", &json!({ "job": id.0, "prompt": prompt }));
-        st.agent.review_file = None;
+        let Some(attachments) = attachment_paths(&st.agent.context) else {
+            s.status = "An attachment path is not UTF-8. Rename it or remove it before sending.".into();
+            return;
+        };
+        match s.execute(
+            "agent.followUp",
+            &json!({ "job": id.0, "prompt": st.agent.follow_up, "attachments": attachments }),
+        ) {
+            Ok(_) => {
+                st.agent.follow_up.clear();
+                st.agent.context.clear();
+                st.agent.review_file = None;
+            }
+            Err(e) => s.status = e.to_string(),
+        }
     }
 }
 
@@ -952,9 +1174,14 @@ fn change_badge(theme: &Theme, c: ChangeKind) -> (&'static str, egui::Color32) {
 }
 
 fn review(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, id: JobId) {
-    if codecraft_engine::selfupdate::is_codecraft(s,id.0) && st.selfupdate_preflight_job!=Some(id.0) && !s.selfupdate.busy {
-        st.selfupdate_preflight_job=Some(id.0);
-        if let Some(source)=s.agents.job(id).map(|j|j.project.clone()) {run_command(s,st,"selfupdate.preflight",&json!({"source":source}));}
+    if codecraft_engine::selfupdate::is_codecraft(s, id.0)
+        && st.selfupdate_preflight_job != Some(id.0)
+        && !s.selfupdate.busy
+    {
+        st.selfupdate_preflight_job = Some(id.0);
+        if let Some(source) = s.agents.job(id).map(|j| j.project.clone()) {
+            run_command(s, st, "selfupdate.preflight", &json!({"source":source}));
+        }
     }
     let Some(job) = s.agents.job(id) else { return };
     let files: Vec<ReviewFile> = job.review.clone();
@@ -968,13 +1195,24 @@ fn review(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, theme: &Theme, i
         return;
     }
     let mut cmd: Option<(&str, Value)> = None;
-    if codecraft_engine::selfupdate::is_codecraft(s,id.0) && let Some(report)=&s.selfupdate.report && !report.ready() {
+    if codecraft_engine::selfupdate::is_codecraft(s, id.0)
+        && let Some(report) = &s.selfupdate.report
+        && !report.ready()
+    {
         ui.label("Build requirements need attention");
-        for check in report.checks.iter().filter(|c|c.level==codecraft_selfupdate::preflight::Level::Fail) {
-            ui.label(&check.message);ui.small(&check.fix);
+        for check in report.checks.iter().filter(|c| c.level == codecraft_selfupdate::preflight::Level::Fail) {
+            ui.label(&check.message);
+            ui.small(&check.fix);
         }
-        if report.checks.iter().any(|c|matches!(c.name.as_str(),"cargo"|"rustc")&&c.level==codecraft_selfupdate::preflight::Level::Fail) && ui.small_button("Open rustup.rs").clicked() {cmd=Some(("selfupdate.openRustup",Value::Null));}
-        if ui.add_enabled(!s.selfupdate.busy,egui::Button::new("Check requirements again")).clicked() {cmd=Some(("selfupdate.preflight",json!({"source":job.project})));}
+        if report.checks.iter().any(|c| {
+            matches!(c.name.as_str(), "cargo" | "rustc") && c.level == codecraft_selfupdate::preflight::Level::Fail
+        }) && ui.small_button("Open rustup.rs").clicked()
+        {
+            cmd = Some(("selfupdate.openRustup", Value::Null));
+        }
+        if ui.add_enabled(!s.selfupdate.busy, egui::Button::new("Check requirements again")).clicked() {
+            cmd = Some(("selfupdate.preflight", json!({"source":job.project})));
+        }
     }
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("Changes · {pending}/{}", files.len())).strong())
@@ -1236,5 +1474,33 @@ fn activity_row(
         Activity::Info { text } => {
             ui.label(RichText::new(text).small().italics().color(theme.text_muted));
         }
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::mention_range;
+    #[cfg(unix)]
+    use super::attachment_paths;
+
+    #[cfg(unix)]
+    #[test]
+    fn native_attachment_paths_are_checked_before_json_serialization() {
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+        let valid = vec![PathBuf::from("src/main.rs")];
+        assert_eq!(attachment_paths(&valid), Some(vec!["src/main.rs"]));
+        let invalid = vec![PathBuf::from(std::ffi::OsString::from_vec(b"bad-\xff.rs".to_vec()))];
+        assert!(attachment_paths(&invalid).is_none());
+    }
+
+    #[test]
+    fn mentions_follow_the_unicode_caret_and_ignore_emails() {
+        assert_eq!(mention_range("fix @src/main.rs later", 16), Some(4..16));
+        assert_eq!(mention_range("é @文", 4), Some(3..7));
+        assert_eq!(mention_range("@", 1), Some(0..1));
+        assert_eq!(mention_range("mail a@b.com", 12), None);
+        assert_eq!(mention_range("@src done", 9), None);
+        assert_eq!(mention_range("plain", 5), None);
     }
 }

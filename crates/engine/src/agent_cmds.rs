@@ -15,6 +15,24 @@ use crate::{CommandError, Session};
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
         spec(
+            "agent.context.search",
+            "Find Agent Attachments",
+            None,
+            "{query?: string} → {items: [{path, label, directory}], loading} — files and folders in the background-loaded project tree (up to 30 matches)",
+            Context::Global,
+            always,
+            context_search,
+        ),
+        spec(
+            "agent.context.attach",
+            "Attach Agent Context",
+            None,
+            "{path: string} → {path} — select a file or folder from the project's attachment suggestions",
+            Context::Global,
+            always,
+            context_attach,
+        ),
+        spec(
             "agent.start",
             "Start Agent Job",
             None,
@@ -53,12 +71,26 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "agent.followUp",
             "Agent Follow-Up",
             None,
-            "{job: int, prompt: string} — continue the job's session",
+            "{job: int, prompt: string, attachments?: [path]} — continue the job's session",
             Context::Global,
             always,
             |s, p| {
                 let prompt = req_str(p, "prompt")?.to_string();
-                agents::follow_up(s, job(p)?, &prompt)?;
+                if prompt.trim().is_empty() {
+                    return Err(CommandError::BadParams("the prompt is empty".into()));
+                }
+                let attachments = follow_up_attachments(p)?;
+                let id = job(p)?;
+                let project = s.agents.job(id).map(|job| job.project.as_path());
+                let full = follow_up_prompt(prompt, &attachments, project);
+                agents::follow_up(s, id, &full)?;
+                if let Some(job) = s.agents.jobs.iter_mut().find(|job| job.id == id) {
+                    for path in attachments {
+                        if !job.attachments.contains(&path) {
+                            job.attachments.push(path);
+                        }
+                    }
+                }
                 Ok(Value::Null)
             },
         ),
@@ -319,6 +351,78 @@ fn settings(s: &mut Session, p: &Value) -> CmdResult {
     serde_json::to_value(&s.agents.settings).map_err(|e| CommandError::Failed(e.to_string()))
 }
 
+fn follow_up_prompt(mut prompt: String, attachments: &[PathBuf], project: Option<&std::path::Path>) -> String {
+    if !attachments.is_empty() {
+        prompt.push_str("\n\nAttached files and folders:\n");
+        for path in attachments {
+            // Like a new job, refer to project files relative to the agent's working directory.
+            // A resumed Review agent must use its worktree, rather than the original checkout.
+            let path = project.and_then(|root| path.strip_prefix(root).ok()).unwrap_or(path);
+            if path.as_os_str().is_empty() {
+                prompt.push_str("- .\n");
+            } else {
+                prompt.push_str(&format!("- {}\n", path.display()));
+            }
+        }
+    }
+    prompt
+}
+
+fn follow_up_attachments(p: &Value) -> Result<Vec<PathBuf>, CommandError> {
+    let Some(value) = p.get("attachments") else { return Ok(Vec::new()) };
+    let items = value
+        .as_array()
+        .filter(|items| items.len() <= 100)
+        .ok_or_else(|| CommandError::BadParams("attachments must be an array of at most 100 paths".into()))?;
+    items
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|p| !p.is_empty() && p.len() <= 32_768)
+                .map(PathBuf::from)
+                .ok_or_else(|| CommandError::BadParams("each attachment must be a nonempty path".into()))
+        })
+        .collect()
+}
+
+/// Reuse the project scan, which runs on a worker; completion never touches the disk.
+fn context_search(s: &mut Session, p: &Value) -> CmdResult {
+    let query = opt_str(p, "query").unwrap_or("");
+    if query.len() > 1024 {
+        return Err(CommandError::BadParams("attachment query is too long".into()));
+    }
+    let query = query.to_lowercase();
+    let Some(project) = &s.ws.project else {
+        return Ok(json!({"items": [], "loading": false}));
+    };
+    // Start with the current directory's children, then nested entries; retain only 30.
+    let nodes =
+        project.tree.iter().filter(|(_, n)| n.depth == 1).chain(project.tree.iter().filter(|(_, n)| n.depth > 1));
+    let items: Vec<_> = nodes
+        .filter_map(|(id, n)| {
+            // JSON command paths must be UTF-8; never let a filesystem name panic in json!.
+            let path = n.path.to_str()?;
+            let label = project.tree.relative_path(id)?.display().to_string();
+            label.to_lowercase().contains(&query).then(|| {
+                json!({
+                    "path": path, "label": label, "directory": n.is_dir,
+                })
+            })
+        })
+        .take(30)
+        .collect();
+    Ok(json!({"items": items, "loading": project.tree.is_empty()}))
+}
+
+fn context_attach(s: &mut Session, p: &Value) -> CmdResult {
+    let path = PathBuf::from(req_str(p, "path")?);
+    let project = s.ws.project.as_ref().ok_or_else(|| CommandError::Failed("open a project to attach files".into()))?;
+    if project.tree.find(&path).is_none() {
+        return Err(CommandError::BadParams("choose a file or folder from the current project".into()));
+    }
+    Ok(json!({"path": path}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,6 +434,83 @@ mod tests {
         let mut s = Session::new();
         s.open_file(&file).unwrap();
         (s, dir)
+    }
+
+    #[test]
+    fn follow_up_attachments_stay_relative_to_the_agents_project() {
+        let root = std::env::temp_dir().join("agent-project");
+        let outside = std::env::temp_dir().join("external-reference.rs");
+        let paths = [root.clone(), root.join("src"), outside.clone()];
+        let prompt = follow_up_prompt("Continue".into(), &paths, Some(&root));
+        assert!(prompt.contains("- .\n- src\n"), "{prompt}");
+        assert!(prompt.contains(&outside.display().to_string()), "{prompt}");
+        assert!(!prompt.contains(&root.display().to_string()), "{prompt}");
+        assert_eq!(follow_up_prompt("Continue".into(), &[], Some(&root)), "Continue");
+        assert!(follow_up_attachments(&json!({"attachments": [null]})).is_err());
+        assert!(follow_up_attachments(&json!({"attachments": vec!["a"; 101]})).is_err());
+    }
+
+    #[test]
+    fn attachment_completion_lists_files_folders_and_filters_without_io() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(root.join("README.md"), "demo").unwrap();
+        let mut project = codecraft_workspace::Project::new(root.clone());
+        project.tree = codecraft_fs::scan(&root, &Default::default()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            // Some Unix filesystems reject such names, so inject a synthetic tree entry.
+            let name = std::ffi::OsString::from_vec(b"bad-\xff.rs".to_vec());
+            let mut nodes: Vec<_> = project.tree.iter().map(|(_, node)| node.clone()).collect();
+            let id = codecraft_fs::NodeId(nodes.len());
+            if let Some(root_node) = nodes.first_mut() {
+                root_node.children.push(id);
+            }
+            nodes.push(codecraft_fs::Node {
+                name: "bad filename".into(),
+                path: root.join(name),
+                is_dir: false,
+                parent: Some(codecraft_fs::NodeId(0)),
+                children: Vec::new(),
+                depth: 1,
+            });
+            project.tree = codecraft_fs::FileTree::from_nodes(nodes, false);
+        }
+        let mut s = Session::new();
+        s.ws.project = Some(project);
+        // Delete the source to prove completion only uses the background-loaded tree.
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        let result = s.execute("agent.context.search", &json!({})).unwrap();
+        let items = result["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3, "unrepresentable filesystem paths are skipped without panicking");
+        assert!(items.iter().any(|i| i["label"] == "src" && i["directory"] == true));
+        assert!(items.iter().any(|i| i["label"] == "README.md" && i["directory"] == false));
+        let filtered = s.execute("agent.context.search", &json!({"query": "MAIN.RS"})).unwrap();
+        assert_eq!(filtered["items"].as_array().unwrap().len(), 1);
+        assert_eq!(filtered["items"][0]["label"], "src/main.rs");
+        for path in [root.join("src"), root.join("README.md")] {
+            assert_eq!(s.execute("agent.context.attach", &json!({"path": path})).unwrap()["path"], json!(path));
+        }
+        assert!(s.execute("agent.context.attach", &json!({"path": root.join("../outside")})).is_err());
+        assert!(s.execute("agent.context.search", &json!({"query": "a".repeat(1025)})).is_err());
+    }
+
+    #[test]
+    fn attachment_completion_without_project_and_with_many_entries_is_bounded() {
+        let mut s = Session::new();
+        assert_eq!(s.execute("agent.context.search", &json!({})).unwrap()["items"], json!([]));
+        assert!(s.execute("agent.context.attach", &json!({"path": "/missing"})).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        for n in 0..40 {
+            std::fs::write(dir.path().join(format!("file{n}")), "").unwrap();
+        }
+        let mut project = codecraft_workspace::Project::new(dir.path().into());
+        project.tree = codecraft_fs::scan(dir.path(), &Default::default()).unwrap();
+        s.ws.project = Some(project);
+        assert_eq!(s.execute("agent.context.search", &json!({})).unwrap()["items"].as_array().unwrap().len(), 30);
     }
 
     #[test]

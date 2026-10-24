@@ -102,12 +102,16 @@ echo '{{"type":"result","subtype":"success","is_error":false,"duration_ms":3,"to
     let job = h.state().session.agents.jobs.first().unwrap();
     assert_eq!(job.status, JobStatus::Finished);
     assert!(job.activity.iter().any(|a| matches!(a, Activity::Text { text } if text == "Polished.")));
-    assert!(h.query_by_label_contains("History · 0").is_none(), "an open session leaves the History");
+    assert!(
+        h.query_by_label_contains("History · 0").is_some(),
+        "History remains discoverable after reopening a session"
+    );
     snapshot(&mut h, "agent-history-reopened");
 
     // Resume it.
     std::fs::write(&log, "").unwrap();
     h.state_mut().ui.agent.follow_up = "And the changelog".into();
+    h.state_mut().ui.agent.context = vec![proj.join("README.md")];
     h.run_steps(2);
     h.get_by_label("Resume").click();
     settle(&mut h, "the resumed turn", |a| {
@@ -118,6 +122,9 @@ echo '{{"type":"result","subtype":"success","is_error":false,"duration_ms":3,"to
     });
     let args = std::fs::read_to_string(&log).unwrap();
     assert!(args.contains("--resume\ns-hist"), "{args}");
+    assert!(args.contains("Attached files and folders:"), "{args}");
+    assert!(args.contains("Attached files and folders:\n- README.md\n"), "{args}");
+    assert!(h.state().ui.agent.context.is_empty());
     snapshot(&mut h, "agent-history-resumed");
 
     // Rename it from the job header.

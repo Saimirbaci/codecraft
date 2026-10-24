@@ -219,6 +219,11 @@ impl LiveState {
         self.runs.contains_key(path)
     }
 
+    /// A worker result is queued for `path`, awaiting the next pump (nonblocking).
+    pub fn result_ready(&self, path: &Path) -> bool {
+        self.runs.get(path).is_some_and(|run| !run.rx.is_empty())
+    }
+
     /// The revision of the newest results for `path`.
     pub fn computed_for(&self, path: &Path) -> Option<u64> {
         self.files.get(path).and_then(|f| f.computed)

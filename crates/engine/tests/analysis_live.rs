@@ -290,7 +290,12 @@ fn a_result_for_an_older_revision_is_mapped_forward() {
         assert!(t0.elapsed() < Duration::from_secs(20));
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_millis(200));
+    // The process log precedes delivery of the worker result. Await actual readiness
+    // without pumping, so slow scheduling cannot turn this into a cancellation test.
+    while !s.analysis.editor.live.result_ready(&app) {
+        assert!(t0.elapsed() < Duration::from_secs(20));
+        std::thread::sleep(Duration::from_millis(10));
+    }
     // Insert a line above before the result is read: it is mapped to the newer text.
     type_at(&mut s, 0, "# c\n");
     s.pump();

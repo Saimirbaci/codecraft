@@ -120,15 +120,14 @@ sleep 0.2
     assert!(s.selfupdate.restart_confirm.is_some());
     s.execute("selfupdate.restartInto", &json!({"id":id,"confirm":true})).unwrap();
     assert!(s.effects.iter().any(|e| matches!(e, Effect::Quit)));
+    let expected_args = format!("--wait-pid\n{}\n--version-id\n{id}\n--wait-lock\n", std::process::id());
     let deadline = Instant::now() + Duration::from_secs(3);
-    while !launch_log.exists() {
-        assert!(Instant::now() < deadline);
+    // Creating the log precedes writing its contents; wait for the complete launcher output.
+    while std::fs::read_to_string(&launch_log).ok().as_deref() != Some(expected_args.as_str()) {
+        assert!(Instant::now() < deadline, "launcher output: {:?}", std::fs::read_to_string(&launch_log));
         std::thread::sleep(Duration::from_millis(10));
     }
-    assert_eq!(
-        std::fs::read_to_string(launch_log).unwrap(),
-        format!("--wait-pid\n{}\n--version-id\n{id}\n--wait-lock\n", std::process::id())
-    );
+    assert_eq!(std::fs::read_to_string(launch_log).unwrap(), expected_args);
     store.failed(&id, "deliberate test crash").unwrap();
     s.selfupdate.rollback_notice = store.take_notice().unwrap();
     assert!(s.selfupdate.rollback_notice.as_deref().unwrap().contains("deliberate test crash"));

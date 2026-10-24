@@ -234,7 +234,7 @@ fn zsh_tabs_run_the_users_files_and_keep_their_own_history() {
     assert!(out.contains(&format!("rc=yes zd=unset hf={key}.history")), "{out}");
     run(&mut s, tab, "echo \"g=$(fc -ln 1 | grep -v g= | grep -c from-global-history)\"", "g=1");
     run(&mut s, tab, "echo \"p=${path[1]:t:h}\"", "p=");
-    let out = run(&mut s, tab, "echo \"shim=$(command -v claude)\"", "shim=");
+    let out = run(&mut s, tab, "echo \"shim=$(command -v claude)\"", "integration/bin/claude");
     assert!(out.contains("integration/bin/claude"), "{out}");
     run(&mut s, tab, "echo zsh-$((5*5))", "zsh-25");
     let history = tab_files(&e).join(format!("{key}.history"));

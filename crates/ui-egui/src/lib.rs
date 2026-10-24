@@ -867,8 +867,11 @@ pub fn launch(launch: Launch) -> eframe::Result {
     let Launch { open, no_restore } = launch;
     let persisted = PersistedState::load();
     let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
-    let mut viewport =
-        egui::ViewportBuilder::default().with_title(DISPLAY_NAME).with_inner_size(size).with_min_inner_size([640.0, 400.0]);
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title(DISPLAY_NAME)
+        .with_inner_size(size)
+        .with_min_inner_size([640.0, 400.0])
+        .with_resizable(true);
     if let Some(pos) = persisted.saved_window_pos() {
         viewport = viewport.with_position(pos);
     }
