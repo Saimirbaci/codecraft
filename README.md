@@ -5,8 +5,8 @@ https://github.com/user-attachments/assets/ee7513cc-3394-4163-b46c-138a900cea51
 <h1 align="center">Code Craft</h1>
 
 <p align="center">
-  <b>A native Rust IDE, written in Rust: a clean-room reimplementation of the RustRover workflow.</b><br>
-  The menus, shortcuts and tool windows you know, in a small native egui app.
+  <b>A free, native IDE for Rust, written in Rust.</b><br>
+  Familiar IDE menus, shortcuts and tool windows in a small native egui app.
   rust-analyzer provides language intelligence and Cargo builds, runs and tests.
 </p>
 
@@ -80,10 +80,10 @@ build by hand with Actions › Release (see `docs/release.md`).
 
 ## Documentation
 
-`AGENTS.md` (start here) · `docs/architecture.md` · `docs/development.md` ·
+`CONTRIBUTING.md` · `AGENTS.md` (start here) · `docs/architecture.md` · `docs/development.md` ·
 `docs/roadmap.md` · `docs/gaps.md` · `docs/parity-checklist.md` · `docs/observation/`
 
 ## License
 
-[MIT](LICENSE). RustRover is a trademark of JetBrains s.r.o.; CodeCraft is not affiliated
+[MIT](LICENSE). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). RustRover is a trademark of JetBrains s.r.o.; CodeCraft is not affiliated
 with or endorsed by JetBrains.

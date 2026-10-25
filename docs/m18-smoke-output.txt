@@ -4,11 +4,11 @@ done.
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on package cache
     Blocking waiting for file lock on build directory
-   Compiling codecraft-selfupdate v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
+   Compiling codecraft-selfupdate v0.3.0 (/Users/dev/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
     Finished `dev` profile [optimized + debuginfo] target(s) in 4m 39s
     Blocking waiting for file lock on build directory
-   Compiling codecraft-selfupdate v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
-   Compiling codecraft-launcher v0.3.0 (/Users/saimirbaci/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/apps/codecraft-launcher)
+   Compiling codecraft-selfupdate v0.3.0 (/Users/dev/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/crates/selfupdate)
+   Compiling codecraft-launcher v0.3.0 (/Users/dev/Dev/opsync/repos/automations/rust_rover-m18-selfupdate/apps/codecraft-launcher)
     Finished `dev` profile [optimized + debuginfo] target(s) in 11m 56s
 Setting up CodeCraft's source: cloning repository…
 Setting up CodeCraft's source: checking out user branch…
@@ -36,7 +36,7 @@ Setting up CodeCraft's source: checking out user branch…
    Compiling xtask v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/xtask)
     Finished `dev` profile [optimized + debuginfo] target(s) in 18.65s
      Running `/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/build-target/debug/xtask bundle --profile selfupdate --version-payload '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-0'`
-$ /Users/saimirbaci/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
+$ /Users/dev/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
    Compiling proc-macro2 v1.0.107
    Compiling quote v1.0.47
    Compiling unicode-ident v1.0.24
@@ -430,7 +430,7 @@ Internal requirements count=0 size=12
 COLD_BUILD_SECONDS=617.18
     Finished `dev` profile [optimized + debuginfo] target(s) in 0.28s
      Running `/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/build-target/debug/xtask bundle --profile selfupdate --version-payload '/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T//codecraft smoke.73w2ye/base/payload-54181-1'`
-$ /Users/saimirbaci/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
+$ /Users/dev/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo build -p codecraft --locked --profile selfupdate --message-format=json-render-diagnostics
    Compiling codecraft-engine v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/engine)
    Compiling codecraft-ui-egui v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/crates/ui-egui)
    Compiling codecraft v0.3.0 (/private/var/folders/z0/n9568ly91c71c32h2ph5g5km0000gn/T/codecraft smoke.73w2ye/base/source/apps/codecraft)
