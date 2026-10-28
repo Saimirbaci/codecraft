@@ -4,10 +4,12 @@
 //!
 //! The project is scanned on a worker thread when the tool window is first shown (or an agent
 //! asks); files the watcher reports as changed are re-read; open documents are re-scanned for
-//! references as they change. Nothing here edits code or rewrites a spec file: the only writes
-//! are `spec.new` (a scaffold in a new directory) and `spec.markSynced` (the private baseline
-//! in `.codecraft/spec-state.json`). Implementing a changed requirement stays with the agent
-//! tools and the user's review.
+//! references as they change. Nothing here edits code. The writes are `spec.new` (a scaffold in
+//! a new directory), `spec.markSynced` (the private baseline in `.codecraft/spec-state.json`) and
+//! the edits the user asks for in the view: `spec.addRequirement`, `spec.editRequirement` and
+//! `spec.setTask` change one requirement or one checkbox, through the open editor when the file
+//! is open (undoable) and never touch anything else in the file. Implementing a changed
+//! requirement stays with the agent tools and the user's review.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -555,6 +557,96 @@ fn mark_synced(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "feature": name, "recorded": n }))
 }
 
+// ---------------------------------------------------------------- editing
+
+/// The text of `path` as the editor has it (unsaved edits included), else from disk; a file
+/// that does not exist yet reads as empty.
+fn current_text(s: &Session, path: &Path) -> Result<String, CommandError> {
+    if let Some(od) = s.ws.doc_by_path(path).and_then(|id| s.ws.doc(id)) {
+        return Ok(od.doc.text());
+    }
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    codecraft_fs::read_text_file(path).map_err(|e| CommandError::Failed(format!("cannot read {}: {e}", path.display())))
+}
+
+/// Write an edited spec file (through the open document, else atomically) and read the specs
+/// again.
+fn write_spec_file(s: &mut Session, path: &Path, text: &str) -> Result<(), CommandError> {
+    crate::ide_server::apply_edit(s, path, text).map_err(CommandError::Failed)?;
+    if let Some(root) = s.spec.project.clone().filter(|_| s.spec.started) {
+        reload_features(s, root);
+    }
+    Ok(())
+}
+
+/// The feature a command names, from the last scan.
+fn named_feature<'a>(s: &'a Session, p: &Value) -> Result<&'a sp::Feature, CommandError> {
+    let name = req_str(p, "feature")?;
+    s.spec.feature(name).ok_or_else(|| CommandError::BadParams(format!("no feature `{name}` (scan not finished?)")))
+}
+
+fn add_requirement(s: &mut Session, p: &Value) -> CmdResult {
+    let root = project_root(s)?;
+    let f = named_feature(s, p)?;
+    let (name, dir) = (f.name.clone(), f.dir.clone());
+    let title = opt_str(p, "title").unwrap_or_default();
+    let body = opt_str(p, "text").unwrap_or_default();
+    if title.trim().is_empty() && body.trim().is_empty() {
+        return Err(CommandError::BadParams("give the requirement a title or a text".into()));
+    }
+    let path = dir.join(sp::REQUIREMENTS_FILE);
+    let text = current_text(s, &path)?;
+    // Numbers are project-wide: take the next one after everything on disk.
+    let number = sp::next_requirement_number(&sp::load_features(&root));
+    let updated = sp::add_requirement(&text, number, title, body).map_err(|e| cmd_error(&e))?;
+    write_spec_file(s, &path, &updated)?;
+    let id = format!("REQ-{number}");
+    let line = sp::parse_requirements(&updated).requirements.iter().find(|r| r.id == id).map_or(0, |r| r.line);
+    s.status = format!("Added {id} to {name}");
+    Ok(json!({ "feature": name, "id": id, "file": path, "line": line }))
+}
+
+fn edit_requirement(s: &mut Session, p: &Value) -> CmdResult {
+    let f = named_feature(s, p)?;
+    let (name, file) = (f.name.clone(), f.requirements_file.clone());
+    let id = req_str(p, "id")?.to_string();
+    let (title, body) = (opt_str(p, "title"), opt_str(p, "text"));
+    if title.is_none() && body.is_none() {
+        return Err(CommandError::BadParams("pass `title` and/or `text`".into()));
+    }
+    let path = file.ok_or_else(|| CommandError::Failed(format!("{name} has no requirements.md")))?;
+    let text = current_text(s, &path)?;
+    let updated = sp::edit_requirement(&text, &id, title, body).map_err(|e| cmd_error(&e))?;
+    if updated != text {
+        write_spec_file(s, &path, &updated)?;
+    }
+    let line = sp::parse_requirements(&updated).requirements.iter().find(|r| r.id == id).map_or(0, |r| r.line);
+    s.status = format!("Edited {id}");
+    Ok(json!({ "feature": name, "id": id, "file": path, "line": line, "changed": updated != text }))
+}
+
+fn set_task(s: &mut Session, p: &Value) -> CmdResult {
+    let f = named_feature(s, p)?;
+    let (name, file) = (f.name.clone(), f.tasks_file.clone());
+    let line =
+        u32::try_from(req_usize(p, "line")?).map_err(|_| CommandError::BadParams("`line` is out of range".into()))?;
+    let state = match req_str(p, "state")? {
+        "todo" => sp::TaskState::Todo,
+        "doing" => sp::TaskState::Doing,
+        "done" => sp::TaskState::Done,
+        other => return Err(CommandError::BadParams(format!("state is todo, doing or done, not `{other}`"))),
+    };
+    let path = file.ok_or_else(|| CommandError::Failed(format!("{name} has no tasks.md")))?;
+    let text = current_text(s, &path)?;
+    let updated = sp::set_task_state(&text, line, state).map_err(|e| cmd_error(&e))?;
+    if updated != text {
+        write_spec_file(s, &path, &updated)?;
+    }
+    Ok(json!({ "feature": name, "line": line, "changed": updated != text }))
+}
+
 pub(crate) fn specs() -> Vec<CommandSpec> {
     vec![
         spec(
@@ -624,6 +716,33 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Context::Global,
             has_project,
             new_feature,
+        ),
+        spec(
+            "spec.addRequirement",
+            "Add Requirement",
+            None,
+            "{feature, title?, text?} → {id, file, line} — appends a requirement to the feature's requirements.md in its style, with the next free REQ number (project-wide). Goes through the open editor when the file is open; nothing else in the file changes. Refused if `text` would change the structure of the file",
+            Context::Global,
+            has_project,
+            add_requirement,
+        ),
+        spec(
+            "spec.editRequirement",
+            "Edit Requirement",
+            None,
+            "{feature, id, title?, text?} → {id, file, line, changed} — replaces the requirement's title and/or text (a bullet requirement has no title), keeping its id, heading style and every other requirement. A synced requirement then shows as \"spec changed\". Refused if `text` would change the structure of the file (a heading or id typed into it)",
+            Context::Global,
+            has_project,
+            edit_requirement,
+        ),
+        spec(
+            "spec.setTask",
+            "Set Task State",
+            None,
+            "{feature, line (1-based, of the task in tasks.md), state: todo|doing|done} → {changed} — ticks or clears one checkbox",
+            Context::Global,
+            has_project,
+            set_task,
         ),
         spec(
             "spec.markSynced",
@@ -843,6 +962,110 @@ mod tests {
         s.execute("spec.openLink", &json!({ "path": root.join("src/a.rs"), "line": 1 })).unwrap();
         s.execute("editor.type", &json!({ "text": "// spec: REQ-2\n" })).unwrap();
         assert!(wait(&mut s, &|s| status_of(&list_json(s), "REQ-2") == "linked"));
+    }
+
+    fn scanned_project(files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf, Session) {
+        let (d, root, mut s) = project(files);
+        s.execute("spec.list", &json!({})).unwrap();
+        assert!(wait(&mut s, &|s| s.spec.scanned() && !s.spec.features.is_empty()));
+        (d, root, s)
+    }
+
+    #[test]
+    fn requirements_are_added_and_edited_in_place_and_a_synced_one_shows_spec_changed() {
+        let (_d, root, mut s) = scanned_project(&[
+            ("specs/login/requirements.md", REQS),
+            ("specs/billing/requirements.md", "## REQ-7: Invoice\nTHE SYSTEM SHALL bill.\n"),
+            ("src/a.rs", "// spec: REQ-1\nfn a() {}\n"),
+        ]);
+        s.execute("spec.markSynced", &json!({ "feature": "login" })).unwrap();
+        let file = root.join("specs/login/requirements.md");
+
+        // Added: the next number is project-wide (billing has REQ-7), the rest of the file is untouched.
+        let added = s
+            .execute(
+                "spec.addRequirement",
+                &json!({ "feature": "login", "title": "Reset", "text": "WHEN asked THE SYSTEM SHALL mail a link." }),
+            )
+            .unwrap();
+        assert_eq!(added["id"], "REQ-8");
+        assert_eq!(added["line"], 9);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            text.starts_with(REQS) && text.ends_with("## REQ-8: Reset\nWHEN asked THE SYSTEM SHALL mail a link.\n"),
+            "{text}"
+        );
+        assert!(wait(&mut s, &|s| s.spec.feature("login").is_some_and(|f| f.requirements.len() == 3) && !s.spec.busy()));
+
+        // Edited: only the requested requirement changes; a synced one becomes "spec changed".
+        let edited = s
+            .execute("spec.editRequirement", &json!({ "feature": "login", "id": "REQ-1", "text": "WHEN valid credentials are given THE SYSTEM SHALL open a session within 2 s." }))
+            .unwrap();
+        assert_eq!(edited["changed"], true);
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(after, text.replace("open a session.", "open a session within 2 s."));
+        let status = |s: &mut Session, id: &str| show(s, id)["status"].as_str().unwrap_or("?").to_string();
+        assert!(wait(&mut s, &|s| s.spec.feature("login").is_some_and(|f| {
+            f.requirement("REQ-1").is_some_and(|r| s.spec.status_of(f, r) == sp::SpecStatus::SpecChanged)
+        })));
+        assert_eq!(status(&mut s, "REQ-2"), "unlinked");
+        // The same text again is not a change; a title-only edit keeps the text.
+        let again = s.execute("spec.editRequirement", &json!({ "feature": "login", "id": "REQ-1", "text": "WHEN valid credentials are given THE SYSTEM SHALL open a session within 2 s." })).unwrap();
+        assert_eq!(again["changed"], false);
+        s.execute("spec.editRequirement", &json!({ "feature": "login", "id": "REQ-2", "title": "Lock out" })).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().contains("## REQ-2: Lock out\nIF five attempts"));
+    }
+
+    #[test]
+    fn edits_that_would_change_the_file_s_structure_or_name_nothing_are_refused() {
+        let (_d, root, mut s) = scanned_project(&[("specs/login/requirements.md", REQS)]);
+        let file = root.join("specs/login/requirements.md");
+        let bad = [
+            ("spec.editRequirement", json!({ "feature": "login", "id": "REQ-1", "text": "x\n## REQ-5: Sneaky\ny" })),
+            ("spec.editRequirement", json!({ "feature": "login", "id": "REQ-9", "text": "x" })),
+            ("spec.editRequirement", json!({ "feature": "login", "id": "REQ-1" })),
+            ("spec.editRequirement", json!({ "feature": "nope", "id": "REQ-1", "text": "x" })),
+            ("spec.addRequirement", json!({ "feature": "login" })),
+            ("spec.addRequirement", json!({ "feature": "login", "title": "x", "text": "y\n## REQ-1: Dup" })),
+            ("spec.addRequirement", json!({ "feature": "../x", "title": "x" })),
+            ("spec.setTask", json!({ "feature": "login", "line": 1, "state": "done" })),
+            ("spec.setTask", json!({ "feature": "login", "line": 1, "state": "maybe" })),
+        ];
+        for (id, params) in bad {
+            assert!(s.execute(id, &params).is_err(), "{id} {params}");
+        }
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), REQS, "nothing was written");
+    }
+
+    #[test]
+    fn an_open_requirements_file_is_edited_through_the_editor_and_can_be_undone() {
+        let (_d, root, mut s) = scanned_project(&[("specs/login/requirements.md", REQS)]);
+        let file = root.join("specs/login/requirements.md");
+        s.execute("spec.open", &json!({ "feature": "login", "id": "REQ-2" })).unwrap();
+        s.execute("spec.editRequirement", &json!({ "feature": "login", "id": "REQ-1", "title": "Login" })).unwrap();
+        let in_editor = s.ws.active().map(|(_, d)| d.doc.text()).unwrap();
+        assert!(in_editor.contains("## REQ-1: Login\n"), "{in_editor}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), in_editor, "and it was saved");
+        s.execute("edit.undo", &json!({})).unwrap();
+        assert_eq!(s.ws.active().map(|(_, d)| d.doc.text()).unwrap(), REQS, "one undo step");
+    }
+
+    #[test]
+    fn task_boxes_are_set_through_the_command() {
+        let tasks = "# Tasks\n\n- [ ] 1. Sign in _Requirements: REQ-1_\n- [x] 2. Lock\n";
+        let (_d, root, mut s) =
+            scanned_project(&[("specs/login/requirements.md", REQS), ("specs/login/tasks.md", tasks)]);
+        s.execute("spec.setTask", &json!({ "feature": "login", "line": 3, "state": "done" })).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("specs/login/tasks.md")).unwrap(),
+            tasks.replace("- [ ] 1.", "- [x] 1.")
+        );
+        assert!(
+            wait(&mut s, &|s| s.spec.feature("login").is_some_and(|f| f.task_progress() == (2, 2)) && !s.spec.busy())
+        );
+        let r = s.execute("spec.setTask", &json!({ "feature": "login", "line": 4, "state": "todo" })).unwrap();
+        assert_eq!(r["changed"], true);
+        assert!(s.execute("spec.setTask", &json!({ "feature": "login", "line": 2, "state": "done" })).is_err());
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! changes code or rewrites a spec file.
 
 mod code;
+mod edit;
 mod feature;
 mod hash;
 mod index;
@@ -23,6 +24,7 @@ mod store;
 mod tasks;
 
 pub use code::{Symbol, Syntax, attach_symbols};
+pub use edit::{add_requirement, edit_requirement, set_task_state};
 pub use feature::{load_feature, load_features, parse_feature};
 pub use hash::{fingerprint, fnv1a};
 pub use index::{

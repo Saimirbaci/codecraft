@@ -117,11 +117,28 @@ changed*; the link rows list them. Limits:
 | `spec.open {feature, id?, file?}` | Open a requirement or one of the three files |
 | `spec.openLink {path, line}` | Open code that points at a requirement |
 | `spec.refresh` | Read the specs and scan the project again |
+| `spec.addRequirement {feature, title?, text?}` | Append a requirement to the feature's `requirements.md` in its style, with the next free `REQ-n` (project-wide) |
+| `spec.editRequirement {feature, id, title?, text?}` | Replace a requirement's title and/or text, keeping its id and every other requirement |
+| `spec.setTask {feature, line, state}` | Tick or clear one checkbox in `tasks.md` (`todo`, `doing`, `done`) |
 | `spec.new {name}` | Create `specs/<name>/` with the three files and open `requirements.md`. Never overwrites |
 | `spec.markSynced {feature, id?}` | Record the current text and the code that points at it as implemented. Fails while the scan is running |
 
 Lines in results are 1-based. Agent capability: `spec.list/show/open/openLink/refresh` are `read`;
-`spec.new` and `spec.markSynced` need `write`.
+`spec.new`, `spec.markSynced`, `spec.addRequirement`, `spec.editRequirement` and `spec.setTask`
+need `write`.
+
+## Editing in the view
+
+*＋ Requirement* (next to the file links of a feature) and *Edit…* (context menu of a requirement)
+open an inline form with a title and a text; ticking a task is a click on its box under the
+requirement (the ⛓/☰ toggle). They run `spec.addRequirement`, `spec.editRequirement` and
+`spec.setTask`, which change one requirement or one checkbox and nothing else in the file: the
+heading level, bullet form, blank line after a heading and line endings are kept, and the open
+editor is used when the file is open (the change is one undo step and is saved). Every edit is read
+back before it is applied: text that would split a requirement, add another one or duplicate an id
+(a `## REQ-9` line typed into a body) is refused and the form says why. A requirement written as a
+bullet has no title. Editing the text of a synced requirement makes it *Spec changed*, which is
+the point: the code now has to catch up.
 
 ## How it works
 
@@ -149,8 +166,8 @@ useful (links, dangling references, tasks, baseline, scaffold). Still open:
   setting, off by default.
 - A test-result signal (a linked test that starts failing) to join the code fingerprints.
 - An "Unspecified code" list (public items with no reference), opt-in per module.
-- Editing in the view (add a requirement), EARS linting beyond the hint, "generate a spec from
-  existing code".
+- EARS linting beyond the hint, deleting a requirement from the view (ids are never reused, so
+  this stays a deliberate edit of the file), adding a task, "generate a spec from existing code".
 - Unsaved edits in the spec files themselves show once saved; the code side is live.
 - The specs directory is fixed at `specs/`.
 

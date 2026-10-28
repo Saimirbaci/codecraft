@@ -1766,7 +1766,7 @@ see `docs/m18-plan.md` for validation and platform limits.
     **Reconcile** (a requirement change run by an agent in a worktree and returned as a diff to
     approve; a code change proposing a spec edit that a human accepts, classified as refactor /
     violation / evolution / addition), a failing-linked-test signal for "code changed" (the code
-    fingerprints are done), the "Unspecified code" list, editing and EARS linting in the view, and a setting for
+    fingerprints are done), the "Unspecified code" list, EARS linting in the view (adding and editing requirements and ticking tasks there is done), and a setting for
     the specs directory and for auto-trigger (off by default). The sync baseline is per checkout
     (`.codecraft/spec-state.json`), not shared through git. Spec files show once saved (the code side
     is live). Not verified on Windows or Linux.

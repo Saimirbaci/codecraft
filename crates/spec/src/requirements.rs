@@ -54,6 +54,18 @@ fn parse_ref(text: &str) -> Option<(u32, String)> {
     Some((number, title.trim().to_string()))
 }
 
+/// The reference as written at the start of `text` (`REQ-12`, `Requirement 12`), without the
+/// emphasis around it; empty when `text` does not start with one.
+pub(crate) fn ref_prefix(text: &str) -> &str {
+    let t = text.trim_start_matches(['*', '_']).trim_start();
+    let lead = ["REQ-", "REQ ", "Requirement "]
+        .iter()
+        .find(|p| markdown::strip_prefix_ci(t, p).is_some())
+        .map_or(0, |p| p.len());
+    let digits = t.get(lead..).unwrap_or_default().chars().take_while(char::is_ascii_digit).count();
+    if lead == 0 || digits == 0 { "" } else { t.get(..lead.saturating_add(digits)).unwrap_or_default() }
+}
+
 /// The EARS template a sentence follows.
 pub fn ears_kind(text: &str) -> EarsKind {
     let words: Vec<&str> = text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();

@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use egui::Event;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
@@ -30,6 +31,8 @@ fn open_project() -> (Harness<'static, App>, PathBuf) {
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(move |_| App::ephemeral(Some(r)));
     h.run_steps(5);
     h.state_mut().session.ws.layout.show(ToolWindowId::Spec);
+    // Tall enough for a form and its buttons to be on screen.
+    h.state_mut().session.ws.layout.set_size(ToolWindowId::Spec, 520.0);
     for _ in 0..300 {
         h.run_steps(1);
         let s = &h.state().session.spec;
@@ -98,6 +101,85 @@ fn a_change_to_the_linked_code_shows_a_chip_and_what_changed() {
     h.run_steps(3);
     assert!(h.query_by_label_contains("changed since the last sync").is_some());
     assert!(h.query_by_label("src/auth.rs:1  fn sign_in()").is_some(), "the link names the item it is attached to");
+}
+
+fn wait_for(h: &mut Harness<'static, App>, what: &str, mut done: impl FnMut(&Harness<'static, App>) -> bool) {
+    for _ in 0..300 {
+        h.run_steps(1);
+        if done(h) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn requirements_are_added_and_edited_in_the_view_and_a_refused_edit_says_why() {
+    let (mut h, root) = open_project();
+    let file = root.join("specs/login/requirements.md");
+
+    // Add: the form opens with the focus in the title; Save is off until something is typed.
+    h.get_by_label("＋ Requirement").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("New requirement").is_some());
+    h.event(Event::Text("Reset password".into()));
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    wait_for(&mut h, "the new requirement", |h| {
+        h.state().session.spec.feature("login").is_some_and(|f| f.requirements.len() == 3)
+    });
+    assert!(std::fs::read_to_string(&file).unwrap().ends_with("## REQ-3: Reset password\n"));
+    h.run_steps(3);
+    assert!(h.query_by_label("Reset password").is_some(), "the new row");
+    assert!(h.query_by_label("New requirement").is_none(), "the form closed");
+
+    // Edit through the context menu: the fields start with the current text.
+    h.get_by_label("Lockout").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Edit…").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Edit requirement").is_some());
+    h.event(Event::Text(" out".into()));
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    wait_for(&mut h, "the edited title", |h| h.query_by_label("Lockout out").is_some());
+    assert!(std::fs::read_to_string(&file).unwrap().contains("## REQ-2: Lockout out\nIF five attempts"));
+}
+
+#[test]
+fn an_edit_that_would_change_the_structure_stays_open_with_the_reason() {
+    let (mut h, root) = open_project();
+    let file = root.join("specs/login/requirements.md");
+    let before = std::fs::read_to_string(&file).unwrap();
+    h.get_by_label("Lockout").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Edit…").click();
+    h.run_steps(3);
+    // A heading typed into the text cannot split the requirement in two.
+    h.get_all_by_role(egui::accesskit::Role::MultilineTextInput).next().unwrap().click();
+    h.run_steps(2);
+    h.event(Event::Text("\n## REQ-9: Sneaky".into()));
+    h.run_steps(2);
+    h.get_by_label("Save").click();
+    h.run_steps(4);
+    assert!(h.query_by_label("Edit requirement").is_some(), "still open");
+    assert!(h.query_by_label_contains("change the structure").is_some(), "and it says why");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing was written");
+    // Cancel closes it.
+    h.get_by_label("Cancel").click();
+    h.run_steps(3);
+    assert!(h.query_by_label("Edit requirement").is_none());
+}
+
+#[test]
+fn tasks_under_a_requirement_are_ticked_from_the_view() {
+    let (mut h, root) = open_project();
+    h.get_by_label("☰ 0/1").click();
+    h.run_steps(3);
+    h.get_by_label_contains("☐ 2 Lock").click();
+    wait_for(&mut h, "the task to be ticked", |h| h.query_by_label_contains("☑ 2 Lock").is_some());
+    assert!(std::fs::read_to_string(root.join("specs/login/tasks.md")).unwrap().contains("- [x] 2. Lock"));
 }
 
 #[test]

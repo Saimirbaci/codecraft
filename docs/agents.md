@@ -558,9 +558,12 @@ Through `codecraft_execute` (lines are 1-based). The first `spec.list` starts th
 match), `codeChanged` (the code that points at it differs from the code recorded then;
 `change` is `modified`, `removed` or `added`), `unlinked`, `linked` or `inSync`.
 `spec.list/show/open/openLink/refresh` need `read`; `spec.new {name}` (a scaffold in a new
-directory, never overwriting) and `spec.markSynced {feature, id?}` (records the text and the code
-that points at it as implemented; fails while the scan is running) need `write`. Editing a requirement is an
-ordinary `file_edit` on `requirements.md`; keep its `REQ-n` id.
+directory, never overwriting), `spec.markSynced {feature, id?}` (records the text and the code
+that points at it as implemented; fails while the scan is running), `spec.addRequirement {feature,
+title?, text?}` (the next free `REQ-n`, project-wide), `spec.editRequirement {feature, id, title?,
+text?}` and `spec.setTask {feature, line, state}` need `write`. The last three change one
+requirement or one checkbox and nothing else in the file, and refuse text that would split or
+duplicate a requirement; a plain `file_edit` on `requirements.md` also works (keep the `REQ-n` id).
 
 ## Playbook
 

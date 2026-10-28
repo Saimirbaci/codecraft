@@ -8,7 +8,7 @@ use egui::{Color32, Key, RichText, ScrollArea, Sense};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_spec::{CodeChangeKind, EarsKind, Feature, Requirement, Severity, SpecStatus};
+use codecraft_spec::{CodeChangeKind, EarsKind, Feature, Requirement, Severity, SpecStatus, TaskState};
 
 use crate::theme::Theme;
 use crate::{UiState, run_command};
@@ -38,6 +38,132 @@ fn excerpt(text: &str) -> String {
 
 type Cmds = Vec<(&'static str, Value)>;
 
+/// What the inline editor is for.
+#[derive(Clone, Debug, PartialEq)]
+enum Target {
+    New { feature: String },
+    Edit { feature: String, id: String },
+}
+
+/// The inline requirement editor: view state until Save runs `spec.addRequirement` or
+/// `spec.editRequirement`, which may refuse (and then say why here).
+#[derive(Clone, Debug)]
+struct Editor {
+    target: Target,
+    title: String,
+    text: String,
+    /// What the fields held when the editor opened: only what changed is sent.
+    original: (String, String),
+    error: Option<String>,
+    focus: bool,
+}
+
+impl Editor {
+    fn new_requirement(feature: &str) -> Self {
+        Self {
+            target: Target::New { feature: feature.to_string() },
+            title: String::new(),
+            text: String::new(),
+            original: (String::new(), String::new()),
+            error: None,
+            focus: true,
+        }
+    }
+
+    fn edit(feature: &str, r: &Requirement) -> Self {
+        Self {
+            target: Target::Edit { feature: feature.to_string(), id: r.id.clone() },
+            title: r.title.clone(),
+            text: r.text.clone(),
+            original: (r.title.clone(), r.text.clone()),
+            error: None,
+            focus: true,
+        }
+    }
+
+    fn can_save(&self) -> bool {
+        match self.target {
+            Target::New { .. } => !(self.title.trim().is_empty() && self.text.trim().is_empty()),
+            Target::Edit { .. } => {
+                (self.title.as_str(), self.text.as_str()) != (self.original.0.as_str(), self.original.1.as_str())
+            }
+        }
+    }
+
+    /// The command Save runs.
+    fn command(&self) -> (&'static str, Value) {
+        match &self.target {
+            Target::New { feature } => {
+                ("spec.addRequirement", json!({ "feature": feature, "title": self.title, "text": self.text }))
+            }
+            Target::Edit { feature, id } => {
+                let mut p = json!({ "feature": feature, "id": id });
+                if self.title != self.original.0 {
+                    p["title"] = json!(self.title);
+                }
+                if self.text != self.original.1 {
+                    p["text"] = json!(self.text);
+                }
+                ("spec.editRequirement", p)
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Save,
+    Cancel,
+}
+
+/// The editor and what the user did with it this frame.
+#[derive(Default)]
+struct Editing {
+    editor: Option<Editor>,
+    outcome: Option<Outcome>,
+}
+
+/// The form: a title, the text, the reason the last save was refused, Save and Cancel.
+fn editor_form(ui: &mut egui::Ui, theme: &Theme, ed: &mut Editor) -> Option<Outcome> {
+    let mut outcome = None;
+    let first_frame = ed.focus;
+    let form = egui::Frame::group(ui.style()).show(ui, |ui| {
+        let what = match ed.target {
+            Target::New { .. } => "New requirement",
+            Target::Edit { .. } => "Edit requirement",
+        };
+        ui.label(RichText::new(what).small().strong());
+        let title = ui.add(egui::TextEdit::singleline(&mut ed.title).hint_text("Title").desired_width(f32::INFINITY));
+        let text = ui.add(
+            egui::TextEdit::multiline(&mut ed.text)
+                .hint_text("WHEN <trigger> THE SYSTEM SHALL <response>.")
+                .desired_rows(3)
+                .desired_width(f32::INFINITY),
+        );
+        if ed.focus {
+            title.request_focus();
+            ed.focus = false;
+        }
+        if let Some(error) = &ed.error {
+            ui.label(RichText::new(error).small().color(theme.error));
+        }
+        ui.horizontal(|ui| {
+            if ui.add_enabled(ed.can_save(), egui::Button::new("Save")).clicked() {
+                outcome = Some(Outcome::Save);
+            }
+            let escape = (title.has_focus() || text.has_focus()) && ui.input(|i| i.key_pressed(Key::Escape));
+            if ui.button("Cancel").clicked() || escape {
+                outcome = Some(Outcome::Cancel);
+            }
+        });
+    });
+    if first_frame {
+        // A form opened at the end of a long list must not be below the fold.
+        form.response.scroll_to_me(Some(egui::Align::Center));
+    }
+    outcome
+}
+
 pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let theme = st.theme.clone();
     let mut cmds: Cmds = Vec::new();
@@ -48,6 +174,9 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let name_id = ui.make_persistent_id("spec-new-name");
     let mut adding: bool = ui.data(|d| d.get_temp(adding_id)).unwrap_or(false);
     let mut name: String = ui.data(|d| d.get_temp(name_id)).unwrap_or_default();
+
+    let editor_id = ui.make_persistent_id("spec-editor");
+    let mut editing = Editing { editor: ui.data(|d| d.get_temp(editor_id)).unwrap_or(None), outcome: None };
 
     let mut just_opened = false;
     ui.horizontal(|ui| {
@@ -102,11 +231,24 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         summary(ui, s, &theme);
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for f in &s.spec.features {
-                feature_section(ui, s, &theme, f, &mut cmds);
+                feature_section(ui, s, &theme, f, &mut cmds, &mut editing);
             }
             reference_problems(ui, s, &theme, &mut cmds);
         });
     }
+    match (editing.outcome, editing.editor.as_mut()) {
+        (Some(Outcome::Cancel), _) => editing.editor = None,
+        (Some(Outcome::Save), Some(ed)) => {
+            // Run it here: a refused edit (a heading typed into the text) is explained in the form.
+            let (id, params) = ed.command();
+            match s.execute(id, &params) {
+                Ok(_) => editing.editor = None,
+                Err(e) => ed.error = Some(e.to_string()),
+            }
+        }
+        _ => {}
+    }
+    ui.data_mut(|d| d.insert_temp(editor_id, editing.editor));
     for (id, p) in cmds {
         run_command(s, st, id, &p);
     }
@@ -155,7 +297,7 @@ fn summary(ui: &mut egui::Ui, s: &Session, theme: &Theme) {
     ui.label(RichText::new(text).color(theme.text_muted).small());
 }
 
-fn feature_section(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, cmds: &mut Cmds) {
+fn feature_section(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, cmds: &mut Cmds, editing: &mut Editing) {
     let (done, total) = f.task_progress();
     let mut header = f.name.clone();
     if total > 0 {
@@ -181,12 +323,24 @@ fn feature_section(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, c
                         cmds.push(("spec.open", json!({ "feature": f.name, "file": which })));
                     }
                 }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(egui::Button::new(RichText::new("＋ Requirement").small()).frame(false))
+                        .on_hover_text("Add a requirement to requirements.md")
+                        .clicked()
+                    {
+                        editing.editor = Some(Editor::new_requirement(&f.name));
+                    }
+                });
             });
             if f.requirements.is_empty() {
                 ui.label(RichText::new("No requirements yet (## REQ-1: Title).").color(theme.text_muted).small());
             }
             for r in &f.requirements {
-                requirement_row(ui, s, theme, f, r, cmds);
+                requirement_row(ui, s, theme, f, r, cmds, editing);
+            }
+            if let Some(ed) = editing.editor.as_mut().filter(|e| e.target == Target::New { feature: f.name.clone() }) {
+                editing.outcome = editor_form(ui, theme, ed).or(editing.outcome);
             }
             for d in f.diagnostics.iter().filter(|d| d.severity >= Severity::Warning) {
                 let color = if d.severity == Severity::Error { theme.error } else { theme.warning };
@@ -210,15 +364,24 @@ fn feature_section(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, c
     });
 }
 
-fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r: &Requirement, cmds: &mut Cmds) {
+fn requirement_row(
+    ui: &mut egui::Ui,
+    s: &Session,
+    theme: &Theme,
+    f: &Feature,
+    r: &Requirement,
+    cmds: &mut Cmds,
+    editing: &mut Editing,
+) {
     let status = s.spec.status_of(f, r);
     let (label, color) = chip(theme, status);
     let links = s.spec.index.links_of(&f.name, &r.id);
     let changes = s.spec.code_changes_of(&f.name, &r.id);
+    let tasks: Vec<_> = f.tasks.iter().filter(|t| t.requirements.contains(&r.id)).collect();
     let toggle_id = ui.make_persistent_id(("spec-links", &f.name, &r.id));
     let mut show_links: bool = ui.data(|d| d.get_temp(toggle_id)).unwrap_or(false);
 
-    let row = ui.horizontal(|ui| {
+    ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(RichText::new(label).small().color(color));
         ui.label(RichText::new(&r.id).monospace().small().color(theme.text_muted));
@@ -231,25 +394,35 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
         if title.clicked() {
             cmds.push(("spec.open", json!({ "feature": f.name, "id": r.id })));
         }
-        if !links.is_empty() || !changes.is_empty() {
+        title.context_menu(|ui| {
+            if ui.button("Go to Requirement").clicked() {
+                cmds.push(("spec.open", json!({ "feature": f.name, "id": r.id })));
+                ui.close();
+            }
+            if ui.button("Edit…").clicked() {
+                editing.editor = Some(Editor::edit(&f.name, r));
+                ui.close();
+            }
+            if ui.button("Mark In Sync").on_hover_text("Record this text and its code as implemented").clicked() {
+                cmds.push(("spec.markSynced", json!({ "feature": f.name, "id": r.id })));
+                ui.close();
+            }
+        });
+        if !links.is_empty() || !changes.is_empty() || !tasks.is_empty() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
+                let label = if links.is_empty() {
+                    format!("☰ {done}/{}", tasks.len())
+                } else {
+                    format!("⛓ {}", links.len())
+                };
                 let toggle = ui
-                    .add(egui::Button::new(RichText::new(format!("⛓ {}", links.len())).small()).frame(false))
-                    .on_hover_text("Code that points at this requirement");
+                    .add(egui::Button::new(RichText::new(label).small()).frame(false))
+                    .on_hover_text("Code that points at this requirement, and its tasks");
                 if toggle.clicked() {
                     show_links = !show_links;
                 }
             });
-        }
-    });
-    row.response.context_menu(|ui| {
-        if ui.button("Go to Requirement").clicked() {
-            cmds.push(("spec.open", json!({ "feature": f.name, "id": r.id })));
-            ui.close();
-        }
-        if ui.button("Mark In Sync").on_hover_text("Record this text and its code as implemented").clicked() {
-            cmds.push(("spec.markSynced", json!({ "feature": f.name, "id": r.id })));
-            ui.close();
         }
     });
     if show_links {
@@ -297,6 +470,27 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
                 }
             });
         }
+    }
+    if show_links {
+        for t in &tasks {
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                let (mark, next) = match t.state {
+                    TaskState::Todo => ("☐", "done"),
+                    TaskState::Doing => ("◐", "done"),
+                    TaskState::Done => ("☑", "todo"),
+                };
+                let text = format!("{mark} {} {}", t.id, t.text);
+                let label = egui::Label::new(RichText::new(text.trim_end()).small()).truncate().sense(Sense::click());
+                if ui.add(label).on_hover_text("Click to tick or clear").clicked() {
+                    cmds.push(("spec.setTask", json!({ "feature": f.name, "line": t.line, "state": next })));
+                }
+            });
+        }
+    }
+    let target = Target::Edit { feature: f.name.clone(), id: r.id.clone() };
+    if let Some(ed) = editing.editor.as_mut().filter(|e| e.target == target) {
+        editing.outcome = editor_form(ui, theme, ed).or(editing.outcome);
     }
     ui.data_mut(|d| d.insert_temp(toggle_id, show_links));
 }

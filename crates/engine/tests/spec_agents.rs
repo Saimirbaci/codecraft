@@ -52,7 +52,7 @@ fn spec_commands_have_the_right_capabilities() {
     for id in ["spec.list", "spec.show", "spec.open", "spec.openLink", "spec.refresh"] {
         assert_eq!(command_capability(id), Some(Capability::Read), "{id}");
     }
-    for id in ["spec.new", "spec.markSynced"] {
+    for id in ["spec.new", "spec.markSynced", "spec.addRequirement", "spec.editRequirement", "spec.setTask"] {
         assert_eq!(command_capability(id), Some(Capability::Write), "{id}");
     }
 }
