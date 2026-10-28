@@ -123,10 +123,14 @@ changed*; the link rows list them. Limits:
 | `spec.unspecified {path?}` | Public items no requirement covers, in files that carry `// spec: required` (`waitMs` waits for the scan over MCP) |
 | `spec.new {name}` | Create `specs/<name>/` with the three files and open `requirements.md`. Never overwrites |
 | `spec.markSynced {feature, id?}` | Record the current text and the code that points at it as implemented. Fails while the scan is running |
+| `spec.implement {feature, id? \| task?, backend?, mode?}` | Hand a requirement (or the requirement a task names) to a coding agent; returns the job. See *Implement and Reconcile* |
+| `spec.reconcile {feature, id, backend?, mode?}` | For "Code changed": an agent classifies the change and proposes the edit to the spec |
 
 Lines in results are 1-based. Agent capability: `spec.list/show/open/openLink/refresh/unspecified` are `read`;
 `spec.new`, `spec.markSynced`, `spec.addRequirement`, `spec.editRequirement` and `spec.setTask`
-need `write`.
+need `write`. `spec.implement` and `spec.reconcile` start agents, so an agent may not run them
+(the same rule as `agent.start`). `spec.list` and `spec.show` carry `agentJob` for each requirement:
+`{id, kind: implement|reconcile, status, backend, mode, working}` or `null`.
 
 ## Unspecified code
 
@@ -159,16 +163,53 @@ back before it is applied: text that would split a requirement, add another one 
 bullet has no title. Editing the text of a synced requirement makes it *Spec changed*, which is
 the point: the code now has to catch up.
 
+## Implement and Reconcile
+
+Both hand one requirement to a coding agent as an **ordinary agent job**, the one `agent.start`
+runs: it appears in the Agent tool window and History, takes follow-ups, and asks for approvals
+like any other. Right-click a requirement for *Implement with Agent* or, when the code under it
+changed, *Reconcile with Agent*; right-click a task (under the ⛓/☰ toggle) for *Implement Task
+with Agent*. The row then carries a chip such as `Implement · reviewing` that opens the job.
+
+| | Implement (`spec.implement`) | Reconcile (`spec.reconcile`) |
+|---|---|---|
+| For | A requirement to build or to bring up to date after its text changed. With `task` (a line of `tasks.md`), the requirement that task names, with that task first | A requirement whose linked code changed since the last sync (*Code changed*) |
+| Refused when | An earlier job for it is still building or waiting for its review | The same, or the text also changed (the spec leads: implement it, or *Mark In Sync* to accept the text as it is), or the code did not change |
+| The agent is told | The requirement, the design outline, its tasks, the code already linked, and to: make the smallest change, put `// spec: REQ-n` above every function and test it adds or changes, add tests, tick finished tasks, touch nothing else under `specs/`, run the tests, and say what is left open | The requirement, which items changed (modified, removed, newly linked), the linked code, and to: read the change (`git log` and `git diff` are available), start its answer with `Classification: refactor\|violation\|evolution\|addition`, edit only files under `specs/` (evolution: reword the requirement, keeping its id and EARS form; addition: append a requirement with the next free number), and never edit code |
+| Comes back as | A diff of code, tests and `tasks.md` | Nothing for a refactor or a violation (the answer says what to do); a diff of `specs/…` for an evolution or an addition |
+
+- **Defaults.** The first installed agent (Claude Code, Codex, Grok, Antigravity, in that order) and
+  **review mode**: the agent works in a git worktree that carries your uncommitted changes, and
+  nothing reaches the project until you accept a file in the diff. That needs a git repository with
+  a commit; without one the view says so (`mode: "auto"` or `"ask"` on the command skips the
+  worktree). The menu uses the defaults; the commands take `backend` and `mode`.
+- **What the agent reads.** The spec files as they are on disk, which is also what a review
+  worktree holds. Unsaved edits in an open spec file are not in the brief.
+- **After a Reconcile.** Accepting an evolution changes the requirement's text, so it shows
+  *Spec changed* until you press *Mark In Sync*, which records the new text with the code as it
+  is. After a refactor, press *Mark In Sync* directly. After a violation, fix the code (it can be
+  another agent job) and then sync. Nothing is marked in sync for you.
+- **A human decides.** The classification is the agent's judgment, written on the first line of
+  its answer and not parsed by CodeCraft; what changes the spec is the diff you accept.
+- **One job per requirement.** A finished job stays on the row until the next one replaces it.
+  The sync baseline stores fingerprints, not old code, so a Reconcile brief lists *which* items
+  changed and leaves the *how* to the agent's `git diff`.
+
+Not built: starting either by itself when a requirement or its code changes. That would be a
+setting, off by default; today every run starts from a click or a command.
+
 ## How it works
 
 - `crates/spec` (`codecraft-spec`, L0, std + serde): parsers, the reference scanner, link
-  resolution, status rules, baseline and scaffold. Reading never fails on bad content (problems are
+  resolution, status rules, baseline, scaffold and the two agent briefs (`implement_prompt`,
+  `reconcile_prompt`: pure text). Reading never fails on bad content (problems are
   diagnostics); files over 1 MiB are not read; symbolic links are not followed; counts and lengths
   are capped.
 - `crates/engine/src/spec_view.rs`: `Session::spec`, the scan on a worker thread (first time the
   window is shown, or when an agent asks), the file watcher hook (spec files re-read, changed code
   re-scanned), unsaved buffers of open code files while the window is shown (not in Power Save
-  Mode), and the `spec.*` commands.
+  Mode), the `spec.*` commands, and the job started for each requirement (`SpecState::jobs`,
+  looked up in the agents' job list; a discarded job disappears from the row).
 - `crates/workspace`: `ToolWindowId::Spec`, and `Layout::left_lower`, a second left slot so the
   Spec View sits **under** Project instead of replacing it (its size is a height, remembered per
   window).
@@ -176,26 +217,30 @@ the point: the code now has to catch up.
 
 ## Not built yet
 
-This is the first slice of the plan: the read-only viewer plus the traceability needed to make it
-useful (links, dangling references, tasks, baseline, scaffold). Still open:
+What the plan still leaves open:
 
-- **Implement** and **Reconcile**: a requirement change handed to an agent in a worktree and back
-  as a diff to approve, and the reverse (a code change proposing a spec edit, classified as
-  refactor / violation / evolution / addition, accepted by a human). Auto-trigger would be a
-  setting, off by default.
+- Auto-trigger: an agent started by a spec or code change without a click (a setting, off by
+  default).
 - A test-result signal (a linked test that starts failing) to join the code fingerprints.
 - EARS linting beyond the hint, deleting a requirement from the view (ids are never reused, so
   this stays a deliberate edit of the file), adding a task, "generate a spec from existing code".
+- Choosing the agent and mode in the view (the commands take them; the menu uses the defaults).
 - Unsaved edits in the spec files themselves show once saved; the code side is live.
 - The specs directory is fixed at `specs/`.
 
 ## Validation
 
-`cargo test -p codecraft-spec` (38 tests: parsers on hostile and malformed input, link scanner,
-resolution, status, baseline round-trip and corruption, scaffold, symlinks);
-`cargo test -p codecraft-engine --lib spec_view` (6: scan, resolution, sync and edit,
-live and unsaved code, scaffold, open); `cargo test -p codecraft-ui-egui --test spec_ui` (3: layout
-under Project, content and statuses, clicks, empty project); `cargo test -p codecraft-workspace`
-(the lower-left slot). The whole engine test run (53 suites, 893 library tests), strict
-clippy for the touched crates, `cargo xtask layers` and `cargo xtask parity` (unchanged:
-192/192 core, 407/407 in scope) pass.
+`cargo test -p codecraft-spec` (74 tests: parsers on hostile and malformed input, link scanner,
+resolution, status, code fingerprints, unspecified-code detection, edits, the agent briefs,
+baseline round-trip and corruption, scaffold, symlinks);
+`cargo test -p codecraft-engine --lib spec_view` (15: scan, resolution, sync, edits, live and
+unsaved code, unspecified items, scaffold, open); `--test spec_agents` (6: capabilities, `waitMs`,
+agent edits showing as spec or code changes, agents refused the two agent-starting commands) and
+`--test spec_implement` (4: fake agent CLIs in a real git repository: Implement end to end through
+review and accept, Reconcile with an accepted spec edit and the sync that follows, a task-led
+brief, refused requests); `cargo test -p codecraft-ui-egui --test spec_ui` (12: layout under
+Project, statuses, clicks, editing, unspecified list, the agent menu items, chips and inline
+refusals); `cargo test -p codecraft-workspace` (the lower-left slot). Strict clippy for the touched
+crates, `cargo xtask layers` and `cargo xtask parity` (unchanged: 192/192 core, 407/407 in scope)
+pass. Not exercised against a real agent CLI: the fake CLIs print the stream formats the real
+ones use, as for every other agent test.

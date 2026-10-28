@@ -569,6 +569,11 @@ text?}` and `spec.setTask {feature, line, state}` need `write`. The last three c
 requirement or one checkbox and nothing else in the file, and refuse text that would split or
 duplicate a requirement; a plain `file_edit` on `requirements.md` also works (keep the `REQ-n` id).
 
+`spec.implement` and `spec.reconcile` (a requirement handed to a coding agent: an ordinary job in
+review mode by default, see [spec-view.md](spec-view.md#implement-and-reconcile)) are not available
+through `codecraft_execute`: like `agent.start`, they start agents, and an agent may not start
+another. `spec.list` and `spec.show` show the job each requirement has as `agentJob`.
+
 ## Playbook
 
 Complete call sequences for common tasks, as an agent sends them (any transport). Results are

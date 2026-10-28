@@ -1762,11 +1762,14 @@ see `docs/m18-plan.md` for validation and platform limits.
 ## M19 — Spec View
 
 71. The Spec View (a tool window under Project; `docs/spec-view.md`) reads `specs/<feature>/`,
-    links code to requirements and reports each requirement's status. Remaining: **Implement** and
-    **Reconcile** (a requirement change run by an agent in a worktree and returned as a diff to
-    approve; a code change proposing a spec edit that a human accepts, classified as refactor /
-    violation / evolution / addition), a failing-linked-test signal for "code changed" (the code
-    fingerprints and the "Unspecified code" list are done), EARS linting in the view (adding and editing requirements and ticking tasks there is done), and a setting for
-    the specs directory and for auto-trigger (off by default). The sync baseline is per checkout
-    (`.codecraft/spec-state.json`), not shared through git. Spec files show once saved (the code side
-    is live). Not verified on Windows or Linux.
+    links code to requirements, reports each requirement's status (spec changed / code changed /
+    unlinked / linked / in sync, from text and code fingerprints), lists the public code no
+    requirement covers, edits requirements and ticks tasks in place, and hands a requirement to a
+    coding agent: **Implement** (a diff of code, tests and ticked tasks to approve) and **Reconcile**
+    (for code that moved: the agent classifies the change as refactor / violation / evolution /
+    addition and proposes a spec edit that a human accepts). Remaining: a failing-linked-test
+    signal for "code changed", EARS linting in the view, choosing the agent and mode in the view,
+    a setting for the specs directory, and auto-trigger (off by default; nothing starts an agent
+    without a click or a command). The sync baseline is per checkout (`.codecraft/spec-state.json`),
+    not shared through git. Spec files show once saved (the code side is live). Not verified on
+    Windows or Linux.
