@@ -72,7 +72,7 @@ fn layer_of(name: &str) -> Option<u8> {
     Some(match name {
         "codecraft-text" | "codecraft-syntax" | "codecraft-fs" | "codecraft-lsp" | "codecraft-cargo"
         | "codecraft-dap" | "codecraft-db" | "codecraft-agent" | "codecraft-mcp" | "codecraft-term"
-        | "codecraft-vcs" | "codecraft-http" | "codecraft-remote" | "codecraft-profile" | "codecraft-selfupdate" => 0,
+        | "codecraft-vcs" | "codecraft-http" | "codecraft-remote" | "codecraft-profile" | "codecraft-selfupdate" | "codecraft-spec" => 0,
         "codecraft-workspace" => 1,
         "codecraft-engine" => 2,
         "codecraft-ui-egui" => 3,

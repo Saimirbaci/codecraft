@@ -1024,6 +1024,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codecraft-spec"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "codecraft-syntax"
 version = "0.3.0"
 dependencies = [

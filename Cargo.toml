@@ -12,6 +12,7 @@ rust-version = "1.95"
 [workspace.dependencies]
 # internal
 codecraft-selfupdate = { path = "crates/selfupdate" }
+codecraft-spec = { path = "crates/spec" }
 codecraft-text = { path = "crates/text" }
 codecraft-syntax = { path = "crates/syntax" }
 codecraft-fs = { path = "crates/fs" }
