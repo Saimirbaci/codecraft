@@ -20,6 +20,7 @@ mod index;
 mod links;
 mod markdown;
 mod model;
+mod prompt;
 mod requirements;
 mod store;
 mod tasks;
@@ -35,6 +36,7 @@ pub use index::{
 };
 pub use links::{is_feature_name, mentions_spec, scan_links};
 pub use model::{CodeLink, Diagnostic, EarsKind, Feature, Heading, LinkKind, Requirement, Severity, Task, TaskState};
+pub use prompt::{implement_prompt, reconcile_prompt};
 pub use requirements::{RequirementsDoc, ears_kind, parse_requirements};
 pub use store::{
     Baseline, SpecError, baseline_path, load_baseline, mark_synced, new_feature, next_requirement_number,
