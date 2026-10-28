@@ -8,6 +8,8 @@ use egui::{Color32, Key, RichText, ScrollArea, Sense};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
+use codecraft_engine::agents::{JobId, JobStatus};
+use codecraft_engine::spec_view::{self, AgentWork};
 use codecraft_spec::{CodeChangeKind, EarsKind, Feature, Requirement, Severity, SpecStatus, TaskState};
 
 use crate::theme::Theme;
@@ -37,6 +39,8 @@ fn excerpt(text: &str) -> String {
 }
 
 type Cmds = Vec<(&'static str, Value)>;
+
+const AGENT_BUSY: &str = "An agent is already working on this requirement";
 
 /// What the inline editor is for.
 #[derive(Clone, Debug, PartialEq)]
@@ -116,11 +120,13 @@ enum Outcome {
     Cancel,
 }
 
-/// The editor and what the user did with it this frame.
+/// The editor, and what the user did this frame that takes more than an engine command.
 #[derive(Default)]
 struct Editing {
     editor: Option<Editor>,
     outcome: Option<Outcome>,
+    /// An agent chip was clicked: show that job in the Agent tool window.
+    open_job: Option<u64>,
 }
 
 /// The form: a title, the text, the reason the last save was refused, Save and Cancel.
@@ -176,7 +182,8 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let mut name: String = ui.data(|d| d.get_temp(name_id)).unwrap_or_default();
 
     let editor_id = ui.make_persistent_id("spec-editor");
-    let mut editing = Editing { editor: ui.data(|d| d.get_temp(editor_id)).unwrap_or(None), outcome: None };
+    let mut editing =
+        Editing { editor: ui.data(|d| d.get_temp(editor_id)).unwrap_or(None), outcome: None, open_job: None };
 
     let mut just_opened = false;
     ui.horizontal(|ui| {
@@ -219,6 +226,20 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         d.insert_temp(name_id, name);
     });
 
+    // Why the last Implement / Reconcile was refused (no agent installed, not a repository, …).
+    let notice_id = ui.make_persistent_id("spec-agent-notice");
+    let mut notice: Option<String> = ui.data(|d| d.get_temp(notice_id)).unwrap_or(None);
+    if let Some(text) = &notice {
+        let mut dismissed = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(text).small().color(theme.error));
+            dismissed = ui.add(egui::Button::new("✕").small().frame(false)).on_hover_text("Dismiss").clicked();
+        });
+        if dismissed {
+            notice = None;
+        }
+    }
+
     if !has_project {
         ui.label(RichText::new("Open a project to see its specs.").color(theme.text_muted));
     } else {
@@ -254,8 +275,24 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
     ui.data_mut(|d| d.insert_temp(editor_id, editing.editor));
     for (id, p) in cmds {
-        run_command(s, st, id, &p);
+        if matches!(id, "spec.implement" | "spec.reconcile") {
+            // Run here: a refusal is explained in the view, next to the click.
+            match s.execute(id, &p) {
+                Ok(started) => {
+                    notice = None;
+                    editing.open_job = started["job"].as_u64().or(editing.open_job);
+                }
+                Err(e) => notice = Some(e.to_string()),
+            }
+        } else {
+            run_command(s, st, id, &p);
+        }
     }
+    if let Some(job) = editing.open_job {
+        s.ws.layout.show(codecraft_workspace::ToolWindowId::Agent);
+        st.agent.selected = Some(JobId(job));
+    }
+    ui.data_mut(|d| d.insert_temp(notice_id, notice));
 }
 
 fn empty_state(ui: &mut egui::Ui, theme: &Theme) {
@@ -386,6 +423,8 @@ fn requirement_row(
     let links = s.spec.index.links_of(&f.name, &r.id);
     let changes = s.spec.code_changes_of(&f.name, &r.id);
     let tasks: Vec<_> = f.tasks.iter().filter(|t| t.requirements.contains(&r.id)).collect();
+    let agent = spec_view::spec_job(s, &f.name, &r.id);
+    let working = agent.is_some_and(|(_, job)| spec_view::is_working(job));
     let toggle_id = ui.make_persistent_id(("spec-links", &f.name, &r.id));
     let mut show_links: bool = ui.data(|d| d.get_temp(toggle_id)).unwrap_or(false);
 
@@ -415,20 +454,57 @@ fn requirement_row(
                 cmds.push(("spec.markSynced", json!({ "feature": f.name, "id": r.id })));
                 ui.close();
             }
+            ui.separator();
+            let implement = ui
+                .add_enabled(!working, egui::Button::new("Implement with Agent"))
+                .on_hover_text("A coding agent builds it and links the code; its changes come back as a diff to review")
+                .on_disabled_hover_text(AGENT_BUSY);
+            if implement.clicked() {
+                cmds.push(("spec.implement", json!({ "feature": f.name, "id": r.id })));
+                ui.close();
+            }
+            let reconcile = ui
+                .add_enabled(status == SpecStatus::CodeChanged && !working, egui::Button::new("Reconcile with Agent"))
+                .on_hover_text("A coding agent checks whether the spec still describes the changed code and proposes an edit to the spec")
+                .on_disabled_hover_text(if working { AGENT_BUSY } else { "Only for a requirement whose code changed since the last sync" });
+            if reconcile.clicked() {
+                cmds.push(("spec.reconcile", json!({ "feature": f.name, "id": r.id })));
+                ui.close();
+            }
         });
-        if !links.is_empty() || !changes.is_empty() || !tasks.is_empty() {
+        let has_toggle = !links.is_empty() || !changes.is_empty() || !tasks.is_empty();
+        if has_toggle || agent.is_some() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
-                let label = if links.is_empty() {
-                    format!("☰ {done}/{}", tasks.len())
-                } else {
-                    format!("⛓ {}", links.len())
-                };
-                let toggle = ui
-                    .add(egui::Button::new(RichText::new(label).small()).frame(false))
-                    .on_hover_text("Code that points at this requirement, and its tasks");
-                if toggle.clicked() {
-                    show_links = !show_links;
+                if has_toggle {
+                    let done = tasks.iter().filter(|t| t.state == TaskState::Done).count();
+                    let label = if links.is_empty() {
+                        format!("☰ {done}/{}", tasks.len())
+                    } else {
+                        format!("⛓ {}", links.len())
+                    };
+                    let toggle = ui
+                        .add(egui::Button::new(RichText::new(label).small()).frame(false))
+                        .on_hover_text("Code that points at this requirement, and its tasks");
+                    if toggle.clicked() {
+                        show_links = !show_links;
+                    }
+                }
+                if let Some((sj, job)) = agent {
+                    let kind = match sj.work {
+                        AgentWork::Implement => "Implement",
+                        AgentWork::Reconcile => "Reconcile",
+                    };
+                    let color = match job.status {
+                        JobStatus::Failed | JobStatus::Interrupted => theme.error,
+                        _ if working => theme.accent,
+                        _ => theme.text_muted,
+                    };
+                    let chip = ui
+                        .add(egui::Button::new(RichText::new(format!("{kind} · {}", job.status.label())).small().color(color)).frame(false))
+                        .on_hover_text("Show the agent job in the Agent tool window");
+                    if chip.clicked() {
+                        editing.open_job = Some(sj.job.0);
+                    }
                 }
             });
         }
@@ -490,9 +566,19 @@ fn requirement_row(
                 };
                 let text = format!("{mark} {} {}", t.id, t.text);
                 let label = egui::Label::new(RichText::new(text.trim_end()).small()).truncate().sense(Sense::click());
-                if ui.add(label).on_hover_text("Click to tick or clear").clicked() {
+                let resp = ui.add(label).on_hover_text("Click to tick or clear");
+                if resp.clicked() {
                     cmds.push(("spec.setTask", json!({ "feature": f.name, "line": t.line, "state": next })));
                 }
+                resp.context_menu(|ui| {
+                    let build = ui
+                        .add_enabled(!working, egui::Button::new("Implement Task with Agent"))
+                        .on_disabled_hover_text(AGENT_BUSY);
+                    if build.clicked() {
+                        cmds.push(("spec.implement", json!({ "feature": f.name, "id": r.id, "task": t.line })));
+                        ui.close();
+                    }
+                });
             });
         }
     }

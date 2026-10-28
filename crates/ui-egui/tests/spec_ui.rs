@@ -2,12 +2,13 @@
 //! every click is a `spec.*` command.
 #![allow(clippy::panic, clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::Event;
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
+use codecraft_engine::agents::JobStatus;
 use codecraft_ui_egui::App;
 use codecraft_workspace::ToolWindowId;
 
@@ -229,4 +230,138 @@ fn an_empty_project_explains_how_to_start_and_new_spec_creates_one() {
     assert!(h.query_by_label("billing  0/1 tasks").is_some(), "the new feature and its scaffolded task");
     assert!(h.query_by_label("REQ-1").is_some());
     assert!(root.join("specs/billing/requirements.md").is_file());
+}
+
+/// A fake `claude` that adds `src/lock.rs`, registered as the Claude backend (with its worktrees
+/// in a temporary directory).
+#[cfg(unix)]
+fn install_fake_agent(h: &mut Harness<'static, App>) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = tempfile::tempdir().unwrap();
+    let dir = std::fs::canonicalize(bin.path()).unwrap();
+    std::mem::forget(bin);
+    let fake = dir.join("claude");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '// spec: REQ-2\\npub fn lock() {}\\n' > src/lock.rs\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"Done.\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let settings = serde_json::json!({ "binaries": { "claude": fake }, "worktreesDir": dir.join("worktrees") });
+    h.state_mut().session.execute("agent.settings", &settings).unwrap();
+}
+
+/// Review mode needs a repository: commit the project as it is.
+#[cfg(unix)]
+fn git_init(root: &Path) -> bool {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    git(&["init", "-q", "-b", "main"]) && git(&["add", "-A"]) && git(&["commit", "-q", "-m", "init"])
+}
+
+#[cfg(unix)]
+#[test]
+fn a_requirement_is_handed_to_an_agent_from_its_menu_and_its_chip_opens_the_job() {
+    let (mut h, root) = open_project();
+    if !git_init(&root) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    install_fake_agent(&mut h);
+
+    h.get_by_label("Lockout").click_secondary();
+    h.run_steps(3);
+    // Reconcile is for code that moved: off for a requirement nobody changed code under.
+    assert!(h.get_by_label("Reconcile with Agent").accesskit_node().is_disabled());
+    assert!(!h.get_by_label("Implement with Agent").accesskit_node().is_disabled());
+    h.get_by_label("Implement with Agent").click();
+    wait_for(&mut h, "the review chip", |h| h.query_by_label("Implement · reviewing").is_some());
+
+    let s = &h.state().session;
+    assert_eq!(s.agents.jobs.len(), 1);
+    let job = s.agents.jobs[0].id;
+    assert!(s.agents.jobs[0].title.starts_with("Implement login/REQ-2: Lockout"), "{}", s.agents.jobs[0].title);
+    assert!(s.ws.layout.is_visible(ToolWindowId::Agent), "the Agent window shows the new job");
+    assert_eq!(h.state().ui.agent.selected, Some(job), "and has it selected");
+
+    // The chip selects the job again after the user looked elsewhere.
+    h.state_mut().ui.agent.selected = None;
+    h.get_by_label("Implement · reviewing").click();
+    h.run_steps(3);
+    assert_eq!(h.state().ui.agent.selected, Some(job));
+
+    // While the job waits for its review, nothing else is started for the requirement.
+    h.get_by_label("Lockout").click_secondary();
+    h.run_steps(3);
+    assert!(h.get_by_label("Implement with Agent").accesskit_node().is_disabled());
+    h.key_press(egui::Key::Escape);
+    h.run_steps(2);
+    assert_eq!(h.state().session.agents.job(job).map(|j| j.status), Some(JobStatus::Reviewing));
+}
+
+#[cfg(unix)]
+#[test]
+fn reconcile_is_offered_once_the_code_moved_and_starts_an_agent_on_the_spec() {
+    let (mut h, root) = open_project();
+    if !git_init(&root) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    install_fake_agent(&mut h);
+    h.state_mut().session.execute("spec.markSynced", &serde_json::json!({ "feature": "login" })).unwrap();
+    std::fs::write(root.join("src/auth.rs"), "// spec: REQ-1\nfn sign_in() { changed() }\n").unwrap();
+    h.state_mut().session.execute("spec.refresh", &serde_json::Value::Null).unwrap();
+    wait_for(&mut h, "the code change", |h| h.query_by_label("Code changed").is_some());
+
+    h.get_by_label("Sign in").click_secondary();
+    h.run_steps(3);
+    assert!(!h.get_by_label("Reconcile with Agent").accesskit_node().is_disabled());
+    h.get_by_label("Reconcile with Agent").click();
+    wait_for(&mut h, "the reconcile chip", |h| h.query_by_label_contains("Reconcile · ").is_some());
+    let s = &h.state().session;
+    assert_eq!(s.agents.jobs.len(), 1);
+    assert!(s.agents.jobs[0].title.starts_with("Reconcile login/REQ-1: Sign in"), "{}", s.agents.jobs[0].title);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refused_start_is_explained_in_the_view() {
+    // A fake agent is there, but the project is not a git repository: review mode cannot run.
+    let (mut h, _root) = open_project();
+    install_fake_agent(&mut h);
+    h.get_by_label("Lockout").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Implement with Agent").click();
+    wait_for(&mut h, "the explanation", |h| h.query_by_label_contains("git repository").is_some());
+    assert!(h.state().session.agents.jobs.is_empty());
+    assert!(h.query_by_label_contains("Implement · ").is_none(), "no chip for a job that never started");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_task_is_implemented_from_its_own_menu() {
+    let (mut h, root) = open_project();
+    if !git_init(&root) {
+        eprintln!("skipping: git not available");
+        return;
+    }
+    install_fake_agent(&mut h);
+    h.get_by_label("☰ 0/1").click();
+    h.run_steps(3);
+    h.get_by_label_contains("☐ 2 Lock").click_secondary();
+    h.run_steps(3);
+    h.get_by_label("Implement Task with Agent").click();
+    wait_for(&mut h, "the job", |h| !h.state().session.agents.jobs.is_empty());
+    let job = h.state().session.agents.jobs[0].id;
+    let detail = h.state_mut().session.execute("agent.job", &serde_json::json!({ "job": job.0 })).unwrap();
+    let prompt = detail["prompt"].as_str().unwrap();
+    assert!(prompt.contains("Implement requirement login/REQ-2"), "{prompt}");
+    assert!(prompt.contains("Your task:\n- [ ] 2 Lock"), "{prompt}");
 }
