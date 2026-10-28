@@ -222,6 +222,15 @@ fn stretch(s: &mut Session, toward: Side, vertical_up: Option<bool>) -> CmdResul
     let tw = active(s).map_err(CommandError::Disabled)?;
     let side = tw.side();
     let delta = match (side, toward, vertical_up) {
+        // Under Project, a window's size is its height.
+        _ if tw.is_lower_left() => match vertical_up {
+            Some(true) => STRETCH_STEP,
+            Some(false) => -STRETCH_STEP,
+            None => {
+                s.status = format!("The {} tool window cannot stretch that way", tw.title());
+                return Ok(json!({ "changed": false }));
+            }
+        },
         (Side::Left, Side::Right, None) | (Side::Right, Side::Left, None) => STRETCH_STEP,
         (Side::Left, Side::Left, None) | (Side::Right, Side::Right, None) => -STRETCH_STEP,
         (Side::Bottom, _, Some(true)) => STRETCH_STEP,
@@ -391,6 +400,10 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             has_active,
             |s, _| {
                 let tw = active(s).map_err(CommandError::Disabled)?;
+                if tw.is_lower_left() {
+                    s.status = format!("The {} tool window shares the left side with Project and cannot be maximized", tw.title());
+                    return Ok(json!({ "window": tw.key(), "maximized": false }));
+                }
                 let on = s.ws.layout.maximized != Some(tw);
                 s.ws.layout.maximized = on.then_some(tw);
                 s.ws.layout.size_rev = s.ws.layout.size_rev.wrapping_add(1);
@@ -491,6 +504,18 @@ mod tests {
         assert_eq!(s.ws.layout.maximized, Some(ToolWindowId::Run));
         s.execute("window.activeToolWindow.maximizeToolWindow", &json!({})).unwrap();
         assert_eq!(s.ws.layout.maximized, None);
+        // The Spec View sits under Project: its size is a height, and it does not maximize.
+        s.ws.layout.show(ToolWindowId::Spec);
+        let height = s.ws.layout.current_size(ToolWindowId::Spec);
+        let width = s.ws.layout.left_width;
+        s.execute("window.activeToolWindow.resize.stretchToTop", &json!({})).unwrap();
+        assert_eq!(s.ws.layout.current_size(ToolWindowId::Spec), height + STRETCH_STEP);
+        assert_eq!(s.execute("window.activeToolWindow.resize.stretchToRight", &json!({})).unwrap()["changed"], false);
+        assert_eq!(s.ws.layout.left_width, width);
+        assert_eq!(s.execute("window.activeToolWindow.maximizeToolWindow", &json!({})).unwrap()["maximized"], false);
+        assert_eq!(s.ws.layout.maximized, None);
+        s.ws.layout.hide(ToolWindowId::Spec);
+        s.ws.layout.show(ToolWindowId::Run);
         // Run tabs.
         let a = s.ws.add_run("a", "a", false);
         let b = s.ws.add_run("b", "b", false);

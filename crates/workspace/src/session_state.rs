@@ -471,6 +471,7 @@ fn sanitize_layout(l: &Layout) -> Layout {
     let size = |v: f32, fallback: f32| if v.is_finite() && (40.0..=10_000.0).contains(&v) { v } else { fallback };
     Layout {
         left: l.left,
+        left_lower: l.left_lower,
         bottom: l.bottom,
         right: l.right,
         left_width: size(l.left_width, d.left_width),

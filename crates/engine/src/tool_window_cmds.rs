@@ -50,6 +50,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             always,
             |s, _| {
                 s.ws.layout.left = None;
+                s.ws.layout.left_lower = None;
                 s.ws.layout.right = None;
                 ok()
             },

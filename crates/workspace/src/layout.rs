@@ -41,6 +41,9 @@ pub enum ToolWindowId {
     Zig,
     /// TypeScript compiler errors and tsconfig files (M13 track RC).
     TypeScript,
+    /// Spec View: the project's specs (requirements, design, tasks) and the code linked to them.
+    /// A CodeCraft extension (RustRover has none); docked under Project on the left.
+    Spec,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -51,7 +54,7 @@ pub enum Side {
 }
 
 impl ToolWindowId {
-    pub const ALL: [ToolWindowId; 31] = [
+    pub const ALL: [ToolWindowId; 32] = [
         Self::Project,
         Self::Commit,
         Self::Structure,
@@ -83,6 +86,7 @@ impl ToolWindowId {
         Self::CMake,
         Self::Zig,
         Self::TypeScript,
+        Self::Spec,
     ];
 
     pub fn title(self) -> &'static str {
@@ -118,12 +122,13 @@ impl ToolWindowId {
             Self::CMake => "CMake",
             Self::Zig => "Zig",
             Self::TypeScript => "TypeScript",
+            Self::Spec => "Spec View",
         }
     }
 
     pub fn side(self) -> Side {
         match self {
-            Self::Project | Self::Commit | Self::Structure | Self::Bookmarks => Side::Left,
+            Self::Project | Self::Commit | Self::Structure | Self::Bookmarks | Self::Spec => Side::Left,
             Self::Cargo
             | Self::Notifications
             | Self::Database
@@ -187,7 +192,14 @@ impl ToolWindowId {
             Self::CMake => "cmake",
             Self::Zig => "zig",
             Self::TypeScript => "typeScript",
+            Self::Spec => "spec",
         }
+    }
+
+    /// Docked in the lower half of the left side, below the Project tool window, instead of
+    /// replacing it: both can be open at once.
+    pub fn is_lower_left(self) -> bool {
+        matches!(self, Self::Spec)
     }
 
     pub fn from_key(key: &str) -> Option<Self> {
@@ -195,10 +207,16 @@ impl ToolWindowId {
     }
 }
 
+/// The height a lower-left tool window (Spec View) opens with.
+pub const LOWER_LEFT_HEIGHT: f32 = 240.0;
+
 /// Which tool window is open on each side, and the panel sizes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     pub left: Option<ToolWindowId>,
+    /// The tool window docked under `left` (see [`ToolWindowId::is_lower_left`]).
+    #[serde(default)]
+    pub left_lower: Option<ToolWindowId>,
     pub bottom: Option<ToolWindowId>,
     pub right: Option<ToolWindowId>,
     pub left_width: f32,
@@ -231,6 +249,7 @@ impl Default for Layout {
     fn default() -> Self {
         Self {
             left: Some(ToolWindowId::Project),
+            left_lower: None,
             bottom: None,
             right: None,
             left_width: 280.0,
@@ -285,8 +304,12 @@ impl Layout {
         }
     }
 
-    fn slot_mut(&mut self, side: Side) -> &mut Option<ToolWindowId> {
-        match side {
+    /// The slot `tw` lives in (its side's, or the lower-left one).
+    fn slot_mut(&mut self, tw: ToolWindowId) -> &mut Option<ToolWindowId> {
+        if tw.is_lower_left() {
+            return &mut self.left_lower;
+        }
+        match tw.side() {
             Side::Left => &mut self.left,
             Side::Bottom => &mut self.bottom,
             Side::Right => &mut self.right,
@@ -294,13 +317,14 @@ impl Layout {
     }
 
     pub fn is_visible(&self, tw: ToolWindowId) -> bool {
-        !self.all_hidden && self.slot(tw.side()) == Some(tw)
+        let shown = if tw.is_lower_left() { self.left_lower } else { self.slot(tw.side()) };
+        !self.all_hidden && shown == Some(tw)
     }
 
     /// RustRover's Cmd+digit behaviour: hidden → show; shown → hide.
     pub fn toggle(&mut self, tw: ToolWindowId) {
         self.all_hidden = false;
-        let slot = self.slot_mut(tw.side());
+        let slot = self.slot_mut(tw);
         *slot = if *slot == Some(tw) { None } else { Some(tw) };
         if *slot == Some(tw) {
             self.last_active = Some(tw);
@@ -309,7 +333,7 @@ impl Layout {
 
     pub fn show(&mut self, tw: ToolWindowId) {
         self.all_hidden = false;
-        *self.slot_mut(tw.side()) = Some(tw);
+        *self.slot_mut(tw) = Some(tw);
         self.last_active = Some(tw);
     }
 
@@ -324,10 +348,11 @@ impl Layout {
             .or(self.bottom)
             .or(self.right)
             .or(self.left)
+            .or(self.left_lower)
     }
 
     pub fn hide(&mut self, tw: ToolWindowId) {
-        let slot = self.slot_mut(tw.side());
+        let slot = self.slot_mut(tw);
         if *slot == Some(tw) {
             *slot = None;
         }
@@ -338,6 +363,9 @@ impl Layout {
 
     /// The size a side's open tool window has (its remembered size, else the side's size).
     pub fn current_size(&self, tw: ToolWindowId) -> f32 {
+        if tw.is_lower_left() {
+            return self.size_of(tw, LOWER_LEFT_HEIGHT);
+        }
         let fallback = match tw.side() {
             Side::Left => self.left_width,
             Side::Bottom => self.bottom_height,
@@ -353,6 +381,8 @@ impl Layout {
         }
         let size = size.clamp(80.0, 2000.0);
         match tw.side() {
+            // A lower-left window's size is its height, kept per window.
+            Side::Left if tw.is_lower_left() => {}
             Side::Left => self.left_width = size,
             Side::Bottom => self.bottom_height = size,
             Side::Right => self.right_width = size,
@@ -392,6 +422,43 @@ mod tests {
         l.toggle(ToolWindowId::Problems);
         assert_eq!(l.bottom, None);
         assert!(l.is_visible(ToolWindowId::Project));
+    }
+
+    #[test]
+    fn the_spec_view_sits_under_project_instead_of_replacing_it() {
+        let mut l = Layout::default();
+        l.toggle(ToolWindowId::Spec);
+        assert!(l.is_visible(ToolWindowId::Spec) && l.is_visible(ToolWindowId::Project));
+        assert_eq!((l.left, l.left_lower), (Some(ToolWindowId::Project), Some(ToolWindowId::Spec)));
+        // Another left window replaces Project, not the Spec View.
+        l.toggle(ToolWindowId::Structure);
+        assert!(l.is_visible(ToolWindowId::Spec) && !l.is_visible(ToolWindowId::Project));
+        assert_eq!(l.active(), Some(ToolWindowId::Structure));
+        l.hide(ToolWindowId::Structure);
+        l.hide(ToolWindowId::Spec);
+        assert_eq!((l.left, l.left_lower), (None, None));
+        l.show(ToolWindowId::Spec);
+        l.all_hidden = true;
+        assert!(!l.is_visible(ToolWindowId::Spec));
+        l.all_hidden = false;
+        assert_eq!(l.active(), Some(ToolWindowId::Spec));
+    }
+
+    #[test]
+    fn the_spec_views_size_is_its_height_and_leaves_the_width_alone() {
+        let mut l = Layout::default();
+        assert_eq!(l.current_size(ToolWindowId::Spec), LOWER_LEFT_HEIGHT);
+        let width = l.left_width;
+        l.set_size(ToolWindowId::Spec, 333.0);
+        assert_eq!((l.current_size(ToolWindowId::Spec), l.left_width), (333.0, width));
+    }
+
+    #[test]
+    fn a_saved_layout_without_the_lower_slot_still_loads() {
+        let mut v = serde_json::to_value(Layout::default()).unwrap();
+        v.as_object_mut().unwrap().remove("left_lower");
+        let l: Layout = serde_json::from_value(v).unwrap();
+        assert_eq!(l.left_lower, None);
     }
 
     #[test]

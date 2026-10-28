@@ -14,6 +14,7 @@ codecraft-fs.workspace = true
 codecraft-lsp.workspace = true
 codecraft-cargo.workspace = true
 codecraft-workspace.workspace = true
+codecraft-spec.workspace = true
 codecraft-engine.workspace = true
 egui.workspace = true
 eframe.workspace = true

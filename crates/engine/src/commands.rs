@@ -179,6 +179,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::refactor_cmds::specs());
         specs.extend(crate::bookmark_cmds::specs());
         specs.extend(crate::todo::specs());
+        specs.extend(crate::spec_view::specs());
         specs.extend(crate::local_history_cmds::specs());
         specs.extend(crate::scratch::specs());
         specs.extend(crate::settings_cmds::specs());

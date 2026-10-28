@@ -63,6 +63,7 @@ mod remote_ui;
 mod rust_ui;
 mod selfupdate_ui;
 mod services_panel;
+mod spec_panel;
 mod settings_pages;
 mod settings_ui;
 mod state;

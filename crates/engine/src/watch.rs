@@ -118,6 +118,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     }
     crate::vcs::files_changed(s, &paths);
     crate::todo::files_changed(s, &paths);
+    crate::spec_view::files_changed(s, &paths);
     crate::local_history::files_changed(s, &paths);
     changed
 }

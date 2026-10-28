@@ -45,6 +45,7 @@ fn icon(tw: ToolWindowId) -> &'static str {
         ToolWindowId::CMake => "△",
         ToolWindowId::Zig => "Ƶ",
         ToolWindowId::TypeScript => "TS",
+        ToolWindowId::Spec => "📋",
     }
 }
 
@@ -267,7 +268,9 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             s.ws.layout.remember_size(tw, s.ws.layout.bottom_height);
         }
     }
-    if let Some(tw) = s.ws.layout.left {
+    // The left side holds one window, or two: Project (or another) on top and the Spec View under it.
+    let (upper, lower) = (s.ws.layout.left, s.ws.layout.left_lower);
+    if let Some(tw) = upper.or(lower) {
         let size = s.ws.layout.size_of(tw, s.ws.layout.left_width);
         let mut panel = egui::Panel::left(window_panel_id(ui, ("tw-left", tw.key(), rev)))
             .resizable(true)
@@ -278,10 +281,20 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             panel = panel.resizable(false).exact_size((ui.available_width() - 60.0).max(140.0));
         }
         let resp = panel.show(ui, |ui| {
-            if header(ui, st, tw.title()) {
-                s.ws.layout.hide(tw);
+            if let (Some(_), Some(low)) = (upper, lower) {
+                lower_left(ui, s, st, low, rev);
             }
-            tool_window(ui, s, st, tw);
+            if let Some(top) = upper {
+                if header(ui, st, top.title()) {
+                    s.ws.layout.hide(top);
+                }
+                tool_window(ui, s, st, top);
+            } else if let Some(low) = lower {
+                if header(ui, st, low.title()) {
+                    s.ws.layout.hide(low);
+                }
+                tool_window(ui, s, st, low);
+            }
             fill_panel(ui);
         });
         if maximized != Some(tw) {
@@ -313,6 +326,26 @@ pub fn side_panels(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     }
 }
 
+/// The window under Project: a resizable panel at the bottom of the left panel, so the window
+/// above takes the rest. Its height is remembered per window.
+fn lower_left(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId, rev: u64) {
+    let height = s.ws.layout.current_size(tw);
+    let frame = Frame::new().fill(st.theme.panel_bg).inner_margin(Margin::symmetric(0, 4));
+    let resp = egui::Panel::bottom(window_panel_id(ui, ("tw-left-lower", tw.key(), rev)))
+        .resizable(true)
+        .default_size(height)
+        .size_range(80.0..=900.0)
+        .frame(frame)
+        .show(ui, |ui| {
+            if header(ui, st, tw.title()) {
+                s.ws.layout.hide(tw);
+            }
+            tool_window(ui, s, st, tw);
+            fill_panel(ui);
+        });
+    s.ws.layout.remember_size(tw, resp.response.rect.height());
+}
+
 fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWindowId) {
     match tw {
         ToolWindowId::Project => project_view(ui, s, st),
@@ -331,6 +364,7 @@ fn tool_window(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolWin
         ToolWindowId::Commit => crate::vcs_panels::show(ui, s, st),
         ToolWindowId::Git => crate::vcs_panels::show_git(ui, s, st),
         ToolWindowId::Bookmarks => crate::bookmarks_panel::show_bookmarks(ui, s, st),
+        ToolWindowId::Spec => crate::spec_panel::show(ui, s, st),
         ToolWindowId::Todo => crate::bookmarks_panel::show_todo(ui, s, st),
         ToolWindowId::Coverage => crate::testing_panel::show_coverage(ui, s, st),
         ToolWindowId::Hierarchy => crate::refactor_ui::show_hierarchy(ui, s, st),

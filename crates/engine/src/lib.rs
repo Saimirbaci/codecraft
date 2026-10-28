@@ -135,6 +135,7 @@ pub mod session_store;
 pub mod settings;
 mod settings_cmds;
 pub mod snippet;
+pub mod spec_view;
 mod split_cmds;
 pub mod sql_lang;
 mod sql_lang_cmds;
@@ -295,6 +296,8 @@ pub struct Session {
     pub bookmarks: bookmarks::BookmarksState,
     /// The TODO tool window's scan (track X).
     pub todo: todo::TodoState,
+    /// The Spec View: specs, the code that points at them, and the sync baseline.
+    pub spec: spec_view::SpecState,
     /// Local History snapshots and window (track X).
     pub local_history: local_history::LocalHistoryState,
     /// Scratch files (track X).
@@ -430,6 +433,7 @@ impl Session {
             completion: completion::CompletionState::default(),
             bookmarks: bookmarks::BookmarksState::default(),
             todo: todo::TodoState::default(),
+            spec: spec_view::SpecState::default(),
             local_history: local_history::LocalHistoryState::default(),
             scratch: scratch::ScratchState::default(),
             inspections: inspections::InspectionsState::default(),
@@ -665,6 +669,7 @@ impl Session {
         changed |= refactor::pump(self);
         changed |= bookmarks::pump(self);
         changed |= todo::pump(self);
+        changed |= spec_view::pump(self);
         changed |= settings::pump(self);
         changed |= local_history::pump(self);
         changed |= inspections::pump(self);

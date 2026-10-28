@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 codecraft-selfupdate.workspace = true
+codecraft-spec.workspace = true
 codecraft-text.workspace = true
 codecraft-syntax.workspace = true
 codecraft-fs.workspace = true
