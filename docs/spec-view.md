@@ -72,14 +72,40 @@ and the spec disagree); a bare id defined by several features under **Ambiguous 
 | Status | Meaning |
 |---|---|
 | **Spec changed** | Its text differs from the text recorded at the last sync. The code may no longer match. |
+| **Code changed** | The text is as recorded, but the code that points at it differs from the code recorded at the last sync. The spec may no longer describe the code. |
 | **Unlinked** | No code points at it. |
 | **Linked** | Code points at it; no sync has been recorded. |
 | **In sync** | Code points at it and its text is the one recorded at the last sync. |
 
 "Sync" is `spec.markSynced` (context menu: *Mark In Sync*): you say "the code matches this text".
-The fingerprint ignores whitespace, so re-wrapping a paragraph is not a change. The baseline is
-`.codecraft/spec-state.json`: private to the checkout, not committed, so each clone starts with
-everything *Linked* or *Unlinked*. Unreadable or hostile state files read as empty.
+It records the requirement's text and the code that points at it. The fingerprint ignores whitespace,
+so re-wrapping a paragraph is not a change. The baseline is `.codecraft/spec-state.json`: private to
+the checkout, not committed, so each clone starts with everything *Linked* or *Unlinked*. Unreadable
+or hostile state files read as empty. A spec change wins over a code change in the chip.
+
+### Code fingerprints
+
+A reference is attached to the item that follows it: the function, type or statement after the
+`// spec:` comment (skipping blank lines, other comments, attributes and decorators), or the line it
+trails (`fn a() {} // spec: REQ-1`). Put the marker above the thing that implements the requirement.
+The item's extent comes from a lexical scan that knows comments, strings (raw strings, character
+literals and lifetimes in Rust, backticks in JavaScript, triple quotes in Python) and brackets:
+braces for Rust and the C family, indentation for Python. The fingerprint covers the item's code
+with comments and layout removed (`check( x )` and `check(x)` are the same; `ab` and `a b`, or two
+different strings, are not).
+
+At sync the baseline records, per requirement, each item's fingerprint under the key
+`path#signature`. Later the view compares: an item whose code differs is *modified*; one that is
+no longer there (deleted, renamed, signature changed, reference removed) is *removed*; one that
+points at the requirement now but did not is *added*. Any of them makes the requirement *Code
+changed*; the link rows list them. Limits:
+
+- A reference whose item cannot be delimited (an unterminated item, a line over 2000 bytes, nothing
+  after it) is listed but not tracked. Items are followed for at most 3000 lines, and about 200,000
+  lines are examined per file.
+- A marker inside a function body attaches to the statement after it, not to the function.
+- Moving an item to another file reads as removed + added. Requirements synced before this
+  existed have no recorded code and are not compared until synced again.
 
 ## Commands (also agent tools through `codecraft_execute`)
 
@@ -87,12 +113,12 @@ everything *Linked* or *Unlinked*. Unreadable or hostile state files read as emp
 |---|---|
 | `view.toolWindows.spec` | Show or hide the Spec View |
 | `spec.list {waitMs?}` | Features, requirements with status, link counts, diagnostics, dangling references. Starts a scan if none ran and answers `pending: true` until it finishes; `waitMs` (agents) waits for it |
-| `spec.show {feature, id}` | A requirement's full text, status, fingerprints, linked code and tasks |
+| `spec.show {feature, id}` | A requirement's full text, status, fingerprints, linked code (with the item each reference is attached to), `codeChanges` since the last sync and tasks |
 | `spec.open {feature, id?, file?}` | Open a requirement or one of the three files |
 | `spec.openLink {path, line}` | Open code that points at a requirement |
 | `spec.refresh` | Read the specs and scan the project again |
 | `spec.new {name}` | Create `specs/<name>/` with the three files and open `requirements.md`. Never overwrites |
-| `spec.markSynced {feature, id?}` | Record the current text as implemented |
+| `spec.markSynced {feature, id?}` | Record the current text and the code that points at it as implemented. Fails while the scan is running |
 
 Lines in results are 1-based. Agent capability: `spec.list/show/open/openLink/refresh` are `read`;
 `spec.new` and `spec.markSynced` need `write`.
@@ -121,8 +147,7 @@ useful (links, dangling references, tasks, baseline, scaffold). Still open:
   as a diff to approve, and the reverse (a code change proposing a spec edit, classified as
   refactor / violation / evolution / addition, accepted by a human). Auto-trigger would be a
   setting, off by default.
-- Code fingerprints (symbol signature and body) to detect *code changed*, and a test-result signal
-  (a linked test that starts failing).
+- A test-result signal (a linked test that starts failing) to join the code fingerprints.
 - An "Unspecified code" list (public items with no reference), opt-in per module.
 - Editing in the view (add a requirement), EARS linting beyond the hint, "generate a spec from
   existing code".

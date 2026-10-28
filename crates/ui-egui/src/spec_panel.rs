@@ -8,7 +8,7 @@ use egui::{Color32, Key, RichText, ScrollArea, Sense};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
-use codecraft_spec::{EarsKind, Feature, Requirement, Severity, SpecStatus};
+use codecraft_spec::{CodeChangeKind, EarsKind, Feature, Requirement, Severity, SpecStatus};
 
 use crate::theme::Theme;
 use crate::{UiState, run_command};
@@ -17,6 +17,7 @@ use crate::{UiState, run_command};
 fn chip(theme: &Theme, status: SpecStatus) -> (&'static str, Color32) {
     match status {
         SpecStatus::SpecChanged => ("Spec changed", theme.warning),
+        SpecStatus::CodeChanged => ("Code changed", theme.vcs_modified),
         SpecStatus::Unlinked => ("Unlinked", theme.text_muted),
         SpecStatus::Linked => ("Linked", theme.accent),
         SpecStatus::InSync => ("In sync", theme.success),
@@ -126,12 +127,13 @@ fn empty_state(ui: &mut egui::Ui, theme: &Theme) {
 
 /// One line of totals, so a glance says whether anything needs attention.
 fn summary(ui: &mut egui::Ui, s: &Session, theme: &Theme) {
-    let (mut total, mut changed, mut unlinked) = (0usize, 0usize, 0usize);
+    let (mut total, mut changed, mut code_changed, mut unlinked) = (0usize, 0usize, 0usize, 0usize);
     for f in &s.spec.features {
         for r in &f.requirements {
             total += 1;
             match s.spec.status_of(f, r) {
                 SpecStatus::SpecChanged => changed += 1,
+                SpecStatus::CodeChanged => code_changed += 1,
                 SpecStatus::Unlinked => unlinked += 1,
                 SpecStatus::Linked | SpecStatus::InSync => {}
             }
@@ -140,6 +142,9 @@ fn summary(ui: &mut egui::Ui, s: &Session, theme: &Theme) {
     let mut text = format!("{} feature(s), {total} requirement(s)", s.spec.features.len());
     if changed > 0 {
         text.push_str(&format!(" · {changed} spec changed"));
+    }
+    if code_changed > 0 {
+        text.push_str(&format!(" · {code_changed} code changed"));
     }
     if unlinked > 0 {
         text.push_str(&format!(" · {unlinked} unlinked"));
@@ -209,6 +214,7 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
     let status = s.spec.status_of(f, r);
     let (label, color) = chip(theme, status);
     let links = s.spec.index.links_of(&f.name, &r.id);
+    let changes = s.spec.code_changes_of(&f.name, &r.id);
     let toggle_id = ui.make_persistent_id(("spec-links", &f.name, &r.id));
     let mut show_links: bool = ui.data(|d| d.get_temp(toggle_id)).unwrap_or(false);
 
@@ -225,7 +231,7 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
         if title.clicked() {
             cmds.push(("spec.open", json!({ "feature": f.name, "id": r.id })));
         }
-        if !links.is_empty() {
+        if !links.is_empty() || !changes.is_empty() {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let toggle = ui
                     .add(egui::Button::new(RichText::new(format!("⛓ {}", links.len())).small()).frame(false))
@@ -241,7 +247,7 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
             cmds.push(("spec.open", json!({ "feature": f.name, "id": r.id })));
             ui.close();
         }
-        if ui.button("Mark In Sync").on_hover_text("Record this text as implemented").clicked() {
+        if ui.button("Mark In Sync").on_hover_text("Record this text and its code as implemented").clicked() {
             cmds.push(("spec.markSynced", json!({ "feature": f.name, "id": r.id })));
             ui.close();
         }
@@ -250,7 +256,10 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
         for l in links {
             ui.horizontal(|ui| {
                 ui.add_space(28.0);
-                let text = format!("{}:{}", rel(s, &l.path), l.line);
+                let mut text = format!("{}:{}", rel(s, &l.path), l.line);
+                if let Some(symbol) = &l.symbol {
+                    text.push_str(&format!("  {}", symbol.signature));
+                }
                 if ui
                     .add(
                         egui::Label::new(RichText::new(text).monospace().small().color(theme.link))
@@ -260,6 +269,31 @@ fn requirement_row(ui: &mut egui::Ui, s: &Session, theme: &Theme, f: &Feature, r
                     .clicked()
                 {
                     cmds.push(("spec.openLink", json!({ "path": l.path, "line": l.line })));
+                }
+            });
+        }
+        for c in &changes {
+            let (mark, what) = match c.change {
+                CodeChangeKind::Modified => ("~", "changed"),
+                CodeChangeKind::Added => ("+", "added"),
+                CodeChangeKind::Removed => ("−", "removed"),
+            };
+            ui.horizontal(|ui| {
+                ui.add_space(28.0);
+                let text = format!("{mark} {}  {}  ({what} since the last sync)", c.path, c.symbol);
+                let label = egui::Label::new(RichText::new(text).small().color(theme.vcs_modified)).truncate();
+                match c.line {
+                    Some(line) => {
+                        if ui.add(label.sense(Sense::click())).clicked() {
+                            let path = s.project_root().map(|root| root.join(&c.path));
+                            if let Some(path) = path {
+                                cmds.push(("spec.openLink", json!({ "path": path, "line": line })));
+                            }
+                        }
+                    }
+                    None => {
+                        ui.add(label);
+                    }
                 }
             });
         }

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::code::Symbol;
+
 /// How a requirement's sentence is built, after the EARS templates (Easy Approach to
 /// Requirements Syntax). The keywords are matched in upper case, as EARS writes them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,6 +123,9 @@ pub struct CodeLink {
     pub id: String,
     pub line: u32,
     pub kind: LinkKind,
+    /// The item the reference is attached to, when it could be delimited (see [`crate::attach_symbols`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<Symbol>,
 }
 
 /// One feature: a directory of `requirements.md`, `design.md` and `tasks.md`.

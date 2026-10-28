@@ -9,7 +9,7 @@
 //! in `.codecraft/spec-state.json`). Implementing a changed requirement stays with the agent
 //! tools and the user's review.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -91,10 +91,25 @@ impl SpecState {
         self.features.iter().find(|f| f.name == name)
     }
 
-    /// Where a requirement stands: the baseline, the links and the text decide.
+    /// The code that points at a requirement, as the baseline records it.
+    pub fn code_items_of(&self, feature: &str, id: &str) -> Vec<sp::CodeItem> {
+        match &self.project {
+            Some(root) => sp::code_items(root, self.index.links_of(feature, id)),
+            None => Vec::new(),
+        }
+    }
+
+    /// How that code differs from what it was when the requirement was last marked in sync.
+    pub fn code_changes_of(&self, feature: &str, id: &str) -> Vec<sp::CodeChange> {
+        let synced = self.baseline.code.get(&sp::requirement_key(feature, id));
+        sp::code_changes(synced, &self.code_items_of(feature, id))
+    }
+
+    /// Where a requirement stands: the baseline, the links, the code and the text decide.
     pub fn status_of(&self, feature: &sp::Feature, req: &sp::Requirement) -> sp::SpecStatus {
         let synced = self.baseline.requirements.get(&sp::requirement_key(&feature.name, &req.id)).map(String::as_str);
-        sp::status(req, self.index.links_of(&feature.name, &req.id).len(), synced)
+        let code_changed = !self.code_changes_of(&feature.name, &req.id).is_empty();
+        sp::status(req, self.index.links_of(&feature.name, &req.id).len(), synced, code_changed)
     }
 
     fn rebuild_index(&mut self) {
@@ -126,7 +141,7 @@ fn reference_regex() -> Option<&'static Regex> {
     RE.get_or_init(|| Regex::new(r"(?i)spec[:(]").ok()).as_ref()
 }
 
-/// The references on the lines `find_in_files` matched, by file.
+/// The references in the files `find_in_files` found a candidate line in, by file.
 fn scan_code(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<sp::CodeLink>>, bool) {
     let mut out: BTreeMap<PathBuf, Vec<sp::CodeLink>> = BTreeMap::new();
     let Some(re) = reference_regex() else { return (out, false) };
@@ -134,24 +149,32 @@ fn scan_code(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<sp::Cod
         codecraft_fs::FindOptions { max_results: MAX_MATCHES, max_file_size: MAX_FILE_BYTES, ..Default::default() };
     let Ok(matches) = codecraft_fs::find_in_files(root, re, &opts, cancel) else { return (out, false) };
     let truncated = matches.len() >= MAX_MATCHES;
-    for m in matches {
-        if !is_code_path(root, &m.path) {
-            continue;
+    // The candidates are read again whole: the items the references are attached to span lines.
+    let candidates: BTreeSet<PathBuf> = matches.into_iter().map(|m| m.path).filter(|p| is_code_path(root, p)).collect();
+    for path in candidates {
+        if cancel.load(Ordering::Relaxed) {
+            break;
         }
-        let line = u32::try_from(m.line.saturating_add(1)).unwrap_or(u32::MAX);
-        for mut link in sp::scan_links(&m.line_text) {
-            link.line = line;
-            out.entry(m.path.clone()).or_default().push(link);
+        let links = scan_file(&path);
+        if !links.is_empty() {
+            out.insert(path, links);
         }
     }
     (out, truncated)
+}
+
+/// The references in `text`, each with the item it is attached to.
+fn scan_text(path: &Path, text: &str) -> Vec<sp::CodeLink> {
+    let mut links = sp::scan_links(text);
+    sp::attach_symbols(text, path, &mut links);
+    links
 }
 
 fn scan_file(path: &Path) -> Vec<sp::CodeLink> {
     if std::fs::metadata(path).map(|m| !m.is_file() || m.len() > MAX_FILE_BYTES).unwrap_or(true) {
         return Vec::new();
     }
-    codecraft_fs::read_text_file(path).map(|t| sp::scan_links(&t)).unwrap_or_default()
+    codecraft_fs::read_text_file(path).map(|t| scan_text(path, &t)).unwrap_or_default()
 }
 
 /// Read everything (blocking; runs on a worker thread).
@@ -333,7 +356,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             if s.spec.doc_revs.get(p) == Some(&rev) {
                 continue;
             }
-            updates.push((p.clone(), rev, sp::scan_links(&od.doc.text())));
+            updates.push((p.clone(), rev, scan_text(p, &od.doc.text())));
         }
         for (p, rev, links) in updates {
             s.spec.doc_revs.insert(p.clone(), rev);
@@ -352,6 +375,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
 fn status_name(st: sp::SpecStatus) -> &'static str {
     match st {
         sp::SpecStatus::SpecChanged => "specChanged",
+        sp::SpecStatus::CodeChanged => "codeChanged",
         sp::SpecStatus::Unlinked => "unlinked",
         sp::SpecStatus::Linked => "linked",
         sp::SpecStatus::InSync => "inSync",
@@ -375,6 +399,7 @@ fn feature_json(s: &Session, f: &sp::Feature) -> Value {
                 "ears": r.ears,
                 "line": r.line,
                 "links": s.spec.index.links_of(&f.name, &r.id).len(),
+                "codeChanges": s.spec.code_changes_of(&f.name, &r.id).len(),
                 "tasks": tasks,
             })
         })
@@ -436,6 +461,7 @@ fn show_json(s: &Session, p: &Value) -> CmdResult {
         "hash": r.hash,
         "syncedHash": s.spec.baseline.requirements.get(&sp::requirement_key(&f.name, &r.id)),
         "links": s.spec.index.links_of(&f.name, &r.id),
+        "codeChanges": s.spec.code_changes_of(&f.name, &r.id),
         "tasks": tasks,
     }))
 }
@@ -505,11 +531,23 @@ fn mark_synced(s: &mut Session, p: &Value) -> CmdResult {
     if !sp::is_feature_name(name) {
         return Err(CommandError::BadParams(format!("`{name}` is not a feature name")));
     }
-    // The files as they are on disk now, not the (possibly older) scan.
+    // The code is recorded as the scan has it: do not record a scan that is not there yet.
+    if !s.spec.scanned() {
+        if !s.spec.started {
+            refresh(s);
+        }
+        return Err(CommandError::Failed("the specs are still being scanned; try again in a moment".into()));
+    }
+    // The spec files as they are on disk now, not the (possibly older) scan.
     let feature = sp::load_feature(&root.join(sp::SPEC_DIR).join(name))
         .ok_or_else(|| CommandError::BadParams(format!("no feature `{name}`")))?;
+    let code: BTreeMap<String, Vec<sp::CodeItem>> = feature
+        .requirements
+        .iter()
+        .map(|r| (sp::requirement_key(&feature.name, &r.id), s.spec.code_items_of(&feature.name, &r.id)))
+        .collect();
     let mut baseline = sp::load_baseline(&root);
-    let n = sp::mark_synced(&mut baseline, &feature, opt_str(p, "id")).map_err(|e| cmd_error(&e))?;
+    let n = sp::mark_synced(&mut baseline, &feature, opt_str(p, "id"), &code).map_err(|e| cmd_error(&e))?;
     sp::save_baseline(&root, &baseline).map_err(|e| cmd_error(&e))?;
     s.spec.baseline = baseline;
     s.spec.rebuild_index();
@@ -535,7 +573,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "spec.list",
             "List Specs",
             None,
-            "→ {pending, truncated, specDir, features: [{name, title, dir, files: {requirements, design, tasks}, requirements: [{id, title, status: specChanged|unlinked|linked|inSync, ears, line, links, tasks}], design: [{level, text, line}], tasks: {done, total}, diagnostics: [{file, line, severity, message}]}], counts, codeReferences, danglingLinks: [{path, line, reference}], ambiguousLinks}. Lines are 1-based. Starts a scan if none ran yet; `pending` is true until it finishes (over MCP, pass `waitMs` to wait for it)",
+            "→ {pending, truncated, specDir, features: [{name, title, dir, files: {requirements, design, tasks}, requirements: [{id, title, status: specChanged|codeChanged|unlinked|linked|inSync, ears, line, links, codeChanges, tasks}], design: [{level, text, line}], tasks: {done, total}, diagnostics: [{file, line, severity, message}]}], counts, codeReferences, danglingLinks: [{path, line, reference}], ambiguousLinks}. Lines are 1-based. Starts a scan if none ran yet; `pending` is true until it finishes (over MCP, pass `waitMs` to wait for it)",
             Context::Global,
             always,
             |s, _| -> CmdResult {
@@ -550,7 +588,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "spec.show",
             "Show Requirement",
             None,
-            "{feature, id} → the requirement's full text, status, fingerprint, the code that points at it and the tasks that name it",
+            "{feature, id} → the requirement's full text, status, fingerprint, the code that points at it (with the item each reference is attached to), how that code changed since the last sync (codeChanges: [{path, symbol, line, change: modified|removed|added}]) and the tasks that name it",
             Context::Global,
             has_project,
             |s, p| show_json(s, p),
@@ -591,7 +629,7 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "spec.markSynced",
             "Mark Requirements In Sync",
             None,
-            "{feature, id?} — records the current text of the feature's requirements (or one) as implemented: a later edit shows as \"spec changed\". Kept in .codecraft/spec-state.json",
+            "{feature, id?} — records the current text of the feature's requirements (or one), and the code that points at them, as implemented: a later edit of the text shows as \"spec changed\", of the code as \"code changed\". Kept in .codecraft/spec-state.json. Fails while the scan is running",
             Context::Global,
             has_project,
             mark_synced,
@@ -697,6 +735,95 @@ mod tests {
         assert!(s.execute("spec.markSynced", &json!({ "feature": "login", "id": "REQ-5" })).is_err());
         assert!(s.execute("spec.markSynced", &json!({ "feature": "../x" })).is_err());
         assert!(s.execute("spec.markSynced", &json!({ "feature": "nope" })).is_err());
+    }
+
+    const AUTH: &str = "// spec: REQ-1\nfn sign_in(user: &str) -> bool {\n    check(user)\n}\n\nfn unrelated() {}\n";
+
+    fn show(s: &mut Session, id: &str) -> Value {
+        s.execute("spec.show", &json!({ "feature": "login", "id": id })).unwrap()
+    }
+
+    #[test]
+    fn a_change_to_the_linked_code_shows_as_code_changed_and_comments_do_not() {
+        let (_d, root, mut s) = project(&[("specs/login/requirements.md", REQS), ("src/auth.rs", AUTH)]);
+        s.execute("spec.list", &json!({})).unwrap();
+        assert!(wait(&mut s, &|s| !s.spec.busy() && !s.spec.features.is_empty()));
+        let linked = show(&mut s, "REQ-1");
+        assert_eq!(linked["links"][0]["symbol"]["signature"], "fn sign_in(user: &str) -> bool");
+        assert_eq!(linked["links"][0]["symbol"]["startLine"], 2);
+        assert_eq!(linked["links"][0]["symbol"]["endLine"], 4);
+        s.execute("spec.markSynced", &json!({ "feature": "login" })).unwrap();
+        assert_eq!(status_of(&list_json(&s), "REQ-1"), "inSync");
+        let path = root.join("src/auth.rs");
+
+        // Comments, layout and unrelated code are not changes.
+        let touched = AUTH
+            .replace("    check(user)\n", "    // be careful\n    check( user )\n")
+            .replace("fn unrelated() {}", "fn unrelated() { 1; }");
+        std::fs::write(&path, touched).unwrap();
+        files_changed(&mut s, std::slice::from_ref(&path));
+        assert!(wait(&mut s, &|s| !s.spec.busy()));
+        assert_eq!(status_of(&list_json(&s), "REQ-1"), "inSync");
+
+        // The linked function's code is.
+        std::fs::write(&path, AUTH.replace("check(user)", "check_all(user)")).unwrap();
+        files_changed(&mut s, std::slice::from_ref(&path));
+        assert!(wait(&mut s, &|s| status_of(&list_json(s), "REQ-1") == "codeChanged"));
+        let v = list_json(&s);
+        assert_eq!(v["counts"]["codeChanged"], 1);
+        assert_eq!(v["features"][0]["requirements"][0]["codeChanges"], 1);
+        let shown = show(&mut s, "REQ-1");
+        assert_eq!(shown["status"], "codeChanged");
+        assert_eq!(
+            shown["codeChanges"],
+            json!([{ "path": "src/auth.rs", "symbol": "fn sign_in(user: &str) -> bool", "line": 1, "change": "modified" }])
+        );
+
+        // Syncing again accepts the new code.
+        s.execute("spec.markSynced", &json!({ "feature": "login", "id": "REQ-1" })).unwrap();
+        assert_eq!(status_of(&list_json(&s), "REQ-1"), "inSync");
+
+        // Removing the reference is a change too (the spec no longer says where it is implemented).
+        std::fs::write(&path, AUTH.replace("// spec: REQ-1\n", "").replace("check(user)", "check_all(user)")).unwrap();
+        files_changed(&mut s, std::slice::from_ref(&path));
+        assert!(wait(&mut s, &|s| status_of(&list_json(s), "REQ-1") == "codeChanged"));
+        assert_eq!(show(&mut s, "REQ-1")["codeChanges"][0]["change"], "removed");
+
+        // A spec change still wins.
+        let edited = REQS.replace("open a session", "open a session within 2 seconds");
+        std::fs::write(root.join("specs/login/requirements.md"), edited).unwrap();
+        files_changed(&mut s, &[root.join("specs/login/requirements.md")]);
+        assert!(wait(&mut s, &|s| status_of(&list_json(s), "REQ-1") == "specChanged"));
+    }
+
+    #[test]
+    fn code_is_only_compared_for_requirements_synced_with_it() {
+        // A baseline from before code was fingerprinted: the requirement is synced, its code is not recorded.
+        let hash = sp::parse_requirements(REQS).requirements[0].hash.clone();
+        let old = format!(r#"{{"version": 1, "requirements": {{"login/REQ-1": "{hash}"}}}}"#);
+        let (_d, root, mut s) = project(&[
+            ("specs/login/requirements.md", REQS),
+            ("src/auth.rs", AUTH),
+            (".codecraft/spec-state.json", &old),
+        ]);
+        s.execute("spec.list", &json!({})).unwrap();
+        assert!(wait(&mut s, &|s| !s.spec.busy() && !s.spec.features.is_empty()));
+        assert_eq!(status_of(&list_json(&s), "REQ-1"), "inSync");
+        let path = root.join("src/auth.rs");
+        std::fs::write(&path, AUTH.replace("check(user)", "check_all(user)")).unwrap();
+        files_changed(&mut s, &[path]);
+        assert!(wait(&mut s, &|s| !s.spec.busy()));
+        assert_eq!(status_of(&list_json(&s), "REQ-1"), "inSync", "nothing was recorded to compare with");
+    }
+
+    #[test]
+    fn mark_synced_waits_for_the_scan() {
+        let (_d, _root, mut s) = project(&[("specs/login/requirements.md", REQS), ("src/auth.rs", AUTH)]);
+        let early = s.execute("spec.markSynced", &json!({ "feature": "login" }));
+        assert!(early.is_err_and(|e| e.to_string().contains("still being scanned")));
+        assert!(s.spec.started, "asking started the scan");
+        assert!(wait(&mut s, &|s| s.spec.scanned() && !s.spec.features.is_empty()));
+        assert!(s.execute("spec.markSynced", &json!({ "feature": "login" })).is_ok());
     }
 
     #[test]

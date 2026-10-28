@@ -115,3 +115,34 @@ fn an_agents_edit_of_a_requirement_shows_as_a_spec_change() {
     assert_ne!(shown["hash"], shown["syncedHash"]);
     s.shutdown();
 }
+
+#[test]
+fn an_agents_edit_of_linked_code_shows_as_code_changed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("proj");
+    project(&root);
+    let mut s = session(&tmp.path().join("home"), &root);
+    s.agent_access = AgentAccess::headless(&[Capability::Write]);
+    execute(&mut s, "spec.list", json!({ "waitMs": 30_000 }));
+    let r = execute(&mut s, "spec.markSynced", json!({ "feature": "login" }));
+    assert!(!r.is_error, "{}", result_text(&r));
+    let v = result_json(&execute(&mut s, "spec.list", json!({})))["result"].clone();
+    assert_eq!(v["features"][0]["requirements"][0]["status"], "inSync", "{v:#}");
+
+    let edit = agent_tools::call_blocking(
+        &mut s,
+        Caller::new("test agent"),
+        "file_edit",
+        json!({ "path": "src/auth.rs", "oldText": "fn sign_in() {}", "newText": "fn sign_in() { audit(); }" }),
+        LONG,
+    );
+    assert!(!edit.is_error, "{}", result_text(&edit));
+    s.execute("spec.refresh", &json!({})).unwrap();
+    let v = result_json(&execute(&mut s, "spec.list", json!({ "waitMs": 30_000 })))["result"].clone();
+    assert_eq!(v["features"][0]["requirements"][0]["status"], "codeChanged", "{v:#}");
+    let shown =
+        result_json(&execute(&mut s, "spec.show", json!({ "feature": "login", "id": "REQ-1" })))["result"].clone();
+    assert_eq!(shown["codeChanges"][0]["change"], "modified");
+    assert_eq!(shown["codeChanges"][0]["symbol"], "fn sign_in()");
+    s.shutdown();
+}

@@ -69,10 +69,35 @@ fn clicking_a_requirement_opens_it_and_the_link_toggle_lists_the_code() {
     assert_eq!(doc.path.as_deref(), Some(root.join("specs/login/requirements.md").as_path()));
     h.get_by_label("⛓ 1").click();
     h.run_steps(3);
-    h.get_by_label("src/auth.rs:1").click();
+    h.get_by_label("src/auth.rs:1  fn sign_in()").click();
     h.run_steps(4);
     let (_, doc) = h.state().session.ws.active().unwrap();
     assert_eq!(doc.path.as_deref(), Some(root.join("src/auth.rs").as_path()));
+}
+
+#[test]
+fn a_change_to_the_linked_code_shows_a_chip_and_what_changed() {
+    let (mut h, root) = open_project();
+    h.state_mut().session.execute("spec.markSynced", &serde_json::json!({ "feature": "login" })).unwrap();
+    h.run_steps(3);
+    assert!(h.query_by_label("In sync").is_some());
+    assert!(h.query_by_label("Code changed").is_none());
+
+    std::fs::write(root.join("src/auth.rs"), "// spec: REQ-1\nfn sign_in() { changed() }\n").unwrap();
+    h.state_mut().session.execute("spec.refresh", &serde_json::Value::Null).unwrap();
+    for _ in 0..300 {
+        h.run_steps(1);
+        if h.query_by_label("Code changed").is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(h.query_by_label("Code changed").is_some());
+    assert!(h.query_by_label_contains("1 code changed").is_some(), "the summary line counts it");
+    h.get_by_label("⛓ 1").click();
+    h.run_steps(3);
+    assert!(h.query_by_label_contains("changed since the last sync").is_some());
+    assert!(h.query_by_label("src/auth.rs:1  fn sign_in()").is_some(), "the link names the item it is attached to");
 }
 
 #[test]

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::feature::load_feature;
-use crate::index::requirement_key;
+use crate::index::{CodeItem, requirement_key};
 use crate::links::is_feature_name;
 use crate::model::Feature;
 use crate::{DESIGN_FILE, REQUIREMENTS_FILE, SPEC_DIR, TASKS_FILE};
@@ -45,6 +45,11 @@ pub struct Baseline {
     /// By [`requirement_key`] (`login/REQ-3`) → fingerprint.
     #[serde(default)]
     pub requirements: BTreeMap<String, String>,
+    /// By [`requirement_key`] → the code that pointed at the requirement when it was synced
+    /// (item key → fingerprint, see [`CodeItem`]). Missing for requirements synced before code
+    /// was fingerprinted: their code is not compared until they are synced again.
+    #[serde(default)]
+    pub code: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub fn baseline_path(root: &Path) -> PathBuf {
@@ -67,8 +72,12 @@ pub fn save_baseline(root: &Path, baseline: &Baseline) -> Result<(), SpecError> 
     let path = baseline_path(root);
     let dir = path.parent().ok_or_else(|| SpecError::Invalid("no directory for the spec state".into()))?;
     fs::create_dir_all(dir).map_err(|e| io("cannot create .codecraft", &e))?;
-    let text = serde_json::to_string_pretty(&Baseline { version: 1, requirements: baseline.requirements.clone() })
-        .map_err(|e| SpecError::Invalid(e.to_string()))?;
+    let text = serde_json::to_string_pretty(&Baseline {
+        version: 1,
+        requirements: baseline.requirements.clone(),
+        code: baseline.code.clone(),
+    })
+    .map_err(|e| SpecError::Invalid(e.to_string()))?;
     let tmp = dir.join(format!(".spec-state.{}.tmp", std::process::id()));
     let write = || -> std::io::Result<()> {
         let mut f = fs::File::create(&tmp)?;
@@ -82,21 +91,30 @@ pub fn save_baseline(root: &Path, baseline: &Baseline) -> Result<(), SpecError> 
     })
 }
 
-/// Record the current fingerprints of `feature`'s requirements (only `only`, when given) as in
-/// sync, and forget requirements that no longer exist. Returns how many were recorded.
-pub fn mark_synced(baseline: &mut Baseline, feature: &Feature, only: Option<&str>) -> Result<usize, SpecError> {
+/// Record the current fingerprints of `feature`'s requirements (only `only`, when given) and of
+/// the code that points at them (`code`: by [`requirement_key`]) as in sync, and forget
+/// requirements that no longer exist. Returns how many were recorded.
+pub fn mark_synced(
+    baseline: &mut Baseline,
+    feature: &Feature,
+    only: Option<&str>,
+    code: &BTreeMap<String, Vec<CodeItem>>,
+) -> Result<usize, SpecError> {
     if let Some(id) = only
         && feature.requirement(id).is_none()
     {
         return Err(SpecError::Invalid(format!("{} has no requirement {id}", feature.name)));
     }
     let prefix = requirement_key(&feature.name, "");
-    baseline
-        .requirements
-        .retain(|k, _| k.strip_prefix(prefix.as_str()).is_none_or(|id| feature.requirement(id).is_some()));
+    let exists = |k: &String| k.strip_prefix(prefix.as_str()).is_none_or(|id| feature.requirement(id).is_some());
+    baseline.requirements.retain(|k, _| exists(k));
+    baseline.code.retain(|k, _| exists(k));
     let mut n = 0;
     for r in feature.requirements.iter().filter(|r| only.is_none_or(|id| id == r.id)) {
-        baseline.requirements.insert(requirement_key(&feature.name, &r.id), r.hash.clone());
+        let key = requirement_key(&feature.name, &r.id);
+        let items = code.get(&key).map(Vec::as_slice).unwrap_or_default();
+        baseline.code.insert(key.clone(), items.iter().map(|i| (i.key.clone(), i.fingerprint.clone())).collect());
+        baseline.requirements.insert(key, r.hash.clone());
         n += 1;
     }
     Ok(n)
@@ -237,12 +255,42 @@ mod tests {
         let mut b = Baseline::default();
         b.requirements.insert("a/REQ-9".into(), "stale".into());
         b.requirements.insert("other/REQ-1".into(), "kept".into());
-        assert_eq!(mark_synced(&mut b, &f, Some("REQ-2")).unwrap(), 1);
+        assert_eq!(mark_synced(&mut b, &f, Some("REQ-2"), &BTreeMap::new()).unwrap(), 1);
         assert!(!b.requirements.contains_key("a/REQ-9"), "deleted requirements are forgotten");
         assert_eq!(b.requirements.get("other/REQ-1").map(String::as_str), Some("kept"));
         assert!(b.requirements.contains_key("a/REQ-2") && !b.requirements.contains_key("a/REQ-1"));
-        assert_eq!(mark_synced(&mut b, &f, None).unwrap(), 2);
-        assert!(matches!(mark_synced(&mut b, &f, Some("REQ-5")), Err(SpecError::Invalid(_))));
+        assert_eq!(mark_synced(&mut b, &f, None, &BTreeMap::new()).unwrap(), 2);
+        assert!(matches!(mark_synced(&mut b, &f, Some("REQ-5"), &BTreeMap::new()), Err(SpecError::Invalid(_))));
+    }
+
+    #[test]
+    fn mark_synced_records_the_code_snapshot_and_old_baselines_still_load() {
+        let f = parse_feature("a", PathBuf::from("a"), Some("## REQ-1\nx\n## REQ-2\ny\n"), None, None);
+        let item = |key: &str, fp: &str| CodeItem {
+            key: key.into(),
+            path: "src/a.rs".into(),
+            symbol: "fn f()".into(),
+            line: 1,
+            fingerprint: fp.into(),
+        };
+        let mut code = BTreeMap::new();
+        code.insert("a/REQ-1".to_string(), vec![item("src/a.rs#fn f()", "aa"), item("src/a.rs#fn g()", "bb")]);
+        let mut b = Baseline::default();
+        b.code.insert("a/REQ-9".into(), BTreeMap::new());
+        mark_synced(&mut b, &f, None, &code).unwrap();
+        assert_eq!(b.code["a/REQ-1"].len(), 2);
+        assert_eq!(b.code["a/REQ-1"]["src/a.rs#fn g()"], "bb");
+        assert!(b.code["a/REQ-2"].is_empty(), "synced with no code: tracked, and empty");
+        assert!(!b.code.contains_key("a/REQ-9"), "deleted requirements are forgotten");
+        // It survives a save and a load.
+        let root = tempfile::tempdir().unwrap();
+        save_baseline(root.path(), &b).unwrap();
+        assert_eq!(load_baseline(root.path()).code, b.code);
+        // A baseline written before code was fingerprinted has none, and loads.
+        fs::write(baseline_path(root.path()), r#"{"version": 1, "requirements": {"a/REQ-1": "x"}}"#).unwrap();
+        let old = load_baseline(root.path());
+        assert_eq!(old.requirements.len(), 1);
+        assert!(old.code.is_empty());
     }
 
     #[test]

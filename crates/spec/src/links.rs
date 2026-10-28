@@ -49,7 +49,7 @@ fn scan_line(line: &str, no: u32, out: &mut Vec<CodeLink>) {
         if word_start && in_comment {
             let after = line.get(at.saturating_add(5)..).unwrap_or("");
             for (feature, id) in refs_in_list(after) {
-                out.push(CodeLink { feature, id, line: no, kind: LinkKind::Comment });
+                out.push(CodeLink { feature, id, line: no, kind: LinkKind::Comment, symbol: None });
             }
         }
         from = at.saturating_add(5);
@@ -64,7 +64,7 @@ fn scan_line(line: &str, no: u32, out: &mut Vec<CodeLink>) {
             let args = args.split(')').next().unwrap_or("");
             for lit in string_literals(args) {
                 for (feature, id) in refs_in_list(lit) {
-                    out.push(CodeLink { feature, id, line: no, kind: LinkKind::Attribute });
+                    out.push(CodeLink { feature, id, line: no, kind: LinkKind::Attribute, symbol: None });
                 }
             }
         }

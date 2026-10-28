@@ -11,6 +11,7 @@
 //! ([`Baseline`], kept in `.codecraft/spec-state.json`, private to this checkout). Nothing here
 //! changes code or rewrites a spec file.
 
+mod code;
 mod feature;
 mod hash;
 mod index;
@@ -21,9 +22,13 @@ mod requirements;
 mod store;
 mod tasks;
 
+pub use code::{Symbol, Syntax, attach_symbols};
 pub use feature::{load_feature, load_features, parse_feature};
 pub use hash::{fingerprint, fnv1a};
-pub use index::{Dangling, LinkIndex, LinkRef, SpecStatus, build_index, requirement_key, status};
+pub use index::{
+    CodeChange, CodeChangeKind, CodeItem, Dangling, LinkIndex, LinkRef, SpecStatus, build_index, code_changes,
+    code_items, requirement_key, status,
+};
 pub use links::{is_feature_name, mentions_spec, scan_links};
 pub use model::{CodeLink, Diagnostic, EarsKind, Feature, Heading, LinkKind, Requirement, Severity, Task, TaskState};
 pub use requirements::{RequirementsDoc, ears_kind, parse_requirements};
@@ -51,5 +56,9 @@ pub const MAX_TEXT_CHARS: usize = 8000;
 /// Code lines longer than this (minified bundles) are not scanned for references.
 pub const MAX_LINE_BYTES: usize = 2000;
 pub const MAX_LINKS_PER_FILE: usize = 500;
+/// Longest item (lines) a reference is followed into.
+pub const MAX_ITEM_LINES: usize = 3000;
+/// Lines examined per file when fingerprinting the items references are attached to.
+pub const MAX_SYMBOL_WORK: usize = 200_000;
 /// Most dangling references listed.
 pub const MAX_DANGLING: usize = 500;
