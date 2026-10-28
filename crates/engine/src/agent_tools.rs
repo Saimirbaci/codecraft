@@ -483,6 +483,8 @@ pub fn command_capability(id: &str) -> Option<Capability> {
     }
     if id.starts_with("agentAccess.")
         || id.starts_with("agent.")
+        // These start agents of their own.
+        || matches!(id, "spec.implement" | "spec.reconcile")
         || id.starts_with("ide.")
         || id.starts_with("feedback.")
         || OUTWARD_COMMANDS.contains(&id)

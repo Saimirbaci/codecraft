@@ -55,6 +55,27 @@ fn spec_commands_have_the_right_capabilities() {
     for id in ["spec.new", "spec.markSynced", "spec.addRequirement", "spec.editRequirement", "spec.setTask"] {
         assert_eq!(command_capability(id), Some(Capability::Write), "{id}");
     }
+    // They start agents of their own, which an agent may not do (as with `agent.start`).
+    for id in ["spec.implement", "spec.reconcile", "agent.start"] {
+        assert_eq!(command_capability(id), None, "{id}");
+    }
+}
+
+#[test]
+fn an_agent_cannot_start_another_through_the_spec_commands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("proj");
+    project(&root);
+    let mut s = session(&tmp.path().join("home"), &root);
+    s.agent_access = AgentAccess::headless(&[Capability::Read, Capability::Write]);
+    execute(&mut s, "spec.list", json!({ "waitMs": 30_000 }));
+    for id in ["spec.implement", "spec.reconcile"] {
+        let r = execute(&mut s, id, json!({ "feature": "login", "id": "REQ-2", "mode": "auto" }));
+        assert!(r.is_error, "{id} ran: {}", result_text(&r));
+        assert!(result_text(&r).contains(&format!("agents may not run `{id}`")), "{}", result_text(&r));
+    }
+    assert!(s.agents.jobs.is_empty());
+    s.shutdown();
 }
 
 #[test]

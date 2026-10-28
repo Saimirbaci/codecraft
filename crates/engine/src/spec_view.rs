@@ -8,8 +8,10 @@
 //! a new directory), `spec.markSynced` (the private baseline in `.codecraft/spec-state.json`) and
 //! the edits the user asks for in the view: `spec.addRequirement`, `spec.editRequirement` and
 //! `spec.setTask` change one requirement or one checkbox, through the open editor when the file
-//! is open (undoable) and never touch anything else in the file. Implementing a changed
-//! requirement stays with the agent tools and the user's review.
+//! is open (undoable) and never touch anything else in the file. `spec.implement` and
+//! `spec.reconcile` hand a requirement to a coding agent (an ordinary agent job, in review mode
+//! by default): the first to build it, the second to propose an edit to the spec when the code
+//! moved under it. Both come back as a diff the user accepts or rejects.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -21,11 +23,14 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use regex::Regex;
 use serde_json::{Value, json};
 
+use codecraft_agent::Backend;
 use codecraft_spec as sp;
 use codecraft_workspace::ToolWindowId;
 
+use crate::agents::{self, JobId, JobStatus, StartRequest, mode_id, mode_support, parse_mode};
+use crate::approvals::AgentMode;
 use crate::commands::{CmdResult, CommandSpec, Context, always, has_project, ok, spec};
-use crate::params::{opt_str, req_path, req_str, req_usize};
+use crate::params::{opt_str, opt_usize, req_path, req_str, req_usize};
 use crate::{CommandError, Session};
 
 /// Code lines scanned for references per project (a generated file full of `spec:` cannot flood).
@@ -61,9 +66,36 @@ enum Msg {
     Files(Vec<(PathBuf, FileScan)>),
 }
 
+/// What an agent job started from the view is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentWork {
+    /// Build a requirement.
+    Implement,
+    /// Propose an edit to a requirement the code has moved away from.
+    Reconcile,
+}
+
+impl AgentWork {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Implement => "implement",
+            Self::Reconcile => "reconcile",
+        }
+    }
+}
+
+/// The agent job started for a requirement.
+#[derive(Clone, Copy, Debug)]
+pub struct SpecJob {
+    pub job: JobId,
+    pub work: AgentWork,
+}
+
 #[derive(Default)]
 pub struct SpecState {
     pub features: Vec<sp::Feature>,
+    /// The latest agent job started for each requirement (by [`sp::requirement_key`]).
+    pub jobs: BTreeMap<String, SpecJob>,
     /// References in code, by file.
     pub files: BTreeMap<PathBuf, Vec<sp::CodeLink>>,
     /// Files that ask for their public API to be specified (`// spec: required`), with the public
@@ -133,6 +165,31 @@ impl SpecState {
 
     fn rebuild_index(&mut self) {
         self.index = sp::build_index(&self.features, &self.files);
+    }
+}
+
+/// The agent job last started for a requirement, if it still exists.
+pub fn spec_job<'a>(s: &'a Session, feature: &str, id: &str) -> Option<(SpecJob, &'a agents::Job)> {
+    let sj = *s.spec.jobs.get(&sp::requirement_key(feature, id))?;
+    s.agents.job(sj.job).map(|job| (sj, job))
+}
+
+/// The job is still building, or waiting for its changes to be accepted or rejected.
+pub fn is_working(job: &agents::Job) -> bool {
+    job.can_follow_up().is_err() || job.status == JobStatus::Reviewing || job.pending_review() > 0
+}
+
+fn agent_job_json(s: &Session, feature: &str, id: &str) -> Value {
+    match spec_job(s, feature, id) {
+        Some((sj, job)) => json!({
+            "id": sj.job.0,
+            "kind": sj.work.id(),
+            "status": job.status.label(),
+            "backend": job.backend.id(),
+            "mode": mode_id(job.mode),
+            "working": is_working(job),
+        }),
+        None => Value::Null,
     }
 }
 
@@ -441,6 +498,7 @@ fn feature_json(s: &Session, f: &sp::Feature) -> Value {
                 "links": s.spec.index.links_of(&f.name, &r.id).len(),
                 "codeChanges": s.spec.code_changes_of(&f.name, &r.id).len(),
                 "tasks": tasks,
+                "agentJob": agent_job_json(s, &f.name, &r.id),
             })
         })
         .collect();
@@ -504,6 +562,7 @@ fn show_json(s: &Session, p: &Value) -> CmdResult {
         "links": s.spec.index.links_of(&f.name, &r.id),
         "codeChanges": s.spec.code_changes_of(&f.name, &r.id),
         "tasks": tasks,
+        "agentJob": agent_job_json(s, &f.name, &r.id),
     }))
 }
 
@@ -598,6 +657,17 @@ fn new_feature(s: &mut Session, p: &Value) -> CmdResult {
     Ok(json!({ "feature": f.name, "dir": f.dir, "requirements": f.requirements_file }))
 }
 
+/// Fail while the scan the answer depends on is not there yet (starting it if none ran).
+fn require_scan(s: &mut Session) -> Result<(), CommandError> {
+    if s.spec.scanned() {
+        return Ok(());
+    }
+    if !s.spec.started {
+        refresh(s);
+    }
+    Err(CommandError::Failed("the specs are still being scanned; try again in a moment".into()))
+}
+
 fn mark_synced(s: &mut Session, p: &Value) -> CmdResult {
     let root = project_root(s)?;
     let name = req_str(p, "feature")?;
@@ -605,12 +675,7 @@ fn mark_synced(s: &mut Session, p: &Value) -> CmdResult {
         return Err(CommandError::BadParams(format!("`{name}` is not a feature name")));
     }
     // The code is recorded as the scan has it: do not record a scan that is not there yet.
-    if !s.spec.scanned() {
-        if !s.spec.started {
-            refresh(s);
-        }
-        return Err(CommandError::Failed("the specs are still being scanned; try again in a moment".into()));
-    }
+    require_scan(s)?;
     // The spec files as they are on disk now, not the (possibly older) scan.
     let feature = sp::load_feature(&root.join(sp::SPEC_DIR).join(name))
         .ok_or_else(|| CommandError::BadParams(format!("no feature `{name}`")))?;
@@ -716,6 +781,132 @@ fn set_task(s: &mut Session, p: &Value) -> CmdResult {
         write_spec_file(s, &path, &updated)?;
     }
     Ok(json!({ "feature": name, "line": line, "changed": updated != text }))
+}
+
+// ---------------------------------------------------------------- agents
+
+/// The requirement a `spec.implement` / `spec.reconcile` call is about, and for implementing the
+/// task of `tasks.md` (by line) it narrows the work to.
+fn agent_target<'a>(
+    feature: &'a sp::Feature,
+    p: &Value,
+    work: AgentWork,
+) -> Result<(&'a sp::Requirement, Option<&'a sp::Task>), CommandError> {
+    let task = match (work, opt_usize(p, "task")?) {
+        (AgentWork::Implement, Some(line)) => {
+            Some(feature.tasks.iter().find(|t| usize::try_from(t.line).is_ok_and(|l| l == line)).ok_or_else(|| {
+                CommandError::BadParams(format!("{} has no task at line {line} of tasks.md", feature.name))
+            })?)
+        }
+        _ => None,
+    };
+    let id = match (opt_str(p, "id"), task) {
+        (Some(id), _) => id,
+        (None, Some(t)) => t.requirements.first().map(String::as_str).ok_or_else(|| {
+            CommandError::BadParams("that task names no requirement (write `(REQ-n)` in it, or pass `id`)".into())
+        })?,
+        (None, None) => {
+            return Err(CommandError::BadParams("pass `id` (a requirement) or `task` (a line of tasks.md)".into()));
+        }
+    };
+    let req = feature
+        .requirement(id)
+        .ok_or_else(|| CommandError::BadParams(format!("{} has no requirement {id}", feature.name)))?;
+    Ok((req, task))
+}
+
+/// The agent to run: the one asked for, else the first installed that can run `mode`.
+fn pick_backend(s: &mut Session, p: &Value, mode: AgentMode) -> Result<Backend, CommandError> {
+    if let Some(id) = opt_str(p, "backend") {
+        return Backend::from_id(id).ok_or_else(|| {
+            CommandError::BadParams(format!("unknown backend `{id}` (claude, codex, grok, antigravity)"))
+        });
+    }
+    s.agents.refresh_backends();
+    s.agents.backends().iter().find(|b| mode_support(b, mode).is_ok()).map(|b| b.backend).ok_or_else(|| {
+        let names: Vec<&str> = Backend::ALL.iter().map(|b| b.label()).collect();
+        CommandError::Failed(format!(
+            "no coding agent is installed that can run in {} mode ({}); see the Agent tool window",
+            mode_id(mode),
+            names.join(", ")
+        ))
+    })
+}
+
+/// Hand a requirement to a coding agent: an ordinary agent job (see `agent.start`), with a brief
+/// built from the spec files as they are on disk, which are also what a review-mode agent sees.
+fn start_agent(s: &mut Session, p: &Value, work: AgentWork) -> CmdResult {
+    let root = project_root(s)?;
+    let name = req_str(p, "feature")?;
+    if !sp::is_feature_name(name) {
+        return Err(CommandError::BadParams(format!("`{name}` is not a feature name")));
+    }
+    // The links and code changes in the brief come from the scan.
+    require_scan(s)?;
+    let feature = sp::load_feature(&root.join(sp::SPEC_DIR).join(name))
+        .ok_or_else(|| CommandError::BadParams(format!("no feature `{name}`")))?;
+    let (req, task) = agent_target(&feature, p, work)?;
+    let key = sp::requirement_key(&feature.name, &req.id);
+    if let Some((sj, job)) = spec_job(s, &feature.name, &req.id)
+        && is_working(job)
+    {
+        return Err(CommandError::Failed(format!(
+            "{key} already has an agent job ({} {}, job {}); let it finish, review its changes or stop it first",
+            sj.work.id(),
+            job.status.label(),
+            sj.job.0
+        )));
+    }
+    let mode = opt_str(p, "mode").unwrap_or("review");
+    let mode = parse_mode(mode)
+        .ok_or_else(|| CommandError::BadParams(format!("unknown mode `{mode}` (auto, ask, review)")))?;
+    let backend = pick_backend(s, p, mode)?;
+    let links = s.spec.index.links_of(&feature.name, &req.id).to_vec();
+    let prompt = match work {
+        AgentWork::Implement => sp::implement_prompt(&root, &feature, req, task, &links),
+        AgentWork::Reconcile => {
+            let synced = s.spec.baseline.requirements.get(&key);
+            if synced.is_some_and(|h| *h != req.hash) {
+                return Err(CommandError::Failed(format!(
+                    "the text of {key} changed since the last sync, so the spec leads: implement it, or mark it in sync to accept the text as it is"
+                )));
+            }
+            let changes = s.spec.code_changes_of(&feature.name, &req.id);
+            if changes.is_empty() {
+                return Err(CommandError::Failed(format!("the code of {key} has not changed since the last sync")));
+            }
+            sp::reconcile_prompt(&root, &feature, req, &changes, &links)
+        }
+    };
+    let verb = match work {
+        AgentWork::Implement => "Implement",
+        AgentWork::Reconcile => "Reconcile",
+    };
+    let title: String = format!("{verb} {key}: {}", req.display_title()).chars().take(90).collect();
+    let id = agents::start(
+        s,
+        StartRequest {
+            backend,
+            mode,
+            prompt,
+            attachments: Vec::new(),
+            cwd: None,
+            title: Some(title),
+            include_file: false,
+            include_selection: false,
+        },
+    )?;
+    s.spec.jobs.insert(key.clone(), SpecJob { job: id, work });
+    let session = s.agents.job(id).and_then(|j| j.session_key.clone());
+    Ok(json!({
+        "job": id.0,
+        "session": session,
+        "feature": feature.name,
+        "id": req.id,
+        "kind": work.id(),
+        "backend": backend.id(),
+        "mode": mode_id(mode),
+    }))
 }
 
 pub(crate) fn specs() -> Vec<CommandSpec> {
@@ -832,6 +1023,24 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             Context::Global,
             has_project,
             mark_synced,
+        ),
+        spec(
+            "spec.implement",
+            "Implement Requirement…",
+            None,
+            "{feature, id? | task? (line of tasks.md; implements the requirement it names), backend?: claude|codex|grok|antigravity (default: the first installed), mode?: auto|ask|review (default review)} → {job, session, feature, id, kind, backend, mode} — hands the requirement to a coding agent (an ordinary job, see agent.*): it builds it, links the code with `// spec: REQ-n`, adds tests and ticks the task. In review mode its changes come back as a diff to accept or reject. Fails while the scan runs, and while an earlier job for the requirement is still working",
+            Context::Global,
+            has_project,
+            |s, p| start_agent(s, p, AgentWork::Implement),
+        ),
+        spec(
+            "spec.reconcile",
+            "Reconcile Requirement…",
+            None,
+            "{feature, id, backend?, mode?} → {job, session, feature, id, kind, backend, mode} — for a requirement whose linked code changed since the last sync (\"code changed\"): an agent reads the changes, starts its answer with `Classification: refactor|violation|evolution|addition` and, for the last two, edits only the spec files (review mode: a diff of specs/ to accept). Accept the edit, then spec.markSynced. Refused when the text also changed (implement it instead) or the code did not change",
+            Context::Global,
+            has_project,
+            |s, p| start_agent(s, p, AgentWork::Reconcile),
         ),
     ]
 }
