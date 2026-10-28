@@ -536,6 +536,29 @@ Through `codecraft_execute`, adding or editing a data source (`db.addDataSource`
 `db.editDataSource`) needs `write`; connecting, refreshing, row counts and the query history are
 reads.
 
+### Specs
+
+A project's specs live in `specs/<feature>/{requirements,design,tasks}.md` and code points at
+requirements with `// spec: REQ-12` or `#[spec("REQ-12")]` (see [spec-view.md](spec-view.md)).
+Through `codecraft_execute` (lines are 1-based). The first `spec.list` starts the scan and answers
+`pending: true` with nothing in it; pass `waitMs` to wait for the scan, as for `analysis.fileFindings`:
+
+```json
+{ "id": "spec.list", "params": { "waitMs": 30000 } }
+→ { "id": "spec.list", "result": { "pending": false, "features": [{ "name": "login",
+    "requirements": [{ "id": "REQ-1", "title": "Sign in", "status": "linked", "ears": "eventDriven",
+                       "line": 3, "links": 2, "tasks": 1 }, …], "tasks": { "done": 1, "total": 2 }, … }],
+    "counts": { "linked": 1, "unlinked": 1 }, "danglingLinks": [], … } }
+{ "id": "spec.show", "params": { "feature": "login", "id": "REQ-1" } }
+→ the full text, `hash`, `syncedHash`, `links: [{ path, line, kind }]` and the tasks that name it
+```
+
+`status` is `specChanged` (the text differs from the last recorded sync: the code may no longer
+match), `unlinked`, `linked` or `inSync`. `spec.list/show/open/openLink/refresh` need `read`;
+`spec.new {name}` (a scaffold in a new directory, never overwriting) and `spec.markSynced
+{feature, id?}` (records the text as implemented) need `write`. Editing a requirement is an
+ordinary `file_edit` on `requirements.md`; keep its `REQ-n` id.
+
 ## Playbook
 
 Complete call sequences for common tasks, as an agent sends them (any transport). Results are

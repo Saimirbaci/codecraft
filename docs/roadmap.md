@@ -25,6 +25,7 @@ live; see `docs/parity-checklist.md`. What remains is depth, listed in `docs/gap
 
 | M17 SSH remote projects | Pass 2: automatic detection/conflict UI, checked tree operations, SSH language services/path mapping/read-only sources, remote terminal/run defaults and process-group Stop. Plan: `docs/m17-plan.md`; remaining limits: gaps item 69 | Partial — fake-transport regressions; global test gate has sandbox failures; tracks 5–6 and documented sync/terminal limits remain |
 | M18 self-update | Versions, stable launcher/factory, managed source/preflight, confirmed Accept/build/restart and PID handoff. Plan: `docs/m18-plan.md` | Implemented; offline real-payload rollback smoke passes; native GUI/signing and cross-platform checks remain |
+| M19 Spec View | A tool window under Project for spec-anchored development: `specs/<feature>/{requirements,design,tasks}.md`, requirement status (spec changed / unlinked / linked / in sync), code links (`// spec: REQ-n`, `#[spec("REQ-n")]`), dangling references, `spec.*` commands for agents. Design and limits: `docs/spec-view.md` | First slice ✅ (2026-10-27); Implement/Reconcile through agent worktrees, code fingerprints and the unspecified-code list remain |
 
 ## Current focus
 
