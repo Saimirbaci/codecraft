@@ -37,9 +37,11 @@ pub fn mentions_spec(text: &str) -> bool {
     text.as_bytes().windows(5).any(|w| w.eq_ignore_ascii_case(b"spec:") || w.eq_ignore_ascii_case(b"spec("))
 }
 
-fn scan_line(line: &str, no: u32, out: &mut Vec<CodeLink>) {
+/// The text after each `spec:` that follows a comment marker on `line` (or a `*` that continues
+/// a block comment): `// spec: REQ-1, REQ-2` gives `" REQ-1, REQ-2"`.
+pub(crate) fn comment_markers(line: &str) -> Vec<&str> {
     let lower = line.to_ascii_lowercase();
-    // Comment form: `spec:` after a comment marker (or a `*` that continues a block comment).
+    let mut out = Vec::new();
     let mut from = 0;
     while let Some(rel) = lower.get(from..).and_then(|l| l.find("spec:")) {
         let at = from.saturating_add(rel);
@@ -47,12 +49,20 @@ fn scan_line(line: &str, no: u32, out: &mut Vec<CodeLink>) {
         let word_start = !before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
         let in_comment = COMMENT_MARKERS.iter().any(|m| before.contains(m)) || before.trim_start().starts_with('*');
         if word_start && in_comment {
-            let after = line.get(at.saturating_add(5)..).unwrap_or("");
-            for (feature, id) in refs_in_list(after) {
-                out.push(CodeLink { feature, id, line: no, kind: LinkKind::Comment, symbol: None });
-            }
+            out.push(line.get(at.saturating_add(5)..).unwrap_or(""));
         }
         from = at.saturating_add(5);
+    }
+    out
+}
+
+fn scan_line(line: &str, no: u32, out: &mut Vec<CodeLink>) {
+    let lower = line.to_ascii_lowercase();
+    // Comment form: `spec:` after a comment marker (or a `*` that continues a block comment).
+    for after in comment_markers(line) {
+        for (feature, id) in refs_in_list(after) {
+            out.push(CodeLink { feature, id, line: no, kind: LinkKind::Comment, symbol: None });
+        }
     }
     // Attribute / decorator form: `#[spec("REQ-1", "REQ-2")]`, `@spec("REQ-1")`.
     let mut from = 0;

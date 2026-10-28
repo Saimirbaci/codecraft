@@ -49,7 +49,7 @@ fn execute(s: &mut Session, id: &str, params: Value) -> ToolResult {
 
 #[test]
 fn spec_commands_have_the_right_capabilities() {
-    for id in ["spec.list", "spec.show", "spec.open", "spec.openLink", "spec.refresh"] {
+    for id in ["spec.list", "spec.show", "spec.open", "spec.openLink", "spec.refresh", "spec.unspecified"] {
         assert_eq!(command_capability(id), Some(Capability::Read), "{id}");
     }
     for id in ["spec.new", "spec.markSynced", "spec.addRequirement", "spec.editRequirement", "spec.setTask"] {
@@ -144,5 +144,21 @@ fn an_agents_edit_of_linked_code_shows_as_code_changed() {
         result_json(&execute(&mut s, "spec.show", json!({ "feature": "login", "id": "REQ-1" })))["result"].clone();
     assert_eq!(shown["codeChanges"][0]["change"], "modified");
     assert_eq!(shown["codeChanges"][0]["symbol"], "fn sign_in()");
+    s.shutdown();
+}
+
+#[test]
+fn unspecified_code_waits_for_the_scan_like_spec_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap().join("proj");
+    project(&root);
+    std::fs::write(root.join("src/api.rs"), "// spec: required\npub fn bare() {}\n").unwrap();
+    let mut s = session(&tmp.path().join("home"), &root);
+    let r = execute(&mut s, "spec.unspecified", json!({ "waitMs": 30_000 }));
+    assert!(!r.is_error, "{}", result_text(&r));
+    let v = result_json(&r)["result"].clone();
+    assert_eq!(v["pending"], json!(false), "{v:#}");
+    assert_eq!(v["total"], 1);
+    assert_eq!(v["files"][0]["items"][0]["name"], "bare");
     s.shutdown();
 }

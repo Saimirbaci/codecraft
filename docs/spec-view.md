@@ -120,12 +120,31 @@ changed*; the link rows list them. Limits:
 | `spec.addRequirement {feature, title?, text?}` | Append a requirement to the feature's `requirements.md` in its style, with the next free `REQ-n` (project-wide) |
 | `spec.editRequirement {feature, id, title?, text?}` | Replace a requirement's title and/or text, keeping its id and every other requirement |
 | `spec.setTask {feature, line, state}` | Tick or clear one checkbox in `tasks.md` (`todo`, `doing`, `done`) |
+| `spec.unspecified {path?}` | Public items no requirement covers, in files that carry `// spec: required` (`waitMs` waits for the scan over MCP) |
 | `spec.new {name}` | Create `specs/<name>/` with the three files and open `requirements.md`. Never overwrites |
 | `spec.markSynced {feature, id?}` | Record the current text and the code that points at it as implemented. Fails while the scan is running |
 
-Lines in results are 1-based. Agent capability: `spec.list/show/open/openLink/refresh` are `read`;
+Lines in results are 1-based. Agent capability: `spec.list/show/open/openLink/refresh/unspecified` are `read`;
 `spec.new`, `spec.markSynced`, `spec.addRequirement`, `spec.editRequirement` and `spec.setTask`
 need `write`.
+
+## Unspecified code
+
+The reverse question to "is this requirement implemented?": "is this public code traced to a
+requirement?". It is **opt-in per file**: put `// spec: required` (any comment marker) in a file
+and its public items are listed under *Unspecified code* in the view and by `spec.unspecified`
+unless a reference covers them. Public items are Rust `pub fn`, `struct`, `enum`, `trait`,
+`type`, `const`, `static`, `union` (not `pub(crate)`, `pub use` or `pub mod`; code under
+`#[cfg(test)]` and `#[test]` is not API), Python module-level `def` and `class` without a leading
+underscore, TypeScript and JavaScript `export function`, `class`, `interface`, `type`, `enum`,
+`const`, `let`, `var`, and Go capitalised `func` (methods included) and `type`. Other languages
+list nothing. Text inside strings and comments is not mistaken for code.
+
+An item is covered by a reference attached to it (the `// spec: REQ-n` line above it, or an
+attribute), by one inside it, or by one attached to an item that contains it (a marker above an
+`impl` block covers its methods; above a class, its members). A reference to a requirement that
+does not exist still counts as an attempt: the dangling list flags it. Deliberately not covered
+code belongs outside the opted-in files. At most 500 items are listed per file.
 
 ## Editing in the view
 
@@ -165,7 +184,6 @@ useful (links, dangling references, tasks, baseline, scaffold). Still open:
   refactor / violation / evolution / addition, accepted by a human). Auto-trigger would be a
   setting, off by default.
 - A test-result signal (a linked test that starts failing) to join the code fingerprints.
-- An "Unspecified code" list (public items with no reference), opt-in per module.
 - EARS linting beyond the hint, deleting a requirement from the view (ids are never reused, so
   this stays a deliberate edit of the file), adding a task, "generate a spec from existing code".
 - Unsaved edits in the spec files themselves show once saved; the code side is live.

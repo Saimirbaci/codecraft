@@ -12,6 +12,7 @@
 //! changes code or rewrites a spec file.
 
 mod code;
+mod coverage;
 mod edit;
 mod feature;
 mod hash;
@@ -24,6 +25,7 @@ mod store;
 mod tasks;
 
 pub use code::{Symbol, Syntax, attach_symbols};
+pub use coverage::{PublicItem, requires_spec, unspecified_items};
 pub use edit::{add_requirement, edit_requirement, set_task_state};
 pub use feature::{load_feature, load_features, parse_feature};
 pub use hash::{fingerprint, fnv1a};
@@ -62,5 +64,7 @@ pub const MAX_LINKS_PER_FILE: usize = 500;
 pub const MAX_ITEM_LINES: usize = 3000;
 /// Lines examined per file when fingerprinting the items references are attached to.
 pub const MAX_SYMBOL_WORK: usize = 200_000;
+/// Most unspecified public items listed per file.
+pub const MAX_UNSPECIFIED: usize = 500;
 /// Most dangling references listed.
 pub const MAX_DANGLING: usize = 500;

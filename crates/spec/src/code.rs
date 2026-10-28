@@ -177,8 +177,9 @@ pub(crate) fn extent(lines: &[&str], start: usize, syntax: Syntax) -> Option<Ext
     }
 }
 
+/// Where the lexer is between lines.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(crate) enum Mode {
     Code,
     /// Inside a `/* */` comment, nested this deep.
     Block(usize),
@@ -242,6 +243,122 @@ fn raw_hashes(chars: &[char], i: usize) -> Option<usize> {
     (!before.is_some_and(is_ident)).then_some(hashes)
 }
 
+/// A character outside comments: code, or inside a string or character literal (quotes included).
+#[derive(Clone, Copy)]
+pub(crate) enum Tok {
+    Code(char),
+    Str(char),
+}
+
+/// Lex one line of a brace language, carrying `mode` (open comments and strings) across lines.
+/// `f` sees every character outside comments (a block comment shows as one space) and returns
+/// `false` to stop; the result says whether it did.
+pub(crate) fn lex_braces(line: &[char], syntax: Syntax, mode: &mut Mode, f: &mut dyn FnMut(Tok) -> bool) -> bool {
+    let at = |k: usize| line.get(k).copied();
+    let mut i = 0;
+    while let Some(c) = at(i) {
+        match *mode {
+            Mode::Block(depth) => {
+                if c == '*' && at(i + 1) == Some('/') {
+                    *mode = if depth <= 1 { Mode::Code } else { Mode::Block(depth - 1) };
+                    i += 2;
+                } else if syntax == Syntax::Rust && c == '/' && at(i + 1) == Some('*') {
+                    *mode = Mode::Block(depth + 1);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Mode::Str { quote, raw } => {
+                if !f(Tok::Str(c)) {
+                    return true;
+                }
+                match raw {
+                    Some(hashes) => {
+                        if c == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')) {
+                            for _ in 0..hashes {
+                                if !f(Tok::Str('#')) {
+                                    return true;
+                                }
+                            }
+                            i += 1 + hashes;
+                            *mode = Mode::Code;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    None if c == '\\' => {
+                        if let Some(next) = at(i + 1)
+                            && !f(Tok::Str(next))
+                        {
+                            return true;
+                        }
+                        i += 2;
+                    }
+                    None => {
+                        if c == quote {
+                            *mode = Mode::Code;
+                        }
+                        i += 1;
+                    }
+                }
+            }
+            Mode::Code => {
+                if c == '/' && at(i + 1) == Some('/') {
+                    return false;
+                }
+                if c == '/' && at(i + 1) == Some('*') {
+                    *mode = Mode::Block(1);
+                    i += 2;
+                    if !f(Tok::Code(' ')) {
+                        return true;
+                    }
+                    continue;
+                }
+                i += 1;
+                if !f(Tok::Code(c)) {
+                    return true;
+                }
+                match c {
+                    '"' => *mode = Mode::Str { quote: '"', raw: raw_hashes(line, i - 1) },
+                    '`' if syntax == Syntax::CLike => *mode = Mode::Str { quote: '`', raw: None },
+                    '\'' if syntax == Syntax::CLike => *mode = Mode::Str { quote: '\'', raw: None },
+                    '\'' => {
+                        // Rust: a character literal, or a lifetime (which has no closing quote).
+                        let literal = match at(i) {
+                            Some('\\') => (i + 2..i + 12).find(|k| at(*k) == Some('\'')),
+                            Some(_) if at(i + 1) == Some('\'') => Some(i + 1),
+                            _ => None,
+                        };
+                        if let Some(close) = literal {
+                            for ch in line.get(i..=close).unwrap_or_default() {
+                                if !f(Tok::Str(*ch)) {
+                                    return true;
+                                }
+                            }
+                            i = close + 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A quote left open at the end of a line is a stray one (a regex, an apostrophe) unless the
+/// language lets the string go on (Rust strings, JS template literals, a trailing backslash).
+fn close_stray_quote(mode: &mut Mode, line: &str, syntax: Syntax) {
+    if let Mode::Str { quote, raw: None } = *mode
+        && syntax == Syntax::CLike
+        && quote != '`'
+        && !line.ends_with('\\')
+    {
+        *mode = Mode::Code;
+    }
+}
+
 /// Brace-delimited languages: the item ends at the `}` that closes its first `{`, or at a `;`
 /// reached before any brace. Brackets and parentheses are tracked so a `;` in `[0; 3]` and a
 /// closure's `}` inside a call do not end it.
@@ -254,76 +371,13 @@ fn extent_braces(lines: &[&str], start: usize, syntax: Syntax) -> Option<Extent>
             return None;
         }
         let chars: Vec<char> = line.chars().collect();
-        let at = |k: usize| chars.get(k).copied();
-        let mut i = 0;
-        while let Some(c) = at(i) {
-            match mode {
-                Mode::Block(depth) => {
-                    if c == '*' && at(i + 1) == Some('/') {
-                        mode = if depth <= 1 { Mode::Code } else { Mode::Block(depth - 1) };
-                        i += 2;
-                    } else if syntax == Syntax::Rust && c == '/' && at(i + 1) == Some('*') {
-                        mode = Mode::Block(depth + 1);
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-                Mode::Str { quote, raw } => {
-                    code.push(mask(c));
-                    match raw {
-                        Some(hashes) => {
-                            if c == '"' && (1..=hashes).all(|k| at(i + k) == Some('#')) {
-                                code.extend(std::iter::repeat_n('#', hashes));
-                                i += 1 + hashes;
-                                mode = Mode::Code;
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        None if c == '\\' => {
-                            if let Some(next) = at(i + 1) {
-                                code.push(mask(next));
-                            }
-                            i += 2;
-                        }
-                        None => {
-                            if c == quote {
-                                mode = Mode::Code;
-                            }
-                            i += 1;
-                        }
-                    }
-                }
-                Mode::Code => {
-                    if c == '/' && at(i + 1) == Some('/') {
-                        break;
-                    }
-                    if c == '/' && at(i + 1) == Some('*') {
-                        mode = Mode::Block(1);
-                        code.push(' ');
-                        i += 2;
-                        continue;
-                    }
+        let mut done = false;
+        lex_braces(&chars, syntax, &mut mode, &mut |tok| {
+            match tok {
+                Tok::Str(c) => code.push(mask(c)),
+                Tok::Code(c) => {
                     code.push(c);
-                    i += 1;
-                    let mut done = false;
                     match c {
-                        '"' => mode = Mode::Str { quote: '"', raw: raw_hashes(&chars, i - 1) },
-                        '`' if syntax == Syntax::CLike => mode = Mode::Str { quote: '`', raw: None },
-                        '\'' if syntax == Syntax::CLike => mode = Mode::Str { quote: '\'', raw: None },
-                        '\'' => {
-                            // Rust: a character literal, or a lifetime (which has no closing quote).
-                            let literal = match at(i) {
-                                Some('\\') => (i + 2..i + 12).find(|k| at(*k) == Some('\'')),
-                                Some(_) if at(i + 1) == Some('\'') => Some(i + 1),
-                                _ => None,
-                            };
-                            if let Some(close) = literal {
-                                code.extend(chars.get(i..=close).unwrap_or(&[]));
-                                i = close + 1;
-                            }
-                        }
                         '{' => {
                             braces += 1;
                             opened = true;
@@ -337,24 +391,42 @@ fn extent_braces(lines: &[&str], start: usize, syntax: Syntax) -> Option<Extent>
                         ';' => done = braces == 0 && parens == 0,
                         _ => {}
                     }
-                    if done {
-                        return Some(Extent { end: start + offset, code });
-                    }
                 }
             }
+            !done
+        });
+        if done {
+            return Some(Extent { end: start + offset, code });
         }
-        // A quote left open at the end of a line is a stray one (a regex, an apostrophe) unless
-        // the language allows the string to go on (Rust strings, JS template literals).
-        if let Mode::Str { quote, raw: None } = mode
-            && syntax == Syntax::CLike
-            && quote != '`'
-            && !line.ends_with('\\')
-        {
-            mode = Mode::Code;
-        }
+        close_stray_quote(&mut mode, line, syntax);
         code.push(if matches!(mode, Mode::Str { .. }) { mask('\n') } else { '\n' });
     }
     None
+}
+
+/// Each line with comments removed and the inside of strings blanked, so a line that begins with
+/// `pub fn` really is code. Lines over the length cap come back empty.
+pub(crate) fn masked_lines(lines: &[&str], syntax: Syntax) -> Vec<String> {
+    let mut mode = Mode::Code;
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.len() > MAX_LINE_BYTES {
+            out.push(String::new());
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut masked = String::with_capacity(line.len());
+        lex_braces(&chars, syntax, &mut mode, &mut |tok| {
+            match tok {
+                Tok::Code(c) => masked.push(c),
+                Tok::Str(_) => masked.push(' '),
+            }
+            true
+        });
+        close_stray_quote(&mut mode, line, syntax);
+        out.push(masked);
+    }
+    out
 }
 
 fn indent_of(line: &str) -> usize {

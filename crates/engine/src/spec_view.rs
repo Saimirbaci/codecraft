@@ -40,7 +40,16 @@ struct Scan {
     features: Vec<sp::Feature>,
     baseline: sp::Baseline,
     files: BTreeMap<PathBuf, Vec<sp::CodeLink>>,
+    required: BTreeMap<PathBuf, Vec<sp::PublicItem>>,
     truncated: bool,
+}
+
+/// What one code file holds.
+#[derive(Default)]
+struct FileScan {
+    links: Vec<sp::CodeLink>,
+    /// The public items nothing covers, when the file asks for it (`// spec: required`).
+    unspecified: Option<Vec<sp::PublicItem>>,
 }
 
 enum Msg {
@@ -48,8 +57,8 @@ enum Msg {
     Full(Scan),
     /// The spec files were read again.
     Features(Vec<sp::Feature>, sp::Baseline),
-    /// Some code files were rescanned (an empty list removes the file).
-    Files(Vec<(PathBuf, Vec<sp::CodeLink>)>),
+    /// Some code files were rescanned (a file with nothing in it is forgotten).
+    Files(Vec<(PathBuf, FileScan)>),
 }
 
 #[derive(Default)]
@@ -57,6 +66,9 @@ pub struct SpecState {
     pub features: Vec<sp::Feature>,
     /// References in code, by file.
     pub files: BTreeMap<PathBuf, Vec<sp::CodeLink>>,
+    /// Files that ask for their public API to be specified (`// spec: required`), with the public
+    /// items no reference covers.
+    pub required: BTreeMap<PathBuf, Vec<sp::PublicItem>>,
     /// The references resolved against the features.
     pub index: sp::LinkIndex,
     pub baseline: sp::Baseline,
@@ -87,6 +99,11 @@ impl SpecState {
     /// Number of references in code.
     pub fn link_count(&self) -> usize {
         self.files.values().map(Vec::len).sum()
+    }
+
+    /// Public items in files that require specs and that no reference covers.
+    pub fn unspecified_count(&self) -> usize {
+        self.required.values().map(Vec::len).sum()
     }
 
     pub fn feature(&self, name: &str) -> Option<&sp::Feature> {
@@ -143,13 +160,19 @@ fn reference_regex() -> Option<&'static Regex> {
     RE.get_or_init(|| Regex::new(r"(?i)spec[:(]").ok()).as_ref()
 }
 
-/// The references in the files `find_in_files` found a candidate line in, by file.
-fn scan_code(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<sp::CodeLink>>, bool) {
-    let mut out: BTreeMap<PathBuf, Vec<sp::CodeLink>> = BTreeMap::new();
-    let Some(re) = reference_regex() else { return (out, false) };
+/// The references (and, for files that ask, the unspecified public items) in the files
+/// `find_in_files` found a candidate line in.
+#[allow(clippy::type_complexity)]
+fn scan_code(
+    root: &Path,
+    cancel: &AtomicBool,
+) -> (BTreeMap<PathBuf, Vec<sp::CodeLink>>, BTreeMap<PathBuf, Vec<sp::PublicItem>>, bool) {
+    let mut files: BTreeMap<PathBuf, Vec<sp::CodeLink>> = BTreeMap::new();
+    let mut required: BTreeMap<PathBuf, Vec<sp::PublicItem>> = BTreeMap::new();
+    let Some(re) = reference_regex() else { return (files, required, false) };
     let opts =
         codecraft_fs::FindOptions { max_results: MAX_MATCHES, max_file_size: MAX_FILE_BYTES, ..Default::default() };
-    let Ok(matches) = codecraft_fs::find_in_files(root, re, &opts, cancel) else { return (out, false) };
+    let Ok(matches) = codecraft_fs::find_in_files(root, re, &opts, cancel) else { return (files, required, false) };
     let truncated = matches.len() >= MAX_MATCHES;
     // The candidates are read again whole: the items the references are attached to span lines.
     let candidates: BTreeSet<PathBuf> = matches.into_iter().map(|m| m.path).filter(|p| is_code_path(root, p)).collect();
@@ -157,24 +180,29 @@ fn scan_code(root: &Path, cancel: &AtomicBool) -> (BTreeMap<PathBuf, Vec<sp::Cod
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let links = scan_file(&path);
-        if !links.is_empty() {
-            out.insert(path, links);
+        let scan = scan_file(&path);
+        if !scan.links.is_empty() {
+            files.insert(path.clone(), scan.links);
+        }
+        if let Some(items) = scan.unspecified {
+            required.insert(path, items);
         }
     }
-    (out, truncated)
+    (files, required, truncated)
 }
 
-/// The references in `text`, each with the item it is attached to.
-fn scan_text(path: &Path, text: &str) -> Vec<sp::CodeLink> {
+/// The references in `text`, each with the item it is attached to, and the public items nothing
+/// covers if the file asks for that.
+fn scan_text(path: &Path, text: &str) -> FileScan {
     let mut links = sp::scan_links(text);
     sp::attach_symbols(text, path, &mut links);
-    links
+    let unspecified = sp::requires_spec(text).then(|| sp::unspecified_items(text, path, &links));
+    FileScan { links, unspecified }
 }
 
-fn scan_file(path: &Path) -> Vec<sp::CodeLink> {
+fn scan_file(path: &Path) -> FileScan {
     if std::fs::metadata(path).map(|m| !m.is_file() || m.len() > MAX_FILE_BYTES).unwrap_or(true) {
-        return Vec::new();
+        return FileScan::default();
     }
     codecraft_fs::read_text_file(path).map(|t| scan_text(path, &t)).unwrap_or_default()
 }
@@ -183,8 +211,8 @@ fn scan_file(path: &Path) -> Vec<sp::CodeLink> {
 fn scan_all(root: &Path, cancel: &AtomicBool) -> Scan {
     let features = sp::load_features(root);
     let baseline = sp::load_baseline(root);
-    let (files, truncated) = scan_code(root, cancel);
-    Scan { features, baseline, files, truncated }
+    let (files, required, truncated) = scan_code(root, cancel);
+    Scan { features, baseline, files, required, truncated }
 }
 
 fn reset(s: &mut Session, root: Option<PathBuf>) {
@@ -265,11 +293,11 @@ pub(crate) fn files_changed(s: &mut Session, paths: &[PathBuf]) {
     }
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new().name("codecraft-spec-code".into()).spawn(move || {
-        let out: Vec<(PathBuf, Vec<sp::CodeLink>)> = code
+        let out: Vec<(PathBuf, FileScan)> = code
             .into_iter()
             .map(|p| {
-                let links = scan_file(&p);
-                (p, links)
+                let scan = scan_file(&p);
+                (p, scan)
             })
             .collect();
         let _ = tx.send(Msg::Files(out));
@@ -279,15 +307,24 @@ pub(crate) fn files_changed(s: &mut Session, paths: &[PathBuf]) {
     }
 }
 
-fn set_file(st: &mut SpecState, path: PathBuf, links: Vec<sp::CodeLink>) -> bool {
-    if links.is_empty() {
-        st.files.remove(&path).is_some()
-    } else if st.files.get(&path) != Some(&links) {
-        st.files.insert(path, links);
-        true
-    } else {
-        false
+/// Take what a file holds now; says whether anything changed.
+fn set_file(st: &mut SpecState, path: PathBuf, scan: FileScan) -> bool {
+    let mut changed = false;
+    if scan.links.is_empty() {
+        changed |= st.files.remove(&path).is_some();
+    } else if st.files.get(&path) != Some(&scan.links) {
+        st.files.insert(path.clone(), scan.links);
+        changed = true;
     }
+    match scan.unspecified {
+        None => changed |= st.required.remove(&path).is_some(),
+        Some(items) if st.required.get(&path) != Some(&items) => {
+            st.required.insert(path, items);
+            changed = true;
+        }
+        Some(_) => {}
+    }
+    changed
 }
 
 pub(crate) fn pump(s: &mut Session) -> bool {
@@ -308,6 +345,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
                 s.spec.features = scan.features;
                 s.spec.baseline = scan.baseline;
                 s.spec.files = scan.files;
+                s.spec.required = scan.required;
                 s.spec.truncated = scan.truncated;
                 s.spec.scanning = false;
                 s.spec.full = None;
@@ -334,9 +372,9 @@ pub(crate) fn pump(s: &mut Session) -> bool {
                 reindex = true;
             }
             Ok(Msg::Files(list)) => {
-                for (p, links) in list {
+                for (p, scan) in list {
                     if s.ws.doc_by_path(&p).is_none() {
-                        reindex |= set_file(&mut s.spec, p, links);
+                        reindex |= set_file(&mut s.spec, p, scan);
                     }
                 }
                 s.spec.others.remove(i);
@@ -360,9 +398,9 @@ pub(crate) fn pump(s: &mut Session) -> bool {
             }
             updates.push((p.clone(), rev, scan_text(p, &od.doc.text())));
         }
-        for (p, rev, links) in updates {
+        for (p, rev, scan) in updates {
             s.spec.doc_revs.insert(p.clone(), rev);
-            reindex |= set_file(&mut s.spec, p, links);
+            reindex |= set_file(&mut s.spec, p, scan);
         }
     }
     if reindex {
@@ -439,6 +477,7 @@ fn list_json(s: &Session) -> Value {
         "features": s.spec.features.iter().map(|f| feature_json(s, f)).collect::<Vec<_>>(),
         "counts": counts,
         "codeReferences": s.spec.link_count(),
+        "unspecified": { "files": s.spec.required.len(), "items": s.spec.unspecified_count() },
         "danglingLinks": s.spec.index.dangling,
         "ambiguousLinks": s.spec.index.ambiguous,
     })
@@ -466,6 +505,38 @@ fn show_json(s: &Session, p: &Value) -> CmdResult {
         "codeChanges": s.spec.code_changes_of(&f.name, &r.id),
         "tasks": tasks,
     }))
+}
+
+/// Start the scan if none ran for the open project (a command that reads the results).
+fn ensure_scan(s: &mut Session) {
+    let current = s.ws.project.as_ref().map(|p| p.root.clone());
+    if current.is_some() && (!s.spec.started || s.spec.project != current) {
+        refresh(s);
+    }
+}
+
+/// The public items no requirement covers, in the files that ask (`// spec: required`).
+fn unspecified_json(s: &Session, p: &Value) -> Value {
+    let only = opt_str(p, "path").map(|path| {
+        let path = PathBuf::from(path);
+        match &s.spec.project {
+            Some(root) if path.is_relative() => root.join(path),
+            _ => path,
+        }
+    });
+    let files: Vec<Value> = s
+        .spec
+        .required
+        .iter()
+        .filter(|(path, items)| !items.is_empty() && only.as_ref().is_none_or(|o| o == *path))
+        .map(|(path, items)| json!({ "path": path, "count": items.len(), "items": items }))
+        .collect();
+    json!({
+        "pending": s.spec.busy(),
+        "optedIn": s.spec.required.len(),
+        "total": s.spec.unspecified_count(),
+        "files": files,
+    })
 }
 
 fn cmd_error(e: &sp::SpecError) -> CommandError {
@@ -665,15 +736,24 @@ pub(crate) fn specs() -> Vec<CommandSpec> {
             "spec.list",
             "List Specs",
             None,
-            "→ {pending, truncated, specDir, features: [{name, title, dir, files: {requirements, design, tasks}, requirements: [{id, title, status: specChanged|codeChanged|unlinked|linked|inSync, ears, line, links, codeChanges, tasks}], design: [{level, text, line}], tasks: {done, total}, diagnostics: [{file, line, severity, message}]}], counts, codeReferences, danglingLinks: [{path, line, reference}], ambiguousLinks}. Lines are 1-based. Starts a scan if none ran yet; `pending` is true until it finishes (over MCP, pass `waitMs` to wait for it)",
+            "→ {pending, truncated, specDir, features: [{name, title, dir, files: {requirements, design, tasks}, requirements: [{id, title, status: specChanged|codeChanged|unlinked|linked|inSync, ears, line, links, codeChanges, tasks}], design: [{level, text, line}], tasks: {done, total}, diagnostics: [{file, line, severity, message}]}], counts, codeReferences, unspecified: {files, items}, danglingLinks: [{path, line, reference}], ambiguousLinks}. Lines are 1-based. Starts a scan if none ran yet; `pending` is true until it finishes (over MCP, pass `waitMs` to wait for it)",
             Context::Global,
             always,
             |s, _| -> CmdResult {
-                let current = s.ws.project.as_ref().map(|p| p.root.clone());
-                if current.is_some() && (!s.spec.started || s.spec.project != current) {
-                    refresh(s);
-                }
+                ensure_scan(s);
                 Ok(list_json(s))
+            },
+        ),
+        spec(
+            "spec.unspecified",
+            "List Unspecified Code",
+            None,
+            "{path?} → {pending, optedIn, total, files: [{path, count, items: [{line, endLine, kind, name}]}]} — public items (Rust pub, Python top-level def/class, TypeScript export, Go exported func/type) that no requirement covers, in files that carry `// spec: required`; `path` limits it to one file. A reference above an item, inside it, or above an item that contains it covers it. Starts a scan if none ran; `pending` is true until it finishes (pass `waitMs` over MCP)",
+            Context::Global,
+            always,
+            |s, p| -> CmdResult {
+                ensure_scan(s);
+                Ok(unspecified_json(s, p))
             },
         ),
         spec(
@@ -1066,6 +1146,59 @@ mod tests {
         let r = s.execute("spec.setTask", &json!({ "feature": "login", "line": 4, "state": "todo" })).unwrap();
         assert_eq!(r["changed"], true);
         assert!(s.execute("spec.setTask", &json!({ "feature": "login", "line": 2, "state": "done" })).is_err());
+    }
+
+    const API: &str =
+        "// spec: required\n\n// spec: REQ-1\npub fn covered() {}\n\npub fn bare() {}\n\nfn private() {}\n";
+
+    fn unspecified(s: &mut Session) -> Value {
+        s.execute("spec.unspecified", &json!({})).unwrap()
+    }
+
+    #[test]
+    fn public_items_no_requirement_covers_are_listed_for_files_that_ask() {
+        let (_d, root, mut s) = scanned_project(&[
+            ("specs/login/requirements.md", REQS),
+            ("src/api.rs", API),
+            ("src/other.rs", "pub fn not_asked_for() {}\n"),
+            ("docs/notes.md", "// spec: required\npub fn quoted() {}\n"),
+        ]);
+        let list = list_json(&s);
+        assert_eq!(list["unspecified"], json!({ "files": 1, "items": 1 }), "{list:#}");
+        let v = unspecified(&mut s);
+        assert_eq!(v["optedIn"], 1);
+        assert_eq!(v["total"], 1);
+        assert_eq!(v["files"][0]["path"], json!(root.join("src/api.rs")));
+        assert_eq!(v["files"][0]["items"][0]["name"], "bare");
+        assert_eq!(v["files"][0]["items"][0]["kind"], "fn");
+        assert_eq!(v["files"][0]["items"][0]["line"], 6);
+        // A path filter; an unknown one lists nothing.
+        let one = s.execute("spec.unspecified", &json!({ "path": "src/api.rs" })).unwrap();
+        assert_eq!(one["files"].as_array().map(Vec::len), Some(1));
+        assert_eq!(s.execute("spec.unspecified", &json!({ "path": "src/other.rs" })).unwrap()["files"], json!([]));
+
+        // Covering the item (on disk) clears it.
+        let path = root.join("src/api.rs");
+        std::fs::write(&path, API.replace("pub fn bare", "// spec: REQ-2\npub fn bare")).unwrap();
+        files_changed(&mut s, std::slice::from_ref(&path));
+        assert!(wait(&mut s, &|s| !s.spec.busy() && s.spec.unspecified_count() == 0));
+        assert_eq!(unspecified(&mut s)["files"], json!([]));
+        assert_eq!(unspecified(&mut s)["optedIn"], 1, "the file still asks");
+        // Dropping the marker stops asking.
+        std::fs::write(&path, API.replace("// spec: required\n", "")).unwrap();
+        files_changed(&mut s, std::slice::from_ref(&path));
+        assert!(wait(&mut s, &|s| !s.spec.busy() && s.spec.required.is_empty()));
+    }
+
+    #[test]
+    fn an_unsaved_edit_covers_an_item_while_the_view_is_shown() {
+        let (_d, root, mut s) = project(&[("specs/login/requirements.md", REQS), ("src/api.rs", API)]);
+        s.ws.layout.show(ToolWindowId::Spec);
+        assert!(wait(&mut s, &|s| s.spec.scanned() && s.spec.unspecified_count() == 1));
+        s.execute("spec.openLink", &json!({ "path": root.join("src/api.rs"), "line": 6 })).unwrap();
+        s.execute("editor.type", &json!({ "text": "// spec: REQ-2\n" })).unwrap();
+        assert!(wait(&mut s, &|s| s.spec.unspecified_count() == 0));
+        assert_eq!(std::fs::read_to_string(root.join("src/api.rs")).unwrap(), API, "nothing was saved");
     }
 
     #[test]

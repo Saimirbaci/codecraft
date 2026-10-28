@@ -27,6 +27,7 @@ fn open_project() -> (Harness<'static, App>, PathBuf) {
     )
     .unwrap();
     std::fs::write(root.join("src/auth.rs"), "// spec: REQ-1\nfn sign_in() {}\n").unwrap();
+    std::fs::write(root.join("src/api.rs"), "// spec: required\npub fn bare() {}\n").unwrap();
     let r = root.clone();
     let mut h = Harness::builder().with_size(egui::vec2(1280.0, 800.0)).build_eframe(move |_| App::ephemeral(Some(r)));
     h.run_steps(5);
@@ -180,6 +181,19 @@ fn tasks_under_a_requirement_are_ticked_from_the_view() {
     h.get_by_label_contains("☐ 2 Lock").click();
     wait_for(&mut h, "the task to be ticked", |h| h.query_by_label_contains("☑ 2 Lock").is_some());
     assert!(std::fs::read_to_string(root.join("specs/login/tasks.md")).unwrap().contains("- [x] 2. Lock"));
+}
+
+#[test]
+fn unspecified_public_items_are_listed_counted_and_open_on_click() {
+    let (mut h, root) = open_project();
+    assert!(h.query_by_label("Unspecified code (1)").is_some());
+    assert!(h.query_by_label_contains("1 unspecified").is_some(), "the summary line counts it");
+    h.get_by_label("Unspecified code (1)").click();
+    h.run_steps(3);
+    h.get_by_label("src/api.rs:2  fn bare").click();
+    h.run_steps(4);
+    let (_, doc) = h.state().session.ws.active().unwrap();
+    assert_eq!(doc.path.as_deref(), Some(root.join("src/api.rs").as_path()));
 }
 
 #[test]

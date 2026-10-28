@@ -221,19 +221,23 @@ pub fn show(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
 
     if !has_project {
         ui.label(RichText::new("Open a project to see its specs.").color(theme.text_muted));
-    } else if s.spec.features.is_empty() {
-        if s.spec.scanned() {
-            empty_state(ui, &theme);
-        } else {
-            ui.label(RichText::new("Scanning…").color(theme.text_muted));
-        }
     } else {
-        summary(ui, s, &theme);
+        if !s.spec.features.is_empty() {
+            summary(ui, s, &theme);
+        }
         ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            if s.spec.features.is_empty() {
+                if s.spec.scanned() {
+                    empty_state(ui, &theme);
+                } else {
+                    ui.label(RichText::new("Scanning…").color(theme.text_muted));
+                }
+            }
             for f in &s.spec.features {
                 feature_section(ui, s, &theme, f, &mut cmds, &mut editing);
             }
             reference_problems(ui, s, &theme, &mut cmds);
+            unspecified_code(ui, s, &theme, &mut cmds);
         });
     }
     match (editing.outcome, editing.editor.as_mut()) {
@@ -290,6 +294,10 @@ fn summary(ui: &mut egui::Ui, s: &Session, theme: &Theme) {
     }
     if unlinked > 0 {
         text.push_str(&format!(" · {unlinked} unlinked"));
+    }
+    let unspecified = s.spec.unspecified_count();
+    if unspecified > 0 {
+        text.push_str(&format!(" · {unspecified} unspecified"));
     }
     if s.spec.truncated {
         text.push_str(" · references truncated");
@@ -519,4 +527,32 @@ fn reference_problems(ui: &mut egui::Ui, s: &Session, theme: &Theme, cmds: &mut 
                 }
             });
     }
+}
+
+/// Public items in files that ask for specs (`// spec: required`) that no requirement covers.
+fn unspecified_code(ui: &mut egui::Ui, s: &Session, theme: &Theme, cmds: &mut Cmds) {
+    let total = s.spec.unspecified_count();
+    if total == 0 {
+        return;
+    }
+    egui::CollapsingHeader::new(RichText::new(format!("Unspecified code ({total})")).color(theme.warning))
+        .id_salt("spec-unspecified")
+        .default_open(false)
+        .show(ui, |ui| {
+            ui.label(
+                RichText::new("Public items no requirement covers, in files marked `// spec: required`.")
+                    .small()
+                    .color(theme.text_muted),
+            );
+            for (path, items) in s.spec.required.iter().filter(|(_, items)| !items.is_empty()) {
+                for item in items {
+                    let text = format!("{}:{}  {} {}", rel(s, path), item.line, item.kind, item.name);
+                    let label =
+                        egui::Label::new(RichText::new(text).monospace().small()).truncate().sense(Sense::click());
+                    if ui.add(label).on_hover_text("Go to it, then add a `// spec: REQ-n` line above").clicked() {
+                        cmds.push(("spec.openLink", json!({ "path": path, "line": item.line })));
+                    }
+                }
+            }
+        });
 }

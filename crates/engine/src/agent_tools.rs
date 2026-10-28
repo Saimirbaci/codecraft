@@ -284,7 +284,7 @@ enum Wait {
     },
     /// A command that answered `pending: true` to answer again without it (M16 LT:
     /// `analysis.fileFindings {waitMs}` waits for the current revision's results; `spec.list
-    /// {waitMs}` for the scan).
+    /// {waitMs}` and `spec.unspecified {waitMs}` for the scan).
     Pending {
         id: String,
         params: Value,
@@ -417,6 +417,7 @@ const READ_COMMANDS: &[&str] = &[
     "spec.openLink",
     "spec.refresh",
     "spec.show",
+    "spec.unspecified",
     "test.summary",
     "test.tree",
     // QA M15: the playbook's `vcs.status` (and the other repository queries) needed `write`.
@@ -1678,11 +1679,11 @@ fn run_tool(s: &mut Session, caller: &Caller, name: &str, args: &Value) -> Step 
             let id = args.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
             let params = args.get("params").cloned().unwrap_or(Value::Null);
             // `waitMs` on a command that reports `pending` (analysis.fileFindings, M16 LT;
-            // spec.list): wait here, polling with the IDE's pumps, instead of blocking the command.
+            // spec.list, spec.unspecified): wait here, polling with the IDE's pumps, instead of blocking the command.
             let wait_ms = params
                 .get("waitMs")
                 .and_then(Value::as_u64)
-                .filter(|ms| *ms > 0 && matches!(id.as_str(), "analysis.fileFindings" | "spec.list"));
+                .filter(|ms| *ms > 0 && matches!(id.as_str(), "analysis.fileFindings" | "spec.list" | "spec.unspecified"));
             match s.execute(&id, &params) {
                 Ok(v) if wait_ms.is_some() && v.get("pending").and_then(Value::as_bool) == Some(true) => {
                     let mut params = params.clone();

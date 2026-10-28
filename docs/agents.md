@@ -554,10 +554,14 @@ Through `codecraft_execute` (lines are 1-based). The first `spec.list` starts th
   the reference is attached to), `codeChanges: [{ path, symbol, line, change }]` and the tasks that name it
 ```
 
+`spec.unspecified {path?, waitMs?}` lists the public items no requirement covers in files that carry
+`// spec: required` (`{ pending, optedIn, total, files: [{ path, count, items: [{ line, endLine,
+kind, name }] }] }`); `spec.list` carries the totals as `unspecified: { files, items }`.
+
 `status` is `specChanged` (the text differs from the last recorded sync: the code may no longer
 match), `codeChanged` (the code that points at it differs from the code recorded then;
 `change` is `modified`, `removed` or `added`), `unlinked`, `linked` or `inSync`.
-`spec.list/show/open/openLink/refresh` need `read`; `spec.new {name}` (a scaffold in a new
+`spec.list/show/open/openLink/refresh/unspecified` need `read`; `spec.new {name}` (a scaffold in a new
 directory, never overwriting), `spec.markSynced {feature, id?}` (records the text and the code
 that points at it as implemented; fails while the scan is running), `spec.addRequirement {feature,
 title?, text?}` (the next free `REQ-n`, project-wide), `spec.editRequirement {feature, id, title?,
