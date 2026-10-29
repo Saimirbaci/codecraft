@@ -820,6 +820,7 @@ name = "codecraft"
 version = "0.3.0"
 dependencies = [
  "codecraft-engine",
+ "codecraft-handoff",
  "codecraft-selfupdate",
  "codecraft-ui-egui",
  "eframe",
@@ -945,6 +946,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "codecraft-handoff"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "codecraft-http"
 version = "0.3.0"
 dependencies = [
@@ -960,6 +970,7 @@ dependencies = [
 name = "codecraft-launcher"
 version = "0.3.0"
 dependencies = [
+ "codecraft-handoff",
  "codecraft-selfupdate",
  "serde_json",
  "tempfile",
@@ -1076,6 +1087,7 @@ dependencies = [
  "codecraft-cargo",
  "codecraft-engine",
  "codecraft-fs",
+ "codecraft-handoff",
  "codecraft-lsp",
  "codecraft-selfupdate",
  "codecraft-spec",

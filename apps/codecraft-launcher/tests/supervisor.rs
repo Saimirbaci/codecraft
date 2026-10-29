@@ -183,3 +183,41 @@ fn wait_pid_rejects_invalid_and_waits_for_a_real_local_child() {
     assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
     assert!(start.elapsed() >= Duration::from_secs(2));
 }
+#[test]
+fn paths_go_to_a_running_instance_instead_of_starting_another() {
+    let f = Fixture::new();
+    let marker = f._dir.path().join("started");
+    script(&f.s.factory, &format!("touch '{}'; {HEALTHY}", marker.display()));
+    let (server, rx) = codecraft_handoff::Server::start(&f.s.base, || {}).unwrap();
+    let cwd = f._dir.path().join("work");
+    fs::create_dir_all(&cwd).unwrap();
+    // The process's working directory is the physical path (macOS temp dirs sit behind a symlink).
+    let cwd = cwd.canonicalize().unwrap();
+    let out = bounded(f.cmd().current_dir(&cwd).args(["-r", "src/../main.rs:3:9", "folder"]).spawn().unwrap());
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(request.reuse_window);
+    assert_eq!(request.targets.len(), 2);
+    assert_eq!(request.targets[0].path, cwd.join("main.rs"));
+    assert_eq!((request.targets[0].line, request.targets[0].column), (Some(3), Some(9)));
+    assert_eq!(request.targets[1].path, cwd.join("folder"));
+    assert!(!marker.exists(), "no second app was started");
+    drop(server);
+}
+#[test]
+fn nothing_is_forwarded_without_a_listener_or_for_a_fresh_start() {
+    let f = Fixture::new();
+    let marker = f._dir.path().join("started");
+    script(&f.s.factory, &format!("touch '{}'; {HEALTHY}", marker.display()));
+    // No instance: the launcher starts the app as before, passing the path along.
+    assert!(f.run().status.success());
+    assert!(marker.exists());
+    fs::remove_file(&marker).unwrap();
+    // An instance is running, but `--no-restore` needs a fresh process.
+    let (server, rx) = codecraft_handoff::Server::start(&f.s.base, || {}).unwrap();
+    let out = bounded(f.cmd().arg("--no-restore").spawn().unwrap());
+    assert!(out.status.success());
+    assert!(marker.exists(), "--no-restore starts the app");
+    assert!(rx.try_recv().is_err());
+    drop(server);
+}

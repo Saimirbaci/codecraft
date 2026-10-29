@@ -29,6 +29,7 @@ behaviour, with a smaller, faster native app where every action is drivable by a
 crates/
   text syntax fs lsp cargo   L0 standalone (no workspace deps): text model, lexical syntax,
                                 project files, LSP client, Cargo integration
+  handoff                    L0 `codecraft <path>` to the running instance (loopback socket, std only)
   workspace                  L1 pure-data model: project, documents, editors, tool windows, run configs
   engine                     L2 Session + services + command registry (every action is a command)
   ui-egui                    L3 egui shell (thin: all actions go through the engine)

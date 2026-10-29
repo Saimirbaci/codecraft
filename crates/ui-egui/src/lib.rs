@@ -35,6 +35,7 @@ mod editor_menu_ui;
 mod er_diagram;
 mod feedback;
 mod fonts;
+mod handoff;
 mod history_ui;
 mod hot_exit_ui;
 mod http_ui;
@@ -225,6 +226,10 @@ pub struct App {
     windows: project_windows::ProjectWindows,
     /// When the persisted state was last checked for a periodic save, and what was saved.
     state_saved: (Instant, String),
+    /// Listener for `codecraft <path>` from a second command line (installed builds only).
+    handoff: Option<(codecraft_handoff::Server, std::sync::mpsc::Receiver<codecraft_handoff::OpenRequest>)>,
+    /// Open requests waiting for the next frame (the command line this process started with).
+    pending_open: Vec<codecraft_handoff::OpenRequest>,
 }
 
 /// How the desktop app starts.
@@ -234,6 +239,9 @@ pub struct Launch {
     pub open: Option<PathBuf>,
     /// `--no-restore`: reopen no project and no editors (sessions are still saved).
     pub no_restore: bool,
+    /// Every path on the command line (with `file:line:col` positions) and `-r`. `open` is the
+    /// first of them; the rest, and the positions, are applied once the window is up.
+    pub request: codecraft_handoff::OpenRequest,
 }
 
 /// How often the persisted state is saved while it changes (so a crash loses little).
@@ -324,6 +332,8 @@ impl App {
             native_menu: native_menu::NativeMenu::default(),
             windows: project_windows::ProjectWindows::default(),
             state_saved: (Instant::now(), String::new()),
+            handoff: None,
+            pending_open: Vec::new(),
         };
         let reopen = reopen && app.session.ws.settings.reopen_last_project;
         let explicit = open.is_some();
@@ -344,6 +354,100 @@ impl App {
             }
         }
         app
+    }
+
+    /// Listen for `codecraft <path>` from other command lines (see `codecraft_handoff`).
+    fn start_handoff(&mut self, ctx: egui::Context) {
+        let Ok(base) = codecraft_selfupdate::default_base() else { return };
+        match codecraft_handoff::Server::start(&base, move || ctx.request_repaint()) {
+            Ok(pair) => self.handoff = Some(pair),
+            Err(e) => log::warn!("cannot listen for command-line handoffs: {e}"),
+        }
+    }
+
+    /// Where the windows stand, for [`handoff::plan`].
+    fn window_layout(&self, ctx: &egui::Context) -> handoff::Layout {
+        let focused = self.windows.focused(ctx).map_or(handoff::Slot::Main, handoff::Slot::Window);
+        handoff::Layout {
+            main: self.session.ws.project.as_ref().map(|p| codecraft_engine::normalize_path(&p.root)),
+            windows: self.windows.roots_by_index(),
+            focused,
+        }
+    }
+
+    fn focus_slot(&self, ctx: &egui::Context, slot: handoff::Slot) {
+        match slot {
+            handoff::Slot::Main => {
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
+            handoff::Slot::Window(i) => self.windows.focus(ctx, i),
+        }
+    }
+
+    /// Run `f` on a window's session and view state.
+    fn with_slot(&mut self, slot: handoff::Slot, f: impl FnOnce(&mut Session, &mut UiState)) {
+        match slot {
+            handoff::Slot::Main => f(&mut self.session, &mut self.ui),
+            handoff::Slot::Window(i) => {
+                if let Some((s, st)) = self.windows.session_ui_mut(i) {
+                    f(s, st);
+                }
+            }
+        }
+    }
+
+    /// Carry out what the command line asked: the arguments this process started with and any
+    /// `codecraft <path>` handed over by a later command line.
+    fn apply_open_requests(&mut self, ctx: &egui::Context) {
+        let mut requests = std::mem::take(&mut self.pending_open);
+        if let Some((_, rx)) = &self.handoff {
+            requests.extend(rx.try_iter());
+        }
+        for request in requests {
+            self.apply_open_request(ctx, &request);
+        }
+    }
+
+    fn apply_open_request(&mut self, ctx: &egui::Context, request: &codecraft_handoff::OpenRequest) {
+        if request.targets.is_empty() {
+            let focused = self.window_layout(ctx).focused;
+            self.focus_slot(ctx, focused);
+            return;
+        }
+        for target in &request.targets {
+            // The layout is read per target: an earlier folder may have opened a window.
+            let action = handoff::plan(target, request.reuse_window, &self.window_layout(ctx));
+            match action {
+                handoff::Action::Focus(slot) => self.focus_slot(ctx, slot),
+                handoff::Action::OpenFolderIn(slot, path) => {
+                    self.with_slot(slot, |s, st| run_command(s, st, "file.open", &json!({ "path": path })));
+                    self.focus_slot(ctx, slot);
+                }
+                handoff::Action::OpenWindow(path) => {
+                    self.windows.open(path, &self.session, &self.persisted);
+                    if let Some(i) = self.windows.last_index() {
+                        self.focus_slot(ctx, handoff::Slot::Window(i));
+                    }
+                }
+                handoff::Action::OpenFile { slot, path, line, column } => {
+                    self.with_slot(slot, |s, st| {
+                        run_command(s, st, "file.open", &json!({ "path": path }));
+                        if let Some(line) = line {
+                            let params = json!({ "line": line, "column": column.unwrap_or(1) });
+                            run_command(s, st, "navigate.lineColumn", &params);
+                        }
+                    });
+                    self.focus_slot(ctx, slot);
+                }
+                handoff::Action::Missing(path) => {
+                    let focused = self.window_layout(ctx).focused;
+                    self.with_slot(focused, |s, _| s.status = format!("{} does not exist", path.display()));
+                    self.focus_slot(ctx, focused);
+                }
+            }
+        }
+        ctx.request_repaint();
     }
 
     /// Copy the project windows' positions and sizes into the persisted state.
@@ -820,6 +924,7 @@ impl eframe::App for App {
                 project_windows::Request::Switch(delta) => self.windows.switch(&ctx, from, delta),
             }
         }
+        self.apply_open_requests(&ctx);
         self.windows.sync_settings(&mut self.session);
         codecraft_engine::app_cmds::set_project_window_count(self.windows.count());
         self.remember_window_rects();
@@ -844,6 +949,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        self.handoff = None;
         let open_windows = self.windows.project_roots();
         self.remember_window_rects();
         self.windows.shutdown();
@@ -860,12 +966,12 @@ impl eframe::App for App {
 
 /// Launch the desktop app.
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
-    launch(Launch { open, no_restore: false })
+    launch(Launch { open, ..Launch::default() })
 }
 
 /// Launch the desktop app with command-line options.
 pub fn launch(launch: Launch) -> eframe::Result {
-    let Launch { open, no_restore } = launch;
+    let Launch { open, no_restore, request } = launch;
     let persisted = PersistedState::load();
     let size = persisted.saved_window_size().unwrap_or([1400.0, 900.0]);
     let mut viewport = egui::ViewportBuilder::default()
@@ -880,7 +986,7 @@ pub fn launch(launch: Launch) -> eframe::Result {
     eframe::run_native(
         "CodeCraft",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
             let mut session = Session::new();
             session.session_store.autosave = true;
             session.hot_exit.enabled = true;
@@ -889,6 +995,14 @@ pub fn launch(launch: Launch) -> eframe::Result {
             session.prefs_services.network_lookups = true;
             let mut app = App::build(open, persisted, true, !no_restore, session);
             app.native_menu.allowed = true;
+            // Installed builds (started by the launcher) take `codecraft <path>` from a second
+            // command line; a developer's `cargo run` never takes over the installed app's port.
+            if std::env::var_os("CODECRAFT_LAUNCHER").is_some() {
+                app.start_handoff(cc.egui_ctx.clone());
+            }
+            if !request.targets.is_empty() {
+                app.pending_open.push(request);
+            }
             Ok(Box::new(app))
         }),
     )

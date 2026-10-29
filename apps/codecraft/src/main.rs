@@ -1,7 +1,10 @@
 //! Code Craft desktop app.
 //!
-//! `codecraft [--no-restore] [PATH]`: open PATH (a file or directory), else the last project(s)
-//! with their editors. `--no-restore` starts without reopening any project or editor.
+//! `codecraft [--no-restore] [-r] [PATH[:LINE[:COL]]]…`: open the paths (files or directories), else
+//! the last project(s) with their editors. A folder opens in its own window; `-r` reuses the
+//! current window. With Code Craft already running, the installed `codecraft` launcher hands the
+//! paths to that instance instead (`codecraft-handoff`). `--no-restore` starts without reopening
+//! any project or editor.
 //! `codecraft --version` prints the version and build.
 //! `codecraft --mcp-bridge --port N [--lock-dir D] [--job J]`: an MCP stdio bridge to the
 //! running IDE's server (what built-in agent jobs launch; see docs/agents.md); `--ide` instead of
@@ -56,17 +59,17 @@ fn main() -> eframe::Result {
 }
 
 fn parse(args: impl Iterator<Item = OsString>) -> Launch {
-    let mut launch = Launch::default();
-    for arg in args {
-        if arg == "--no-restore" {
-            launch.no_restore = true;
-        } else if arg.to_str().is_some_and(|a| a.starts_with("--")) {
-            log::warn!("ignoring unknown option {}", arg.to_string_lossy());
-        } else if launch.open.is_none() {
-            launch.open = Some(PathBuf::from(arg));
-        }
+    let args: Vec<OsString> = args.collect();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let parsed = codecraft_handoff::parse_args(&args, &cwd);
+    for option in &parsed.unknown {
+        log::warn!("ignoring unknown option {}", option.to_string_lossy());
     }
-    launch
+    Launch {
+        open: parsed.request.targets.first().map(|t| t.path.clone()),
+        no_restore: parsed.no_restore,
+        request: parsed.request,
+    }
 }
 
 #[cfg(test)]
@@ -94,5 +97,17 @@ mod tests {
         assert_eq!(l.open, Some(PathBuf::from("/p")));
         let l = args(&["/p"]);
         assert_eq!((l.open, l.no_restore), (Some(PathBuf::from("/p")), false));
+    }
+
+    #[test]
+    fn several_paths_positions_and_reuse_window() {
+        let l = args(&["-r", "/p/a.rs:12:3", "/q"]);
+        assert_eq!(l.open, Some(PathBuf::from("/p/a.rs")));
+        assert!(l.request.reuse_window);
+        assert_eq!(l.request.targets.len(), 2);
+        assert_eq!((l.request.targets[0].line, l.request.targets[0].column), (Some(12), Some(3)));
+        assert_eq!(l.request.targets[1].path, PathBuf::from("/q"));
+        let none = args(&[]);
+        assert!(none.request.targets.is_empty() && !none.request.reuse_window);
     }
 }

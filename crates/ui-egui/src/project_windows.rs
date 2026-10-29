@@ -127,6 +127,37 @@ impl ProjectWindows {
         self.windows.get(index).map(|w| &w.session)
     }
 
+    /// Each window's project root by index (`None`: closed or without a project).
+    pub(crate) fn roots_by_index(&self) -> Vec<Option<PathBuf>> {
+        self.windows
+            .iter()
+            .map(|w| {
+                if w.closed {
+                    return None;
+                }
+                w.session.ws.project.as_ref().map(|p| codecraft_engine::normalize_path(&p.root))
+            })
+            .collect()
+    }
+
+    /// The session and view state of the `index`th window.
+    pub(crate) fn session_ui_mut(&mut self, index: usize) -> Option<(&mut Session, &mut UiState)> {
+        self.windows.get_mut(index).map(|w| (&mut w.session, &mut w.ui))
+    }
+
+    /// Bring the `index`th window to the front.
+    pub(crate) fn focus(&self, ctx: &egui::Context, index: usize) {
+        if let Some(w) = self.windows.get(index) {
+            ctx.send_viewport_cmd_to(w.id, ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd_to(w.id, ViewportCommand::Focus);
+        }
+    }
+
+    /// The index of the newest window.
+    pub(crate) fn last_index(&self) -> Option<usize> {
+        self.windows.len().checked_sub(1)
+    }
+
     /// The project of each open window (reopened on the next start).
     pub(crate) fn project_roots(&self) -> Vec<PathBuf> {
         self.windows

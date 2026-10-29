@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 codecraft-selfupdate.workspace = true
+codecraft-handoff.workspace = true
 codecraft-engine.workspace = true
 codecraft-ui-egui.workspace = true
 eframe.workspace = true

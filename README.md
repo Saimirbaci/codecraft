@@ -60,6 +60,20 @@ cargo run -p codecraft-cli -- commands                     # every command, with
 cargo run -p codecraft-ui-egui --example snapshot -- path/to/project out.png view.toolWindows.problems
 ```
 
+## Command line
+
+```sh
+codecraft .                      # open a folder (a new window if Code Craft is already running)
+codecraft src/main.rs:42:7       # open a file at a line and column
+codecraft -r other-project       # open the folder in the current window instead of a new one
+codecraft a.rs b.rs ../lib       # several paths at once
+```
+
+With Code Craft running, the installed `codecraft` hands the paths to that instance and exits. A
+folder that is already open is just brought to the front; a file opens in the window whose
+project contains it. `--no-restore` always starts a fresh process. Protocol and routing:
+`crates/handoff` and `crates/ui-egui/src/handoff.rs`.
+
 ## Under the hood
 
 - **Engine first:** a pure-data workspace model and a command engine, with a thin egui UI on

@@ -86,6 +86,18 @@ fn run() -> io::Result<()> {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    // `codecraft <path>` while Code Craft is running: hand the paths to that instance (which
+    // opens them in a window) instead of failing on its launcher lock. Not for the maintenance
+    // modes (`--factory`, `--version-id`, `--rollback`, `--wait-lock`, `--wait-pid`), which need a fresh start.
+    if !opts.factory
+        && opts.version.is_none()
+        && !opts.rollback
+        && !opts.wait
+        && opts.wait_pid.is_none()
+        && codecraft_handoff::try_forward(&store.base, &opts.args)
+    {
+        return Ok(());
+    }
     let lock_start = Instant::now();
     let _launcher = loop {
         match store.launcher_lock() {

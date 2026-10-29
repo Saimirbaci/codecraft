@@ -1,0 +1,17 @@
+[package]
+name = "codecraft-handoff"
+description = "CodeCraft command-line handoff: send `codecraft <path>` to the running instance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
