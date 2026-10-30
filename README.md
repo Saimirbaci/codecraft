@@ -71,7 +71,16 @@ codecraft a.rs b.rs ../lib       # several paths at once
 
 With Code Craft running, the installed `codecraft` hands the paths to that instance and exits. A
 folder that is already open is just brought to the front; a file opens in the window whose
-project contains it. `--no-restore` always starts a fresh process. Protocol and routing:
+project contains it. `--no-restore` always starts a fresh process.
+
+The Linux packages and the Windows installer (tick "Add codecraft to PATH") put `codecraft` on
+your PATH. On macOS, link the command inside the app once:
+
+```sh
+sudo ln -sf "/Applications/Code Craft.app/Contents/Resources/bin/codecraft" /usr/local/bin/codecraft
+```
+
+ Protocol and routing:
 `crates/handoff` and `crates/ui-egui/src/handoff.rs`.
 
 ## Under the hood

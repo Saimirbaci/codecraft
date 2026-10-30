@@ -283,6 +283,21 @@ pub fn sign_bundle(root: &Path, opts: &Options, layout: &AppLayout) -> Result<()
     }
 }
 
+/// `Contents/Resources/bin/codecraft`: a shell command that runs the bundle's launcher. It resolves
+/// symlinks, so `ln -s .../Resources/bin/codecraft /usr/local/bin/codecraft` works.
+pub const MACOS_SHELL_COMMAND: &str = "#!/bin/sh\n\
+# Command-line entry point of Code Craft: `codecraft [-r] <file[:line[:col]]|folder>...`\n\
+self=\"$0\"\n\
+while [ -L \"$self\" ]; do\n\
+\tlink=$(readlink \"$self\")\n\
+\tcase \"$link\" in\n\
+\t\t/*) self=\"$link\" ;;\n\
+\t\t*) self=\"$(dirname \"$self\")/$link\" ;;\n\
+\tesac\n\
+done\n\
+here=$(cd \"$(dirname \"$self\")\" && pwd -P) || exit 1\n\
+exec \"$here/../../MacOS/codecraft-launcher\" \"$@\"\n";
+
 /// Stable release layout: background launcher outside, full foreground factory app inside.
 pub fn write_launcher_bundle(
     bundle_dir: &Path,
@@ -298,6 +313,10 @@ pub fn write_launcher_bundle(
     let plist = info_plist(version()).replace("<string>codecraft</string>", "<string>codecraft-launcher</string>")
         .replace("</dict>", "<key>LSUIElement</key><true/>\n</dict>");
     write(&layout.info_plist, plist)?;
+    let bin_dir = layout.app.join("Contents/Resources/bin");
+    create_dir(&bin_dir)?;
+    write(bin_dir.join("codecraft"), MACOS_SHELL_COMMAND)?;
+    make_executable(&bin_dir.join("codecraft"))?;
     Ok(layout)
 }
 
@@ -743,6 +762,10 @@ pub fn inno_script(version: &str, arch: &str, source: &Path, out_dir: &Path, bas
          \n\
          [Tasks]\n\
          Name: \"desktopicon\"; Description: \"{{cm:CreateDesktopIcon}}\"; GroupDescription: \"{{cm:AdditionalIcons}}\"; Flags: unchecked\n\
+         Name: \"addtopath\"; Description: \"Add codecraft to PATH (open files and folders from a terminal)\"; GroupDescription: \"Command line:\"\n\
+         \n\
+         [Registry]\n\
+         Root: HKCU; Subkey: \"Environment\"; ValueType: expandsz; ValueName: \"Path\"; ValueData: \"{{olddata}};{{app}}\"; Tasks: addtopath; Check: NeedsPath\n\
          \n\
          [Files]\n\
          Source: \"{src}\\*\"; DestDir: \"{{app}}\"; Flags: ignoreversion recursesubdirs createallsubdirs\n\
@@ -752,7 +775,15 @@ pub fn inno_script(version: &str, arch: &str, source: &Path, out_dir: &Path, bas
          Name: \"{{autodesktop}}\\{DISPLAY_NAME}\"; Filename: \"{{app}}\\codecraft.exe\"; IconFilename: \"{{app}}\\codecraft.ico\"; Tasks: desktopicon\n\
          \n\
          [Run]\n\
-         Filename: \"{{app}}\\codecraft.exe\"; Description: \"{{cm:LaunchProgram,{DISPLAY_NAME}}}\"; Flags: nowait postinstall skipifsilent\n",
+         Filename: \"{{app}}\\codecraft.exe\"; Description: \"{{cm:LaunchProgram,{DISPLAY_NAME}}}\"; Flags: nowait postinstall skipifsilent\n\
+         \n\
+         [Code]\n\
+         function NeedsPath: Boolean;\n\
+         var Path: string;\n\
+         begin\n\
+         \x20 if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then Path := '';\n\
+         \x20 Result := Pos(';' + Lowercase(ExpandConstant('{{app}}')) + ';', ';' + Lowercase(Path) + ';') = 0;\n\
+         end;\n",
         out_dir.display()
     )
 }
@@ -932,6 +963,10 @@ mod tests {
         assert!(plist.contains("<string>codecraft-launcher</string>")); assert!(plist.contains("<key>LSUIElement</key><true/>"));
         let payload = write_app_bundle(&dir.path().join("payload"), Some(&bin), Some(&icon)).unwrap();
         assert!(!payload.app.join("Contents/Resources/factory").exists());
+        let shim = layout.app.join("Contents/Resources/bin/codecraft");
+        assert_eq!(std::fs::read_to_string(&shim).unwrap(), MACOS_SHELL_COMMAND);
+        assert!(MACOS_SHELL_COMMAND.contains("MacOS/codecraft-launcher\" \"$@\""));
+        assert!(!payload.app.join("Contents/Resources/bin").exists());
         assert!(Options::parse(&["--version-payload".into(), "payload".into()]).unwrap().version_payload.is_some());
     }
 
@@ -1097,6 +1132,10 @@ mod tests {
             "Source: \"C:\\b\\pkg\\codecraft-0.2.0-windows-x64\\*\"; DestDir: \"{app}\"",
             "Name: \"{autoprograms}\\Code Craft\"; Filename: \"{app}\\codecraft.exe\"",
             "Description: \"{cm:LaunchProgram,Code Craft}\"",
+            "Name: \"addtopath\"",
+            "ValueData: \"{olddata};{app}\"; Tasks: addtopath; Check: NeedsPath",
+            "function NeedsPath: Boolean;",
+            "ExpandConstant('{app}')",
         ] {
             assert!(s.contains(needle), "missing {needle:?} in\n{s}");
         }
