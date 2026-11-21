@@ -27,6 +27,11 @@ on:
         required: false
         type: boolean
         default: false
+      runners:
+        description: "Where to run: github or self-hosted (empty: the CODECRAFT_RUNNERS repository variable, else github)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -43,7 +48,7 @@ jobs:
   bump:
     name: bump, commit and tag
     if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","Linux"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
     outputs:
@@ -106,4 +111,5 @@ jobs:
     with:
       tag: ${{ needs.bump.outputs.tag }}
       draft: ${{ !inputs.publish }}
+      runners: ${{ inputs.runners }}
     secrets: inherit

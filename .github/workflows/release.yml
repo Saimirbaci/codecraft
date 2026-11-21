@@ -30,11 +30,20 @@ on:
         required: false
         type: boolean
         default: true
+      runners:
+        description: "Where to build: github (GitHub-hosted runners) or self-hosted (runners labelled self-hosted + Linux / macOS / Windows). Empty: the CODECRAFT_RUNNERS repository variable, else github."
+        required: false
+        type: string
+        default: ""
   workflow_call:
     inputs:
       tag:
         required: true
         type: string
+      runners:
+        required: false
+        type: string
+        default: ""
       draft:
         required: false
         type: boolean
@@ -51,7 +60,7 @@ env:
 jobs:
   version:
     name: version and build metadata
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","Linux"]') || 'ubuntu-latest' }}
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       ref: ${{ steps.meta.outputs.ref }}
@@ -95,7 +104,7 @@ jobs:
   macos:
     name: macOS dmg
     needs: version
-    runs-on: macos-latest
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","macOS"]') || 'macos-latest' }}
     timeout-minutes: 150
     env:
       CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
@@ -112,6 +121,7 @@ jobs:
 
       - name: Install Rust
         run: |
+          command -v rustup >/dev/null || { echo "::error::rustup is not installed on this runner"; exit 1; }
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
 
@@ -196,7 +206,7 @@ jobs:
     needs: version
     # The oldest supported Ubuntu LTS runner: the binary needs the glibc it was built against or
     # newer (2.35 here: Ubuntu 22.04+, Debian 12+, Fedora 36+).
-    runs-on: ubuntu-22.04
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","Linux"]') || 'ubuntu-22.04' }}
     timeout-minutes: 90
     env:
       CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
@@ -207,10 +217,14 @@ jobs:
           ref: ${{ needs.version.outputs.ref }}
       - name: Install Rust and build dependencies
         run: |
+          command -v rustup >/dev/null || { echo "::error::rustup is not installed on this runner"; exit 1; }
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+          # A self-hosted runner without passwordless sudo must already have these installed.
+          if sudo -n true 2>/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends pkg-config libssl-dev libwayland-dev libxkbcommon-dev
+          fi
       - name: Package
         run: |
           cargo xtask package-linux --release
@@ -227,7 +241,7 @@ jobs:
   windows:
     name: Windows installer and zip
     needs: version
-    runs-on: windows-latest
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","Windows"]') || 'windows-latest' }}
     timeout-minutes: 90
     env:
       CODECRAFT_BUILD_COMMIT: ${{ needs.version.outputs.ref }}
@@ -239,6 +253,7 @@ jobs:
       - name: Install Rust
         shell: bash
         run: |
+          command -v rustup >/dev/null || { echo "::error::rustup is not installed on this runner"; exit 1; }
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
       - name: Install Inno Setup (when the runner lacks it)
@@ -262,7 +277,7 @@ jobs:
     name: GitHub release
     needs: [version, macos, linux, windows]
     if: needs.version.outputs.tag != ''
-    runs-on: ubuntu-latest
+    runs-on: ${{ (inputs.runners || vars.CODECRAFT_RUNNERS) == 'self-hosted' && fromJSON('["self-hosted","Linux"]') || 'ubuntu-latest' }}
     permissions:
       contents: write
     steps:

@@ -293,6 +293,37 @@ The script must be named `clang`: the `cc` crate guesses the compiler family fro
 otherwise may take the stand-in for MSVC. The result says nothing about linking or running;
 CI's Linux job does that. (2026-10-16: the whole workspace, all targets, checks clean this way.)
 
+## Versioning each commit and local builds
+
+`tools/commit-release.sh` versions the commit you are on and builds this OS's packages:
+
+```sh
+tools/commit-release.sh              # asks: patch, minor, major, or Enter to skip
+tools/commit-release.sh minor --yes  # no questions
+tools/commit-release.sh --install-hook   # ask after every commit you make by hand
+```
+
+It bumps the version (`cargo xtask version`), commits "Release vX.Y.Z", tags it (nothing is
+pushed), then builds into `dist/vX.Y.Z/` with `SHA256SUMS.txt`: on macOS the dmg plus a
+`payload/` for self-update (`bundle --profile selfupdate --version-payload`), on Linux the tarball
+and `.deb`, on Windows (Git Bash) the installer and zip. `--no-build` stops after the tag. Local
+builds are ad hoc signed unless `CODECRAFT_SIGN_IDENTITY` is set. The hook asks only when a
+terminal is attached, and stays quiet during rebases, merges and its own release commits
+(`CODECRAFT_NO_RELEASE=1` silences it once).
+
+## Runners
+
+The Release and New version workflows run on GitHub-hosted runners by default. To build on your
+own machines instead, register self-hosted runners with the labels `self-hosted` plus `Linux`,
+`macOS` and `Windows` (one per OS you want), then either pick `self-hosted` in the **runners**
+input of Run workflow, or set the repository variable `CODECRAFT_RUNNERS` to `self-hosted` to make
+it the default (the input wins when filled in). Self-hosted machines need `rustup` (the jobs
+install the toolchain but not rustup itself), Xcode command-line tools on macOS, Git Bash and
+Inno Setup on Windows, and on Linux either the build libraries (`pkg-config libssl-dev
+libwayland-dev libxkbcommon-dev`) or passwordless `sudo` so the job can install them. Only use
+self-hosted runners for a private repository or for trusted workflows: these two run only when
+started by hand, never for pull requests.
+
 ## Self-update payloads (M18 pass 1)
 
 Release bundles use `Contents/MacOS/codecraft-launcher` as `CFBundleExecutable` with
