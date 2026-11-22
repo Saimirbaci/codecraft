@@ -130,6 +130,7 @@ pub mod rust_repl;
 pub mod rust_tools;
 pub mod scratch;
 pub mod selfupdate;
+pub mod app_update;
 pub mod services;
 pub mod session_store;
 pub mod settings;
@@ -252,6 +253,7 @@ pub enum LspStatus {
 pub struct Session {
     pub versions: version_cmds::Versions,
     pub selfupdate: selfupdate::State,
+    pub app_update: app_update::State,
     pub ws: Workspace,
     pub popup: Option<Popup>,
     pub find_bar: Option<FindBar>,
@@ -405,6 +407,7 @@ impl Session {
         Self {
             versions: version_cmds::Versions::default(),
             selfupdate: selfupdate::State::default(),
+            app_update: app_update::State::default(),
             ws: Workspace::new(),
             popup: None,
             find_bar: None,
@@ -632,6 +635,7 @@ impl Session {
     fn pump_frame(&mut self) -> bool {
         version_cmds::pump(self);
         selfupdate::pump(self);
+        app_update::pump(self);
         let lock = self.remote.project.as_ref().and_then(|_| self.project_root()).map(|r| remote::mirror_lock(&r));
         let _guard = match lock.as_ref().map(|l| l.try_lock()) {
             Some(Ok(g)) => Some(g),

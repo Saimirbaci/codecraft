@@ -199,6 +199,7 @@ fn supervise(
         .env("CODECRAFT_VERSION_ID", id)
         .env("CODECRAFT_HEALTH_FILE", health)
         .env("CODECRAFT_LAUNCHER", "1")
+        .env("CODECRAFT_LAUNCHER_VERSION", env!("CARGO_PKG_VERSION"))
         .env("CODECRAFT_LAUNCHER_PATH", launcher)
         .env("CODECRAFT_FACTORY_DIR", &store.factory)
         .stdout(Stdio::piped())

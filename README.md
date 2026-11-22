@@ -83,6 +83,13 @@ sudo ln -sf "/Applications/Code Craft.app/Contents/Resources/bin/codecraft" /usr
  Protocol and routing:
 `crates/handoff` and `crates/ui-egui/src/handoff.rs`.
 
+## Updates
+
+An installed Code Craft checks this repository's GitHub releases once a day and offers
+"Update to X" in the status bar. Updates are ed25519-signed, verified before anything is
+unpacked, and roll back automatically if the new version fails to start. Details:
+`docs/release.md` › Updates from GitHub releases.
+
 ## Under the hood
 
 - **Engine first:** a pure-data workspace model and a command engine, with a thin egui UI on

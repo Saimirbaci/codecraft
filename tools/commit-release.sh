@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Version the current commit and build its packages, locally.
 #
-#   tools/commit-release.sh [patch|minor|major|skip] [--no-build] [--yes]
+#   tools/commit-release.sh [patch|minor|major|skip] [--no-build] [--publish] [--yes]
 #   tools/commit-release.sh --install-hook | --uninstall-hook
 #
 # Asks "patch, minor or major?" (Enter or "skip" does nothing), then:
 #   1. bumps the workspace version (`cargo xtask version`: Cargo.toml and the workspace entries
 #      of Cargo.lock), commits "Release vX.Y.Z" and tags it vX.Y.Z (nothing is pushed);
 #   2. builds the packages for this OS into dist/vX.Y.Z/ with a SHA256SUMS file:
-#        macOS    CodeCraft-X.Y.Z.dmg, plus payload/ for self-update
-#                 (`cargo xtask bundle --profile selfupdate --version-payload`)
+#        macOS    CodeCraft-X.Y.Z.dmg
 #        Linux    codecraft-X.Y.Z-linux-<arch>.tar.gz and codecraft_X.Y.Z_<arch>.deb
 #        Windows  codecraft-X.Y.Z-windows-<arch>-setup.exe and .zip   (run from Git Bash)
+#      plus the self-update files for this OS: codecraft-payload-X.Y.Z-<platform>.tar.gz,
+#      update-<platform>.json and its .sig, signed with ~/.codecraft-release/update.key
+#      (`cargo xtask update-keygen` creates it once; docs/release.md › Updates).
+#   3. with --publish: pushes the commit and tag, and creates the GitHub release with everything
+#      in dist/vX.Y.Z/ (gh must be logged in). Installed apps then offer the update.
 #
 # Signing follows `cargo xtask`: ad hoc unless CODECRAFT_SIGN_IDENTITY is set (docs/release.md).
 # For releases that other people download, push the tag and run the Release workflow instead
@@ -30,6 +34,7 @@ usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 level=""
 build=true
+publish=false
 yes=false
 hook=false
 action=""
@@ -37,6 +42,7 @@ for arg in "$@"; do
     case "$arg" in
         patch|minor|major|skip) level=$arg ;;
         --no-build) build=false ;;
+        --publish) publish=true ;;
         --yes|-y) yes=true ;;
         --hook) hook=true ;;
         --install-hook|--uninstall-hook) action=$arg ;;
@@ -81,6 +87,10 @@ export CODECRAFT_RELEASE_RUNNING=1
 [ -z "$(git status --porcelain --untracked-files=no)" ] || die "tracked files have uncommitted changes; commit or stash them first"
 current=$(cargo xtask version | tail -n 1)
 subject=$(git log -1 --format='%h %s')
+
+if $build && [ ! -f "${CODECRAFT_UPDATE_KEY:-$HOME/.codecraft-release/update.key}" ]; then
+    die "no update signing key; run 'cargo xtask update-keygen' once (or use --no-build)"
+fi
 
 # ---- which bump
 if [ -z "$level" ]; then
@@ -127,24 +137,31 @@ mkdir -p "$out"
 target=${CARGO_TARGET_DIR:-target}
 case "$target" in /*) ;; *) target="$root/$target" ;; esac
 
+payload="$out/payload"
 case "$(uname -s)" in
     Darwin)
         cargo xtask dmg --release
         cp "$target"/bundle/CodeCraft-*.dmg "$out/"
-        # The self-update payload: the foreground app a running install can switch to.
-        cargo xtask bundle --profile selfupdate --version-payload "$out/payload"
+        # The foreground app a running install can switch to (self-update payload).
+        cargo xtask bundle --release --version-payload "$payload"
         ;;
     Linux)
         cargo xtask package-linux --release
         cargo xtask package-deb --release
         cp "$target"/package/codecraft-*.tar.gz "$target"/package/codecraft_*.deb "$out/"
+        mkdir -p "$payload" && cp "$target/release/codecraft" "$payload/"
         ;;
     MINGW*|MSYS*|CYGWIN*)
         cargo xtask package-windows-installer --release
         cp "$target"/package/codecraft-*-setup.exe "$target"/package/codecraft-*.zip "$out/"
+        mkdir -p "$payload" && cp "$target/release/codecraft.exe" "$payload/"
         ;;
     *) die "no packaging for $(uname -s)" ;;
 esac
+
+# Signed update manifest + payload archive (the payload folder itself is not shipped).
+cargo xtask update-pack --payload "$payload" --out "$out" --version "$next" --commit "$CODECRAFT_BUILD_COMMIT"
+rm -rf "$payload"
 
 (
     cd "$out"
@@ -154,4 +171,13 @@ echo
 echo "Built $tag in $out:"
 ls -1 "$out"
 echo
-echo "Share it: git push origin HEAD $tag, then Actions › Release for signed downloads."
+if $publish; then
+    git push --atomic origin "HEAD:refs/heads/$(git rev-parse --abbrev-ref HEAD)" "refs/tags/$tag"
+    flags=()
+    case "$next" in *-*) flags+=(--prerelease) ;; esac
+    # Updates are read from the repository's latest release, so a stable release must not be a draft.
+    gh release create "$tag" "$out"/* --verify-tag ${flags[@]+"${flags[@]}"} --title "Code Craft $tag" --generate-notes
+    echo "Published $tag. Installed apps will offer it within a day, or via Check for Updates."
+else
+    echo "Share it: re-run with --publish, or: git push origin HEAD $tag && gh release create $tag $out/*"
+fi

@@ -184,10 +184,16 @@ pub fn status_bar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
             if s.selfupdate.busy {
                 ui.spinner(); ui.label(&s.selfupdate.phase);
                 if ui.small_button("Cancel build").clicked() { run_command(s, st, "selfupdate.cancel", &serde_json::Value::Null); }
-            } else if let Some(id) = s.selfupdate.ready.clone()
-                && ui.small_button("Restart now").clicked()
+            } else if let Some(id) = s.selfupdate.ready.clone() {
+                if ui.small_button("Restart now").clicked() {
+                    run_command(s, st, "selfupdate.restartInto", &serde_json::json!({"id":id}));
+                }
+            } else if s.app_update.busy {
+                ui.spinner();
+            } else if let Some(version) = s.app_update.available.as_ref().map(|m| m.version.clone())
+                && ui.small_button(format!("Update to {version}")).clicked()
             {
-                run_command(s, st, "selfupdate.restartInto", &serde_json::json!({"id":id}));
+                run_command(s, st, "update.install", &serde_json::Value::Null);
             }
             let muted = st.theme.text_muted;
             // Left: a pending two-stroke shortcut, the status message (Status Text widget), else

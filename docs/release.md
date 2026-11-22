@@ -324,6 +324,54 @@ libwayland-dev libxkbcommon-dev`) or passwordless `sudo` so the job can install 
 self-hosted runners for a private repository or for trusted workflows: these two run only when
 started by hand, never for pull requests.
 
+## Updates from GitHub releases
+
+An installed Code Craft (started by its launcher) can update itself from this repository's
+releases. Developer builds (`cargo run`) never do; they update from source.
+
+**What a release publishes**, per platform (`macos-aarch64`, `linux-x86_64`, `windows-x86_64`, …):
+
+| File | What |
+|---|---|
+| `codecraft-payload-<version>-<platform>.tar.gz` | the foreground app only (the launcher is never replaced) |
+| `update-<platform>.json` | version, commit, asset URL, SHA-256, size, minimum launcher |
+| `update-<platform>.json.sig` | detached ed25519 signature over those exact bytes |
+
+**What the app does** (`crates/update`, `crates/engine/src/app_update.rs`):
+
+1. `update.check` (once a day at launch, silently; or Check for Updates from the command palette;
+   `CODECRAFT_NO_UPDATE_CHECK=1` turns the daily check off) fetches
+   `https://github.com/<repo>/releases/latest/download/update-<platform>.json[.sig]`. Nothing is
+   trusted before the signature verifies against the public key built into the binary
+   (`crates/update/update.pub`). Then the version must be newer than the running one (never a
+   downgrade), the asset URL must be a release asset of this repository, and the SHA-256 and size
+   must be well formed. A newer release shows "Update to X" in the status bar.
+2. `update.install` (the status bar button) downloads the payload over HTTPS, checking size and
+   SHA-256 as it streams, unpacks it with a strict extractor (relative paths only, no links, size
+   caps), stages it in the version store and promotes it, then offers **Restart now**. The restart,
+   health check (20 s of UI progress), rollback and "Roll Back" are the M18 mechanisms, so a
+   payload that fails to start returns to the previous version by itself.
+3. If a release needs a newer launcher than the installed one (`min_launcher`), the app says to
+   install the full release (dmg, installer, `.deb`) instead.
+
+**Signing key.** `cargo xtask update-keygen` creates `~/.codecraft-release/update.key` (owner-only;
+refuses to overwrite) and writes `crates/update/update.pub`, which is committed. Back the private
+key up and never commit it. Losing it, or replacing it, means installed apps reject every later
+update until people install a full release that carries the new public key. For the same reason
+the first release that contains `update.pub` has to be installed by hand (dmg and so on); updates
+work from then on. `CODECRAFT_UPDATE_KEY` points at a key elsewhere. `cargo xtask update-pack`
+refuses a key that does not match `update.pub`.
+
+**Publishing.** `tools/commit-release.sh <patch|minor|major> --publish` bumps, builds the
+packages and the signed update files for the machine's OS, pushes the commit and tag and creates
+the GitHub release with all of them. Updates are read from the repository's *latest* release, so
+publish it (not a draft) for installs to see it, and publish each platform's files to the same
+release (run the script on that OS with the same tag, or upload its `update-*` and payload files
+with `gh release upload`). Check by hand with
+`curl -sL https://github.com/Saimirbaci/codecraft/releases/latest/download/update-macos-aarch64.json`.
+
+The GitHub workflows do not sign updates: the key lives on your machine, not in CI.
+
 ## Self-update payloads (M18 pass 1)
 
 Release bundles use `Contents/MacOS/codecraft-launcher` as `CFBundleExecutable` with

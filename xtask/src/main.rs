@@ -13,10 +13,13 @@
 //!   `--app <path>`, `--keychain <path>`, `--dry-run`.
 //! - `version [patch|minor|major|<x.y.z>] [--dry-run]` prints or bumps the workspace version
 //!   (`version.rs`, docs/release.md).
+//! - `update-keygen`, `update-pack` create the release signing key and pack a payload with its
+//!   signed manifest for self-update (`update.rs`, docs/release.md › Updates).
 
 mod icon;
 mod package;
 mod sign;
+mod update;
 mod version;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,8 +50,10 @@ fn main() -> ExitCode {
         "package-windows-installer" => opts().and_then(|o| package::package_windows_installer(&root, &o)).map(drop),
         "package-deb" => opts().and_then(|o| package::package_deb(&root, &o)).map(drop),
         "version" => version::run(&root, &rest),
+        "update-keygen" => update::keygen(&root, &rest),
+        "update-pack" => update::pack(&rest),
         _ => Err("usage: cargo xtask <layers|catalog|parity|bundle|dmg|notarize|package-linux|package-deb|package-windows|\
-                  package-windows-installer|version> \
+                  package-windows-installer|version|update-keygen|update-pack> \
                   [--release] [--dry-run] [--sign <identity>] [--profile <notarytool profile>]"
             .to_string()),
     };
@@ -73,7 +78,7 @@ fn layer_of(name: &str) -> Option<u8> {
         "codecraft-text" | "codecraft-syntax" | "codecraft-fs" | "codecraft-lsp" | "codecraft-cargo"
         | "codecraft-dap" | "codecraft-db" | "codecraft-agent" | "codecraft-mcp" | "codecraft-term"
         | "codecraft-vcs" | "codecraft-http" | "codecraft-remote" | "codecraft-profile" | "codecraft-selfupdate" | "codecraft-spec"
-        | "codecraft-handoff" => 0,
+        | "codecraft-handoff" | "codecraft-update" => 0,
         "codecraft-workspace" => 1,
         "codecraft-engine" => 2,
         "codecraft-ui-egui" => 3,
