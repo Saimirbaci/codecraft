@@ -109,8 +109,11 @@ next=$(cargo xtask version "$level" --dry-run | tail -n 1)
 tag="v$next"
 git rev-parse -q --verify "refs/tags/$tag" > /dev/null && die "tag $tag already exists"
 echo "Version: $current → $next (tag $tag, commit \"Release $tag\")"
+if $build; then echo "Build:   packages and signed update files for this OS into dist/$tag/ (takes several minutes)"; else echo "Build:   no (--no-build)"; fi
+if $publish; then echo "Publish: push the commit and $tag, then create the GitHub release (public)"; else echo "Publish: no (add --publish)"; fi
 if ! $yes && ! $hook; then
-    read -r -p "Go ahead? [y/N] " answer
+    [ -t 0 ] || die "needs a terminal to ask for confirmation; pass --yes"
+    read -r -p "Go ahead? [y/N] " answer || answer=""
     case "$answer" in y|Y|yes|YES) ;; *) echo "Cancelled."; exit 1 ;; esac
 fi
 
@@ -129,6 +132,7 @@ echo "Committed and tagged $tag (not pushed)."
 $build || { echo "Skipping the build (--no-build)."; exit 0; }
 
 # ---- build the packages for this OS
+echo "==> Building $tag (the first build of a release can take 10+ minutes; cargo output follows)"
 export CODECRAFT_BUILD_COMMIT=$(git rev-parse HEAD)
 export CODECRAFT_BUILD_DATE=$(date -u +%F)
 out="$root/dist/$tag"
@@ -160,6 +164,7 @@ case "$(uname -s)" in
 esac
 
 # Signed update manifest + payload archive (the payload folder itself is not shipped).
+echo "==> Signing the update"
 cargo xtask update-pack --payload "$payload" --out "$out" --version "$next" --commit "$CODECRAFT_BUILD_COMMIT"
 rm -rf "$payload"
 
@@ -172,6 +177,7 @@ echo "Built $tag in $out:"
 ls -1 "$out"
 echo
 if $publish; then
+    echo "==> Publishing $tag"
     git push --atomic origin "HEAD:refs/heads/$(git rev-parse --abbrev-ref HEAD)" "refs/tags/$tag"
     flags=()
     case "$next" in *-*) flags+=(--prerelease) ;; esac
