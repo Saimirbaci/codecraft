@@ -159,6 +159,7 @@ pub mod templates;
 pub mod templates_django;
 pub mod terminal;
 mod terminal_cmds;
+mod terminal_remote;
 pub mod terminal_shell;
 pub mod test_file;
 pub mod testing;

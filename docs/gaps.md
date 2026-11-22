@@ -1636,6 +1636,21 @@ Known shortfalls against RustRover, ranked. Update this list when you close one 
     mode) are not repeated on resume; restored output is plain text (no colours); other shells
     (nu, xonsh, sh) get no per-tab history; the shell's directory is read every 5 s, so a `cd`
     just before quitting is caught by the final save only.
+    Remote projects (2026-11-22): a shell tab on the project's SSH host gets the same per-tab
+    history and Claude Code tracking, kept **on the host** under `~/.codecraft/terminals/`
+    (`terminal_remote.rs`): the one `ssh` command that opens the tab writes the startup files and
+    `claude` shim there (private, rewritten on every connect) and starts the shell with its own
+    `HISTFILE`; the tab's Claude record is read back every 10 s over the project's connection
+    (one `ssh`, off the UI thread) so the snapshot holds the last known session without
+    connecting at save time. A restored tab reconnects, starts in the directory Claude Code ran
+    in, and runs `claude --resume <id>` there; closing a tab removes its files on the host.
+    Remaining: the record is only as fresh as the last poll (a `claude` that ended in between
+    is resumed anyway), the transcript is not checked (a missing one makes `claude` say so),
+    only zsh/bash/fish get per-tab history, an unwritable `~/.codecraft` or a `$HOME` with odd
+    characters falls back to the plain login shell, files of tabs never closed stay on the
+    host, a `cd` in a remote tab is not tracked (remote shells send no OSC 7; Claude's own
+    directory is), and `ssh host` typed into a local tab is not restored or reconnected. Tested
+    against a fake `ssh` and `claude` only.
 68. Releases and versions (2026-10-17): the display name is **Code Craft** (window title, app
     menu, About, Info.plist, desktop entry, installer); MIT only (`LICENSE`); Help › About shows
     the version, build commit and date, platform, license and links, with Copy Version Info;

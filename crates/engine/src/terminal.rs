@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use codecraft_term::{ExitInfo, Palette, Screen, SharedPalette, SharedWaker, TermConfig, TermEvent, Terminal};
 use codecraft_workspace::{ClaudeSnapshot, MAX_TERMINALS, TerminalKind, TerminalSnapshot, ToolWindowId};
 
+use crate::terminal_remote::{self as remote_int, RemoteClaude};
 use crate::terminal_shell as shell_int;
 use crate::{CommandError, Effect, Session};
 
@@ -29,6 +30,8 @@ use crate::{CommandError, Effect, Session};
 pub const MAX_TABS: usize = 32;
 /// How often the shells' working directories are read while tabs are open.
 pub const CWD_POLL: Duration = Duration::from_secs(5);
+/// How often the Claude Code sessions of the remote tabs are read back from their host.
+pub const REMOTE_POLL: Duration = Duration::from_secs(10);
 
 /// Inherited variables a CodeCraft terminal must not pass on: another terminal's or IDE's
 /// identity (CodeCraft sets its own), and Claude Code's nesting marker (a CodeCraft terminal is
@@ -53,6 +56,9 @@ pub enum TabStatus {
     Running,
     Exited(ExitInfo),
 }
+
+/// A finished lookup of the remote tabs' sessions (`None`: the host did not answer).
+type RemotePoll = Option<Vec<(String, RemoteClaude)>>;
 
 pub struct TerminalTab {
     /// Stable id (the `tab` param of `terminal.*` commands).
@@ -143,6 +149,14 @@ pub struct TerminalState {
     /// A working-directory lookup running in the background, and when the last one started.
     cwd_poll: Option<Receiver<Vec<(u32, PathBuf)>>>,
     cwd_polled: Option<Instant>,
+    /// The Claude Code sessions of remote tabs as the host last reported them (by tab key), and
+    /// the lookup running in the background (`None` inside: the host did not answer, the last
+    /// report stays).
+    remote_claude: std::collections::HashMap<String, RemoteClaude>,
+    remote_poll: Option<Receiver<RemotePoll>>,
+    remote_polled: Option<Instant>,
+    /// How often that lookup runs.
+    pub remote_poll_every: Duration,
     /// Where tab histories, saved output and Claude Code session records go (default:
     /// `terminals/` in the config directory, in sessions with background services only).
     pub data_dir: Option<PathBuf>,
@@ -169,6 +183,10 @@ impl Default for TerminalState {
             closing: Vec::new(),
             cwd_poll: None,
             cwd_polled: None,
+            remote_claude: std::collections::HashMap::new(),
+            remote_poll: None,
+            remote_polled: None,
+            remote_poll_every: REMOTE_POLL,
             data_dir: None,
             env: Vec::new(),
             installed: None,
@@ -344,7 +362,14 @@ pub(crate) fn open(s: &mut Session, new: NewTab) -> Result<u64, CommandError> {
         let directory = if s.project_root().is_some_and(|root| cwd.starts_with(root)) {
             codecraft_remote::command::join(&project.remote, &rel)
         } else { cwd.to_string_lossy().into_owned() };
-        args.push(codecraft_remote::quote::sh_c(&format!("cd {} || exit 1; exec \"${{SHELL:-/bin/sh}}\" -l", codecraft_remote::quote::quote_path(&directory))));
+        // Sessions that keep terminal files get the per-tab history and Claude Code tracking on
+        // the host too; the others (tests, the CLI) the plain login shell.
+        let script = if shell_int::data_dir(s).is_some() {
+            remote_int::launch_script(&key, &directory)
+        } else {
+            format!("cd {} || exit 1; exec \"${{SHELL:-/bin/sh}}\" -l", codecraft_remote::quote::quote_path(&directory))
+        };
+        args.push(codecraft_remote::quote::sh_c(&script));
         program = Some(opts.program);
         extra_env.clear();
     }
@@ -449,8 +474,12 @@ fn unique_name(s: &Session, title: Option<&str>, command: Option<&str>) -> Strin
 /// Close a tab (killing its processes in the background). Closing the last tab hides the tool
 /// window, like RustRover.
 pub(crate) fn close(s: &mut Session, index: usize) -> bool {
-    if let Some(key) = s.terminal.tabs.get(index).map(|t| t.key.clone()) {
+    if let Some((key, remote)) = s.terminal.tabs.get(index).map(|t| (t.key.clone(), t.remote)) {
         forget_files(s, &key);
+        if remote {
+            forget_remote(s, &key);
+        }
+        s.terminal.remote_claude.remove(&key);
     }
     let closed = s.terminal.close_index(index);
     if closed && s.terminal.tabs.is_empty() {
@@ -490,6 +519,7 @@ pub(crate) fn pump(s: &mut Session) -> bool {
     }
     s.effects.extend(effects);
     poll_cwds(s);
+    poll_remote(s);
     let before = s.terminal.closing.len();
     s.terminal.closing.retain(|rx| matches!(rx.try_recv(), Err(crossbeam_channel::TryRecvError::Empty)));
     changed | (before != s.terminal.closing.len())
@@ -523,6 +553,60 @@ fn poll_cwds(s: &mut Session) {
         Ok(_) => s.terminal.cwd_poll = Some(rx),
         Err(e) => log::debug!("cannot start the terminal cwd lookup: {e}"),
     }
+}
+
+/// The `ssh` that runs `script` on the remote project's host, when there is a connected one.
+fn remote_ssh(s: &mut Session, script: &str) -> Option<(PathBuf, Vec<String>)> {
+    let project = s.remote.project.clone()?;
+    if project.connection != crate::remote::ConnectionState::Connected {
+        return None;
+    }
+    let server = crate::deployment::server(s, &project.server).ok()?;
+    let opts = s.remote.ssh_options(&project.server);
+    let args = codecraft_remote::command::ssh_exec(&server, &opts, &codecraft_remote::quote::sh_c(script)).ok()?;
+    Some((crate::remote::resolve_program(&opts.program), args))
+}
+
+/// Apply a finished lookup of the remote tabs' Claude Code sessions; start the next one every
+/// [`TerminalState::remote_poll_every`] while remote tabs are open and the host is connected.
+fn poll_remote(s: &mut Session) {
+    if let Some(rx) = &s.terminal.remote_poll {
+        match rx.try_recv() {
+            Ok(found) => {
+                if let Some(found) = found {
+                    s.terminal.remote_claude = found.into_iter().collect();
+                }
+                s.terminal.remote_poll = None;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => s.terminal.remote_poll = None,
+        }
+    }
+    if !s.terminal.tabs.iter().any(|t| t.remote && t.alive()) || shell_int::data_dir(s).is_none() {
+        return;
+    }
+    if s.terminal.remote_polled.is_some_and(|t| t.elapsed() < s.terminal.remote_poll_every) {
+        return;
+    }
+    let Some((program, args)) = remote_ssh(s, &remote_int::poll_script()) else { return };
+    s.terminal.remote_polled = Some(Instant::now());
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let spawned = std::thread::Builder::new().name("term-remote".into()).spawn(move || {
+        let _ = tx.send(remote_int::run_ssh(&program, &args).map(|out| remote_int::parse_poll(&out)));
+    });
+    match spawned {
+        Ok(_) => s.terminal.remote_poll = Some(rx),
+        Err(e) => log::debug!("cannot start the remote terminal lookup: {e}"),
+    }
+}
+
+/// A closed remote tab's history and session record on its host (best effort, in the background).
+fn forget_remote(s: &mut Session, key: &str) {
+    let Some(script) = remote_int::forget_script(key) else { return };
+    let Some((program, args)) = remote_ssh(s, &script) else { return };
+    let _ = std::thread::Builder::new().name("term-remote-forget".into()).spawn(move || {
+        let _ = remote_int::run_ssh(&program, &args);
+    });
 }
 
 /// The processes of live shell tabs (the ones a session snapshot keeps).
@@ -560,12 +644,19 @@ pub fn snapshot(s: &Session) -> (Vec<TerminalSnapshot>, Option<usize>) {
         if i == s.terminal.active {
             active = Some(out.len());
         }
+        let claude = claude_session(s, tab);
+        // A remote tab's session belongs to the directory Claude Code ran in on the host.
+        let cwd = match (tab.remote, s.terminal.remote_claude.get(&tab.key)) {
+            (true, Some(r)) if claude.is_some() => r.state.cwd.as_ref().map(PathBuf::from).unwrap_or_else(|| tab.cwd.clone()),
+            _ => tab.cwd.clone(),
+        };
         out.push(TerminalSnapshot {
             key: Some(tab.key.clone()),
             name: tab.renamed.then(|| tab.name.clone()),
-            cwd: tab.cwd.clone(),
+            cwd,
             kind: if tab.claude { TerminalKind::ClaudeCode } else { TerminalKind::Shell },
-            claude: claude_session(s, tab),
+            claude,
+            remote: tab.remote,
         });
     }
     (out, active)
@@ -574,6 +665,11 @@ pub fn snapshot(s: &Session) -> (Vec<TerminalSnapshot>, Option<usize>) {
 /// The Claude Code session running in `tab`: the one its hook reported (for a shell tab, only
 /// while that claude process still runs in the tab), else the one a Claude Code tab started with.
 fn claude_session(s: &Session, tab: &TerminalTab) -> Option<ClaudeSnapshot> {
+    if tab.remote {
+        // What the host last reported, while that `claude` ran (its transcript is on the host).
+        let r = s.terminal.remote_claude.get(&tab.key).filter(|r| r.alive)?;
+        return Some(ClaudeSnapshot { session: r.state.session.clone(), transcript: None });
+    }
     let state = shell_int::claude_state_file(s, &tab.key).and_then(|p| shell_int::read_claude_state(&p));
     if tab.claude {
         return match state {
@@ -636,8 +732,10 @@ pub(crate) fn restore(s: &mut Session, saved: &[TerminalSnapshot], active: Optio
         let renamed = name.is_some();
         let cwd = Some(tab.cwd.clone()).filter(|d| d.is_absolute() && (d.is_dir() || s.remote.project.is_some()));
         let key = tab.key.clone().filter(|k| shell_int::valid_id(k));
-        let resume = resumable(tab.claude.as_ref());
-        let base = NewTab { cwd, title: name, renamed, background: true, key, local_shell: resume.is_some(), ..NewTab::default() };
+        // A remote tab's session is resumed on its host, so only in a remote project.
+        let resume = resumable(tab.claude.as_ref()).filter(|_| !tab.remote || s.remote.project.is_some());
+        let local_shell = resume.is_some() && !tab.remote;
+        let base = NewTab { cwd, title: name, renamed, background: true, key, local_shell, ..NewTab::default() };
         let result = match tab.kind {
             TerminalKind::ClaudeCode => {
                 crate::terminal_cmds::claude_tab(s, resume.as_deref(), base).and_then(|new| open(s, new))

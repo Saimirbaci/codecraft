@@ -72,6 +72,14 @@ pub struct TerminalSnapshot {
     /// restoring resumes exactly this one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claude: Option<ClaudeSnapshot>,
+    /// The tab was a shell on the remote project's host (SSH), so its `claude` session lives
+    /// there and the tab is restored there.
+    #[serde(skip_serializing_if = "is_false")]
+    pub remote: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// What a terminal tab runs.

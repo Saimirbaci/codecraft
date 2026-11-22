@@ -39,22 +39,22 @@ pub const ENV_CLAUDE_PID: &str = "CODECRAFT_CLAUDE_PID";
 const ENV_USER_ZDOTDIR: &str = "CODECRAFT_USER_ZDOTDIR";
 const ENV_ZDOTDIR_SET: &str = "CODECRAFT_ZDOTDIR_SET";
 
-const HEADER: &str = "# CodeCraft terminal integration (generated: edits are overwritten).\n";
+pub(crate) const HEADER: &str = "# CodeCraft terminal integration (generated: edits are overwritten).\n";
 
-const ZSHENV: &str = r#"_codecraft_zdotdir=$ZDOTDIR
+pub(crate) const ZSHENV: &str = r#"_codecraft_zdotdir=$ZDOTDIR
 ZDOTDIR=${CODECRAFT_USER_ZDOTDIR:-$HOME}
 [[ -r $ZDOTDIR/.zshenv ]] && source $ZDOTDIR/.zshenv
 CODECRAFT_USER_ZDOTDIR=$ZDOTDIR
 ZDOTDIR=$_codecraft_zdotdir
 "#;
 
-const ZPROFILE: &str = r#"ZDOTDIR=$CODECRAFT_USER_ZDOTDIR
+pub(crate) const ZPROFILE: &str = r#"ZDOTDIR=$CODECRAFT_USER_ZDOTDIR
 [[ -r $ZDOTDIR/.zprofile ]] && source $ZDOTDIR/.zprofile
 CODECRAFT_USER_ZDOTDIR=$ZDOTDIR
 ZDOTDIR=$_codecraft_zdotdir
 "#;
 
-const ZSHRC: &str = r#"# macOS's /etc/zshrc put the history file under this directory; it belongs in the user's.
+pub(crate) const ZSHRC: &str = r#"# macOS's /etc/zshrc put the history file under this directory; it belongs in the user's.
 [[ $HISTFILE == $_codecraft_zdotdir/.zsh_history ]] && HISTFILE=$CODECRAFT_USER_ZDOTDIR/.zsh_history
 ZDOTDIR=$CODECRAFT_USER_ZDOTDIR
 [[ -r $ZDOTDIR/.zshrc ]] && source $ZDOTDIR/.zshrc
@@ -76,7 +76,7 @@ fi
 unset _codecraft_zdotdir CODECRAFT_USER_ZDOTDIR CODECRAFT_ZDOTDIR_SET CODECRAFT_HISTFILE
 "#;
 
-const BASHRC: &str = r#"# Started as `bash --rcfile <this file> -i`: the startup files of a login shell, then this
+pub(crate) const BASHRC: &str = r#"# Started as `bash --rcfile <this file> -i`: the startup files of a login shell, then this
 # tab's own history on top of the user's.
 [ -r /etc/profile ] && . /etc/profile
 if [ -r ~/.bash_profile ]; then . ~/.bash_profile
@@ -93,7 +93,7 @@ fi
 unset CODECRAFT_HISTFILE
 "#;
 
-const CLAUDE_SHIM: &str = r#"# `claude` in a CodeCraft terminal tab: the real one, with a SessionStart hook that tells
+pub(crate) const CLAUDE_SHIM: &str = r#"# `claude` in a CodeCraft terminal tab: the real one, with a SessionStart hook that tells
 # CodeCraft which session runs here, so the restored tab resumes it.
 set -f
 self_dir=$(cd "$(dirname "$0")" && pwd -P)
@@ -116,7 +116,7 @@ fi
 exec "$real" "$@"
 "#;
 
-const CLAUDE_HOOK: &str = r#"# Claude Code's SessionStart hook in a CodeCraft terminal tab: records the session (and the
+pub(crate) const CLAUDE_HOOK: &str = r#"# Claude Code's SessionStart hook in a CodeCraft terminal tab: records the session (and the
 # claude process) running in the tab. Prints nothing: SessionStart output would reach the model.
 [ -n "$CODECRAFT_CLAUDE_STATE" ] || exit 0
 tmp="$CODECRAFT_CLAUDE_STATE.$$"
@@ -341,6 +341,8 @@ pub(crate) struct ClaudeState {
     pub pid: Option<u32>,
     pub session: String,
     pub transcript: Option<PathBuf>,
+    /// The directory Claude Code ran in (an absolute path): sessions belong to their directory.
+    pub cwd: Option<String>,
 }
 
 pub(crate) fn read_claude_state(path: &Path) -> Option<ClaudeState> {
@@ -348,7 +350,12 @@ pub(crate) fn read_claude_state(path: &Path) -> Option<ClaudeState> {
     if !meta.is_file() || meta.len() > MAX_STATE_BYTES {
         return None;
     }
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    parse_claude_state(&std::fs::read_to_string(path).ok()?)
+}
+
+/// A record the hook wrote (a local file, or one read back from a remote host).
+pub(crate) fn parse_claude_state(text: &str) -> Option<ClaudeState> {
+    let v: Value = serde_json::from_str(text).ok()?;
     let session = v.pointer("/hook/session_id")?.as_str()?.to_string();
     if !valid_id(&session) {
         return None;
@@ -356,7 +363,8 @@ pub(crate) fn read_claude_state(path: &Path) -> Option<ClaudeState> {
     let pid = v.get("pid").and_then(Value::as_str).and_then(|p| p.parse::<u32>().ok()).filter(|p| *p > 0);
     let transcript =
         v.pointer("/hook/transcript_path").and_then(Value::as_str).filter(|p| p.starts_with('/')).map(PathBuf::from);
-    Some(ClaudeState { pid, session, transcript })
+    let cwd = v.pointer("/hook/cwd").and_then(Value::as_str).filter(|p| p.starts_with('/') && p.len() <= 4096).map(str::to_string);
+    Some(ClaudeState { pid, session, transcript, cwd })
 }
 
 /// The last [`MAX_OUTPUT_LINES`] lines of `text` (at most [`MAX_OUTPUT_BYTES`]), trailing blank
@@ -416,7 +424,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             read_claude_state(&p),
-            Some(ClaudeState { pid: Some(123), session: "abc-1".into(), transcript: Some("/t/abc-1.jsonl".into()) })
+            Some(ClaudeState { pid: Some(123), session: "abc-1".into(), transcript: Some("/t/abc-1.jsonl".into()), cwd: None })
         );
         std::fs::write(&p, r#"{"pid":"","hook":{"session_id":"x"}}"#).unwrap();
         assert_eq!(read_claude_state(&p).unwrap().pid, None);
