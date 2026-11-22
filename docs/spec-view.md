@@ -3,7 +3,8 @@
 A tool window under Project that shows the project's **specs**: what the software is supposed to do,
 written as numbered requirements, and which code points at each one. It is a CodeCraft extension
 (RustRover has nothing like it), so it has no entry in the observed menus or the parity checklist.
-Open it from the left stripe (📋) or with the command `view.toolWindows.spec`.
+Open it from the left stripe (📋), the 📋 button on the main toolbar, View › Tool Windows › Spec View,
+or with the command `view.toolWindows.spec`.
 
 The aim is **spec-anchored** development: specs and code evolve together and every link between
 them is machine-checked. It is deliberately not spec-as-source. CodeCraft never regenerates code

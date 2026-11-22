@@ -17,6 +17,8 @@ pub(crate) const EXTRA: &[(&str, &str)] = &[
     ("View › Active Editor", "view.toggleSoftWrap"),
     ("View › Active Editor", "view.toggleWhitespace"),
     ("View", "view.toggleLineNumbers"),
+    // CodeCraft's own: the Spec View (also on the toolbar).
+    ("View › Tool Windows", "view.toolWindows.spec"),
     ("Code", "code.showContextActions"),
     // RustRover's Refactor menu fills Extract/Inline/Change Signature for the caret's context.
     ("Refactor", "refactor.extract.variable"),

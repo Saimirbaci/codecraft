@@ -102,6 +102,9 @@ pub fn toolbar(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
                 if tool_button(ui, st, "🔍", "Search Everywhere (⇧⇧)", true, None) {
                     run_command(s, st, "navigate.searchEverywhere", &Value::Null);
                 }
+                if tool_button(ui, st, "📋", "Spec View", true, None) {
+                    run_command(s, st, "view.toolWindows.spec", &Value::Null);
+                }
                 ui.add_space(8.0);
                 let has_project = s.ws.project.is_some();
                 let running = s.ws.runs.iter().any(|r| r.is_running());

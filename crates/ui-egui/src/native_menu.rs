@@ -829,6 +829,7 @@ mod tests {
         assert!(window.contains(&Node::Role(Role::Zoom)));
         // EXTRA commands appear where the in-window bar puts them.
         assert!(find_item(submenu(&m, "Build"), "cargo.check").is_some());
+        assert!(find_item(submenu(&m, "View"), "view.toolWindows.spec").is_some(), "View › Tool Windows › Spec View");
         assert!(find_item(submenu(&m, "Run"), "run.debuggingActions.stepOver").is_some());
         // Checkable toggles.
         let view = submenu(&m, "View");

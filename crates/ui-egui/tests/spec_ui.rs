@@ -365,3 +365,18 @@ fn a_task_is_implemented_from_its_own_menu() {
     assert!(prompt.contains("Implement requirement login/REQ-2"), "{prompt}");
     assert!(prompt.contains("Your task:\n- [ ] 2 Lock"), "{prompt}");
 }
+
+#[test]
+fn the_toolbar_button_toggles_the_spec_view() {
+    let (mut h, _root) = open_project();
+    assert!(h.state().session.ws.layout.is_visible(ToolWindowId::Spec));
+    for want_visible in [false, true] {
+        // 📋 is also the stripe button; the toolbar's is the one in the top bar, on the right.
+        h.query_all_by_label("📋")
+            .find(|n| n.rect().min.y < 60.0 && n.rect().min.x > 640.0)
+            .expect("a 📋 button on the right of the main toolbar")
+            .click();
+        h.run_steps(3);
+        assert_eq!(h.state().session.ws.layout.is_visible(ToolWindowId::Spec), want_visible);
+    }
+}
