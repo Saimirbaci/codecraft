@@ -30,7 +30,7 @@ pub use document::{
     DocId, Editor, EditorId, InlayHint, InlayKind, InlayLabelPart, InlayLocation, OpenDocument, SemanticSpan,
     TextEncoding,
 };
-pub use layout::{Layout, Side, ToolWindowId};
+pub use layout::{Layout, Side, ToolWindowBars, ToolWindowId};
 pub use problems::{Problem, ProblemSource, Severity};
 pub use project::Project;
 pub use run::{ConsoleKind, ConsoleLine, RunStatus, RunTab, RunTabId, TestRecord};
@@ -228,6 +228,8 @@ pub struct Settings {
     pub navigation_bar_members: bool,
     /// View › Appearance › Tool Window Bars (the stripes with the tool window buttons).
     pub show_tool_window_bars: bool,
+    /// Which tool window buttons the bars show, and in what order (right-click a bar).
+    pub tool_window_bars: ToolWindowBars,
     /// View › Appearance › Status Bar.
     pub show_status_bar: bool,
     /// View › Appearance › Status Bar Widgets: visibility by widget key (`lineColumnNumber`, …);
@@ -445,6 +447,7 @@ impl Default for Settings {
             navigation_bar: NavigationBar::InStatusBar,
             navigation_bar_members: true,
             show_tool_window_bars: true,
+            tool_window_bars: ToolWindowBars::default(),
             show_status_bar: true,
             status_bar_widgets: BTreeMap::new(),
             find_usages: FindUsagesOptions::default(),

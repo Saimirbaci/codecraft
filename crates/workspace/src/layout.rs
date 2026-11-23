@@ -207,6 +207,80 @@ impl ToolWindowId {
     }
 }
 
+/// The user's choices for the tool window bars (the stripes): which buttons are shown and in
+/// what order. Windows stay reachable from View › Tool Windows and their shortcuts when hidden.
+///
+/// The order is one list for all bars: each bar (or group of a bar) is the windows on it sorted
+/// by their position here; a window that is not listed comes after the listed ones in its
+/// default place. So a settings file from before this existed, or one that names a window that
+/// has gone, still works.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolWindowBars {
+    /// Windows without a button on their bar.
+    pub hidden: Vec<ToolWindowId>,
+    /// Button order, first to last.
+    pub order: Vec<ToolWindowId>,
+}
+
+impl ToolWindowBars {
+    pub fn is_shown(&self, tw: ToolWindowId) -> bool {
+        !self.hidden.contains(&tw)
+    }
+
+    pub fn is_default(&self) -> bool {
+        self.hidden.is_empty() && self.order.is_empty()
+    }
+
+    /// `group` (windows of one bar, in their default order) in the user's order, with or without
+    /// the hidden ones.
+    pub fn arrange(&self, group: &[ToolWindowId], include_hidden: bool) -> Vec<ToolWindowId> {
+        let mut v: Vec<ToolWindowId> =
+            group.iter().copied().filter(|t| include_hidden || self.is_shown(*t)).collect();
+        // Stable: windows that are not listed keep their default order, after the listed ones.
+        v.sort_by_key(|t| self.order.iter().position(|o| o == t).unwrap_or(usize::MAX));
+        v
+    }
+
+    pub fn set_shown(&mut self, tw: ToolWindowId, shown: bool) {
+        self.hidden.retain(|t| *t != tw);
+        if !shown {
+            self.hidden.push(tw);
+        }
+    }
+
+    /// Moves `tw` by `delta` places within `group` (default order; hidden windows count, so the
+    /// list the user sees in the dialog moves one row at a time). False when it is not in the
+    /// group or already at that end.
+    pub fn shift(&mut self, group: &[ToolWindowId], tw: ToolWindowId, delta: i32) -> bool {
+        let mut cur = self.arrange(group, true);
+        let Some(from) = cur.iter().position(|t| *t == tw) else { return false };
+        let to = (from as i64 + i64::from(delta)).clamp(0, cur.len() as i64 - 1) as usize;
+        if to == from {
+            return false;
+        }
+        cur.remove(from);
+        cur.insert(to, tw);
+        // Keep what this group does not own (other bars' positions) and re-list the group.
+        self.order.retain(|t| !group.contains(t));
+        self.order.extend(cur);
+        true
+    }
+
+    /// Moves `tw` to the place of `before` (or the end with `None`).
+    pub fn move_before(&mut self, group: &[ToolWindowId], tw: ToolWindowId, before: Option<ToolWindowId>) -> bool {
+        let mut cur = self.arrange(group, true);
+        let Some(from) = cur.iter().position(|t| *t == tw) else { return false };
+        cur.remove(from);
+        let at = before.and_then(|b| cur.iter().position(|t| *t == b)).unwrap_or(cur.len());
+        cur.insert(at, tw);
+        let changed = cur != self.arrange(group, true);
+        self.order.retain(|t| !group.contains(t));
+        self.order.extend(cur);
+        changed
+    }
+}
+
 /// The height a lower-left tool window (Spec View) opens with.
 pub const LOWER_LEFT_HEIGHT: f32 = 240.0;
 
@@ -395,6 +469,59 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const G: [ToolWindowId; 4] =
+        [ToolWindowId::Project, ToolWindowId::Commit, ToolWindowId::Structure, ToolWindowId::Bookmarks];
+
+    #[test]
+    fn bars_default_to_the_given_order_and_hide_on_request() {
+        let mut b = ToolWindowBars::default();
+        assert!(b.is_default());
+        assert_eq!(b.arrange(&G, false), G.to_vec());
+        b.set_shown(ToolWindowId::Commit, false);
+        assert_eq!(b.arrange(&G, false), vec![G[0], G[2], G[3]]);
+        assert_eq!(b.arrange(&G, true).len(), 4, "the dialog still lists hidden windows");
+        b.set_shown(ToolWindowId::Commit, true);
+        assert!(b.is_default());
+    }
+
+    #[test]
+    fn shifting_reorders_one_group_and_stops_at_the_ends() {
+        let mut b = ToolWindowBars::default();
+        assert!(b.shift(&G, ToolWindowId::Bookmarks, -1));
+        assert_eq!(b.arrange(&G, true), vec![G[0], G[1], G[3], G[2]]);
+        assert!(!b.shift(&G, ToolWindowId::Project, -1), "already first");
+        assert!(!b.shift(&G, ToolWindowId::Structure, 1), "already last");
+        assert!(!b.shift(&G, ToolWindowId::Run, 1), "not in the group");
+        // Another group's order is untouched.
+        let other = [ToolWindowId::Cargo, ToolWindowId::Agent];
+        assert!(b.shift(&other, ToolWindowId::Agent, -1));
+        assert_eq!(b.arrange(&G, true), vec![G[0], G[1], G[3], G[2]]);
+        assert_eq!(b.arrange(&other, true), vec![ToolWindowId::Agent, ToolWindowId::Cargo]);
+    }
+
+    #[test]
+    fn moving_before_a_window_and_unlisted_windows() {
+        let mut b = ToolWindowBars::default();
+        assert!(b.move_before(&G, ToolWindowId::Bookmarks, Some(ToolWindowId::Commit)));
+        assert_eq!(b.arrange(&G, true), vec![G[0], G[3], G[1], G[2]]);
+        assert!(b.move_before(&G, ToolWindowId::Project, None));
+        assert_eq!(b.arrange(&G, true), vec![G[3], G[1], G[2], G[0]]);
+        // A window added later (not in `order`) comes after the listed ones.
+        let more = [G[0], G[1], G[2], G[3], ToolWindowId::Spec];
+        assert_eq!(b.arrange(&more, true).last(), Some(&ToolWindowId::Spec));
+    }
+
+    #[test]
+    fn hostile_settings_are_harmless() {
+        let b: ToolWindowBars = serde_json::from_str(r#"{"hidden":["project","project"],"order":["x","commit"]}"#)
+            .unwrap_or_default();
+        // An unknown window name fails the whole value, which falls back to the defaults.
+        assert!(b.is_default());
+        let b: ToolWindowBars = serde_json::from_str(r#"{"hidden":["Project","Project"],"order":["Commit","Commit"]}"#)
+            .unwrap_or_default();
+        assert_eq!(b.arrange(&G, false), vec![G[1], G[2], G[3]]);
+    }
 
     #[test]
     fn pane_sizes_are_remembered_and_hostile_values_ignored() {

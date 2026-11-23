@@ -74,6 +74,8 @@ pub struct AppearanceState {
     pub full_screen: bool,
     /// The Zoom IDE popup is open.
     pub zoom_popup: bool,
+    /// The Customize Tool Window Bars dialog is open.
+    pub bars_dialog: bool,
     /// Resident memory of this process (MiB), for the Memory Indicator.
     pub memory_mb: Option<u64>,
     /// Full screen before a mode turned it on (restored when the last such mode ends).
@@ -306,6 +308,7 @@ fn state(s: &Session) -> Value {
         "zoom": zoom_of(&s.ws.settings),
         "zoomPopup": a.zoom_popup,
         "chrome": chrome(s),
+        "bars": crate::bars::state(s),
         "widgets": WIDGETS
             .iter()
             .map(|w| json!({ "key": w.0, "label": w.1, "visible": widget_visible(&s.ws.settings, w.0), "painted": w.3 }))

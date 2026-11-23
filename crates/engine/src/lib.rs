@@ -26,6 +26,7 @@ pub mod agents;
 pub mod analysis;
 pub mod app_cmds;
 pub mod appearance;
+pub mod bars;
 pub mod approvals;
 pub mod asm;
 pub mod before_launch;

@@ -192,6 +192,7 @@ pub fn registry() -> &'static Registry {
         specs.extend(crate::session_store::specs());
         specs.extend(crate::hot_exit::specs());
         specs.extend(crate::appearance::specs());
+        specs.extend(crate::bars::specs());
         specs.extend(crate::paste::specs());
         specs.extend(crate::usages::specs());
         specs.extend(crate::folding::specs());

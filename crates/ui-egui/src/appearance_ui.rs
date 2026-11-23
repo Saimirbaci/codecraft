@@ -2,11 +2,12 @@
 //! Compact Mode spacing, the Zoom IDE popup and the Find Usages Settings dialog. Every change
 //! goes through engine commands.
 
-use egui::{Align2, Id, Key, RichText};
+use egui::{Align, Align2, Id, Key, RichText};
 use serde_json::{Value, json};
 
 use codecraft_engine::Session;
 use codecraft_engine::appearance;
+use codecraft_engine::bars;
 use codecraft_workspace::UsageScope;
 
 use crate::{UiState, run_command};
@@ -52,6 +53,7 @@ pub(crate) fn windows(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
     let mut cmds: Cmds = Vec::new();
     zoom_popup(&ctx, s, st, &mut cmds);
     find_usages_settings(&ctx, s, st, &mut cmds);
+    bars_dialog(&ctx, s, st, &mut cmds);
     for (id, p) in cmds {
         run_command(s, st, id, &p);
     }
@@ -88,6 +90,77 @@ fn zoom_popup(ctx: &egui::Context, s: &Session, st: &UiState, cmds: &mut Cmds) {
         });
     if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
         cmds.push(("view.appearance.zoomIde.close", Value::Null));
+    }
+}
+
+/// Customize Tool Window Bars: each bar's buttons with a checkbox (shown) and ▲ ▼ (order). Every
+/// click is a `view.appearance.toolWindowBars.*` command; the bars change as you click.
+fn bars_dialog(ctx: &egui::Context, s: &Session, st: &UiState, cmds: &mut Cmds) {
+    if !s.appearance.bars_dialog {
+        return;
+    }
+    let mut open = true;
+    let moves = std::cell::RefCell::new(Vec::<Value>::new());
+    let shows = std::cell::RefCell::new(Vec::<Value>::new());
+    egui::Window::new("Customize Tool Window Bars")
+        .id(Id::new("bars-dialog"))
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_width(340.0)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new("A hidden button stays in View › Tool Windows and keeps its shortcut.")
+                    .size(11.0)
+                    .color(st.theme.text_muted),
+            );
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for g in bars::Group::ALL {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(g.title()).strong());
+                    let list = bars::buttons(s, g, true);
+                    let n = list.len();
+                    for (i, tw) in list.into_iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            let mut shown = s.ws.settings.tool_window_bars.is_shown(tw);
+                            if ui.checkbox(&mut shown, tw.title()).changed() {
+                                shows.borrow_mut().push(json!({ "tool": tw.key(), "on": shown }));
+                            }
+                            ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add_enabled(i + 1 < n, egui::Button::new("▼").small()).on_hover_text("Move down").clicked() {
+                                    moves.borrow_mut().push(json!({ "tool": tw.key(), "by": 1 }));
+                                }
+                                if ui.add_enabled(i > 0, egui::Button::new("▲").small()).on_hover_text("Move up").clicked() {
+                                    moves.borrow_mut().push(json!({ "tool": tw.key(), "by": -1 }));
+                                }
+                            });
+                        });
+                    }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let custom = !s.ws.settings.tool_window_bars.is_default();
+                if ui.add_enabled(custom, egui::Button::new("Reset to Default")).clicked() {
+                    cmds.push(("view.appearance.toolWindowBars.reset", Value::Null));
+                }
+                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        cmds.push(("view.appearance.toolWindowBars.close", Value::Null));
+                    }
+                });
+            });
+        });
+    // One change per frame is enough; the commands carry their own parameters.
+    for p in shows.into_inner() {
+        cmds.push(("view.appearance.toolWindowBars.show", p));
+    }
+    for p in moves.into_inner() {
+        cmds.push(("view.appearance.toolWindowBars.move", p));
+    }
+    if !open || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        cmds.push(("view.appearance.toolWindowBars.close", Value::Null));
     }
 }
 

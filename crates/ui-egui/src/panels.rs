@@ -6,9 +6,10 @@ use egui::text::{LayoutJob, TextFormat};
 use egui::{Align, Color32, CornerRadius, FontId, Frame, Layout, Margin, RichText, ScrollArea, Sense, Stroke, vec2};
 use serde_json::{Value, json};
 
-use codecraft_engine::{IMPLEMENTED_TOOL_WINDOWS, Session};
+use codecraft_engine::bars::{self, Group};
+use codecraft_engine::Session;
 use codecraft_fs::NodeId;
-use codecraft_workspace::{ConsoleKind, NotificationLevel, RunStatus, Severity, Side, ToolWindowId};
+use codecraft_workspace::{ConsoleKind, NotificationLevel, RunStatus, Severity, ToolWindowId};
 
 use crate::{UiState, keymap, run_command};
 
@@ -71,6 +72,31 @@ fn stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, tw: ToolW
     if resp.clicked() {
         run_command(s, st, &format!("view.toolWindows.{}", tw.key()), &Value::Null);
     }
+    resp.context_menu(|ui| {
+        if ui.button("Hide This Button").clicked() {
+            run_command(s, st, "view.appearance.toolWindowBars.show", &json!({ "tool": tw.key(), "on": false }));
+            ui.close();
+        }
+        bars_menu(ui, s, st);
+    });
+}
+
+/// What every right-click on a bar offers.
+fn bars_menu(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
+    if ui.button("Customize Tool Window Bars…").clicked() {
+        run_command(s, st, "view.appearance.toolWindowBars.customize", &Value::Null);
+        ui.close();
+    }
+    if ui.add_enabled(!s.ws.settings.tool_window_bars.is_default(), egui::Button::new("Reset Tool Window Bars")).clicked()
+    {
+        run_command(s, st, "view.appearance.toolWindowBars.reset", &Value::Null);
+        ui.close();
+    }
+}
+
+/// The bar's empty space answers a right-click too (added first, so the buttons win their own).
+fn bar_background(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, id: &'static str) {
+    ui.interact(ui.max_rect(), egui::Id::new(id), Sense::click()).context_menu(|ui| bars_menu(ui, s, st));
 }
 
 /// The feedback overlay on the right stripe, under Remote Host (also on the toolbar and in Tools).
@@ -84,6 +110,7 @@ fn feedback_stripe_button(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState, 
                 .min_size(vec2(size, size)),
         )
         .on_hover_text("Draw Feedback for an Agent (⌥⇧⌘F)");
+    resp.context_menu(|ui| bars_menu(ui, s, st));
     if active {
         ui.painter().rect_filled(resp.rect.shrink(1.0), CornerRadius::same(6), Color32::from_white_alpha(14));
     }
@@ -100,21 +127,23 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         .stroke(Stroke::new(1.0, st.theme.border));
     let width = if s.ws.settings.compact_mode { 32.0 } else { 38.0 };
     egui::Panel::left("stripe-left").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
-        let top: Vec<ToolWindowId> = IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Left).collect();
-        // Bottom tool windows sit low on the stripe, the last one lowest.
-        let mut bottom: Vec<ToolWindowId> =
-            IMPLEMENTED_TOOL_WINDOWS.into_iter().rev().filter(|t| t.side() == Side::Bottom).collect();
-        // CMake projects get the CMake tool window (track CL).
-        if s.cpp.cmake.is_cmake {
-            bottom.push(ToolWindowId::CMake);
-        }
-        // Zig and TypeScript projects get their tool windows (M13 track RC).
-        if is_project_of(ui, s, "zig", codecraft_engine::zig_tool::is_zig_project) {
-            bottom.push(ToolWindowId::Zig);
-        }
-        if is_project_of(ui, s, "typescript", codecraft_engine::typescript_tool::is_typescript_project) {
-            bottom.push(ToolWindowId::TypeScript);
-        }
+        bar_background(ui, s, st, "stripe-left-bg");
+        let top: Vec<ToolWindowId> = bars::buttons(s, Group::Left, false);
+        // The bottom tool windows sit low on the stripe; `bottom` is from the lowest up. The CMake,
+        // Zig and TypeScript windows (tracks CL and RC) only exist in projects of their kind.
+        let cmake = s.cpp.cmake.is_cmake;
+        let zig = is_project_of(ui, s, "zig", codecraft_engine::zig_tool::is_zig_project);
+        let typescript = is_project_of(ui, s, "typescript", codecraft_engine::typescript_tool::is_typescript_project);
+        let bottom: Vec<ToolWindowId> = bars::buttons(s, Group::Bottom, false)
+            .into_iter()
+            .filter(|t| match t {
+                ToolWindowId::CMake => cmake,
+                ToolWindowId::Zig => zig,
+                ToolWindowId::TypeScript => typescript,
+                _ => true,
+            })
+            .rev()
+            .collect();
         // The two groups overlapped in a 700 px window (QA M14): buttons shrink to fit, and when
         // even small ones don't fit, the stripe is one list that scrolls.
         let (size, fits) = stripe_fit(ui, top.len() + bottom.len());
@@ -147,7 +176,8 @@ pub fn stripes(ui: &mut egui::Ui, s: &mut Session, st: &mut UiState) {
         }
     });
     egui::Panel::right("stripe-right").exact_size(width).resizable(false).frame(frame).show(ui, |ui| {
-        let right: Vec<ToolWindowId> = IMPLEMENTED_TOOL_WINDOWS.into_iter().filter(|t| t.side() == Side::Right).collect();
+        bar_background(ui, s, st, "stripe-right-bg");
+        let right: Vec<ToolWindowId> = bars::buttons(s, Group::Right, false);
         // + 1: the feedback button under the tool windows.
         let (size, _) = stripe_fit(ui, right.len() + 1);
         ScrollArea::vertical()

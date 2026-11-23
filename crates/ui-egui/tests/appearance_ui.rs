@@ -200,3 +200,53 @@ fn find_usages_settings_dialog_saves_the_options() {
     run(&mut h, "editor.escape", Value::Null);
     assert!(h.state().session.usages.highlights.is_none());
 }
+
+#[test]
+fn the_tool_window_bars_dialog_hides_and_reorders_buttons() {
+    use codecraft_engine::bars::{self, Group};
+    use codecraft_workspace::ToolWindowId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = ready(dir.path());
+    assert!(h.query_by_label("Customize Tool Window Bars").is_none());
+    run(&mut h, "view.appearance.toolWindowBars.customize", Value::Null);
+    assert!(h.query_by_label("Customize Tool Window Bars").is_some(), "the dialog is open");
+    assert!(h.query_by_label("Reset to Default").is_some());
+    h.run_steps(5); // the window settles (it is centered and sizes itself over a few frames)
+
+    // Unchecking a window hides its button (a command underneath).
+    // (A row near the top: the list scrolls, and a row out of view cannot be clicked.)
+    h.get_by_label("Structure").click();
+    h.run_steps(3);
+    let bars_cfg = &h.state().session.ws.settings.tool_window_bars;
+    assert!(!bars_cfg.is_shown(ToolWindowId::Structure), "{bars_cfg:?}");
+    assert!(!bars::buttons(&h.state().session, Group::Left, false).contains(&ToolWindowId::Structure));
+    assert!(bars::buttons(&h.state().session, Group::Left, true).contains(&ToolWindowId::Structure));
+
+    // ▼ on the first row (Project) moves it one row down (the dialog lists hidden windows too).
+    assert_eq!(bars::buttons(&h.state().session, Group::Left, true)[0], ToolWindowId::Project);
+    h.get_all_by_label("▼").next().unwrap().click();
+    h.run_steps(3);
+    assert_eq!(bars::buttons(&h.state().session, Group::Left, true)[1], ToolWindowId::Project);
+
+    // Reset restores both.
+    h.get_by_label("Reset to Default").click();
+    h.run_steps(3);
+    assert!(h.state().session.ws.settings.tool_window_bars.is_default());
+    h.get_by_label("Close").click();
+    h.run_steps(3);
+    assert!(!h.state().session.appearance.bars_dialog);
+}
+
+#[test]
+fn a_hidden_tool_window_has_no_stripe_button_but_still_opens() {
+    use codecraft_workspace::ToolWindowId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut h = ready(dir.path());
+    run(&mut h, "view.appearance.toolWindowBars.show", json!({ "tool": "cargo", "on": false }));
+    assert!(!h.state().session.ws.layout.is_visible(ToolWindowId::Cargo));
+    run(&mut h, "view.toolWindows.cargo", Value::Null);
+    assert!(h.state().session.ws.layout.is_visible(ToolWindowId::Cargo));
+    assert!(h.state().session.ws.settings.tool_window_bars.hidden.contains(&ToolWindowId::Cargo));
+}
