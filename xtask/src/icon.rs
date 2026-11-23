@@ -206,6 +206,18 @@ mod tests {
         [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
     }
 
+    /// The window icon the app embeds (`crates/ui-egui/assets/app-icon.png`) is this same artwork.
+    /// `CODECRAFT_UPDATE_ICON=1 cargo test -p xtask app_icon_asset` rewrites it.
+    #[test]
+    fn app_icon_asset_is_current() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../crates/ui-egui/assets/app-icon.png");
+        let want = encode_png(256, &render(256)).unwrap();
+        if std::env::var_os("CODECRAFT_UPDATE_ICON").is_some() {
+            std::fs::write(&path, &want).unwrap();
+        }
+        assert!(std::fs::read(&path).is_ok_and(|have| have == want), "app-icon.png is stale: rerun with CODECRAFT_UPDATE_ICON=1");
+    }
+
     #[test]
     fn icns_chunks_are_bounded_valid_png_representations() {
         let dir = tempfile::tempdir().unwrap(); let path = dir.path().join("icon.icns");

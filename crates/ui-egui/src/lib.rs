@@ -964,6 +964,13 @@ impl eframe::App for App {
     }
 }
 
+/// The app icon (the same artwork as the bundle's `.icns`, see `xtask/src/icon.rs`).
+fn app_icon() -> Option<egui::IconData> {
+    let png = include_bytes!("../assets/app-icon.png");
+    let img = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.into_rgba8();
+    Some(egui::IconData { width: img.width(), height: img.height(), rgba: img.into_raw() })
+}
+
 /// Launch the desktop app.
 pub fn run(open: Option<PathBuf>) -> eframe::Result {
     launch(Launch { open, ..Launch::default() })
@@ -979,6 +986,10 @@ pub fn launch(launch: Launch) -> eframe::Result {
         .with_inner_size(size)
         .with_min_inner_size([640.0, 400.0])
         .with_resizable(true);
+    // Our own icon for the window and the Dock; without it eframe shows its default one.
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     if let Some(pos) = persisted.saved_window_pos() {
         viewport = viewport.with_position(pos);
     }
@@ -1006,4 +1017,14 @@ pub fn launch(launch: Launch) -> eframe::Result {
             Ok(Box::new(app))
         }),
     )
+}
+
+#[cfg(test)]
+mod app_icon_tests {
+    #[test]
+    fn the_embedded_app_icon_decodes() {
+        let icon = super::app_icon().expect("embedded icon decodes");
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 }
